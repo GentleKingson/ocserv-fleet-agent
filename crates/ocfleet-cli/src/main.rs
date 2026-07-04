@@ -7,6 +7,7 @@ use ocfleet_cli::store::{NodeInsert, Store};
 use ocfleet_config::validation::{
     validate_controller_endpoint_id, validate_node_id, validate_region, validate_role,
 };
+use ocfleet_protocol::method::{NODE_INFO, NODE_PING};
 
 fn local_actor() -> String {
     match std::env::var("USER") {
@@ -37,9 +38,16 @@ async fn main() -> anyhow::Result<()> {
             store.insert_audit(&event)?;
             println!("controller_endpoint_id={}", secret_key.secret_key.public());
         }
+        Command::Ping { node_id } => {
+            let store = Store::open(&cli.database).context("failed to open controller database")?;
+            reject_direct_rpc_without_endpoint_addr(&store, &node_id, NODE_PING)?;
+        }
         Command::Node { command } => {
             let store = Store::open(&cli.database).context("failed to open controller database")?;
             match command {
+                NodeCommand::Info { node_id } => {
+                    reject_direct_rpc_without_endpoint_addr(&store, &node_id, NODE_INFO)?;
+                }
                 NodeCommand::Add {
                     node_id,
                     endpoint_id,
@@ -111,4 +119,24 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn reject_direct_rpc_without_endpoint_addr(
+    store: &Store,
+    node_id: &str,
+    method: &str,
+) -> anyhow::Result<()> {
+    validate_node_id(node_id)?;
+    let Some(node) = store.get_node(node_id)? else {
+        bail!("node not found: {node_id}");
+    };
+    if !node.enabled {
+        bail!("node disabled: {node_id}");
+    }
+
+    bail!(
+        "direct RPC dialing for {method} requires an explicit EndpointAddr or local E2E harness; controller database currently stores only EndpointID {} for node {}",
+        node.endpoint_id,
+        node.node_id
+    );
 }

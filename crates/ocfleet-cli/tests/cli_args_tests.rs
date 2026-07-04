@@ -64,3 +64,28 @@ fn parses_node_remove_yes_flag() {
     assert_eq!(node_id, "hk-ocserv-01");
     assert!(yes);
 }
+
+#[test]
+fn parses_top_level_ping_command() {
+    let cli = Cli::parse_from(["ocfleet", "ping", "hk-ocserv-01"]);
+
+    let Command::Ping { node_id } = cli.command else {
+        panic!("expected ping command");
+    };
+
+    assert_eq!(node_id, "hk-ocserv-01");
+}
+
+#[test]
+fn parses_node_info_command() {
+    let cli = Cli::parse_from(["ocfleet", "node", "info", "hk-ocserv-01"]);
+
+    let Command::Node {
+        command: NodeCommand::Info { node_id },
+    } = cli.command
+    else {
+        panic!("expected node info command");
+    };
+
+    assert_eq!(node_id, "hk-ocserv-01");
+}

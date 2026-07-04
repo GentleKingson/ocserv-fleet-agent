@@ -16,6 +16,9 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     Init,
+    Ping {
+        node_id: String,
+    },
     Node {
         #[command(subcommand)]
         command: NodeCommand,
@@ -24,6 +27,9 @@ pub enum Command {
 
 #[derive(Debug, Subcommand)]
 pub enum NodeCommand {
+    Info {
+        node_id: String,
+    },
     Add {
         node_id: String,
         #[arg(long)]

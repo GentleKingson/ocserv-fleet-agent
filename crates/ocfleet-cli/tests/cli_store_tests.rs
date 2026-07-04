@@ -1,5 +1,12 @@
 use ocfleet_cli::audit::AuditEvent;
-use ocfleet_cli::store::{NodeInsert, Store};
+use ocfleet_cli::store::{NodeInsert, Store, StoreError};
+
+fn assert_node_not_found(result: Result<(), StoreError>, expected_node_id: &str) {
+    match result {
+        Err(StoreError::NodeNotFound(node_id)) => assert_eq!(node_id, expected_node_id),
+        other => panic!("expected NodeNotFound for {expected_node_id}, got {other:?}"),
+    }
+}
 
 #[test]
 fn initializes_schema_and_migration_version() {
@@ -48,6 +55,17 @@ fn disabled_node_is_visible_but_not_enabled() {
     store.disable_node("hk-ocserv-01").expect("disable");
     let loaded = store.get_node("hk-ocserv-01").expect("load").expect("exists");
     assert!(!loaded.enabled);
+}
+
+#[test]
+fn missing_node_mutations_return_node_not_found() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("controller.sqlite");
+    let store = Store::open(&db).expect("store opens");
+
+    assert_node_not_found(store.disable_node("missing-disable"), "missing-disable");
+    assert_node_not_found(store.enable_node("missing-enable"), "missing-enable");
+    assert_node_not_found(store.remove_node("missing-remove"), "missing-remove");
 }
 
 #[test]

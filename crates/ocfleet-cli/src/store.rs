@@ -10,6 +10,8 @@ pub enum StoreError {
     Sqlite(#[from] rusqlite::Error),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("node not found: {0}")]
+    NodeNotFound(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,24 +139,34 @@ impl Store {
     }
 
     pub fn disable_node(&self, node_id: &str) -> Result<(), StoreError> {
-        self.conn.execute(
+        let affected = self.conn.execute(
             "UPDATE nodes SET enabled = 0, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE node_id = ?1",
             [node_id],
         )?;
+        if affected == 0 {
+            return Err(StoreError::NodeNotFound(node_id.to_string()));
+        }
         Ok(())
     }
 
     pub fn enable_node(&self, node_id: &str) -> Result<(), StoreError> {
-        self.conn.execute(
+        let affected = self.conn.execute(
             "UPDATE nodes SET enabled = 1, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE node_id = ?1",
             [node_id],
         )?;
+        if affected == 0 {
+            return Err(StoreError::NodeNotFound(node_id.to_string()));
+        }
         Ok(())
     }
 
     pub fn remove_node(&self, node_id: &str) -> Result<(), StoreError> {
-        self.conn
+        let affected = self
+            .conn
             .execute("DELETE FROM nodes WHERE node_id = ?1", [node_id])?;
+        if affected == 0 {
+            return Err(StoreError::NodeNotFound(node_id.to_string()));
+        }
         Ok(())
     }
 

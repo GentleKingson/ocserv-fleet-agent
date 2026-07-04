@@ -21,12 +21,12 @@ pub struct AgentServerState {
 
 #[derive(Debug, Clone)]
 pub struct AllowlistHook {
-    allowed: HashSet<String>,
+    allowed: HashSet<EndpointId>,
     audit: JsonlAuditWriter,
 }
 
 impl AllowlistHook {
-    pub fn new(allowed: HashSet<String>, audit: JsonlAuditWriter) -> Self {
+    pub fn new(allowed: HashSet<EndpointId>, audit: JsonlAuditWriter) -> Self {
         Self { allowed, audit }
     }
 }
@@ -37,7 +37,7 @@ impl EndpointHooks for AllowlistHook {
             return AfterHandshakeOutcome::Accept;
         }
 
-        let remote_endpoint_id = conn.remote_id().to_string();
+        let remote_endpoint_id = conn.remote_id();
         if self.allowed.contains(&remote_endpoint_id) {
             return AfterHandshakeOutcome::Accept;
         }
@@ -45,9 +45,10 @@ impl EndpointHooks for AllowlistHook {
         let alpn = String::from_utf8_lossy(conn.alpn());
         let reason = format!("endpoint not allowed for ALPN {alpn}");
         let mut event = AgentAuditEvent::new("rpc_rejected");
-        event.remote_endpoint_id = Some(remote_endpoint_id);
+        event.remote_endpoint_id = Some(remote_endpoint_id.to_string());
         event.stage = Some("endpoint_allowlist".to_string());
         event.allowed = Some(false);
+        event.error_code = Some("ENDPOINT_NOT_ALLOWED".to_string());
         event.reason = Some(reason.clone());
         if let Err(err) = self.audit.write(&event) {
             tracing::warn!(error = %err, "failed to write endpoint allowlist rejection audit event");
@@ -65,7 +66,7 @@ pub async fn bind_agent_endpoint(
     secret_key: SecretKey,
     audit: JsonlAuditWriter,
 ) -> Result<Endpoint> {
-    agent_endpoint_builder(config, secret_key, audit)
+    agent_endpoint_builder(config, secret_key, audit)?
         .bind()
         .await
         .context("failed to bind agent iroh endpoint")
@@ -76,7 +77,7 @@ pub async fn bind_agent_endpoint_local_only(
     secret_key: SecretKey,
     audit: JsonlAuditWriter,
 ) -> Result<Endpoint> {
-    agent_endpoint_builder(config, secret_key, audit)
+    agent_endpoint_builder(config, secret_key, audit)?
         .relay_mode(RelayMode::Disabled)
         .clear_address_lookup()
         .clear_ip_transports()
@@ -95,16 +96,23 @@ fn agent_endpoint_builder(
     config: &AgentConfig,
     secret_key: SecretKey,
     audit: JsonlAuditWriter,
-) -> iroh::endpoint::Builder {
+) -> Result<iroh::endpoint::Builder> {
     let allowed = config
         .security
         .controllers
         .iter()
-        .map(|controller| controller.endpoint_id.clone())
-        .collect::<HashSet<_>>();
+        .map(|controller| {
+            parse_endpoint_id(&controller.endpoint_id).with_context(|| {
+                format!(
+                    "invalid allowed controller endpoint id: {}",
+                    controller.endpoint_id
+                )
+            })
+        })
+        .collect::<Result<HashSet<_>>>()?;
 
-    Endpoint::builder(presets::N0)
+    Ok(Endpoint::builder(presets::N0)
         .secret_key(secret_key)
         .alpns(vec![config.iroh.alpn.as_bytes().to_vec()])
-        .hooks(AllowlistHook::new(allowed, audit))
+        .hooks(AllowlistHook::new(allowed, audit)))
 }

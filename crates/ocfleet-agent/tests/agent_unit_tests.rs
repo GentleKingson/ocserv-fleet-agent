@@ -7,9 +7,10 @@ use ocfleet_agent::{
     AGENT_VERSION,
 };
 use ocfleet_config::agent::{
-    AgentConfig, AuditConfig, IrohConfig, NodeConfig, SecurityConfig,
+    AgentConfig, AuditConfig, ControllerConfig, IrohConfig, NodeConfig, SecurityConfig,
 };
 use std::net::{IpAddr, Ipv4Addr};
+use std::path::Path;
 use std::time::Duration;
 use time::OffsetDateTime;
 
@@ -157,31 +158,7 @@ async fn local_only_endpoint_binds_only_to_ipv4_loopback() {
     let dir = tempfile::tempdir().expect("temp dir");
     let secret_key = load_or_create_secret_key(&dir.path().join("iroh.secret"), false)
         .expect("agent secret key");
-    let config = AgentConfig {
-        node: NodeConfig {
-            id: "agent-1".to_string(),
-            region: "hk".to_string(),
-            role: "ocserv".to_string(),
-        },
-        iroh: IrohConfig {
-            secret_key_path: dir.path().join("iroh.secret"),
-            alpn: "/com.github.gentlekingson.ocfleet.mgmt/1".to_string(),
-        },
-        security: SecurityConfig {
-            allowed_clock_skew_seconds: 60,
-            default_deadline_ms: 5_000,
-            max_deadline_ms: 10_000,
-            max_rpc_timeout_ms: 5_000,
-            max_request_bytes: 65_536,
-            max_response_bytes: 2_097_152,
-            controllers: Vec::new(),
-        },
-        audit: AuditConfig {
-            path: dir.path().join("audit.log"),
-        },
-        ocserv: None,
-        logs: None,
-    };
+    let config = test_agent_config(dir.path(), Vec::new());
     let audit = JsonlAuditWriter::new(dir.path().join("audit.log"));
 
     let endpoint = bind_agent_endpoint_local_only(&config, secret_key, audit)
@@ -192,4 +169,53 @@ async fn local_only_endpoint_binds_only_to_ipv4_loopback() {
     assert_eq!(bound_sockets.len(), 1);
     assert_eq!(bound_sockets[0].ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
     endpoint.close().await;
+}
+
+#[tokio::test]
+async fn endpoint_bind_rejects_invalid_allowed_controller_endpoint_id() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let secret_key = load_or_create_secret_key(&dir.path().join("iroh.secret"), false)
+        .expect("agent secret key");
+    let config = test_agent_config(
+        dir.path(),
+        vec![ControllerConfig {
+            endpoint_id: "not-an-endpoint-id".to_string(),
+            role: "viewer".to_string(),
+        }],
+    );
+    let audit = JsonlAuditWriter::new(dir.path().join("audit.log"));
+
+    assert!(
+        bind_agent_endpoint_local_only(&config, secret_key, audit)
+            .await
+            .is_err()
+    );
+}
+
+fn test_agent_config(dir: &Path, controllers: Vec<ControllerConfig>) -> AgentConfig {
+    AgentConfig {
+        node: NodeConfig {
+            id: "agent-1".to_string(),
+            region: "hk".to_string(),
+            role: "ocserv".to_string(),
+        },
+        iroh: IrohConfig {
+            secret_key_path: dir.join("iroh.secret"),
+            alpn: "/com.github.gentlekingson.ocfleet.mgmt/1".to_string(),
+        },
+        security: SecurityConfig {
+            allowed_clock_skew_seconds: 60,
+            default_deadline_ms: 5_000,
+            max_deadline_ms: 10_000,
+            max_rpc_timeout_ms: 5_000,
+            max_request_bytes: 65_536,
+            max_response_bytes: 2_097_152,
+            controllers,
+        },
+        audit: AuditConfig {
+            path: dir.join("audit.log"),
+        },
+        ocserv: None,
+        logs: None,
+    }
 }

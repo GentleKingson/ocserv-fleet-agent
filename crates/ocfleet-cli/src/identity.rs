@@ -27,8 +27,9 @@ pub fn load_or_create_secret_key(
         Err(err) => return Err(err),
     }
 
-    let parent = path.parent().ok_or(IdentityError::MissingParent)?;
-    fs::create_dir_all(parent)?;
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)?;
+    }
 
     let key = SecretKey::generate();
     let encoded = base64::engine::general_purpose::STANDARD.encode(key.to_bytes());

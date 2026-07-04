@@ -9,7 +9,10 @@ use ocfleet_config::validation::{
 };
 
 fn local_actor() -> String {
-    std::env::var("USER").unwrap_or_else(|_| "local-cli".to_string())
+    match std::env::var("USER") {
+        Ok(actor) if !actor.trim().is_empty() => actor,
+        _ => "local-cli".to_string(),
+    }
 }
 
 #[tokio::main]

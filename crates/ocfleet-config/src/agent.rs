@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
-use crate::validation::{validate_node_id, validate_region, validate_role};
+use crate::validation::{validate_node_id, validate_region, validate_role, validate_service_name};
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -98,6 +98,13 @@ pub fn validate_agent_config(config: &AgentConfig) -> Result<(), ConfigError> {
     validate_node_id(&config.node.id).map_err(|e| ConfigError::Invalid(e.to_string()))?;
     validate_region(&config.node.region).map_err(|e| ConfigError::Invalid(e.to_string()))?;
     validate_role(&config.node.role).map_err(|e| ConfigError::Invalid(e.to_string()))?;
+    if let Some(service_name) = config
+        .ocserv
+        .as_ref()
+        .and_then(|ocserv| ocserv.service_name.as_deref())
+    {
+        validate_service_name(service_name).map_err(|e| ConfigError::Invalid(e.to_string()))?;
+    }
     if config.security.default_deadline_ms == 0 {
         return Err(ConfigError::Invalid(
             "default_deadline_ms must be greater than zero".into(),

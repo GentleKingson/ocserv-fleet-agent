@@ -1,5 +1,5 @@
-use ocfleet_config::agent::{validate_agent_config, AgentConfig, ConfigError};
-use ocfleet_config::cli::{load_cli_config, validate_cli_config, CliConfig, CliConfigError};
+use ocfleet_config::agent::{AgentConfig, ConfigError, validate_agent_config};
+use ocfleet_config::cli::{CliConfig, CliConfigError, load_cli_config, validate_cli_config};
 use ocfleet_config::validation::{validate_node_id, validate_region, validate_service_name};
 use std::fs;
 use std::path::PathBuf;
@@ -33,6 +33,26 @@ path = "/tmp/ocfleet-audit.log"
 "#,
     )
     .expect("valid agent config should parse")
+}
+
+fn minimal_agent_config() -> AgentConfig {
+    toml::from_str(
+        r#"
+[node]
+id = "hk-ocserv-01"
+region = "hk"
+role = "ocserv"
+
+[iroh]
+secret_key_path = "/tmp/iroh.secret"
+
+[security]
+
+[audit]
+path = "/tmp/ocfleet-audit.log"
+"#,
+    )
+    .expect("minimal agent config should parse")
 }
 
 fn valid_cli_config() -> CliConfig {
@@ -224,6 +244,90 @@ fn agent_config_rejects_too_small_max_response_bytes() {
         err,
         ConfigError::Invalid(message)
             if message.contains("max_response_bytes") && message.contains("512")
+    ));
+}
+
+#[test]
+fn agent_config_defaults_include_resource_limits() {
+    let config = minimal_agent_config();
+
+    assert_eq!(config.security.max_handshake_tasks_global, 256);
+    assert_eq!(config.security.max_connections_global, 256);
+    assert_eq!(config.security.max_connections_per_controller, 32);
+    assert_eq!(config.security.max_streams_global, 1024);
+    assert_eq!(config.security.max_streams_per_controller, 128);
+    assert_eq!(config.security.max_live_nonces_global, 100_000);
+    assert_eq!(config.security.max_live_nonces_per_controller, 10_000);
+    assert_eq!(config.audit.rejected_peer_log_burst, 10);
+    assert_eq!(config.audit.rejected_peer_log_refill_per_sec, 1);
+    assert_eq!(config.audit.rejected_peer_log_max_buckets, 4096);
+    assert_eq!(config.audit.rejected_peer_log_bucket_ttl_seconds, 3600);
+    assert_eq!(
+        config.audit.rejected_peer_log_aggregate_interval_seconds,
+        60
+    );
+}
+
+#[test]
+fn agent_config_rejects_invalid_resource_limit_relationships() {
+    let mut config = valid_agent_config();
+    config.security.max_connections_per_controller = config.security.max_connections_global + 1;
+    let err = validate_agent_config(&config).expect_err("per-controller connection cap rejected");
+    assert!(matches!(
+        err,
+        ConfigError::Invalid(message)
+            if message.contains("max_connections_per_controller")
+                && message.contains("max_connections_global")
+    ));
+
+    let mut config = valid_agent_config();
+    config.security.max_streams_per_controller = config.security.max_streams_global + 1;
+    let err = validate_agent_config(&config).expect_err("per-controller stream cap rejected");
+    assert!(matches!(
+        err,
+        ConfigError::Invalid(message)
+            if message.contains("max_streams_per_controller")
+                && message.contains("max_streams_global")
+    ));
+
+    let mut config = valid_agent_config();
+    config.security.max_live_nonces_per_controller = config.security.max_live_nonces_global + 1;
+    let err = validate_agent_config(&config).expect_err("per-controller nonce cap rejected");
+    assert!(matches!(
+        err,
+        ConfigError::Invalid(message)
+            if message.contains("max_live_nonces_per_controller")
+                && message.contains("max_live_nonces_global")
+    ));
+}
+
+#[test]
+fn agent_config_rejects_invalid_audit_limiter_values() {
+    let mut config = valid_agent_config();
+    config.audit.rejected_peer_log_burst = 0;
+    let err = validate_agent_config(&config).expect_err("zero burst rejected");
+    assert!(matches!(
+        err,
+        ConfigError::Invalid(message) if message.contains("rejected_peer_log_burst")
+    ));
+
+    let mut config = valid_agent_config();
+    config.audit.rejected_peer_log_refill_per_sec = 0;
+    let err = validate_agent_config(&config).expect_err("zero refill rejected");
+    assert!(matches!(
+        err,
+        ConfigError::Invalid(message) if message.contains("rejected_peer_log_refill_per_sec")
+    ));
+
+    let mut config = valid_agent_config();
+    config.audit.rejected_peer_log_bucket_ttl_seconds =
+        config.audit.rejected_peer_log_aggregate_interval_seconds - 1;
+    let err = validate_agent_config(&config).expect_err("ttl smaller than aggregate rejected");
+    assert!(matches!(
+        err,
+        ConfigError::Invalid(message)
+            if message.contains("rejected_peer_log_bucket_ttl_seconds")
+                && message.contains("rejected_peer_log_aggregate_interval_seconds")
     ));
 }
 

@@ -4,9 +4,12 @@ use std::sync::{Arc, Mutex};
 use anyhow::Context;
 use clap::Parser;
 use ocfleet_agent::audit::JsonlAuditWriter;
+use ocfleet_agent::audit_limiter::RejectedAuditLimiter;
 use ocfleet_agent::identity::load_or_create_secret_key;
 use ocfleet_agent::nonce::NonceCache;
-use ocfleet_agent::server::{AgentServerState, bind_agent_endpoint, serve_endpoint};
+use ocfleet_agent::server::{
+    AgentServerState, ServerLimiters, bind_agent_endpoint, serve_endpoint,
+};
 use ocfleet_config::agent::load_agent_config;
 
 #[derive(Debug, Parser)]
@@ -26,12 +29,19 @@ async fn main() -> anyhow::Result<()> {
     let secret_key = load_or_create_secret_key(&config.iroh.secret_key_path, true)
         .context("failed to load or create agent SecretKey")?;
     let audit = JsonlAuditWriter::new(config.audit.path.clone());
-    let endpoint = bind_agent_endpoint(&config, secret_key, audit.clone()).await?;
+    let audit_limiter = Arc::new(Mutex::new(RejectedAuditLimiter::new(&config.audit)));
+    let endpoint =
+        bind_agent_endpoint(&config, secret_key, audit.clone(), audit_limiter.clone()).await?;
     let endpoint_id = endpoint.id().to_string();
     let state = AgentServerState {
         config: config.clone(),
         audit,
-        nonce_cache: Arc::new(Mutex::new(NonceCache::new())),
+        nonce_cache: Arc::new(Mutex::new(NonceCache::with_limits(
+            config.security.max_live_nonces_global,
+            config.security.max_live_nonces_per_controller,
+        ))),
+        limiters: Arc::new(ServerLimiters::from_config(&config.security)),
+        audit_limiter,
         agent_endpoint_id: endpoint_id.clone(),
     };
 

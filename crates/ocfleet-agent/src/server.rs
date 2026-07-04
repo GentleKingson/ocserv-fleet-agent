@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
@@ -10,7 +10,7 @@ use iroh::endpoint::{
     AfterHandshakeOutcome, Connection, EndpointHooks, RecvStream, SendStream, Side, presets,
 };
 use iroh::{Endpoint, EndpointId, RelayMode, SecretKey};
-use ocfleet_config::agent::AgentConfig;
+use ocfleet_config::agent::{AgentConfig, SecurityConfig};
 use ocfleet_protocol::constants::PROTOCOL_VERSION;
 use ocfleet_protocol::error::{ErrorCode, RpcError};
 use ocfleet_protocol::method::{MethodStatus, NODE_INFO, NODE_PING, classify_phase_one_method};
@@ -18,18 +18,125 @@ use ocfleet_protocol::rpc::{RpcRequest, RpcResponse};
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use crate::audit::{AgentAuditEvent, JsonlAuditWriter};
-use crate::node_info::collect_node_info;
-use crate::nonce::NonceCache;
 use crate::AGENT_VERSION;
+use crate::audit::{AgentAuditEvent, JsonlAuditWriter};
+use crate::audit_limiter::{AuditLimitDecision, RejectedAuditLimiter};
+use crate::node_info::collect_node_info;
+use crate::nonce::{NonceCache, NonceDecision, NonceLimitScope};
 
 #[derive(Debug, Clone)]
 pub struct AgentServerState {
     pub config: AgentConfig,
     pub audit: JsonlAuditWriter,
     pub nonce_cache: Arc<Mutex<NonceCache>>,
+    pub limiters: Arc<ServerLimiters>,
+    pub audit_limiter: Arc<Mutex<RejectedAuditLimiter>>,
     pub agent_endpoint_id: String,
+}
+
+#[derive(Debug)]
+pub struct ServerLimiters {
+    handshake_global: Arc<Semaphore>,
+    connections_global: Arc<Semaphore>,
+    connections_per_controller_limit: usize,
+    connections_per_controller: Mutex<HashMap<String, Arc<Semaphore>>>,
+    streams_global: Arc<Semaphore>,
+    streams_per_controller_limit: usize,
+    streams_per_controller: Mutex<HashMap<String, Arc<Semaphore>>>,
+}
+
+#[derive(Debug)]
+pub struct ConnectionPermits {
+    _global: OwnedSemaphorePermit,
+    _per_controller: OwnedSemaphorePermit,
+}
+
+#[derive(Debug)]
+pub struct StreamPermits {
+    _global: OwnedSemaphorePermit,
+    _per_controller: OwnedSemaphorePermit,
+}
+
+impl ServerLimiters {
+    pub fn from_config(config: &SecurityConfig) -> Self {
+        Self::new(
+            config.max_handshake_tasks_global,
+            config.max_connections_global,
+            config.max_connections_per_controller,
+            config.max_streams_global,
+            config.max_streams_per_controller,
+        )
+    }
+
+    pub fn new(
+        max_handshake_tasks_global: usize,
+        max_connections_global: usize,
+        max_connections_per_controller: usize,
+        max_streams_global: usize,
+        max_streams_per_controller: usize,
+    ) -> Self {
+        Self {
+            handshake_global: Arc::new(Semaphore::new(max_handshake_tasks_global)),
+            connections_global: Arc::new(Semaphore::new(max_connections_global)),
+            connections_per_controller_limit: max_connections_per_controller,
+            connections_per_controller: Mutex::new(HashMap::new()),
+            streams_global: Arc::new(Semaphore::new(max_streams_global)),
+            streams_per_controller_limit: max_streams_per_controller,
+            streams_per_controller: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn try_acquire_handshake(&self) -> Option<OwnedSemaphorePermit> {
+        self.handshake_global.clone().try_acquire_owned().ok()
+    }
+
+    pub fn try_acquire_connection(&self, remote_endpoint_id: &str) -> Option<ConnectionPermits> {
+        let global = self.connections_global.clone().try_acquire_owned().ok()?;
+        let per_controller = self
+            .connection_controller_semaphore(remote_endpoint_id)
+            .try_acquire_owned()
+            .ok()?;
+        Some(ConnectionPermits {
+            _global: global,
+            _per_controller: per_controller,
+        })
+    }
+
+    pub fn try_acquire_stream(&self, remote_endpoint_id: &str) -> Option<StreamPermits> {
+        let global = self.streams_global.clone().try_acquire_owned().ok()?;
+        let per_controller = self
+            .stream_controller_semaphore(remote_endpoint_id)
+            .try_acquire_owned()
+            .ok()?;
+        Some(StreamPermits {
+            _global: global,
+            _per_controller: per_controller,
+        })
+    }
+
+    fn connection_controller_semaphore(&self, remote_endpoint_id: &str) -> Arc<Semaphore> {
+        let mut semaphores = self
+            .connections_per_controller
+            .lock()
+            .expect("connection limiter mutex poisoned");
+        semaphores
+            .entry(remote_endpoint_id.to_string())
+            .or_insert_with(|| Arc::new(Semaphore::new(self.connections_per_controller_limit)))
+            .clone()
+    }
+
+    fn stream_controller_semaphore(&self, remote_endpoint_id: &str) -> Arc<Semaphore> {
+        let mut semaphores = self
+            .streams_per_controller
+            .lock()
+            .expect("stream limiter mutex poisoned");
+        semaphores
+            .entry(remote_endpoint_id.to_string())
+            .or_insert_with(|| Arc::new(Semaphore::new(self.streams_per_controller_limit)))
+            .clone()
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -57,11 +164,20 @@ impl RpcServerError {
 pub struct AllowlistHook {
     allowed: HashSet<EndpointId>,
     audit: JsonlAuditWriter,
+    audit_limiter: Arc<Mutex<RejectedAuditLimiter>>,
 }
 
 impl AllowlistHook {
-    pub fn new(allowed: HashSet<EndpointId>, audit: JsonlAuditWriter) -> Self {
-        Self { allowed, audit }
+    pub fn new(
+        allowed: HashSet<EndpointId>,
+        audit: JsonlAuditWriter,
+        audit_limiter: Arc<Mutex<RejectedAuditLimiter>>,
+    ) -> Self {
+        Self {
+            allowed,
+            audit,
+            audit_limiter,
+        }
     }
 }
 
@@ -78,15 +194,26 @@ impl EndpointHooks for AllowlistHook {
 
         let alpn = String::from_utf8_lossy(conn.alpn());
         let reason = format!("endpoint not allowed for ALPN {alpn}");
-        let mut event = AgentAuditEvent::new("rpc_rejected");
-        event.remote_endpoint_id = Some(remote_endpoint_id.to_string());
-        event.stage = Some("endpoint_allowlist".to_string());
-        event.allowed = Some(false);
-        event.error_code = Some("ENDPOINT_NOT_ALLOWED".to_string());
-        event.reason = Some(reason.clone());
-        if let Err(err) = self.audit.write(&event) {
-            tracing::warn!(error = %err, "failed to write endpoint allowlist rejection audit event");
-        }
+        write_limited_audit_event(
+            &self.audit,
+            &self.audit_limiter,
+            Some(&remote_endpoint_id.to_string()),
+            "connection",
+            "ENDPOINT_NOT_ALLOWED",
+            |suppressed_count, limit_key| {
+                let mut event = AgentAuditEvent::new("rpc_rejected");
+                event.remote_endpoint_id = Some(remote_endpoint_id.to_string());
+                event.stage = Some("endpoint_allowlist".to_string());
+                event.allowed = Some(false);
+                event.ok = Some(false);
+                event.error_code = Some("ENDPOINT_NOT_ALLOWED".to_string());
+                event.reason = Some(reason.clone());
+                event.resource = Some("connection".to_string());
+                event.suppressed_count = Some(suppressed_count);
+                event.limit_key = Some(limit_key);
+                event
+            },
+        );
 
         AfterHandshakeOutcome::Reject {
             error_code: 403u32.into(),
@@ -99,8 +226,9 @@ pub async fn bind_agent_endpoint(
     config: &AgentConfig,
     secret_key: SecretKey,
     audit: JsonlAuditWriter,
+    audit_limiter: Arc<Mutex<RejectedAuditLimiter>>,
 ) -> Result<Endpoint> {
-    agent_endpoint_builder(config, secret_key, audit)?
+    agent_endpoint_builder(config, secret_key, audit, audit_limiter)?
         .bind()
         .await
         .context("failed to bind agent iroh endpoint")
@@ -110,8 +238,9 @@ pub async fn bind_agent_endpoint_local_only(
     config: &AgentConfig,
     secret_key: SecretKey,
     audit: JsonlAuditWriter,
+    audit_limiter: Arc<Mutex<RejectedAuditLimiter>>,
 ) -> Result<Endpoint> {
-    agent_endpoint_builder(config, secret_key, audit)?
+    agent_endpoint_builder(config, secret_key, audit, audit_limiter)?
         .relay_mode(RelayMode::Disabled)
         .clear_address_lookup()
         .clear_ip_transports()
@@ -236,8 +365,22 @@ pub async fn handle_request(
 
 pub async fn serve_endpoint(endpoint: Endpoint, state: AgentServerState) -> Result<()> {
     while let Some(incoming) = endpoint.accept().await {
+        let Some(handshake_permit) = state.limiters.try_acquire_handshake() else {
+            tracing::warn!(
+                "incoming iroh connection rejected because handshake task limit is full"
+            );
+            audit_resource_rejection(
+                &state,
+                None,
+                "handshake",
+                "handshake_admission",
+                "handshake task limit exceeded",
+            );
+            continue;
+        };
         let state = state.clone();
         tokio::spawn(async move {
+            let handshake_permit = handshake_permit;
             let connecting = match incoming.accept() {
                 Ok(connecting) => connecting,
                 Err(err) => {
@@ -247,7 +390,23 @@ pub async fn serve_endpoint(endpoint: Endpoint, state: AgentServerState) -> Resu
             };
 
             match connecting.await {
-                Ok(conn) => serve_connection(state, conn).await,
+                Ok(conn) => {
+                    drop(handshake_permit);
+                    let remote_endpoint_id = conn.remote_id().to_string();
+                    let Some(connection_permits) =
+                        state.limiters.try_acquire_connection(&remote_endpoint_id)
+                    else {
+                        audit_resource_rejection(
+                            &state,
+                            Some(&remote_endpoint_id),
+                            "connection",
+                            "connection_admission",
+                            "connection limit exceeded",
+                        );
+                        return;
+                    };
+                    serve_connection(state, conn, connection_permits).await
+                }
                 Err(err) => {
                     tracing::warn!(error = %err, "incoming iroh handshake failed");
                 }
@@ -261,6 +420,7 @@ fn agent_endpoint_builder(
     config: &AgentConfig,
     secret_key: SecretKey,
     audit: JsonlAuditWriter,
+    audit_limiter: Arc<Mutex<RejectedAuditLimiter>>,
 ) -> Result<iroh::endpoint::Builder> {
     let allowed = config
         .security
@@ -279,15 +439,46 @@ fn agent_endpoint_builder(
     Ok(Endpoint::builder(presets::N0)
         .secret_key(secret_key)
         .alpns(vec![config.iroh.alpn.as_bytes().to_vec()])
-        .hooks(AllowlistHook::new(allowed, audit)))
+        .hooks(AllowlistHook::new(allowed, audit, audit_limiter)))
 }
 
-async fn serve_connection(state: AgentServerState, conn: Connection) {
+async fn serve_connection(
+    state: AgentServerState,
+    conn: Connection,
+    _connection_permits: ConnectionPermits,
+) {
     let remote_endpoint_id = conn.remote_id().to_string();
     while let Ok((send, recv)) = conn.accept_bi().await {
+        let Some(stream_permits) = state.limiters.try_acquire_stream(&remote_endpoint_id) else {
+            let mut send = send;
+            audit_resource_rejection(
+                &state,
+                Some(&remote_endpoint_id),
+                "stream",
+                "stream_admission",
+                "stream limit exceeded",
+            );
+            let response = error_response(
+                None,
+                ErrorCode::ResourceExhausted,
+                "stream limit exceeded",
+                json!({"resource": "stream"}),
+            );
+            if let Err(err) = write_response(
+                &mut send,
+                &response,
+                state.config.security.max_response_bytes,
+            )
+            .await
+            {
+                tracing::warn!(error = %err, "failed to write stream admission rejection response");
+            }
+            continue;
+        };
         let state = state.clone();
         let remote_endpoint_id = remote_endpoint_id.clone();
         tokio::spawn(async move {
+            let _stream_permits = stream_permits;
             if let Err(err) = handle_bi_stream(state, remote_endpoint_id, recv, send).await {
                 tracing::warn!(error = %err, "failed to handle rpc stream");
             }
@@ -457,7 +648,10 @@ fn serialize_response(
     if payload.len() > max_response_bytes {
         return Err(RpcServerError::structured(
             ErrorCode::ResponseTooLarge,
-            format!("response too large: {} > {max_response_bytes}", payload.len()),
+            format!(
+                "response too large: {} > {max_response_bytes}",
+                payload.len()
+            ),
         ));
     }
     Ok(payload)
@@ -514,7 +708,8 @@ async fn validate_and_dispatch_request(
     remote_endpoint_id: &str,
     request: RpcRequest,
 ) -> std::result::Result<(String, Value), RequestDispatchError> {
-    let request_id_for_error = valid_request_id(&request.request_id).then(|| request.request_id.clone());
+    let request_id_for_error =
+        valid_request_id(&request.request_id).then(|| request.request_id.clone());
 
     if request.version != PROTOCOL_VERSION {
         return Err(RequestDispatchError::new(
@@ -576,7 +771,7 @@ async fn validate_and_dispatch_request(
         request.deadline_ms,
         state.config.security.allowed_clock_skew_seconds,
     );
-    let nonce_registered = state
+    let nonce_decision = state
         .nonce_cache
         .lock()
         .map_err(|_| {
@@ -588,13 +783,28 @@ async fn validate_and_dispatch_request(
             )
         })?
         .register(remote_endpoint_id, request.nonce.clone(), nonce_ttl);
-    if !nonce_registered {
-        return Err(RequestDispatchError::new(
-            Some(request_id),
-            ErrorCode::ReplayedNonce,
-            "nonce was already used by this remote endpoint",
-            json!({}),
-        ));
+    match nonce_decision {
+        NonceDecision::Accepted => {}
+        NonceDecision::Replay => {
+            return Err(RequestDispatchError::new(
+                Some(request_id),
+                ErrorCode::ReplayedNonce,
+                "nonce was already used by this remote endpoint",
+                json!({}),
+            ));
+        }
+        NonceDecision::ResourceExhausted { scope, limit } => {
+            return Err(RequestDispatchError::new(
+                Some(request_id),
+                ErrorCode::ResourceExhausted,
+                "nonce cache limit exceeded",
+                json!({
+                    "resource": "nonce_cache",
+                    "scope": nonce_limit_scope_name(scope),
+                    "limit": limit,
+                }),
+            ));
+        }
     }
 
     match classify_phase_one_method(&request.method) {
@@ -602,7 +812,10 @@ async fn validate_and_dispatch_request(
             return Err(RequestDispatchError::new(
                 Some(request_id),
                 ErrorCode::MethodNotAllowed,
-                format!("method is known but not allowed in phase 1: {}", request.method),
+                format!(
+                    "method is known but not allowed in phase 1: {}",
+                    request.method
+                ),
                 json!({"method": request.method}),
             ));
         }
@@ -610,7 +823,10 @@ async fn validate_and_dispatch_request(
             return Err(RequestDispatchError::new(
                 Some(request_id),
                 ErrorCode::MethodNotAllowed,
-                format!("method is known but not allowed in phase 1: {}", request.method),
+                format!(
+                    "method is known but not allowed in phase 1: {}",
+                    request.method
+                ),
                 json!({"method": request.method}),
             ));
         }
@@ -749,12 +965,12 @@ fn validate_issued_at(
 
     let issued = OffsetDateTime::parse(issued_at, &time::format_description::well_known::Rfc3339)
         .map_err(|err| {
-            (
-                ErrorCode::InvalidTimestamp,
-                err.to_string(),
-                json!({"issued_at": issued_at}),
-            )
-        })?;
+        (
+            ErrorCode::InvalidTimestamp,
+            err.to_string(),
+            json!({"issued_at": issued_at}),
+        )
+    })?;
     let now = OffsetDateTime::now_utc();
     let skew = time::Duration::seconds(allowed_clock_skew_seconds);
     if issued > now + skew {
@@ -800,26 +1016,86 @@ fn nonce_ttl(deadline_ms: u64, allowed_clock_skew_seconds: i64) -> StdDuration {
     StdDuration::from_millis(deadline_ms.saturating_add(skew_ms))
 }
 
+fn nonce_limit_scope_name(scope: NonceLimitScope) -> &'static str {
+    match scope {
+        NonceLimitScope::Global => "global",
+        NonceLimitScope::PerPeer => "per_peer",
+    }
+}
+
 fn with_response_timing(mut response: RpcResponse, started_at: OffsetDateTime) -> RpcResponse {
     let finished_at = OffsetDateTime::now_utc();
     response.started_at = format_rfc3339(started_at);
     response.finished_at = format_rfc3339(finished_at);
-    response.duration_ms = (finished_at - started_at)
-        .whole_milliseconds()
-        .max(0) as u64;
+    response.duration_ms = (finished_at - started_at).whole_milliseconds().max(0) as u64;
     response
 }
 
-fn base_audit_event(
-    remote_endpoint_id: &str,
-    stage: &str,
-    started: Instant,
-) -> AgentAuditEvent {
+fn base_audit_event(remote_endpoint_id: &str, stage: &str, started: Instant) -> AgentAuditEvent {
     let mut event = AgentAuditEvent::new("rpc_request");
     event.remote_endpoint_id = Some(remote_endpoint_id.to_string());
     event.stage = Some(stage.to_string());
     event.duration_ms = Some(started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64);
     event
+}
+
+fn audit_resource_rejection(
+    state: &AgentServerState,
+    remote_endpoint_id: Option<&str>,
+    resource: &str,
+    stage: &str,
+    reason: &str,
+) {
+    write_limited_audit_event(
+        &state.audit,
+        &state.audit_limiter,
+        remote_endpoint_id,
+        resource,
+        "RESOURCE_EXHAUSTED",
+        |suppressed_count, limit_key| {
+            let mut event = AgentAuditEvent::new("resource_rejected");
+            event.remote_endpoint_id = remote_endpoint_id.map(ToOwned::to_owned);
+            event.stage = Some(stage.to_string());
+            event.allowed = Some(false);
+            event.ok = Some(false);
+            event.error_code = Some("RESOURCE_EXHAUSTED".to_string());
+            event.reason = Some(reason.to_string());
+            event.resource = Some(resource.to_string());
+            event.suppressed_count = Some(suppressed_count);
+            event.limit_key = Some(limit_key);
+            event
+        },
+    );
+}
+
+fn write_limited_audit_event(
+    audit: &JsonlAuditWriter,
+    audit_limiter: &Arc<Mutex<RejectedAuditLimiter>>,
+    remote_endpoint_id: Option<&str>,
+    resource: &str,
+    error_code: &str,
+    event_builder: impl FnOnce(u64, String) -> AgentAuditEvent,
+) {
+    let decision = match audit_limiter.lock() {
+        Ok(mut limiter) => limiter.check(remote_endpoint_id, resource, error_code),
+        Err(err) => {
+            tracing::warn!(error = %err, "audit limiter lock poisoned");
+            return;
+        }
+    };
+
+    match decision {
+        AuditLimitDecision::Write {
+            suppressed_count,
+            limit_key,
+        } => {
+            let event = event_builder(suppressed_count, limit_key);
+            if let Err(err) = audit.write(&event) {
+                tracing::warn!(error = %err, "failed to write limited audit event");
+            }
+        }
+        AuditLimitDecision::Suppress => {}
+    }
 }
 
 fn response_error_code(response: &RpcResponse) -> Option<String> {
@@ -856,6 +1132,32 @@ mod tests {
         AuditConfig, ControllerConfig, IrohConfig, NodeConfig, SecurityConfig,
     };
 
+    #[test]
+    fn server_limiters_use_admission_and_release_permits_on_drop() {
+        let limiters = ServerLimiters::new(1, 1, 1, 1, 1);
+
+        let handshake = limiters
+            .try_acquire_handshake()
+            .expect("first handshake permit");
+        assert!(limiters.try_acquire_handshake().is_none());
+        drop(handshake);
+        assert!(limiters.try_acquire_handshake().is_some());
+
+        let connection = limiters
+            .try_acquire_connection("controller-1")
+            .expect("first connection permit");
+        assert!(limiters.try_acquire_connection("controller-1").is_none());
+        drop(connection);
+        assert!(limiters.try_acquire_connection("controller-1").is_some());
+
+        let stream = limiters
+            .try_acquire_stream("controller-1")
+            .expect("first stream permit");
+        assert!(limiters.try_acquire_stream("controller-1").is_none());
+        drop(stream);
+        assert!(limiters.try_acquire_stream("controller-1").is_some());
+    }
+
     #[tokio::test]
     async fn response_too_large_fallback_audit_matches_actual_response() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -863,6 +1165,10 @@ mod tests {
             config: test_agent_config(dir.path()),
             audit: JsonlAuditWriter::new(dir.path().join("audit.log")),
             nonce_cache: Arc::new(Mutex::new(NonceCache::new())),
+            limiters: Arc::new(ServerLimiters::new(256, 256, 32, 1024, 128)),
+            audit_limiter: Arc::new(Mutex::new(RejectedAuditLimiter::new(
+                &test_agent_config(dir.path()).audit,
+            ))),
             agent_endpoint_id: "agent-endpoint-1".to_string(),
         };
         let response = ok_response(
@@ -881,19 +1187,26 @@ mod tests {
             .await
             .expect("write fallback response");
 
-        let audit_text =
-            std::fs::read_to_string(dir.path().join("audit.log")).expect("audit log");
+        let audit_text = std::fs::read_to_string(dir.path().join("audit.log")).expect("audit log");
         let audit_json: Value = serde_json::from_str(audit_text.trim()).expect("audit json");
         assert_eq!(audit_json["ok"], false);
         assert_eq!(audit_json["allowed"], false);
         assert_eq!(audit_json["error_code"], "RESPONSE_TOO_LARGE");
-        assert!(audit_json["response_bytes"].as_u64().expect("response bytes") <= 512);
+        assert!(
+            audit_json["response_bytes"]
+                .as_u64()
+                .expect("response bytes")
+                <= 512
+        );
     }
 
     #[tokio::test]
     async fn read_frame_with_timeout_rejects_incomplete_header() {
         let (mut writer, mut reader) = tokio::io::duplex(64);
-        writer.write_all(&[0, 0]).await.expect("write partial header");
+        writer
+            .write_all(&[0, 0])
+            .await
+            .expect("write partial header");
 
         let err = read_frame_with_timeout(&mut reader, 64, StdDuration::from_millis(10))
             .await
@@ -920,10 +1233,22 @@ mod tests {
                 max_rpc_timeout_ms: 5_000,
                 max_request_bytes: 65_536,
                 max_response_bytes: 512,
+                max_handshake_tasks_global: 256,
+                max_connections_global: 256,
+                max_connections_per_controller: 32,
+                max_streams_global: 1024,
+                max_streams_per_controller: 128,
+                max_live_nonces_global: 100_000,
+                max_live_nonces_per_controller: 10_000,
                 controllers: Vec::<ControllerConfig>::new(),
             },
             audit: AuditConfig {
                 path: dir.join("audit.log"),
+                rejected_peer_log_burst: 10,
+                rejected_peer_log_refill_per_sec: 1,
+                rejected_peer_log_max_buckets: 4096,
+                rejected_peer_log_bucket_ttl_seconds: 3600,
+                rejected_peer_log_aggregate_interval_seconds: 60,
             },
             ocserv: None,
             logs: None,

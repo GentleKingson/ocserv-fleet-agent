@@ -27,6 +27,7 @@ pub enum ErrorCode {
     ConnectFailed,
     RpcTimeout,
     AuditWriteFailed,
+    ResourceExhausted,
     SqliteError,
     SqliteBusyTimeout,
     SchemaMigrationFailed,

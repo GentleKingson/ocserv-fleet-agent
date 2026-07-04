@@ -56,11 +56,8 @@ pub fn validate_issued_at(
 ) -> Result<(), RpcError> {
     let parsed = OffsetDateTime::parse(issued_at, &time::format_description::well_known::Rfc3339)
         .map_err(|_| {
-            RpcError::new(
-                ErrorCode::InvalidTimestamp,
-                "issued_at must be RFC3339 UTC",
-            )
-        })?;
+        RpcError::new(ErrorCode::InvalidTimestamp, "issued_at must be RFC3339 UTC")
+    })?;
 
     let skew = if parsed > now {
         parsed - now

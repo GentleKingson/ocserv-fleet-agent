@@ -1,4 +1,4 @@
-use ocfleet_protocol::frame::{decode_frame, encode_frame, FrameError};
+use ocfleet_protocol::frame::{FrameError, decode_frame, encode_frame};
 
 #[test]
 fn frame_round_trips_json_bytes() {

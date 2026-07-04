@@ -4,8 +4,11 @@ use std::time::{Duration, Instant};
 
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 use ocfleet_agent::audit::JsonlAuditWriter;
+use ocfleet_agent::audit_limiter::RejectedAuditLimiter;
 use ocfleet_agent::nonce::NonceCache;
-use ocfleet_agent::server::{AgentServerState, bind_agent_endpoint_local_only, serve_endpoint};
+use ocfleet_agent::server::{
+    AgentServerState, ServerLimiters, bind_agent_endpoint_local_only, serve_endpoint,
+};
 use ocfleet_cli::rpc_client::{
     bind_controller_endpoint_local_only, build_request, call_endpoint_addr,
 };
@@ -148,16 +151,10 @@ async fn local_agent_rejects_replayed_nonce() {
 async fn local_agent_rejects_unauthorized_controller() {
     let dir = tempfile::tempdir().expect("temp dir");
     let authorized_controller_key = SecretKey::generate();
-    let harness = spawn_local_agent(
-        authorized_controller_key,
-        SecretKey::generate(),
-        &dir,
-    )
-    .await;
-    let unauthorized_controller =
-        bind_controller_endpoint_local_only(SecretKey::generate())
-            .await
-            .expect("unauthorized controller endpoint");
+    let harness = spawn_local_agent(authorized_controller_key, SecretKey::generate(), &dir).await;
+    let unauthorized_controller = bind_controller_endpoint_local_only(SecretKey::generate())
+        .await
+        .expect("unauthorized controller endpoint");
     let request = build_request(NODE_PING, json!({}), Some("local-cli".into()), 5_000);
 
     let result = call_endpoint_addr(
@@ -236,15 +233,22 @@ async fn spawn_local_agent(
         dir.path().join("agent.secret"),
     );
     let audit = JsonlAuditWriter::new(audit_path.clone());
-    let agent = bind_agent_endpoint_local_only(&config, agent_key, audit.clone())
-        .await
-        .expect("bind local-only agent endpoint");
+    let audit_limiter = Arc::new(Mutex::new(RejectedAuditLimiter::new(&config.audit)));
+    let agent =
+        bind_agent_endpoint_local_only(&config, agent_key, audit.clone(), audit_limiter.clone())
+            .await
+            .expect("bind local-only agent endpoint");
     let agent_addr = agent.addr();
     let agent_id = agent.id();
     let state = AgentServerState {
         config: config.clone(),
         audit,
-        nonce_cache: Arc::new(Mutex::new(NonceCache::new())),
+        nonce_cache: Arc::new(Mutex::new(NonceCache::with_limits(
+            config.security.max_live_nonces_global,
+            config.security.max_live_nonces_per_controller,
+        ))),
+        limiters: Arc::new(ServerLimiters::from_config(&config.security)),
+        audit_limiter,
         agent_endpoint_id: agent_id.to_string(),
     };
     let server_task = tokio::spawn(serve_endpoint(agent.clone(), state));
@@ -284,12 +288,26 @@ fn test_config(
             max_rpc_timeout_ms: 5_000,
             max_request_bytes: 65_536,
             max_response_bytes: 2_097_152,
+            max_handshake_tasks_global: 256,
+            max_connections_global: 256,
+            max_connections_per_controller: 32,
+            max_streams_global: 1024,
+            max_streams_per_controller: 128,
+            max_live_nonces_global: 100_000,
+            max_live_nonces_per_controller: 10_000,
             controllers: vec![ControllerConfig {
                 endpoint_id: controller_endpoint_id.to_string(),
                 role: "viewer".to_string(),
             }],
         },
-        audit: AuditConfig { path: audit_path },
+        audit: AuditConfig {
+            path: audit_path,
+            rejected_peer_log_burst: 10,
+            rejected_peer_log_refill_per_sec: 1,
+            rejected_peer_log_max_buckets: 4096,
+            rejected_peer_log_bucket_ttl_seconds: 3600,
+            rejected_peer_log_aggregate_interval_seconds: 60,
+        },
         ocserv: None,
         logs: None,
     }

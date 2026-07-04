@@ -12,6 +12,7 @@ blake3.workspace = true
 clap.workspace = true
 hostname.workspace = true
 iroh.workspace = true
+libc.workspace = true
 ocfleet-config = { path = "../ocfleet-config" }
 ocfleet-protocol = { path = "../ocfleet-protocol" }
 serde.workspace = true

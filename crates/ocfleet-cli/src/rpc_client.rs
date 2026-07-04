@@ -203,7 +203,10 @@ where
         Ok(result) => result,
         Err(_) => Err(RpcClientError::structured(
             ErrorCode::RpcTimeout,
-            format!("response frame read timed out after {} ms", timeout.as_millis()),
+            format!(
+                "response frame read timed out after {} ms",
+                timeout.as_millis()
+            ),
         )),
     }
 }
@@ -271,10 +274,7 @@ pub fn validate_rpc_response(
     ))
 }
 
-async fn write_request_frame<W>(
-    writer: &mut W,
-    request: &RpcRequest,
-) -> Result<(), RpcClientError>
+async fn write_request_frame<W>(writer: &mut W, request: &RpcRequest) -> Result<(), RpcClientError>
 where
     W: AsyncWrite + Unpin,
 {

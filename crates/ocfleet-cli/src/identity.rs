@@ -1,9 +1,10 @@
 use base64::Engine;
 use iroh::SecretKey;
-use std::fs;
 use std::io;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
+
+use crate::private_file::{self, PrivateFileError};
 
 pub struct SecretKeyLoadResult {
     pub secret_key: SecretKey,
@@ -31,9 +32,9 @@ pub fn load_or_create_secret_key(
 
 pub fn load_or_create_secret_key_with_status(
     path: &Path,
-    production_mode: bool,
+    _production_mode: bool,
 ) -> Result<SecretKeyLoadResult, IdentityError> {
-    match load_secret_key(path, production_mode) {
+    match load_secret_key(path, true) {
         Ok(secret_key) => {
             return Ok(SecretKeyLoadResult {
                 secret_key,
@@ -42,10 +43,6 @@ pub fn load_or_create_secret_key_with_status(
         }
         Err(IdentityError::Io(err)) if err.kind() == io::ErrorKind::NotFound => {}
         Err(err) => return Err(err),
-    }
-
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        fs::create_dir_all(parent)?;
     }
 
     let key = SecretKey::generate();
@@ -57,7 +54,7 @@ pub fn load_or_create_secret_key_with_status(
         }),
         Err(IdentityError::Io(err)) if err.kind() == io::ErrorKind::AlreadyExists => {
             Ok(SecretKeyLoadResult {
-                secret_key: load_secret_key(path, production_mode)?,
+                secret_key: load_secret_key(path, true)?,
                 created: false,
             })
         }
@@ -65,12 +62,11 @@ pub fn load_or_create_secret_key_with_status(
     }
 }
 
-pub fn load_secret_key(path: &Path, production_mode: bool) -> Result<SecretKey, IdentityError> {
-    if production_mode && !secret_key_file_mode_is_private(path)? {
-        return Err(IdentityError::InvalidPermissions);
-    }
-
-    let text = fs::read_to_string(path)?;
+pub fn load_secret_key(path: &Path, _production_mode: bool) -> Result<SecretKey, IdentityError> {
+    let mut file =
+        private_file::open_existing_private_read(path).map_err(map_private_file_error)?;
+    let mut text = String::new();
+    file.read_to_string(&mut text)?;
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(text.trim())
         .map_err(|_| IdentityError::InvalidLength)?;
@@ -79,7 +75,7 @@ pub fn load_secret_key(path: &Path, production_mode: bool) -> Result<SecretKey, 
 }
 
 fn write_new_secret_key(path: &Path, encoded: &str) -> Result<(), IdentityError> {
-    let mut file = open_new_secret_file(path)?;
+    let mut file = private_file::open_private_create_new(path).map_err(map_private_file_error)?;
     file.write_all(encoded.as_bytes())?;
     file.write_all(b"\n")?;
     file.sync_all()?;
@@ -87,33 +83,30 @@ fn write_new_secret_key(path: &Path, encoded: &str) -> Result<(), IdentityError>
 }
 
 #[cfg(unix)]
-fn open_new_secret_file(path: &Path) -> Result<fs::File, IdentityError> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    Ok(fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)?)
-}
-
-#[cfg(not(unix))]
-fn open_new_secret_file(path: &Path) -> Result<fs::File, IdentityError> {
-    Ok(fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)?)
-}
-
-#[cfg(unix)]
 pub fn secret_key_file_mode_is_private(path: &Path) -> Result<bool, IdentityError> {
-    use std::os::unix::fs::PermissionsExt;
-
-    let mode = fs::metadata(path)?.permissions().mode() & 0o777;
-    Ok(mode == 0o600)
+    Ok(private_file::open_existing_private_read(path).is_ok())
 }
 
 #[cfg(not(unix))]
 pub fn secret_key_file_mode_is_private(_path: &Path) -> Result<bool, IdentityError> {
     Ok(true)
+}
+
+fn map_private_file_error(err: PrivateFileError) -> IdentityError {
+    match err {
+        PrivateFileError::Io(err)
+            if err.kind() == io::ErrorKind::PermissionDenied
+                || err.raw_os_error() == Some(libc::ELOOP) =>
+        {
+            IdentityError::InvalidPermissions
+        }
+        PrivateFileError::Io(err) => IdentityError::Io(err),
+        PrivateFileError::MissingParent => IdentityError::Io(io::Error::new(
+            io::ErrorKind::NotFound,
+            "missing parent directory",
+        )),
+        PrivateFileError::UnsafeParent | PrivateFileError::UnsafeFile => {
+            IdentityError::InvalidPermissions
+        }
+    }
 }

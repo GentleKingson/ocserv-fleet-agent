@@ -1,9 +1,10 @@
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 use crate::audit::AuditEvent;
+use crate::private_file::{self, PrivateFileError};
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -11,6 +12,8 @@ pub enum StoreError {
     Sqlite(#[from] rusqlite::Error),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("controller state file permissions are unsafe")]
+    UnsafePermissions,
     #[error("node not found: {0}")]
     NodeNotFound(String),
 }
@@ -45,18 +48,11 @@ pub struct StoreOpenResult {
 
 impl Store {
     pub fn open(path: &Path) -> Result<Self, StoreError> {
-        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            std::fs::create_dir_all(parent)?;
-        }
-
+        let _created_database = create_database_file_if_missing(path)?;
         Self::open_existing_or_create(path)
     }
 
     pub fn open_with_status(path: &Path) -> Result<StoreOpenResult, StoreError> {
-        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            std::fs::create_dir_all(parent)?;
-        }
-
         let created_database = create_database_file_if_missing(path)?;
         let store = Self::open_existing_or_create(path)?;
         Ok(StoreOpenResult {
@@ -66,6 +62,7 @@ impl Store {
     }
 
     fn open_existing_or_create(path: &Path) -> Result<Self, StoreError> {
+        validate_database_files(path)?;
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
@@ -73,6 +70,7 @@ impl Store {
 
         let store = Self { conn };
         store.migrate()?;
+        validate_database_files(path)?;
         Ok(store)
     }
 
@@ -158,7 +156,8 @@ impl Store {
             "SELECT node_id, endpoint_id, name, region, role, enabled FROM nodes ORDER BY node_id",
         )?;
         let rows = stmt.query_map([], node_from_row)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
     }
 
     pub fn disable_node(&self, node_id: &str) -> Result<(), StoreError> {
@@ -228,14 +227,42 @@ impl Store {
 }
 
 fn create_database_file_if_missing(path: &Path) -> Result<bool, StoreError> {
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-    {
+    match private_file::open_private_create_new(path) {
         Ok(_) => Ok(true),
-        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Ok(false),
-        Err(err) => Err(StoreError::Io(err)),
+        Err(PrivateFileError::Io(err)) if err.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+        Err(err) => Err(map_private_file_error(err)),
+    }
+}
+
+fn validate_database_files(path: &Path) -> Result<(), StoreError> {
+    private_file::validate_existing_private_file(path).map_err(map_private_file_error)?;
+    for sidecar in sqlite_sidecar_paths(path) {
+        match std::fs::symlink_metadata(&sidecar) {
+            Ok(_) => {
+                private_file::validate_existing_private_file(&sidecar)
+                    .map_err(map_private_file_error)?;
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(StoreError::Io(err)),
+        }
+    }
+    Ok(())
+}
+
+fn sqlite_sidecar_paths(path: &Path) -> [PathBuf; 2] {
+    let mut wal = path.as_os_str().to_os_string();
+    wal.push("-wal");
+    let mut shm = path.as_os_str().to_os_string();
+    shm.push("-shm");
+    [PathBuf::from(wal), PathBuf::from(shm)]
+}
+
+fn map_private_file_error(err: PrivateFileError) -> StoreError {
+    match err {
+        PrivateFileError::Io(err) => StoreError::Io(err),
+        PrivateFileError::MissingParent
+        | PrivateFileError::UnsafeParent
+        | PrivateFileError::UnsafeFile => StoreError::UnsafePermissions,
     }
 }
 

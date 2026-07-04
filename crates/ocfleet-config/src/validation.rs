@@ -80,10 +80,7 @@ pub fn validate_service_name(value: &str) -> Result<(), ValidationError> {
     }
 }
 
-pub fn validate_non_empty_path(
-    path: &Path,
-    field: &'static str,
-) -> Result<(), ValidationError> {
+pub fn validate_non_empty_path(path: &Path, field: &'static str) -> Result<(), ValidationError> {
     if path.as_os_str().is_empty() {
         Err(ValidationError::EmptyPath { field })
     } else {
@@ -109,10 +106,7 @@ pub fn validate_controller_role(value: &str) -> Result<(), ValidationError> {
     }
 }
 
-pub fn validate_positive_i64(
-    value: i64,
-    field: &'static str,
-) -> Result<(), ValidationError> {
+pub fn validate_positive_i64(value: i64, field: &'static str) -> Result<(), ValidationError> {
     if value > 0 {
         Ok(())
     } else {
@@ -120,10 +114,7 @@ pub fn validate_positive_i64(
     }
 }
 
-pub fn validate_positive_u64(
-    value: u64,
-    field: &'static str,
-) -> Result<(), ValidationError> {
+pub fn validate_positive_u64(value: u64, field: &'static str) -> Result<(), ValidationError> {
     if value > 0 {
         Ok(())
     } else {
@@ -131,10 +122,7 @@ pub fn validate_positive_u64(
     }
 }
 
-pub fn validate_positive_usize(
-    value: usize,
-    field: &'static str,
-) -> Result<(), ValidationError> {
+pub fn validate_positive_usize(value: usize, field: &'static str) -> Result<(), ValidationError> {
     if value > 0 {
         Ok(())
     } else {

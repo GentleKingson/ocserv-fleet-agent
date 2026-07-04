@@ -59,10 +59,21 @@ struct LatestRpcAudit {
     detail: Value,
 }
 
+type LatestRpcAuditRow = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    i64,
+    Option<String>,
+    String,
+);
+
 fn latest_rpc_audit(database: &Path) -> LatestRpcAudit {
     let conn = Connection::open(database).expect("open db");
-    let row: (String, String, Option<String>, Option<String>, Option<String>, i64, Option<String>, String) =
-        conn.query_row(
+    let row: LatestRpcAuditRow = conn
+        .query_row(
             "SELECT event, actor, node_id, endpoint_id, method, ok, error_code, detail_json FROM controller_audit_log ORDER BY id DESC LIMIT 1",
             [],
             |row| {
@@ -185,4 +196,57 @@ fn ping_disabled_node_writes_failure_audit() {
     assert_eq!(audit.ok, 0);
     assert_eq!(audit.error_code.as_deref(), Some("NODE_DISABLED"));
     assert_eq!(audit.detail["message"], "node disabled: hk-ocserv-01");
+}
+
+#[cfg(unix)]
+#[test]
+fn ping_with_unsafe_controller_secret_key_writes_permission_error_audit() {
+    use base64::Engine;
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let secret_key = dir.path().join("controller.secret");
+    let endpoint_id = iroh::SecretKey::generate().public().to_string();
+    let store = Store::open(&database).expect("store opens");
+    store
+        .add_node(&NodeInsert {
+            node_id: "hk-ocserv-01".to_string(),
+            endpoint_id: endpoint_id.clone(),
+            name: "hk-ocserv-01".to_string(),
+            region: "hk".to_string(),
+            role: "ocserv".to_string(),
+        })
+        .expect("insert node");
+    drop(store);
+
+    let key = iroh::SecretKey::generate();
+    let encoded = base64::engine::general_purpose::STANDARD.encode(key.to_bytes());
+    std::fs::write(&secret_key, format!("{encoded}\n")).expect("write key");
+    std::fs::set_permissions(&secret_key, std::fs::Permissions::from_mode(0o644))
+        .expect("chmod key");
+
+    let database_arg = database.to_string_lossy().into_owned();
+    let secret_key_arg = secret_key.to_string_lossy().into_owned();
+    let output = run_ocfleet_failure(&[
+        "--database",
+        &database_arg,
+        "--secret-key",
+        &secret_key_arg,
+        "ping",
+        "hk-ocserv-01",
+    ]);
+
+    assert!(String::from_utf8_lossy(&output.stderr).contains("SecretKey"));
+    let audit = latest_rpc_audit(&database);
+    assert_eq!(audit.event, "rpc.completed");
+    assert_eq!(audit.actor, "audit-user");
+    assert_eq!(audit.node_id.as_deref(), Some("hk-ocserv-01"));
+    assert_eq!(audit.endpoint_id.as_deref(), Some(endpoint_id.as_str()));
+    assert_eq!(audit.method.as_deref(), Some(NODE_PING));
+    assert_eq!(audit.ok, 0);
+    assert_eq!(
+        audit.error_code.as_deref(),
+        Some("SECRET_KEY_PERMISSION_INVALID")
+    );
 }

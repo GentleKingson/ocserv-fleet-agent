@@ -5,8 +5,8 @@ use thiserror::Error;
 
 use crate::validation::{
     validate_controller_endpoint_id, validate_controller_role, validate_node_id,
-    validate_non_empty_path, validate_positive_i64, validate_positive_u64,
-    validate_positive_usize, validate_region, validate_role, validate_service_name,
+    validate_non_empty_path, validate_positive_i64, validate_positive_u64, validate_positive_usize,
+    validate_region, validate_role, validate_service_name,
 };
 
 #[derive(Debug, Error)]
@@ -59,6 +59,20 @@ pub struct SecurityConfig {
     pub max_request_bytes: usize,
     #[serde(default = "default_max_response_bytes")]
     pub max_response_bytes: usize,
+    #[serde(default = "default_max_handshake_tasks_global")]
+    pub max_handshake_tasks_global: usize,
+    #[serde(default = "default_max_connections_global")]
+    pub max_connections_global: usize,
+    #[serde(default = "default_max_connections_per_controller")]
+    pub max_connections_per_controller: usize,
+    #[serde(default = "default_max_streams_global")]
+    pub max_streams_global: usize,
+    #[serde(default = "default_max_streams_per_controller")]
+    pub max_streams_per_controller: usize,
+    #[serde(default = "default_max_live_nonces_global")]
+    pub max_live_nonces_global: usize,
+    #[serde(default = "default_max_live_nonces_per_controller")]
+    pub max_live_nonces_per_controller: usize,
     #[serde(default)]
     pub controllers: Vec<ControllerConfig>,
 }
@@ -73,6 +87,16 @@ pub struct ControllerConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct AuditConfig {
     pub path: PathBuf,
+    #[serde(default = "default_rejected_peer_log_burst")]
+    pub rejected_peer_log_burst: usize,
+    #[serde(default = "default_rejected_peer_log_refill_per_sec")]
+    pub rejected_peer_log_refill_per_sec: usize,
+    #[serde(default = "default_rejected_peer_log_max_buckets")]
+    pub rejected_peer_log_max_buckets: usize,
+    #[serde(default = "default_rejected_peer_log_bucket_ttl_seconds")]
+    pub rejected_peer_log_bucket_ttl_seconds: u64,
+    #[serde(default = "default_rejected_peer_log_aggregate_interval_seconds")]
+    pub rejected_peer_log_aggregate_interval_seconds: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -142,6 +166,85 @@ pub fn validate_agent_config(config: &AgentConfig) -> Result<(), ConfigError> {
             "max_response_bytes must be >= 512".to_string(),
         ));
     }
+    validate_positive_usize(
+        config.security.max_handshake_tasks_global,
+        "max_handshake_tasks_global",
+    )
+    .map_err(|e| ConfigError::Invalid(e.to_string()))?;
+    validate_positive_usize(
+        config.security.max_connections_global,
+        "max_connections_global",
+    )
+    .map_err(|e| ConfigError::Invalid(e.to_string()))?;
+    validate_positive_usize(
+        config.security.max_connections_per_controller,
+        "max_connections_per_controller",
+    )
+    .map_err(|e| ConfigError::Invalid(e.to_string()))?;
+    if config.security.max_connections_per_controller > config.security.max_connections_global {
+        return Err(ConfigError::Invalid(
+            "max_connections_per_controller must be <= max_connections_global".to_string(),
+        ));
+    }
+    validate_positive_usize(config.security.max_streams_global, "max_streams_global")
+        .map_err(|e| ConfigError::Invalid(e.to_string()))?;
+    validate_positive_usize(
+        config.security.max_streams_per_controller,
+        "max_streams_per_controller",
+    )
+    .map_err(|e| ConfigError::Invalid(e.to_string()))?;
+    if config.security.max_streams_per_controller > config.security.max_streams_global {
+        return Err(ConfigError::Invalid(
+            "max_streams_per_controller must be <= max_streams_global".to_string(),
+        ));
+    }
+    validate_positive_usize(
+        config.security.max_live_nonces_global,
+        "max_live_nonces_global",
+    )
+    .map_err(|e| ConfigError::Invalid(e.to_string()))?;
+    validate_positive_usize(
+        config.security.max_live_nonces_per_controller,
+        "max_live_nonces_per_controller",
+    )
+    .map_err(|e| ConfigError::Invalid(e.to_string()))?;
+    if config.security.max_live_nonces_per_controller > config.security.max_live_nonces_global {
+        return Err(ConfigError::Invalid(
+            "max_live_nonces_per_controller must be <= max_live_nonces_global".to_string(),
+        ));
+    }
+    validate_positive_usize(
+        config.audit.rejected_peer_log_burst,
+        "rejected_peer_log_burst",
+    )
+    .map_err(|e| ConfigError::Invalid(e.to_string()))?;
+    validate_positive_usize(
+        config.audit.rejected_peer_log_refill_per_sec,
+        "rejected_peer_log_refill_per_sec",
+    )
+    .map_err(|e| ConfigError::Invalid(e.to_string()))?;
+    validate_positive_usize(
+        config.audit.rejected_peer_log_max_buckets,
+        "rejected_peer_log_max_buckets",
+    )
+    .map_err(|e| ConfigError::Invalid(e.to_string()))?;
+    validate_positive_u64(
+        config.audit.rejected_peer_log_bucket_ttl_seconds,
+        "rejected_peer_log_bucket_ttl_seconds",
+    )
+    .map_err(|e| ConfigError::Invalid(e.to_string()))?;
+    validate_positive_u64(
+        config.audit.rejected_peer_log_aggregate_interval_seconds,
+        "rejected_peer_log_aggregate_interval_seconds",
+    )
+    .map_err(|e| ConfigError::Invalid(e.to_string()))?;
+    if config.audit.rejected_peer_log_bucket_ttl_seconds
+        < config.audit.rejected_peer_log_aggregate_interval_seconds
+    {
+        return Err(ConfigError::Invalid(
+            "rejected_peer_log_bucket_ttl_seconds must be >= rejected_peer_log_aggregate_interval_seconds".to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -171,6 +274,54 @@ fn default_max_request_bytes() -> usize {
 
 fn default_max_response_bytes() -> usize {
     2_097_152
+}
+
+fn default_max_handshake_tasks_global() -> usize {
+    256
+}
+
+fn default_max_connections_global() -> usize {
+    256
+}
+
+fn default_max_connections_per_controller() -> usize {
+    32
+}
+
+fn default_max_streams_global() -> usize {
+    1024
+}
+
+fn default_max_streams_per_controller() -> usize {
+    128
+}
+
+fn default_max_live_nonces_global() -> usize {
+    100_000
+}
+
+fn default_max_live_nonces_per_controller() -> usize {
+    10_000
+}
+
+fn default_rejected_peer_log_burst() -> usize {
+    10
+}
+
+fn default_rejected_peer_log_refill_per_sec() -> usize {
+    1
+}
+
+fn default_rejected_peer_log_max_buckets() -> usize {
+    4096
+}
+
+fn default_rejected_peer_log_bucket_ttl_seconds() -> u64 {
+    3600
+}
+
+fn default_rejected_peer_log_aggregate_interval_seconds() -> u64 {
+    60
 }
 
 fn default_controller_role() -> String {

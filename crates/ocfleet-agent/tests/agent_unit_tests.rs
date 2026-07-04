@@ -1,13 +1,14 @@
 use ocfleet_agent::identity::{load_or_create_secret_key, secret_key_file_mode_is_private};
 use ocfleet_agent::{
-    audit::{AgentAuditEvent, JsonlAuditWriter},
-    node_info::collect_node_info,
-    nonce::NonceCache,
-    server::{
-        AgentServerState, bind_agent_endpoint_local_only, handle_request, parse_endpoint_id,
-        read_frame,
-    },
     AGENT_VERSION,
+    audit::{AgentAuditEvent, JsonlAuditWriter},
+    audit_limiter::{AuditLimitDecision, RejectedAuditLimiter},
+    node_info::collect_node_info,
+    nonce::{NonceCache, NonceDecision, NonceLimitScope},
+    server::{
+        AgentServerState, ServerLimiters, bind_agent_endpoint_local_only, handle_request,
+        parse_endpoint_id, read_frame,
+    },
 };
 use ocfleet_config::agent::{
     AgentConfig, AuditConfig, ControllerConfig, IrohConfig, NodeConfig, SecurityConfig,
@@ -103,9 +104,51 @@ fn nonce_cache_rejects_replay_per_remote_endpoint() {
     let mut cache = NonceCache::new();
     let ttl = Duration::from_secs(60);
 
-    assert!(cache.register("remote-a", "nonce-1", ttl));
-    assert!(!cache.register("remote-a", "nonce-1", ttl));
-    assert!(cache.register("remote-b", "nonce-1", ttl));
+    assert_eq!(
+        cache.register("remote-a", "nonce-1", ttl),
+        NonceDecision::Accepted
+    );
+    assert_eq!(
+        cache.register("remote-a", "nonce-1", ttl),
+        NonceDecision::Replay
+    );
+    assert_eq!(
+        cache.register("remote-b", "nonce-1", ttl),
+        NonceDecision::Accepted
+    );
+}
+
+#[test]
+fn nonce_cache_enforces_caps_without_evicting_live_replay_entries() {
+    let mut cache = NonceCache::with_limits(2, 1);
+    let ttl = Duration::from_secs(60);
+
+    assert_eq!(
+        cache.register("remote-a", "nonce-1", ttl),
+        NonceDecision::Accepted
+    );
+    assert_eq!(
+        cache.register("remote-a", "nonce-1", ttl),
+        NonceDecision::Replay
+    );
+    assert_eq!(
+        cache.register("remote-a", "nonce-2", ttl),
+        NonceDecision::ResourceExhausted {
+            scope: NonceLimitScope::PerPeer,
+            limit: 1,
+        }
+    );
+    assert_eq!(
+        cache.register("remote-b", "nonce-1", ttl),
+        NonceDecision::Accepted
+    );
+    assert_eq!(
+        cache.register("remote-c", "nonce-1", ttl),
+        NonceDecision::ResourceExhausted {
+            scope: NonceLimitScope::Global,
+            limit: 2,
+        }
+    );
 }
 
 #[test]
@@ -139,6 +182,179 @@ fn jsonl_audit_writer_appends_lines_and_creates_parent_directory() {
     assert_eq!(second_json["ok"], true);
 }
 
+#[cfg(unix)]
+#[test]
+fn jsonl_audit_writer_creates_private_file_and_parent_directory() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("audit").join("agent.jsonl");
+    let writer = JsonlAuditWriter::new(path.clone());
+
+    writer
+        .write(&AgentAuditEvent::new("request.completed"))
+        .expect("write audit");
+
+    let file_mode = std::fs::metadata(&path)
+        .expect("audit metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    let parent_mode = std::fs::metadata(path.parent().expect("parent"))
+        .expect("parent metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(file_mode, 0o600);
+    assert_eq!(parent_mode, 0o700);
+}
+
+#[cfg(unix)]
+#[test]
+fn jsonl_audit_writer_creates_nested_parent_directories_private_under_permissive_umask() {
+    use std::os::unix::fs::PermissionsExt;
+
+    struct UmaskGuard(libc::mode_t);
+
+    impl Drop for UmaskGuard {
+        fn drop(&mut self) {
+            unsafe {
+                libc::umask(self.0);
+            }
+        }
+    }
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("logs").join("audit").join("agent.jsonl");
+    let old_umask = unsafe { libc::umask(0) };
+    let _guard = UmaskGuard(old_umask);
+    let writer = JsonlAuditWriter::new(path);
+
+    writer
+        .write(&AgentAuditEvent::new("request.completed"))
+        .expect("write audit");
+
+    for component in [
+        dir.path().join("logs"),
+        dir.path().join("logs").join("audit"),
+    ] {
+        let mode = std::fs::metadata(&component)
+            .expect("directory metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn jsonl_audit_writer_rejects_existing_world_readable_file_without_writing() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("agent.jsonl");
+    std::fs::write(&path, "existing\n").expect("write existing audit");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+    let writer = JsonlAuditWriter::new(path.clone());
+
+    assert!(
+        writer
+            .write(&AgentAuditEvent::new("request.completed"))
+            .is_err()
+    );
+    assert_eq!(
+        std::fs::read_to_string(path).expect("audit file"),
+        "existing\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn jsonl_audit_writer_rejects_final_path_symlink() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let real_path = dir.path().join("real.jsonl");
+    let link_path = dir.path().join("agent.jsonl");
+    std::fs::write(&real_path, "").expect("write real audit");
+    std::os::unix::fs::symlink(&real_path, &link_path).expect("symlink");
+    let writer = JsonlAuditWriter::new(link_path);
+
+    assert!(
+        writer
+            .write(&AgentAuditEvent::new("request.completed"))
+            .is_err()
+    );
+}
+
+#[test]
+fn rejected_audit_limiter_suppresses_repeated_resource_rejections_and_bounds_buckets() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let config = AuditConfig {
+        path: dir.path().join("audit.log"),
+        rejected_peer_log_burst: 1,
+        rejected_peer_log_refill_per_sec: 1,
+        rejected_peer_log_max_buckets: 2,
+        rejected_peer_log_bucket_ttl_seconds: 3600,
+        rejected_peer_log_aggregate_interval_seconds: 60,
+    };
+    let mut limiter = RejectedAuditLimiter::new(&config);
+
+    assert!(matches!(
+        limiter.check(Some("peer-a"), "stream", "RESOURCE_EXHAUSTED"),
+        AuditLimitDecision::Write {
+            suppressed_count: 0,
+            ..
+        }
+    ));
+    for _ in 0..5 {
+        assert_eq!(
+            limiter.check(Some("peer-a"), "stream", "RESOURCE_EXHAUSTED"),
+            AuditLimitDecision::Suppress
+        );
+    }
+    assert_eq!(
+        limiter.suppressed_count_for_tests(Some("peer-a"), "stream", "RESOURCE_EXHAUSTED"),
+        5
+    );
+
+    for index in 0..10 {
+        let peer = format!("peer-{index}");
+        let _ = limiter.check(Some(&peer), "connection", "RESOURCE_EXHAUSTED");
+    }
+    assert!(limiter.bucket_count_for_tests() <= 3);
+    assert!(limiter.overflow_suppressed_count_for_tests() > 0);
+}
+
+#[test]
+fn rejected_audit_limiter_does_not_write_aggregate_before_interval() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let config = AuditConfig {
+        path: dir.path().join("audit.log"),
+        rejected_peer_log_burst: 1,
+        rejected_peer_log_refill_per_sec: 1,
+        rejected_peer_log_max_buckets: 4,
+        rejected_peer_log_bucket_ttl_seconds: 3600,
+        rejected_peer_log_aggregate_interval_seconds: 60,
+    };
+    let mut limiter = RejectedAuditLimiter::new(&config);
+
+    assert!(matches!(
+        limiter.check(Some("peer-a"), "stream", "RESOURCE_EXHAUSTED"),
+        AuditLimitDecision::Write { .. }
+    ));
+    assert_eq!(
+        limiter.check(Some("peer-a"), "stream", "RESOURCE_EXHAUSTED"),
+        AuditLimitDecision::Suppress
+    );
+
+    std::thread::sleep(Duration::from_millis(1100));
+
+    assert_eq!(
+        limiter.check(Some("peer-a"), "stream", "RESOURCE_EXHAUSTED"),
+        AuditLimitDecision::Suppress
+    );
+}
+
 #[test]
 fn collect_node_info_returns_supplied_identity_and_basic_host_metadata() {
     let info = collect_node_info(
@@ -158,11 +374,13 @@ fn collect_node_info_returns_supplied_identity_and_basic_host_metadata() {
     assert!(!info.os_release.trim().is_empty());
     assert!(!info.kernel.trim().is_empty());
     assert!(!info.arch.trim().is_empty());
-    assert!(OffsetDateTime::parse(
-        &info.current_time_utc,
-        &time::format_description::well_known::Rfc3339
-    )
-    .is_ok());
+    assert!(
+        OffsetDateTime::parse(
+            &info.current_time_utc,
+            &time::format_description::well_known::Rfc3339
+        )
+        .is_ok()
+    );
     let _: u64 = info.uptime_seconds;
 }
 
@@ -188,8 +406,11 @@ async fn local_only_endpoint_binds_only_to_ipv4_loopback() {
         .expect("agent secret key");
     let config = test_agent_config(dir.path(), Vec::new());
     let audit = JsonlAuditWriter::new(dir.path().join("audit.log"));
+    let audit_limiter = std::sync::Arc::new(std::sync::Mutex::new(RejectedAuditLimiter::new(
+        &config.audit,
+    )));
 
-    let endpoint = bind_agent_endpoint_local_only(&config, secret_key, audit)
+    let endpoint = bind_agent_endpoint_local_only(&config, secret_key, audit, audit_limiter)
         .await
         .expect("bind local endpoint");
     let bound_sockets = endpoint.bound_sockets();
@@ -212,9 +433,12 @@ async fn endpoint_bind_rejects_invalid_allowed_controller_endpoint_id() {
         }],
     );
     let audit = JsonlAuditWriter::new(dir.path().join("audit.log"));
+    let audit_limiter = std::sync::Arc::new(std::sync::Mutex::new(RejectedAuditLimiter::new(
+        &config.audit,
+    )));
 
     assert!(
-        bind_agent_endpoint_local_only(&config, secret_key, audit)
+        bind_agent_endpoint_local_only(&config, secret_key, audit, audit_limiter)
             .await
             .is_err()
     );
@@ -325,16 +549,35 @@ async fn handle_request_rejects_replayed_nonce_per_remote_endpoint() {
     .await;
     assert!(first.ok);
 
-    let replay = handle_request(
-        &state,
-        "controller-1",
-        test_rpc_request(NODE_PING, nonce),
-    )
-    .await;
+    let replay = handle_request(&state, "controller-1", test_rpc_request(NODE_PING, nonce)).await;
     assert_eq!(
         replay.error.as_ref().expect("error").code,
         ErrorCode::ReplayedNonce
     );
+}
+
+#[tokio::test]
+async fn handle_request_returns_resource_exhausted_with_original_request_id_when_nonce_cache_full()
+{
+    let dir = tempfile::tempdir().expect("temp dir");
+    let state = test_server_state(dir.path(), "agent-endpoint-1");
+    {
+        let mut cache = state.nonce_cache.lock().expect("nonce cache");
+        *cache = NonceCache::with_limits(1, 1);
+        assert_eq!(
+            cache.register("controller-1", valid_nonce(11), Duration::from_secs(60)),
+            NonceDecision::Accepted
+        );
+    }
+    let request = test_rpc_request(NODE_PING, valid_nonce(12));
+    let request_id = request.request_id.clone();
+
+    let response = handle_request(&state, "controller-1", request).await;
+
+    let error = response.error.as_ref().expect("error");
+    assert_eq!(response.request_id.as_deref(), Some(request_id.as_str()));
+    assert_eq!(error.code, ErrorCode::ResourceExhausted);
+    assert_eq!(error.details["resource"], "nonce_cache");
 }
 
 #[tokio::test]
@@ -399,10 +642,22 @@ fn test_agent_config(dir: &Path, controllers: Vec<ControllerConfig>) -> AgentCon
             max_rpc_timeout_ms: 5_000,
             max_request_bytes: 65_536,
             max_response_bytes: 2_097_152,
+            max_handshake_tasks_global: 256,
+            max_connections_global: 256,
+            max_connections_per_controller: 32,
+            max_streams_global: 1024,
+            max_streams_per_controller: 128,
+            max_live_nonces_global: 100_000,
+            max_live_nonces_per_controller: 10_000,
             controllers,
         },
         audit: AuditConfig {
             path: dir.join("audit.log"),
+            rejected_peer_log_burst: 10,
+            rejected_peer_log_refill_per_sec: 1,
+            rejected_peer_log_max_buckets: 4096,
+            rejected_peer_log_bucket_ttl_seconds: 3600,
+            rejected_peer_log_aggregate_interval_seconds: 60,
         },
         ocserv: None,
         logs: None,
@@ -413,7 +668,13 @@ fn test_server_state(dir: &Path, agent_endpoint_id: &str) -> AgentServerState {
     AgentServerState {
         config: test_agent_config(dir, Vec::new()),
         audit: JsonlAuditWriter::new(dir.join("audit.log")),
-        nonce_cache: std::sync::Arc::new(std::sync::Mutex::new(NonceCache::new())),
+        nonce_cache: std::sync::Arc::new(std::sync::Mutex::new(NonceCache::with_limits(
+            100_000, 10_000,
+        ))),
+        limiters: std::sync::Arc::new(ServerLimiters::new(256, 256, 32, 1024, 128)),
+        audit_limiter: std::sync::Arc::new(std::sync::Mutex::new(RejectedAuditLimiter::new(
+            &test_agent_config(dir, Vec::new()).audit,
+        ))),
         agent_endpoint_id: agent_endpoint_id.to_string(),
     }
 }

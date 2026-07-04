@@ -69,6 +69,102 @@ fn open_with_status_supports_single_file_relative_path() {
     assert!(dir.path().join(path).is_file());
 }
 
+#[cfg(unix)]
+#[test]
+fn open_with_status_creates_private_database_and_parent_directory() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("state").join("controller.sqlite");
+
+    let opened = Store::open_with_status(&db).expect("open store");
+    drop(opened);
+
+    let db_mode = std::fs::metadata(&db)
+        .expect("db metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    let parent_mode = std::fs::metadata(db.parent().expect("parent"))
+        .expect("parent metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(db_mode, 0o600);
+    assert_eq!(parent_mode, 0o700);
+
+    for sidecar in [
+        db.with_extension("sqlite-wal"),
+        db.with_extension("sqlite-shm"),
+    ] {
+        if sidecar.exists() {
+            let mode = std::fs::metadata(&sidecar)
+                .expect("sidecar metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode & 0o077, 0);
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn open_with_status_rejects_existing_world_readable_database() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("controller.sqlite");
+    std::fs::write(&db, b"").expect("write db placeholder");
+    std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+
+    assert!(Store::open_with_status(&db).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn open_with_status_rejects_final_path_symlink() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let real_db = dir.path().join("real.sqlite");
+    let link_db = dir.path().join("controller.sqlite");
+    std::fs::write(&real_db, b"").expect("write real db placeholder");
+    std::os::unix::fs::symlink(&real_db, &link_db).expect("symlink");
+
+    assert!(Store::open_with_status(&link_db).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn open_with_status_rejects_unsafe_existing_wal_or_shm_sidecar() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("controller.sqlite");
+    let opened = Store::open_with_status(&db).expect("create store");
+    drop(opened);
+
+    let wal = db.with_extension("sqlite-wal");
+    std::fs::write(&wal, b"unsafe wal").expect("write wal");
+    std::fs::set_permissions(&wal, std::fs::Permissions::from_mode(0o644)).expect("chmod wal");
+
+    assert!(Store::open_with_status(&db).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn open_with_status_rejects_existing_sidecar_symlink() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("controller.sqlite");
+    let opened = Store::open_with_status(&db).expect("create store");
+    drop(opened);
+
+    let wal = db.with_extension("sqlite-wal");
+    let target = dir.path().join("missing-wal-target");
+    std::os::unix::fs::symlink(&target, &wal).expect("symlink wal");
+
+    assert!(Store::open_with_status(&db).is_err());
+}
+
 #[test]
 fn node_endpoint_id_must_be_unique() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -106,7 +202,10 @@ fn disabled_node_is_visible_but_not_enabled() {
     };
     store.add_node(&node).expect("insert");
     store.disable_node("hk-ocserv-01").expect("disable");
-    let loaded = store.get_node("hk-ocserv-01").expect("load").expect("exists");
+    let loaded = store
+        .get_node("hk-ocserv-01")
+        .expect("load")
+        .expect("exists");
     assert!(!loaded.enabled);
 }
 

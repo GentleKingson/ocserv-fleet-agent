@@ -1,8 +1,9 @@
 use serde::Serialize;
-use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use time::OffsetDateTime;
+
+use crate::private_file;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AgentAuditEvent {
@@ -20,6 +21,9 @@ pub struct AgentAuditEvent {
     pub response_bytes: Option<usize>,
     pub stage: Option<String>,
     pub reason: Option<String>,
+    pub suppressed_count: Option<u64>,
+    pub limit_key: Option<String>,
+    pub resource: Option<String>,
 }
 
 impl AgentAuditEvent {
@@ -41,6 +45,9 @@ impl AgentAuditEvent {
             response_bytes: None,
             stage: None,
             reason: None,
+            suppressed_count: None,
+            limit_key: None,
+            resource: None,
         }
     }
 }
@@ -56,18 +63,7 @@ impl JsonlAuditWriter {
     }
 
     pub fn write(&self, event: &AgentAuditEvent) -> io::Result<()> {
-        if let Some(parent) = self
-            .path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            fs::create_dir_all(parent)?;
-        }
-
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
+        let mut file = private_file::open_private_append(&self.path)?;
         serde_json::to_writer(&mut file, event).map_err(io::Error::other)?;
         file.write_all(b"\n")?;
         Ok(())

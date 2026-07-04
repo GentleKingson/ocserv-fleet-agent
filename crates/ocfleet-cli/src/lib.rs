@@ -1,6 +1,7 @@
 pub mod args;
 pub mod audit;
 pub mod identity;
+pub mod private_file;
 pub mod rpc_client;
 pub mod store;
 

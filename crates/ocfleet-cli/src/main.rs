@@ -3,7 +3,9 @@ use clap::Parser;
 use iroh::{EndpointAddr, EndpointId};
 use ocfleet_cli::args::{Cli, Command, NodeCommand};
 use ocfleet_cli::audit::AuditEvent;
-use ocfleet_cli::identity::{load_or_create_secret_key_with_status, load_secret_key};
+use ocfleet_cli::identity::{
+    IdentityError, load_or_create_secret_key_with_status, load_secret_key,
+};
 use ocfleet_cli::rpc_client::{
     RpcClientError, bind_controller_endpoint, build_request, call_endpoint_addr,
     validate_rpc_response,
@@ -261,8 +263,12 @@ async fn execute_node_rpc(
     params: Value,
 ) -> Result<RpcCommandSuccess, RpcCommandFailure> {
     let secret_key = load_secret_key(secret_key_path, false).map_err(|err| {
+        let code = match &err {
+            IdentityError::InvalidPermissions => ErrorCode::SecretKeyPermissionInvalid,
+            _ => ErrorCode::SecretKeyLoadFailed,
+        };
         RpcCommandFailure::new(
-            ErrorCode::SecretKeyLoadFailed,
+            code,
             format!("failed to load controller SecretKey: {err}"),
             None,
             json!({ "error": err.to_string() }),
@@ -284,12 +290,7 @@ async fn execute_node_rpc(
             json!({ "endpoint_id": node.endpoint_id, "error": err.to_string() }),
         )
     })?;
-    let request = build_request(
-        method,
-        params,
-        Some(local_actor()),
-        DEFAULT_DEADLINE_MS,
-    );
+    let request = build_request(method, params, Some(local_actor()), DEFAULT_DEADLINE_MS);
     let request_id = request.request_id.clone();
     let response = call_endpoint_addr(
         &endpoint,

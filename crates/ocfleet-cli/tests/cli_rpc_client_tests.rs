@@ -16,10 +16,13 @@ async fn read_response_frame_rejects_oversized_declared_length_without_reading_p
         .await
         .expect("write frame length");
 
-    let err = tokio::time::timeout(Duration::from_millis(100), read_response_frame(&mut reader, 4))
-        .await
-        .expect("read_response_frame returns after reading only the header")
-        .expect_err("oversized frame rejected");
+    let err = tokio::time::timeout(
+        Duration::from_millis(100),
+        read_response_frame(&mut reader, 4),
+    )
+    .await
+    .expect("read_response_frame returns after reading only the header")
+    .expect_err("oversized frame rejected");
 
     assert_eq!(err.code(), ErrorCode::FrameTooLarge);
 }
@@ -95,8 +98,8 @@ fn validate_error_response_preserves_agent_details() {
         duration_ms: 0,
     };
 
-    let err = validate_rpc_response(&response, "request-1", None)
-        .expect_err("agent error is returned");
+    let err =
+        validate_rpc_response(&response, "request-1", None).expect_err("agent error is returned");
 
     assert_eq!(err.code(), ErrorCode::MethodNotAllowed);
     assert_eq!(err.details()["method"], "ocserv.status");
@@ -111,14 +114,10 @@ fn endpoint_mismatch_error_exposes_structured_details() {
     let err = RpcClientError::endpoint_mismatch(expected, actual);
 
     assert_eq!(err.code(), ErrorCode::EndpointMismatch);
-    assert!(
-        err.to_string()
-            .contains(&format!("ENDPOINT_MISMATCH expected={expected} actual={actual}"))
-    );
-    assert_eq!(
-        err.details()["expected_endpoint_id"],
-        expected.to_string()
-    );
+    assert!(err.to_string().contains(&format!(
+        "ENDPOINT_MISMATCH expected={expected} actual={actual}"
+    )));
+    assert_eq!(err.details()["expected_endpoint_id"], expected.to_string());
     assert_eq!(
         err.details()["actual_remote_endpoint_id"],
         actual.to_string()

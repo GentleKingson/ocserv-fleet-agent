@@ -1,4 +1,6 @@
-use ocfleet_cli::identity::load_or_create_secret_key;
+use ocfleet_cli::identity::{
+    load_or_create_secret_key, load_or_create_secret_key_with_status,
+};
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
@@ -37,4 +39,19 @@ fn load_or_create_secret_key_supports_single_file_relative_path() {
 
     assert_eq!(first.to_bytes(), second.to_bytes());
     assert!(dir.path().join(path).is_file());
+}
+
+#[test]
+fn load_or_create_secret_key_with_status_reports_actual_creation() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("controller.secret");
+
+    let first =
+        load_or_create_secret_key_with_status(&path, false).expect("create key with status");
+    let second =
+        load_or_create_secret_key_with_status(&path, false).expect("reuse key with status");
+
+    assert!(first.created);
+    assert!(!second.created);
+    assert_eq!(first.secret_key.to_bytes(), second.secret_key.to_bytes());
 }

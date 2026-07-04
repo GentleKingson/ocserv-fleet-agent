@@ -1,5 +1,30 @@
 use ocfleet_cli::audit::AuditEvent;
 use ocfleet_cli::store::{NodeInsert, Store, StoreError};
+use std::path::Path;
+use std::sync::{Mutex, OnceLock};
+
+fn cwd_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+struct CurrentDirGuard {
+    original: std::path::PathBuf,
+}
+
+impl CurrentDirGuard {
+    fn enter(path: &Path) -> Self {
+        let original = std::env::current_dir().expect("current dir");
+        std::env::set_current_dir(path).expect("set current dir");
+        Self { original }
+    }
+}
+
+impl Drop for CurrentDirGuard {
+    fn drop(&mut self) {
+        std::env::set_current_dir(&self.original).expect("restore current dir");
+    }
+}
 
 fn assert_node_not_found(result: Result<(), StoreError>, expected_node_id: &str) {
     match result {
@@ -14,6 +39,34 @@ fn initializes_schema_and_migration_version() {
     let db = dir.path().join("controller.sqlite");
     let store = Store::open(&db).expect("store opens");
     assert_eq!(store.current_schema_version().expect("version"), 1);
+}
+
+#[test]
+fn open_with_status_reports_database_creation() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("controller.sqlite");
+
+    let first = Store::open_with_status(&db).expect("create store with status");
+    assert!(first.created_database);
+    assert_eq!(first.store.current_schema_version().expect("version"), 1);
+    drop(first);
+
+    let second = Store::open_with_status(&db).expect("reopen store with status");
+    assert!(!second.created_database);
+    assert_eq!(second.store.current_schema_version().expect("version"), 1);
+}
+
+#[test]
+fn open_with_status_supports_single_file_relative_path() {
+    let _guard = cwd_lock().lock().expect("cwd lock");
+    let dir = tempfile::tempdir().expect("temp dir");
+    let _cwd = CurrentDirGuard::enter(dir.path());
+    let path = Path::new("controller.sqlite");
+
+    let opened = Store::open_with_status(path).expect("open relative store");
+
+    assert!(opened.created_database);
+    assert!(dir.path().join(path).is_file());
 }
 
 #[test]

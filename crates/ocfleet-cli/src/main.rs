@@ -2,7 +2,7 @@ use anyhow::{Context, bail};
 use clap::Parser;
 use ocfleet_cli::args::{Cli, Command, NodeCommand};
 use ocfleet_cli::audit::AuditEvent;
-use ocfleet_cli::identity::load_or_create_secret_key;
+use ocfleet_cli::identity::load_or_create_secret_key_with_status;
 use ocfleet_cli::store::{NodeInsert, Store};
 use ocfleet_config::validation::{
     validate_controller_endpoint_id, validate_node_id, validate_region, validate_role,
@@ -22,20 +22,20 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Command::Init => {
-            let created_database = !cli.database.exists();
-            let created_secret_key = !cli.secret_key.exists();
-            let secret_key = load_or_create_secret_key(&cli.secret_key, false)
+            let secret_key = load_or_create_secret_key_with_status(&cli.secret_key, false)
                 .context("failed to load or create controller SecretKey")?;
-            let store = Store::open(&cli.database).context("failed to open controller database")?;
+            let opened = Store::open_with_status(&cli.database)
+                .context("failed to open controller database")?;
+            let store = opened.store;
             let mut event = AuditEvent::new(local_actor(), "controller.init");
             event.ok = Some(true);
             event.detail_json = serde_json::json!({
-                "created_database": created_database,
-                "created_secret_key": created_secret_key,
+                "created_database": opened.created_database,
+                "created_secret_key": secret_key.created,
                 "schema_version": store.current_schema_version()?,
             });
             store.insert_audit(&event)?;
-            println!("controller_endpoint_id={}", secret_key.public());
+            println!("controller_endpoint_id={}", secret_key.secret_key.public());
         }
         Command::Node { command } => {
             let store = Store::open(&cli.database).context("failed to open controller database")?;
@@ -65,7 +65,14 @@ async fn main() -> anyhow::Result<()> {
                     store.insert_audit(&event)?;
                 }
                 NodeCommand::List => {
-                    for node in store.list_nodes()? {
+                    let nodes = store.list_nodes()?;
+                    let mut event = AuditEvent::new(local_actor(), "node.list");
+                    event.ok = Some(true);
+                    event.detail_json = serde_json::json!({
+                        "node_count": nodes.len(),
+                    });
+                    store.insert_audit(&event)?;
+                    for node in nodes {
                         println!(
                             "{} {} {} enabled={}",
                             node.node_id, node.endpoint_id, node.region, node.enabled

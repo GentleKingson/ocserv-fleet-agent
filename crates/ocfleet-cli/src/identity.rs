@@ -5,6 +5,11 @@ use std::io;
 use std::io::Write;
 use std::path::Path;
 
+pub struct SecretKeyLoadResult {
+    pub secret_key: SecretKey,
+    pub created: bool,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum IdentityError {
     #[error("secret key io error: {0}")]
@@ -21,8 +26,20 @@ pub fn load_or_create_secret_key(
     path: &Path,
     production_mode: bool,
 ) -> Result<SecretKey, IdentityError> {
+    Ok(load_or_create_secret_key_with_status(path, production_mode)?.secret_key)
+}
+
+pub fn load_or_create_secret_key_with_status(
+    path: &Path,
+    production_mode: bool,
+) -> Result<SecretKeyLoadResult, IdentityError> {
     match load_secret_key(path, production_mode) {
-        Ok(key) => return Ok(key),
+        Ok(secret_key) => {
+            return Ok(SecretKeyLoadResult {
+                secret_key,
+                created: false,
+            });
+        }
         Err(IdentityError::Io(err)) if err.kind() == io::ErrorKind::NotFound => {}
         Err(err) => return Err(err),
     }
@@ -34,9 +51,15 @@ pub fn load_or_create_secret_key(
     let key = SecretKey::generate();
     let encoded = base64::engine::general_purpose::STANDARD.encode(key.to_bytes());
     match write_new_secret_key(path, &encoded) {
-        Ok(()) => Ok(key),
+        Ok(()) => Ok(SecretKeyLoadResult {
+            secret_key: key,
+            created: true,
+        }),
         Err(IdentityError::Io(err)) if err.kind() == io::ErrorKind::AlreadyExists => {
-            load_secret_key(path, production_mode)
+            Ok(SecretKeyLoadResult {
+                secret_key: load_secret_key(path, production_mode)?,
+                created: false,
+            })
         }
         Err(err) => Err(err),
     }

@@ -1,4 +1,5 @@
 use rusqlite::{params, Connection, OptionalExtension};
+use std::io;
 use std::path::Path;
 use thiserror::Error;
 
@@ -37,12 +38,34 @@ pub struct Store {
     conn: Connection,
 }
 
+pub struct StoreOpenResult {
+    pub store: Store,
+    pub created_database: bool,
+}
+
 impl Store {
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent)?;
         }
 
+        Self::open_existing_or_create(path)
+    }
+
+    pub fn open_with_status(path: &Path) -> Result<StoreOpenResult, StoreError> {
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let created_database = create_database_file_if_missing(path)?;
+        let store = Self::open_existing_or_create(path)?;
+        Ok(StoreOpenResult {
+            store,
+            created_database,
+        })
+    }
+
+    fn open_existing_or_create(path: &Path) -> Result<Self, StoreError> {
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
@@ -201,6 +224,18 @@ impl Store {
             .query_row("SELECT count(*) FROM controller_audit_log", [], |row| {
                 row.get(0)
             })?)
+    }
+}
+
+fn create_database_file_if_missing(path: &Path) -> Result<bool, StoreError> {
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(_) => Ok(true),
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+        Err(err) => Err(StoreError::Io(err)),
     }
 }
 

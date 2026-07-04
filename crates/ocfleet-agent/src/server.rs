@@ -404,8 +404,7 @@ where
         Err(err) => return Err(err),
     };
 
-    event.response_bytes = Some(payload.len());
-    event.error_code = response_error_code(&response);
+    sync_audit_event_with_response(&mut event, &response, payload.len());
     if let Err(err) = state.audit.write(&event) {
         let audit_response = error_response(
             response.request_id.clone(),
@@ -418,6 +417,17 @@ where
     }
 
     write_response_payload(writer, &payload).await
+}
+
+fn sync_audit_event_with_response(
+    event: &mut AgentAuditEvent,
+    response: &RpcResponse,
+    response_bytes: usize,
+) {
+    event.ok = Some(response.ok);
+    event.allowed = Some(response.ok);
+    event.error_code = response_error_code(response);
+    event.response_bytes = Some(response_bytes);
 }
 
 fn serialize_response(
@@ -795,4 +805,74 @@ fn format_rfc3339(value: OffsetDateTime) -> String {
     value
         .format(&time::format_description::well_known::Rfc3339)
         .expect("RFC3339 formatting succeeds")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ocfleet_config::agent::{
+        AuditConfig, ControllerConfig, IrohConfig, NodeConfig, SecurityConfig,
+    };
+
+    #[tokio::test]
+    async fn response_too_large_fallback_audit_matches_actual_response() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let state = AgentServerState {
+            config: test_agent_config(dir.path()),
+            audit: JsonlAuditWriter::new(dir.path().join("audit.log")),
+            nonce_cache: Arc::new(Mutex::new(NonceCache::new())),
+            agent_endpoint_id: "agent-endpoint-1".to_string(),
+        };
+        let response = ok_response(
+            "00000000-0000-4000-8000-000000000001".to_string(),
+            json!({"large": "x".repeat(2048)}),
+        );
+        let mut event = AgentAuditEvent::new("rpc_request");
+        event.remote_endpoint_id = Some("controller-1".to_string());
+        event.request_id = response.request_id.clone();
+        event.stage = Some("dispatch".to_string());
+        event.allowed = Some(true);
+        event.ok = Some(true);
+
+        let mut writer = tokio::io::sink();
+        audit_then_write_response(&state, &mut writer, response, event, 512)
+            .await
+            .expect("write fallback response");
+
+        let audit_text =
+            std::fs::read_to_string(dir.path().join("audit.log")).expect("audit log");
+        let audit_json: Value = serde_json::from_str(audit_text.trim()).expect("audit json");
+        assert_eq!(audit_json["ok"], false);
+        assert_eq!(audit_json["allowed"], false);
+        assert_eq!(audit_json["error_code"], "RESPONSE_TOO_LARGE");
+        assert!(audit_json["response_bytes"].as_u64().expect("response bytes") <= 512);
+    }
+
+    fn test_agent_config(dir: &std::path::Path) -> AgentConfig {
+        AgentConfig {
+            node: NodeConfig {
+                id: "agent-1".to_string(),
+                region: "hk".to_string(),
+                role: "ocserv".to_string(),
+            },
+            iroh: IrohConfig {
+                secret_key_path: dir.join("iroh.secret"),
+                alpn: "/com.github.gentlekingson.ocfleet.mgmt/1".to_string(),
+            },
+            security: SecurityConfig {
+                allowed_clock_skew_seconds: 60,
+                default_deadline_ms: 5_000,
+                max_deadline_ms: 10_000,
+                max_rpc_timeout_ms: 5_000,
+                max_request_bytes: 65_536,
+                max_response_bytes: 512,
+                controllers: Vec::<ControllerConfig>::new(),
+            },
+            audit: AuditConfig {
+                path: dir.join("audit.log"),
+            },
+            ocserv: None,
+            logs: None,
+        }
+    }
 }

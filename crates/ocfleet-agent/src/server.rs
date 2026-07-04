@@ -192,6 +192,23 @@ where
     Ok(payload)
 }
 
+async fn read_frame_with_timeout<R>(
+    reader: &mut R,
+    max_request_bytes: usize,
+    timeout: StdDuration,
+) -> std::result::Result<Vec<u8>, RpcServerError>
+where
+    R: AsyncRead + Unpin,
+{
+    match tokio::time::timeout(timeout, read_frame(reader, max_request_bytes)).await {
+        Ok(result) => result,
+        Err(_) => Err(RpcServerError::structured(
+            ErrorCode::RpcTimeout,
+            format!("frame read timed out after {} ms", timeout.as_millis()),
+        )),
+    }
+}
+
 pub async fn write_response<W>(
     writer: &mut W,
     response: &RpcResponse,
@@ -287,8 +304,9 @@ async fn handle_bi_stream(
     let started = Instant::now();
     let max_request_bytes = state.config.security.max_request_bytes;
     let max_response_bytes = state.config.security.max_response_bytes;
+    let frame_timeout = StdDuration::from_millis(state.config.security.max_rpc_timeout_ms);
 
-    let payload = match read_frame(&mut recv, max_request_bytes).await {
+    let payload = match read_frame_with_timeout(&mut recv, max_request_bytes, frame_timeout).await {
         Ok(payload) => payload,
         Err(err) => {
             let response = error_response(
@@ -643,16 +661,29 @@ async fn dispatch_allowed_method(
             "agent_version": AGENT_VERSION,
             "time_utc": now_rfc3339(),
         })),
-        NODE_INFO => serde_json::to_value(collect_node_info(
-            state.config.node.id.clone(),
-            state.config.node.region.clone(),
-            state.config.node.role.clone(),
-            AGENT_VERSION.to_string(),
-            state.agent_endpoint_id.clone(),
-        ))
-        .map_err(|err| {
-            RequestDispatchError::new(None, ErrorCode::InternalError, err.to_string(), json!({}))
-        }),
+        NODE_INFO => {
+            let node_id = state.config.node.id.clone();
+            let region = state.config.node.region.clone();
+            let role = state.config.node.role.clone();
+            let agent_version = AGENT_VERSION.to_string();
+            let agent_endpoint_id = state.agent_endpoint_id.clone();
+            let info = tokio::task::spawn_blocking(move || {
+                collect_node_info(node_id, region, role, agent_version, agent_endpoint_id)
+            })
+            .await
+            .map_err(|err| {
+                RequestDispatchError::new(None, ErrorCode::InternalError, err.to_string(), json!({}))
+            })?;
+
+            serde_json::to_value(info).map_err(|err| {
+                RequestDispatchError::new(
+                    None,
+                    ErrorCode::InternalError,
+                    err.to_string(),
+                    json!({}),
+                )
+            })
+        }
         _ => Err(RequestDispatchError::new(
             None,
             ErrorCode::MethodNotFound,
@@ -846,6 +877,18 @@ mod tests {
         assert_eq!(audit_json["allowed"], false);
         assert_eq!(audit_json["error_code"], "RESPONSE_TOO_LARGE");
         assert!(audit_json["response_bytes"].as_u64().expect("response bytes") <= 512);
+    }
+
+    #[tokio::test]
+    async fn read_frame_with_timeout_rejects_incomplete_header() {
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        writer.write_all(&[0, 0]).await.expect("write partial header");
+
+        let err = read_frame_with_timeout(&mut reader, 64, StdDuration::from_millis(10))
+            .await
+            .expect_err("incomplete header times out");
+
+        assert_eq!(err.code(), ErrorCode::RpcTimeout);
     }
 
     fn test_agent_config(dir: &std::path::Path) -> AgentConfig {

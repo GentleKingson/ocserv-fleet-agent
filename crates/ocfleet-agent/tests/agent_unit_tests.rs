@@ -70,6 +70,25 @@ fn existing_invalid_secret_key_is_rejected() {
 }
 
 #[test]
+fn agent_binary_reports_config_load_context_for_missing_config() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let missing_config = dir.path().join("missing-agent.toml");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_ocfleet-agent"))
+        .arg("--config")
+        .arg(&missing_config)
+        .output()
+        .expect("run ocfleet-agent binary");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("failed to load agent config"),
+        "stderr was: {stderr}"
+    );
+}
+
+#[test]
 fn deleting_secret_key_changes_endpoint_identity() {
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("iroh.secret");

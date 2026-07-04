@@ -3,7 +3,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
-use crate::validation::{validate_node_id, validate_region, validate_role, validate_service_name};
+use crate::validation::{
+    validate_controller_endpoint_id, validate_controller_role, validate_node_id,
+    validate_non_empty_path, validate_positive_i64, validate_positive_u64,
+    validate_positive_usize, validate_region, validate_role, validate_service_name,
+};
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -98,6 +102,10 @@ pub fn validate_agent_config(config: &AgentConfig) -> Result<(), ConfigError> {
     validate_node_id(&config.node.id).map_err(|e| ConfigError::Invalid(e.to_string()))?;
     validate_region(&config.node.region).map_err(|e| ConfigError::Invalid(e.to_string()))?;
     validate_role(&config.node.role).map_err(|e| ConfigError::Invalid(e.to_string()))?;
+    validate_non_empty_path(&config.iroh.secret_key_path, "iroh.secret_key_path")
+        .map_err(|e| ConfigError::Invalid(e.to_string()))?;
+    validate_non_empty_path(&config.audit.path, "audit.path")
+        .map_err(|e| ConfigError::Invalid(e.to_string()))?;
     if let Some(service_name) = config
         .ocserv
         .as_ref()
@@ -105,21 +113,30 @@ pub fn validate_agent_config(config: &AgentConfig) -> Result<(), ConfigError> {
     {
         validate_service_name(service_name).map_err(|e| ConfigError::Invalid(e.to_string()))?;
     }
-    if config.security.default_deadline_ms == 0 {
-        return Err(ConfigError::Invalid(
-            "default_deadline_ms must be greater than zero".into(),
-        ));
+    for controller in &config.security.controllers {
+        validate_controller_endpoint_id(&controller.endpoint_id)
+            .map_err(|e| ConfigError::Invalid(e.to_string()))?;
+        validate_controller_role(&controller.role)
+            .map_err(|e| ConfigError::Invalid(e.to_string()))?;
     }
-    if config.security.max_rpc_timeout_ms == 0 {
-        return Err(ConfigError::Invalid(
-            "max_rpc_timeout_ms must be greater than zero".into(),
-        ));
-    }
+    validate_positive_i64(
+        config.security.allowed_clock_skew_seconds,
+        "allowed_clock_skew_seconds",
+    )
+    .map_err(|e| ConfigError::Invalid(e.to_string()))?;
+    validate_positive_u64(config.security.default_deadline_ms, "default_deadline_ms")
+        .map_err(|e| ConfigError::Invalid(e.to_string()))?;
+    validate_positive_u64(config.security.max_rpc_timeout_ms, "max_rpc_timeout_ms")
+        .map_err(|e| ConfigError::Invalid(e.to_string()))?;
     if config.security.max_deadline_ms < config.security.default_deadline_ms {
         return Err(ConfigError::Invalid(
             "max_deadline_ms must be >= default_deadline_ms".into(),
         ));
     }
+    validate_positive_usize(config.security.max_request_bytes, "max_request_bytes")
+        .map_err(|e| ConfigError::Invalid(e.to_string()))?;
+    validate_positive_usize(config.security.max_response_bytes, "max_response_bytes")
+        .map_err(|e| ConfigError::Invalid(e.to_string()))?;
     Ok(())
 }
 

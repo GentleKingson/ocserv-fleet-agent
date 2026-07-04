@@ -1,4 +1,12 @@
 use ocfleet_agent::identity::{load_or_create_secret_key, secret_key_file_mode_is_private};
+use ocfleet_agent::{
+    audit::{AgentAuditEvent, JsonlAuditWriter},
+    node_info::collect_node_info,
+    nonce::NonceCache,
+    AGENT_VERSION,
+};
+use std::time::Duration;
+use time::OffsetDateTime;
 
 #[test]
 fn secret_key_is_created_and_reused() {
@@ -54,4 +62,72 @@ fn deleting_secret_key_changes_endpoint_identity() {
     std::fs::remove_file(&path).expect("remove key");
     let second = load_or_create_secret_key(&path, false).expect("second key");
     assert_ne!(first.public(), second.public());
+}
+
+#[test]
+fn nonce_cache_rejects_replay_per_remote_endpoint() {
+    let mut cache = NonceCache::new();
+    let ttl = Duration::from_secs(60);
+
+    assert!(cache.register("remote-a", "nonce-1", ttl));
+    assert!(!cache.register("remote-a", "nonce-1", ttl));
+    assert!(cache.register("remote-b", "nonce-1", ttl));
+}
+
+#[test]
+fn jsonl_audit_writer_appends_lines_and_creates_parent_directory() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("audit").join("agent.jsonl");
+    let writer = JsonlAuditWriter::new(path.clone());
+
+    let mut first = AgentAuditEvent::new("request.received");
+    first.request_id = Some("req-1".to_string());
+    first.allowed = Some(true);
+    writer.write(&first).expect("write first event");
+
+    let mut second = AgentAuditEvent::new("request.completed");
+    second.request_id = Some("req-2".to_string());
+    second.ok = Some(true);
+    writer.write(&second).expect("write second event");
+
+    let text = std::fs::read_to_string(path).expect("audit file");
+    assert!(text.ends_with('\n'));
+    let lines = text.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), 2);
+
+    let first_json: serde_json::Value = serde_json::from_str(lines[0]).expect("first json");
+    let second_json: serde_json::Value = serde_json::from_str(lines[1]).expect("second json");
+    assert_eq!(first_json["event"], "request.received");
+    assert_eq!(first_json["request_id"], "req-1");
+    assert_eq!(first_json["allowed"], true);
+    assert_eq!(second_json["event"], "request.completed");
+    assert_eq!(second_json["request_id"], "req-2");
+    assert_eq!(second_json["ok"], true);
+}
+
+#[test]
+fn collect_node_info_returns_supplied_identity_and_basic_host_metadata() {
+    let info = collect_node_info(
+        "node-1".to_string(),
+        "hk".to_string(),
+        "gateway".to_string(),
+        AGENT_VERSION.to_string(),
+        "endpoint-1".to_string(),
+    );
+
+    assert_eq!(info.node_id, "node-1");
+    assert_eq!(info.region, "hk");
+    assert_eq!(info.role, "gateway");
+    assert_eq!(info.agent_version, AGENT_VERSION);
+    assert_eq!(info.agent_endpoint_id, "endpoint-1");
+    assert!(!info.hostname.trim().is_empty());
+    assert!(!info.os_release.trim().is_empty());
+    assert!(!info.kernel.trim().is_empty());
+    assert!(!info.arch.trim().is_empty());
+    assert!(OffsetDateTime::parse(
+        &info.current_time_utc,
+        &time::format_description::well_known::Rfc3339
+    )
+    .is_ok());
+    let _: u64 = info.uptime_seconds;
 }

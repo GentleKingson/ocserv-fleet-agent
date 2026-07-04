@@ -3,6 +3,7 @@ use ocfleet_agent::{
     audit::{AgentAuditEvent, JsonlAuditWriter},
     node_info::collect_node_info,
     nonce::NonceCache,
+    server::parse_endpoint_id,
     AGENT_VERSION,
 };
 use std::time::Duration;
@@ -130,4 +131,19 @@ fn collect_node_info_returns_supplied_identity_and_basic_host_metadata() {
     )
     .is_ok());
     let _: u64 = info.uptime_seconds;
+}
+
+#[test]
+fn parse_endpoint_id_accepts_valid_iroh_endpoint_ids() {
+    let endpoint_id = iroh::SecretKey::generate().public();
+
+    assert_eq!(
+        parse_endpoint_id(&endpoint_id.to_string()).expect("valid endpoint id"),
+        endpoint_id
+    );
+}
+
+#[test]
+fn parse_endpoint_id_rejects_invalid_iroh_endpoint_ids() {
+    assert!(parse_endpoint_id("not-an-endpoint-id").is_err());
 }

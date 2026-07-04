@@ -1,0 +1,25 @@
+[Unit]
+Description=ocfleet agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ocfleet
+Group=ocfleet
+ExecStart=/usr/local/bin/ocfleet-agent --config /etc/ocfleet-agent/agent.toml
+Restart=on-failure
+RestartSec=5s
+UMask=0077
+StateDirectory=ocfleet-agent
+LogsDirectory=ocfleet-agent
+StateDirectoryMode=0700
+LogsDirectoryMode=0700
+ProtectSystem=strict
+ProtectHome=yes
+NoNewPrivileges=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/ocfleet-agent /var/log/ocfleet-agent
+
+[Install]
+WantedBy=multi-user.target

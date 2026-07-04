@@ -23,4 +23,5 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+ocfleet-cli = { path = "../ocfleet-cli" }
 tempfile.workspace = true

@@ -2322,6 +2322,7 @@ dependencies = [
  "clap",
  "hostname",
  "iroh",
+ "ocfleet-cli",
  "ocfleet-config",
  "ocfleet-protocol",
  "serde",

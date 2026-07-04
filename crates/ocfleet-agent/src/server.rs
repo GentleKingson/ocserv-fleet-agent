@@ -565,6 +565,13 @@ async fn validate_and_dispatch_request(
         )
     })?;
 
+    validate_issued_at(
+        &request.issued_at,
+        request.deadline_ms,
+        state.config.security.allowed_clock_skew_seconds,
+    )
+    .map_err(|err| RequestDispatchError::new(Some(request_id.clone()), err.0, err.1, err.2))?;
+
     let nonce_ttl = nonce_ttl(
         request.deadline_ms,
         state.config.security.allowed_clock_skew_seconds,
@@ -589,13 +596,6 @@ async fn validate_and_dispatch_request(
             json!({}),
         ));
     }
-
-    validate_issued_at(
-        &request.issued_at,
-        request.deadline_ms,
-        state.config.security.allowed_clock_skew_seconds,
-    )
-    .map_err(|err| RequestDispatchError::new(Some(request_id.clone()), err.0, err.1, err.2))?;
 
     match classify_phase_one_method(&request.method) {
         MethodStatus::KnownButNotAllowed => {
@@ -639,7 +639,12 @@ async fn validate_and_dispatch_request(
             .deadline_ms
             .min(state.config.security.max_rpc_timeout_ms),
     );
-    match tokio::time::timeout(timeout, dispatch_allowed_method(state, &request.method)).await {
+    match tokio::time::timeout(
+        timeout,
+        dispatch_allowed_method(state, &request.method, &request_id),
+    )
+    .await
+    {
         Ok(result) => result.map(|value| (request.request_id, value)),
         Err(_) => Err(RequestDispatchError::new(
             Some(request.request_id),
@@ -653,6 +658,7 @@ async fn validate_and_dispatch_request(
 async fn dispatch_allowed_method(
     state: &AgentServerState,
     method: &str,
+    request_id: &str,
 ) -> std::result::Result<Value, RequestDispatchError> {
     match method {
         NODE_PING => Ok(json!({
@@ -672,12 +678,17 @@ async fn dispatch_allowed_method(
             })
             .await
             .map_err(|err| {
-                RequestDispatchError::new(None, ErrorCode::InternalError, err.to_string(), json!({}))
+                RequestDispatchError::new(
+                    Some(request_id.to_string()),
+                    ErrorCode::InternalError,
+                    err.to_string(),
+                    json!({}),
+                )
             })?;
 
             serde_json::to_value(info).map_err(|err| {
                 RequestDispatchError::new(
-                    None,
+                    Some(request_id.to_string()),
                     ErrorCode::InternalError,
                     err.to_string(),
                     json!({}),
@@ -685,7 +696,7 @@ async fn dispatch_allowed_method(
             })
         }
         _ => Err(RequestDispatchError::new(
-            None,
+            Some(request_id.to_string()),
             ErrorCode::MethodNotFound,
             format!("method not found: {method}"),
             json!({"method": method}),

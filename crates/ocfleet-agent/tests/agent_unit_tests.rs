@@ -338,6 +338,28 @@ async fn handle_request_rejects_replayed_nonce_per_remote_endpoint() {
 }
 
 #[tokio::test]
+async fn handle_request_does_not_register_nonce_when_timestamp_invalid() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let state = test_server_state(dir.path(), "agent-endpoint-1");
+    let mut request = test_rpc_request(NODE_PING, valid_nonce(10));
+    request.issued_at = (OffsetDateTime::now_utc() + time::Duration::hours(1))
+        .format(&time::format_description::well_known::Rfc3339)
+        .expect("format issued_at");
+
+    let first = handle_request(&state, "controller-1", request.clone()).await;
+    let second = handle_request(&state, "controller-1", request).await;
+
+    assert_eq!(
+        first.error.as_ref().expect("error").code,
+        ErrorCode::ClockSkewExceeded
+    );
+    assert_eq!(
+        second.error.as_ref().expect("error").code,
+        ErrorCode::ClockSkewExceeded
+    );
+}
+
+#[tokio::test]
 async fn handle_request_rejects_invalid_and_too_large_deadlines() {
     let dir = tempfile::tempdir().expect("temp dir");
     let state = test_server_state(dir.path(), "agent-endpoint-1");

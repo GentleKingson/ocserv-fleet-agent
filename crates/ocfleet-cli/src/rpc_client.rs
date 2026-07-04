@@ -9,14 +9,18 @@ use ocfleet_protocol::constants::{
 };
 use ocfleet_protocol::error::ErrorCode;
 use ocfleet_protocol::rpc::{RpcRequest, RpcResponse};
-use serde_json::Value;
+use serde_json::{Value, json};
 use time::OffsetDateTime;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 #[derive(Debug, thiserror::Error)]
 pub enum RpcClientError {
     #[error("{message}")]
-    Structured { code: ErrorCode, message: String },
+    Structured {
+        code: ErrorCode,
+        message: String,
+        details: Value,
+    },
 }
 
 impl RpcClientError {
@@ -26,10 +30,36 @@ impl RpcClientError {
         }
     }
 
+    pub fn details(&self) -> &Value {
+        match self {
+            Self::Structured { details, .. } => details,
+        }
+    }
+
+    pub fn endpoint_mismatch(expected: EndpointId, actual: EndpointId) -> Self {
+        Self::structured_with_details(
+            ErrorCode::EndpointMismatch,
+            format!("ENDPOINT_MISMATCH expected={expected} actual={actual}"),
+            json!({
+                "expected_endpoint_id": expected.to_string(),
+                "actual_remote_endpoint_id": actual.to_string(),
+            }),
+        )
+    }
+
     fn structured(code: ErrorCode, message: impl Into<String>) -> Self {
+        Self::structured_with_details(code, message, json!({}))
+    }
+
+    fn structured_with_details(
+        code: ErrorCode,
+        message: impl Into<String>,
+        details: Value,
+    ) -> Self {
         Self::Structured {
             code,
             message: message.into(),
+            details,
         }
     }
 }
@@ -116,13 +146,10 @@ async fn call_endpoint_addr_inner(
         .map_err(|err| RpcClientError::structured(ErrorCode::ConnectFailed, err.to_string()))?;
     let actual_endpoint_id = conn.remote_id();
     if actual_endpoint_id != expected_endpoint_id {
-        let message =
-            format!("ENDPOINT_MISMATCH expected={expected_endpoint_id} actual={actual_endpoint_id}");
+        let err = RpcClientError::endpoint_mismatch(expected_endpoint_id, actual_endpoint_id);
+        let message = err.to_string();
         conn.close(0_u8.into(), message.as_bytes());
-        return Err(RpcClientError::structured(
-            ErrorCode::EndpointMismatch,
-            message,
-        ));
+        return Err(err);
     }
 
     let (mut send, mut recv) = conn
@@ -229,16 +256,18 @@ pub fn validate_rpc_response(
         return Ok(());
     }
 
-    if let Some(error) = &response.error {
+    if response.result.is_some() || response.error.is_none() {
         return Err(RpcClientError::structured(
-            error.code.clone(),
-            error.message.clone(),
+            ErrorCode::InvalidResponse,
+            "error response must include error and omit result".to_string(),
         ));
     }
 
-    Err(RpcClientError::structured(
-        ErrorCode::InvalidResponse,
-        "error response must include error".to_string(),
+    let error = response.error.as_ref().expect("checked above");
+    Err(RpcClientError::structured_with_details(
+        error.code.clone(),
+        error.message.clone(),
+        error.details.clone(),
     ))
 }
 

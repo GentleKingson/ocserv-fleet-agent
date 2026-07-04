@@ -5,7 +5,8 @@ use ocfleet_cli::args::{Cli, Command, NodeCommand};
 use ocfleet_cli::audit::AuditEvent;
 use ocfleet_cli::identity::{load_or_create_secret_key_with_status, load_secret_key};
 use ocfleet_cli::rpc_client::{
-    bind_controller_endpoint, build_request, call_endpoint_addr, validate_rpc_response,
+    RpcClientError, bind_controller_endpoint, build_request, call_endpoint_addr,
+    validate_rpc_response,
 };
 use ocfleet_cli::store::{NodeInsert, NodeRecord, Store};
 use ocfleet_config::validation::{
@@ -14,7 +15,7 @@ use ocfleet_config::validation::{
 use ocfleet_protocol::error::ErrorCode;
 use ocfleet_protocol::method::{NODE_INFO, NODE_PING};
 use ocfleet_protocol::{DEFAULT_ALPN, DEFAULT_DEADLINE_MS, RpcResponse};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use std::path::Path;
 use std::str::FromStr;
 use std::time::Instant;
@@ -272,7 +273,7 @@ async fn execute_node_rpc(
             err.code(),
             err.to_string(),
             None,
-            json!({ "error": err.to_string() }),
+            rpc_client_error_detail_json(&err),
         )
     })?;
     let expected_endpoint_id = EndpointId::from_str(&node.endpoint_id).map_err(|err| {
@@ -303,7 +304,7 @@ async fn execute_node_rpc(
             err.code(),
             err.to_string(),
             Some(request_id.clone()),
-            json!({ "error": err.to_string() }),
+            rpc_client_error_detail_json(&err),
         )
     })?;
 
@@ -326,7 +327,7 @@ fn validate_response_for_method(
             err.code(),
             err.to_string(),
             Some(request_id.to_string()),
-            json!({ "error": err.to_string() }),
+            rpc_client_error_detail_json(&err),
         )
     })
 }
@@ -406,6 +407,19 @@ fn print_rpc_result(method: &str, result: &Value) {
 fn hash_json_value(value: &Value) -> String {
     let bytes = serde_json::to_vec(value).unwrap_or_else(|_| b"null".to_vec());
     blake3::hash(&bytes).to_hex().to_string()
+}
+
+fn rpc_client_error_detail_json(err: &RpcClientError) -> Value {
+    let mut detail = Map::new();
+    let details = err.details().clone();
+    detail.insert("error".to_string(), Value::String(err.to_string()));
+    detail.insert("details".to_string(), details.clone());
+    if let Value::Object(details) = details {
+        for (key, value) in details {
+            detail.entry(key).or_insert(value);
+        }
+    }
+    Value::Object(detail)
 }
 
 fn error_code_name(code: &ErrorCode) -> String {

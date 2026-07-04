@@ -18,6 +18,26 @@ fn secret_key_file_mode_is_private_after_create() {
     assert!(secret_key_file_mode_is_private(&path).expect("mode check"));
 }
 
+#[cfg(unix)]
+#[test]
+fn production_mode_rejects_existing_world_readable_secret_key() {
+    use base64::Engine;
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("iroh.secret");
+    let key = iroh::SecretKey::generate();
+    let encoded = base64::engine::general_purpose::STANDARD.encode(key.to_bytes());
+    std::fs::write(&path, format!("{encoded}\n")).expect("write key");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+
+    let err = load_or_create_secret_key(&path, true).expect_err("world-readable key rejected");
+    assert!(matches!(
+        err,
+        ocfleet_agent::identity::IdentityError::InvalidPermissions
+    ));
+}
+
 #[test]
 fn existing_invalid_secret_key_is_rejected() {
     let dir = tempfile::tempdir().expect("temp dir");

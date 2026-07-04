@@ -1,3 +1,4 @@
+pub mod args;
 pub mod audit;
 pub mod identity;
 pub mod store;

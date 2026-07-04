@@ -214,6 +214,20 @@ fn agent_config_rejects_zero_payload_limits() {
 }
 
 #[test]
+fn agent_config_rejects_too_small_max_response_bytes() {
+    let mut config = valid_agent_config();
+    config.security.max_response_bytes = 511;
+
+    let err =
+        validate_agent_config(&config).expect_err("small max_response_bytes should be rejected");
+    assert!(matches!(
+        err,
+        ConfigError::Invalid(message)
+            if message.contains("max_response_bytes") && message.contains("512")
+    ));
+}
+
+#[test]
 fn cli_config_rejects_empty_controller_database_path() {
     let mut config = valid_cli_config();
     config.controller.database_path = "".into();

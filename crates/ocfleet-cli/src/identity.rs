@@ -65,7 +65,7 @@ pub fn load_or_create_secret_key_with_status(
     }
 }
 
-fn load_secret_key(path: &Path, production_mode: bool) -> Result<SecretKey, IdentityError> {
+pub fn load_secret_key(path: &Path, production_mode: bool) -> Result<SecretKey, IdentityError> {
     if production_mode && !secret_key_file_mode_is_private(path)? {
         return Err(IdentityError::InvalidPermissions);
     }

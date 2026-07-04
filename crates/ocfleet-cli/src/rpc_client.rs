@@ -1,4 +1,5 @@
 use std::net::Ipv4Addr;
+use std::time::Duration;
 
 use base64::Engine;
 use iroh::endpoint::presets;
@@ -86,6 +87,29 @@ pub async fn call_endpoint_addr(
     alpn: &[u8],
     request: RpcRequest,
 ) -> Result<RpcResponse, RpcClientError> {
+    let timeout = Duration::from_millis(request.deadline_ms);
+    match tokio::time::timeout(
+        timeout,
+        call_endpoint_addr_inner(endpoint, target, expected_endpoint_id, alpn, request),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(RpcClientError::structured(
+            ErrorCode::RpcTimeout,
+            format!("rpc timed out after {} ms", timeout.as_millis()),
+        )),
+    }
+}
+
+async fn call_endpoint_addr_inner(
+    endpoint: &Endpoint,
+    target: EndpointAddr,
+    expected_endpoint_id: EndpointId,
+    alpn: &[u8],
+    request: RpcRequest,
+) -> Result<RpcResponse, RpcClientError> {
+    let timeout = Duration::from_millis(request.deadline_ms);
     let conn = endpoint
         .connect(target, alpn)
         .await
@@ -106,7 +130,8 @@ pub async fn call_endpoint_addr(
         .await
         .map_err(|err| RpcClientError::structured(ErrorCode::ConnectFailed, err.to_string()))?;
     write_request_frame(&mut send, &request).await?;
-    let payload = read_response_frame(&mut recv, DEFAULT_MAX_RESPONSE_BYTES).await?;
+    let payload =
+        read_response_frame_with_timeout(&mut recv, DEFAULT_MAX_RESPONSE_BYTES, timeout).await?;
     serde_json::from_slice(&payload)
         .map_err(|err| RpcClientError::structured(ErrorCode::InvalidResponse, err.to_string()))
 }
@@ -137,6 +162,84 @@ where
         .await
         .map_err(|err| RpcClientError::structured(ErrorCode::FrameReadFailed, err.to_string()))?;
     Ok(payload)
+}
+
+pub async fn read_response_frame_with_timeout<R>(
+    reader: &mut R,
+    max_response_bytes: usize,
+    timeout: Duration,
+) -> Result<Vec<u8>, RpcClientError>
+where
+    R: AsyncRead + Unpin,
+{
+    match tokio::time::timeout(timeout, read_response_frame(reader, max_response_bytes)).await {
+        Ok(result) => result,
+        Err(_) => Err(RpcClientError::structured(
+            ErrorCode::RpcTimeout,
+            format!("response frame read timed out after {} ms", timeout.as_millis()),
+        )),
+    }
+}
+
+pub fn validate_rpc_response(
+    response: &RpcResponse,
+    expected_request_id: &str,
+    expected_node_info_endpoint_id: Option<&str>,
+) -> Result<(), RpcClientError> {
+    if response.version != PROTOCOL_VERSION {
+        return Err(RpcClientError::structured(
+            ErrorCode::InvalidResponse,
+            format!(
+                "invalid response version: expected {PROTOCOL_VERSION}, got {}",
+                response.version
+            ),
+        ));
+    }
+
+    if response.request_id.as_deref() != Some(expected_request_id) {
+        return Err(RpcClientError::structured(
+            ErrorCode::InvalidResponse,
+            "response request_id does not match request".to_string(),
+        ));
+    }
+
+    if response.ok {
+        if response.error.is_some() || response.result.is_none() {
+            return Err(RpcClientError::structured(
+                ErrorCode::InvalidResponse,
+                "ok response must include result and omit error".to_string(),
+            ));
+        }
+        if let Some(expected_endpoint_id) = expected_node_info_endpoint_id {
+            let actual = response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("agent_endpoint_id"))
+                .and_then(Value::as_str);
+            if actual != Some(expected_endpoint_id) {
+                return Err(RpcClientError::structured(
+                    ErrorCode::InvalidResponse,
+                    format!(
+                        "node.info endpoint mismatch: expected={expected_endpoint_id} actual={}",
+                        actual.unwrap_or("<missing>")
+                    ),
+                ));
+            }
+        }
+        return Ok(());
+    }
+
+    if let Some(error) = &response.error {
+        return Err(RpcClientError::structured(
+            error.code.clone(),
+            error.message.clone(),
+        ));
+    }
+
+    Err(RpcClientError::structured(
+        ErrorCode::InvalidResponse,
+        "error response must include error".to_string(),
+    ))
 }
 
 async fn write_request_frame<W>(

@@ -137,6 +137,11 @@ pub fn validate_agent_config(config: &AgentConfig) -> Result<(), ConfigError> {
         .map_err(|e| ConfigError::Invalid(e.to_string()))?;
     validate_positive_usize(config.security.max_response_bytes, "max_response_bytes")
         .map_err(|e| ConfigError::Invalid(e.to_string()))?;
+    if config.security.max_response_bytes < 512 {
+        return Err(ConfigError::Invalid(
+            "max_response_bytes must be >= 512".to_string(),
+        ));
+    }
     Ok(())
 }
 

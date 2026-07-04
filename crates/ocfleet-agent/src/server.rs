@@ -79,6 +79,7 @@ pub async fn bind_agent_endpoint_local_only(
     agent_endpoint_builder(config, secret_key, audit)
         .relay_mode(RelayMode::Disabled)
         .clear_address_lookup()
+        .clear_ip_transports()
         .bind_addr((Ipv4Addr::LOCALHOST, 0))
         .context("failed to configure local-only agent endpoint bind address")?
         .bind()

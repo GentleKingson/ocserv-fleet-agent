@@ -107,6 +107,7 @@ fn node_list_writes_success_audit_with_node_count() {
     let dir = tempfile::tempdir().expect("temp dir");
     let database = dir.path().join("controller.sqlite");
     let database_arg = database.to_string_lossy().into_owned();
+    let endpoint_id = iroh::SecretKey::generate().public().to_string();
 
     run_ocfleet(&[
         "--database",
@@ -115,7 +116,7 @@ fn node_list_writes_success_audit_with_node_count() {
         "add",
         "hk-ocserv-01",
         "--endpoint-id",
-        "endpoint-one",
+        &endpoint_id,
         "--region",
         "hk",
     ]);
@@ -125,6 +126,62 @@ fn node_list_writes_success_audit_with_node_count() {
     assert_eq!(event, "node.list");
     assert_eq!(ok, 1);
     assert_eq!(detail, serde_json::json!({ "node_count": 1 }));
+}
+
+#[test]
+fn node_add_rejects_malformed_endpoint_id_without_writing_node() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let database_arg = database.to_string_lossy().into_owned();
+
+    let output = run_ocfleet_failure(&[
+        "--database",
+        &database_arg,
+        "node",
+        "add",
+        "bad-node",
+        "--endpoint-id",
+        "not-an-endpoint-id",
+        "--region",
+        "hk",
+    ]);
+
+    assert!(String::from_utf8_lossy(&output.stderr).contains("endpoint_id"));
+    let store = Store::open(&database).expect("store opens after failed add");
+    assert!(
+        store
+            .get_node("bad-node")
+            .expect("query failed node")
+            .is_none()
+    );
+}
+
+#[test]
+fn node_add_stores_valid_endpoint_id_as_canonical_string() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let database_arg = database.to_string_lossy().into_owned();
+    let endpoint_id = iroh::SecretKey::generate().public();
+    let endpoint_arg = endpoint_id.to_string();
+
+    run_ocfleet(&[
+        "--database",
+        &database_arg,
+        "node",
+        "add",
+        "hk-ocserv-01",
+        "--endpoint-id",
+        &endpoint_arg,
+        "--region",
+        "hk",
+    ]);
+
+    let store = Store::open(&database).expect("store opens");
+    let node = store
+        .get_node("hk-ocserv-01")
+        .expect("query node")
+        .expect("node inserted");
+    assert_eq!(node.endpoint_id, endpoint_id.to_string());
 }
 
 #[test]

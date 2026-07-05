@@ -213,7 +213,8 @@ impl EndpointHooks for AllowlistHook {
                 event.limit_key = Some(limit_key);
                 event
             },
-        );
+        )
+        .await;
 
         AfterHandshakeOutcome::Reject {
             error_code: 403u32.into(),
@@ -375,7 +376,8 @@ pub async fn serve_endpoint(endpoint: Endpoint, state: AgentServerState) -> Resu
                 "handshake",
                 "handshake_admission",
                 "handshake task limit exceeded",
-            );
+            )
+            .await;
             continue;
         };
         let state = state.clone();
@@ -402,7 +404,8 @@ pub async fn serve_endpoint(endpoint: Endpoint, state: AgentServerState) -> Resu
                             "connection",
                             "connection_admission",
                             "connection limit exceeded",
-                        );
+                        )
+                        .await;
                         return;
                     };
                     serve_connection(state, conn, connection_permits).await
@@ -457,7 +460,8 @@ async fn serve_connection(
                 "stream",
                 "stream_admission",
                 "stream limit exceeded",
-            );
+            )
+            .await;
             let response = error_response(
                 None,
                 ErrorCode::ResourceExhausted,
@@ -614,12 +618,13 @@ where
     };
 
     sync_audit_event_with_response(&mut event, &response, payload.len());
-    if let Err(err) = state.audit.write(&event) {
+    if let Err(err) = state.audit.write_async(&event).await {
+        tracing::warn!(error = %err, "failed to write agent audit event");
         let audit_response = error_response(
             response.request_id.clone(),
             ErrorCode::AuditWriteFailed,
             "failed to write agent audit event",
-            json!({"error": err.to_string()}),
+            json!({}),
         );
         write_response(writer, &audit_response, max_response_bytes).await?;
         return Ok(());
@@ -884,24 +889,13 @@ async fn dispatch_allowed_method(
             "time_utc": now_rfc3339(),
         })),
         NODE_INFO => {
-            let node_id = state.config.node.id.clone();
-            let region = state.config.node.region.clone();
-            let role = state.config.node.role.clone();
-            let agent_version = AGENT_VERSION.to_string();
-            let agent_endpoint_id = state.agent_endpoint_id.clone();
-            let info = tokio::task::spawn_blocking(move || {
-                collect_node_info(node_id, region, role, agent_version, agent_endpoint_id)
-            })
-            .await
-            .map_err(|err| {
-                RequestDispatchError::new(
-                    Some(request_id.to_string()),
-                    ErrorCode::InternalError,
-                    err.to_string(),
-                    json!({}),
-                )
-            })?;
-
+            let info = collect_node_info(
+                state.config.node.id.clone(),
+                state.config.node.region.clone(),
+                state.config.node.role.clone(),
+                AGENT_VERSION.to_string(),
+                state.agent_endpoint_id.clone(),
+            );
             serde_json::to_value(info).map_err(|err| {
                 RequestDispatchError::new(
                     Some(request_id.to_string()),
@@ -1039,7 +1033,7 @@ fn base_audit_event(remote_endpoint_id: &str, stage: &str, started: Instant) -> 
     event
 }
 
-fn audit_resource_rejection(
+async fn audit_resource_rejection(
     state: &AgentServerState,
     remote_endpoint_id: Option<&str>,
     resource: &str,
@@ -1065,10 +1059,11 @@ fn audit_resource_rejection(
             event.limit_key = Some(limit_key);
             event
         },
-    );
+    )
+    .await;
 }
 
-fn write_limited_audit_event(
+async fn write_limited_audit_event(
     audit: &JsonlAuditWriter,
     audit_limiter: &Arc<Mutex<RejectedAuditLimiter>>,
     remote_endpoint_id: Option<&str>,
@@ -1090,7 +1085,7 @@ fn write_limited_audit_event(
             limit_key,
         } => {
             let event = event_builder(suppressed_count, limit_key);
-            if let Err(err) = audit.write(&event) {
+            if let Err(err) = audit.write_async(&event).await {
                 tracing::warn!(error = %err, "failed to write limited audit event");
             }
         }
@@ -1201,6 +1196,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn audit_write_failure_response_does_not_expose_local_error_details() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let audit_directory = dir.path().join("audit-directory");
+        std::fs::create_dir(&audit_directory).expect("audit directory");
+        let mut config = test_agent_config(dir.path());
+        config.audit.path = audit_directory.clone();
+        let state = AgentServerState {
+            config,
+            audit: JsonlAuditWriter::new(audit_directory),
+            nonce_cache: Arc::new(Mutex::new(NonceCache::new())),
+            limiters: Arc::new(ServerLimiters::new(256, 256, 32, 1024, 128)),
+            audit_limiter: Arc::new(Mutex::new(RejectedAuditLimiter::new(
+                &test_agent_config(dir.path()).audit,
+            ))),
+            agent_endpoint_id: "agent-endpoint-1".to_string(),
+        };
+        let response = ok_response(
+            "00000000-0000-4000-8000-000000000001".to_string(),
+            json!({"message": "pong"}),
+        );
+        let mut event = AgentAuditEvent::new("rpc_request");
+        event.remote_endpoint_id = Some("controller-1".to_string());
+        event.request_id = response.request_id.clone();
+        event.stage = Some("dispatch".to_string());
+        event.allowed = Some(true);
+        event.ok = Some(true);
+
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        audit_then_write_response(&state, &mut server, response, event, 2048)
+            .await
+            .expect("write audit failure response");
+        let payload = read_frame(&mut client, 4096).await.expect("response frame");
+        let response: RpcResponse = serde_json::from_slice(&payload).expect("rpc response");
+        let error = response.error.expect("audit error");
+
+        assert_eq!(error.code, ErrorCode::AuditWriteFailed);
+        assert_eq!(error.message, "failed to write agent audit event");
+        assert_eq!(error.details, json!({}));
+    }
+
+    #[tokio::test]
     async fn read_frame_with_timeout_rejects_incomplete_header() {
         let (mut writer, mut reader) = tokio::io::duplex(64);
         writer
@@ -1244,6 +1280,7 @@ mod tests {
             },
             audit: AuditConfig {
                 path: dir.join("audit.log"),
+                audit_queue_capacity: 1024,
                 rejected_peer_log_burst: 10,
                 rejected_peer_log_refill_per_sec: 1,
                 rejected_peer_log_max_buckets: 4096,

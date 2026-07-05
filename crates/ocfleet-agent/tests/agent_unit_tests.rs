@@ -291,6 +291,7 @@ fn rejected_audit_limiter_suppresses_repeated_resource_rejections_and_bounds_buc
     let dir = tempfile::tempdir().expect("temp dir");
     let config = AuditConfig {
         path: dir.path().join("audit.log"),
+        audit_queue_capacity: 1024,
         rejected_peer_log_burst: 1,
         rejected_peer_log_refill_per_sec: 1,
         rejected_peer_log_max_buckets: 2,
@@ -330,6 +331,7 @@ fn rejected_audit_limiter_does_not_write_aggregate_before_interval() {
     let dir = tempfile::tempdir().expect("temp dir");
     let config = AuditConfig {
         path: dir.path().join("audit.log"),
+        audit_queue_capacity: 1024,
         rejected_peer_log_burst: 1,
         rejected_peer_log_refill_per_sec: 1,
         rejected_peer_log_max_buckets: 4,
@@ -356,7 +358,7 @@ fn rejected_audit_limiter_does_not_write_aggregate_before_interval() {
 }
 
 #[test]
-fn collect_node_info_returns_supplied_identity_and_basic_host_metadata() {
+fn collect_node_info_returns_supplied_identity_and_runtime_fields() {
     let info = collect_node_info(
         "node-1".to_string(),
         "hk".to_string(),
@@ -370,10 +372,6 @@ fn collect_node_info_returns_supplied_identity_and_basic_host_metadata() {
     assert_eq!(info.role, "gateway");
     assert_eq!(info.agent_version, AGENT_VERSION);
     assert_eq!(info.agent_endpoint_id, "endpoint-1");
-    assert!(!info.hostname.trim().is_empty());
-    assert!(!info.os_release.trim().is_empty());
-    assert!(!info.kernel.trim().is_empty());
-    assert!(!info.arch.trim().is_empty());
     assert!(
         OffsetDateTime::parse(
             &info.current_time_utc,
@@ -381,7 +379,48 @@ fn collect_node_info_returns_supplied_identity_and_basic_host_metadata() {
         )
         .is_ok()
     );
-    let _: u64 = info.uptime_seconds;
+}
+
+#[test]
+fn node_info_schema_contains_only_phase_one_approved_fields() {
+    let info = collect_node_info(
+        "node-1".to_string(),
+        "hk".to_string(),
+        "gateway".to_string(),
+        AGENT_VERSION.to_string(),
+        "endpoint-1".to_string(),
+    );
+
+    let value = serde_json::to_value(info).expect("node info json");
+    let object = value.as_object().expect("node info object");
+    let mut fields = object.keys().map(String::as_str).collect::<Vec<_>>();
+    fields.sort_unstable();
+
+    assert_eq!(
+        fields,
+        vec![
+            "agent_endpoint_id",
+            "agent_version",
+            "current_time_utc",
+            "node_id",
+            "region",
+            "role"
+        ]
+    );
+}
+
+#[test]
+fn production_source_does_not_use_process_command_for_phase_one_rpc() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let src_dir = manifest_dir.join("src");
+    let mut violations = Vec::new();
+
+    collect_production_command_violations(&src_dir, &mut violations);
+
+    assert!(
+        violations.is_empty(),
+        "production command execution boundary violations: {violations:?}"
+    );
 }
 
 #[test]
@@ -518,6 +557,43 @@ async fn handle_request_classifies_phase_one_methods() {
         unknown.error.as_ref().expect("error").code,
         ErrorCode::MethodNotFound
     );
+
+    for (index, method) in ["command.run", "occtl.raw", "journalctl.raw"]
+        .iter()
+        .enumerate()
+    {
+        let response = handle_request(
+            &state,
+            "controller-1",
+            test_rpc_request(method, valid_nonce(10 + index as u8)),
+        )
+        .await;
+        assert_eq!(
+            response.error.as_ref().expect("error").code,
+            ErrorCode::MethodNotFound,
+            "{method} must not dispatch in phase 1"
+        );
+    }
+}
+
+#[tokio::test]
+async fn handle_request_rejects_node_info_params_that_name_local_capabilities() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let state = test_server_state(dir.path(), "agent-endpoint-1");
+    let mut request = test_rpc_request(NODE_INFO, valid_nonce(14));
+    request.params = json!({
+        "path": "/etc/os-release",
+        "command": "/usr/bin/uname",
+        "args": ["-r"],
+        "env": {"PATH": "/tmp"}
+    });
+
+    let response = handle_request(&state, "controller-1", request).await;
+
+    assert_eq!(
+        response.error.as_ref().expect("error").code,
+        ErrorCode::ParamsInvalid
+    );
 }
 
 #[tokio::test]
@@ -653,6 +729,7 @@ fn test_agent_config(dir: &Path, controllers: Vec<ControllerConfig>) -> AgentCon
         },
         audit: AuditConfig {
             path: dir.join("audit.log"),
+            audit_queue_capacity: 1024,
             rejected_peer_log_burst: 10,
             rejected_peer_log_refill_per_sec: 1,
             rejected_peer_log_max_buckets: 4096,
@@ -699,4 +776,22 @@ fn valid_nonce(byte: u8) -> String {
     use base64::Engine;
 
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([byte; 16])
+}
+
+fn collect_production_command_violations(dir: &Path, violations: &mut Vec<String>) {
+    for entry in std::fs::read_dir(dir).expect("read source dir") {
+        let path = entry.expect("source entry").path();
+        if path.is_dir() {
+            collect_production_command_violations(&path, violations);
+            continue;
+        }
+        if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+            continue;
+        }
+
+        let text = std::fs::read_to_string(&path).expect("read source file");
+        if text.contains("std::process::Command") || text.contains("Command::new") {
+            violations.push(path.display().to_string());
+        }
+    }
 }

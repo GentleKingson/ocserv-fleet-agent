@@ -302,6 +302,7 @@ fn test_config(
         },
         audit: AuditConfig {
             path: audit_path,
+            audit_queue_capacity: 1024,
             rejected_peer_log_burst: 10,
             rejected_peer_log_refill_per_sec: 1,
             rejected_peer_log_max_buckets: 4096,

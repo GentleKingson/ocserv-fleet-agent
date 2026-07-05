@@ -6,7 +6,8 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn valid_agent_config() -> AgentConfig {
-    toml::from_str(
+    let endpoint_id = iroh::SecretKey::generate().public().to_string();
+    toml::from_str(&format!(
         r#"
 [node]
 id = "hk-ocserv-01"
@@ -25,13 +26,13 @@ max_request_bytes = 65536
 max_response_bytes = 2097152
 
 [[security.controllers]]
-endpoint_id = "controller-endpoint"
+endpoint_id = "{endpoint_id}"
 role = "viewer"
 
 [audit]
 path = "/tmp/ocfleet-audit.log"
 "#,
-    )
+    ))
     .expect("valid agent config should parse")
 }
 
@@ -107,7 +108,7 @@ fn service_name_rejects_shell_metacharacters() {
 }
 
 #[test]
-fn agent_config_rejects_invalid_ocserv_service_name() {
+fn agent_config_rejects_phase_one_ocserv_section() {
     let config: AgentConfig = toml::from_str(
         r#"
 [node]
@@ -124,15 +125,47 @@ secret_key_path = "/tmp/iroh.secret"
 path = "/tmp/ocfleet-audit.log"
 
 [ocserv]
-service_name = "ocserv;restart"
+service_name = "ocserv.service"
 "#,
     )
     .expect("test config should parse");
 
-    let err = validate_agent_config(&config).expect_err("invalid service name should be rejected");
+    let err = validate_agent_config(&config).expect_err("ocserv section should be rejected");
     assert!(matches!(
         err,
-        ConfigError::Invalid(message) if message.contains("service_name")
+        ConfigError::Invalid(message)
+            if message.contains("[ocserv]") && message.contains("Phase 1 read-only MVP")
+    ));
+}
+
+#[test]
+fn agent_config_rejects_phase_one_logs_section() {
+    let config: AgentConfig = toml::from_str(
+        r#"
+[node]
+id = "hk-ocserv-01"
+region = "hk"
+role = "ocserv"
+
+[iroh]
+secret_key_path = "/tmp/iroh.secret"
+
+[security]
+
+[audit]
+path = "/tmp/ocfleet-audit.log"
+
+[logs]
+journal_unit = "ocserv.service"
+"#,
+    )
+    .expect("test config should parse");
+
+    let err = validate_agent_config(&config).expect_err("logs section should be rejected");
+    assert!(matches!(
+        err,
+        ConfigError::Invalid(message)
+            if message.contains("[logs]") && message.contains("Phase 1 read-only MVP")
     ));
 }
 
@@ -179,6 +212,18 @@ fn agent_config_rejects_controller_endpoint_id_with_ascii_whitespace() {
 
     let err =
         validate_agent_config(&config).expect_err("endpoint_id whitespace should be rejected");
+    assert!(matches!(
+        err,
+        ConfigError::Invalid(message) if message.contains("endpoint_id")
+    ));
+}
+
+#[test]
+fn agent_config_rejects_malformed_controller_endpoint_id() {
+    let mut config = valid_agent_config();
+    config.security.controllers[0].endpoint_id = "not-an-endpoint-id".into();
+
+    let err = validate_agent_config(&config).expect_err("malformed endpoint_id should be rejected");
     assert!(matches!(
         err,
         ConfigError::Invalid(message) if message.contains("endpoint_id")
@@ -258,6 +303,7 @@ fn agent_config_defaults_include_resource_limits() {
     assert_eq!(config.security.max_streams_per_controller, 128);
     assert_eq!(config.security.max_live_nonces_global, 100_000);
     assert_eq!(config.security.max_live_nonces_per_controller, 10_000);
+    assert_eq!(config.audit.audit_queue_capacity, 1024);
     assert_eq!(config.audit.rejected_peer_log_burst, 10);
     assert_eq!(config.audit.rejected_peer_log_refill_per_sec, 1);
     assert_eq!(config.audit.rejected_peer_log_max_buckets, 4096);
@@ -303,6 +349,14 @@ fn agent_config_rejects_invalid_resource_limit_relationships() {
 
 #[test]
 fn agent_config_rejects_invalid_audit_limiter_values() {
+    let mut config = valid_agent_config();
+    config.audit.audit_queue_capacity = 0;
+    let err = validate_agent_config(&config).expect_err("zero audit queue capacity rejected");
+    assert!(matches!(
+        err,
+        ConfigError::Invalid(message) if message.contains("audit_queue_capacity")
+    ));
+
     let mut config = valid_agent_config();
     config.audit.rejected_peer_log_burst = 0;
     let err = validate_agent_config(&config).expect_err("zero burst rejected");

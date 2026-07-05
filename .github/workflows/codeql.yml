@@ -49,7 +49,7 @@ jobs:
         with:
           languages: rust
           queries: security-extended
-          build-mode: autobuild
+          build-mode: none
 
       - name: Perform CodeQL analysis
         uses: github/codeql-action/analyze@v4

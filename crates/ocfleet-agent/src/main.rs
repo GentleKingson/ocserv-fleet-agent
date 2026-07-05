@@ -28,7 +28,10 @@ async fn main() -> anyhow::Result<()> {
     let config = load_agent_config(&args.config).context("failed to load agent config")?;
     let secret_key = load_or_create_secret_key(&config.iroh.secret_key_path, true)
         .context("failed to load or create agent SecretKey")?;
-    let audit = JsonlAuditWriter::new(config.audit.path.clone());
+    let audit = JsonlAuditWriter::with_queue_capacity(
+        config.audit.path.clone(),
+        config.audit.audit_queue_capacity,
+    );
     let audit_limiter = Arc::new(Mutex::new(RejectedAuditLimiter::new(&config.audit)));
     let endpoint =
         bind_agent_endpoint(&config, secret_key, audit.clone(), audit_limiter.clone()).await?;

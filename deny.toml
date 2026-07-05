@@ -1,0 +1,51 @@
+[graph]
+all-features = false
+
+[advisories]
+ignore = [
+    { id = "RUSTSEC-2024-0436", reason = "paste is pulled transitively by iroh via netlink-packet-core for network interface discovery, not used directly by Phase 1 RPC/config/audit code. No safe upstream upgrade is available yet; remove this ignore when iroh/netlink-packet-core replaces paste or RustSec withdraws the advisory." },
+]
+
+[licenses]
+allow = [
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "Unlicense",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.8
+exceptions = []
+
+[licenses.private]
+ignore = false
+registries = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+allow = []
+allow-workspace = true
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+
+[sources.allow-org]
+github = []
+gitlab = []
+bitbucket = []

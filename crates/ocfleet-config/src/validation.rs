@@ -1,4 +1,6 @@
+use iroh::EndpointId;
 use std::path::Path;
+use std::str::FromStr;
 
 use thiserror::Error;
 
@@ -89,13 +91,24 @@ pub fn validate_non_empty_path(path: &Path, field: &'static str) -> Result<(), V
 }
 
 pub fn validate_controller_endpoint_id(value: &str) -> Result<(), ValidationError> {
-    if !value.is_empty() && !value.bytes().any(|b| b.is_ascii_whitespace()) {
-        Ok(())
-    } else {
-        Err(ValidationError::InvalidEndpointId {
-            field: "controller endpoint_id",
-        })
+    canonicalize_controller_endpoint_id(value).map(|_| ())
+}
+
+pub fn canonicalize_controller_endpoint_id(value: &str) -> Result<String, ValidationError> {
+    canonicalize_endpoint_id(value, "controller endpoint_id")
+}
+
+pub fn canonicalize_node_endpoint_id(value: &str) -> Result<String, ValidationError> {
+    canonicalize_endpoint_id(value, "node endpoint_id")
+}
+
+fn canonicalize_endpoint_id(value: &str, field: &'static str) -> Result<String, ValidationError> {
+    if value.is_empty() || value.bytes().any(|b| b.is_ascii_whitespace()) {
+        return Err(ValidationError::InvalidEndpointId { field });
     }
+    EndpointId::from_str(value)
+        .map(|endpoint_id| endpoint_id.to_string())
+        .map_err(|_| ValidationError::InvalidEndpointId { field })
 }
 
 pub fn validate_controller_role(value: &str) -> Result<(), ValidationError> {

@@ -12,7 +12,7 @@ use ocfleet_cli::rpc_client::{
 };
 use ocfleet_cli::store::{NodeInsert, NodeRecord, Store};
 use ocfleet_config::validation::{
-    validate_controller_endpoint_id, validate_node_id, validate_region, validate_role,
+    canonicalize_node_endpoint_id, validate_node_id, validate_region, validate_role,
 };
 use ocfleet_protocol::error::ErrorCode;
 use ocfleet_protocol::method::{NODE_INFO, NODE_PING};
@@ -68,7 +68,7 @@ async fn main() -> anyhow::Result<()> {
                     role,
                 } => {
                     validate_node_id(&node_id)?;
-                    validate_controller_endpoint_id(&endpoint_id)?;
+                    let endpoint_id = canonicalize_node_endpoint_id(&endpoint_id)?;
                     validate_region(&region)?;
                     validate_role(&role)?;
                     let node = NodeInsert {
@@ -388,11 +388,6 @@ fn print_rpc_result(method: &str, result: &Value) {
                 "region",
                 "role",
                 "agent_version",
-                "hostname",
-                "os_release",
-                "kernel",
-                "arch",
-                "uptime_seconds",
                 "current_time_utc",
                 "agent_endpoint_id",
             ] {

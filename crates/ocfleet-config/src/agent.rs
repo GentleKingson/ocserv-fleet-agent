@@ -6,7 +6,7 @@ use thiserror::Error;
 use crate::validation::{
     validate_controller_endpoint_id, validate_controller_role, validate_node_id,
     validate_non_empty_path, validate_positive_i64, validate_positive_u64, validate_positive_usize,
-    validate_region, validate_role, validate_service_name,
+    validate_region, validate_role,
 };
 
 #[derive(Debug, Error)]
@@ -26,9 +26,9 @@ pub struct AgentConfig {
     pub security: SecurityConfig,
     pub audit: AuditConfig,
     #[serde(default)]
-    pub ocserv: Option<OcservConfig>,
+    pub ocserv: Option<toml::Value>,
     #[serde(default)]
-    pub logs: Option<LogsConfig>,
+    pub logs: Option<toml::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -87,6 +87,8 @@ pub struct ControllerConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct AuditConfig {
     pub path: PathBuf,
+    #[serde(default = "default_audit_queue_capacity")]
+    pub audit_queue_capacity: usize,
     #[serde(default = "default_rejected_peer_log_burst")]
     pub rejected_peer_log_burst: usize,
     #[serde(default = "default_rejected_peer_log_refill_per_sec")]
@@ -97,22 +99,6 @@ pub struct AuditConfig {
     pub rejected_peer_log_bucket_ttl_seconds: u64,
     #[serde(default = "default_rejected_peer_log_aggregate_interval_seconds")]
     pub rejected_peer_log_aggregate_interval_seconds: u64,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct OcservConfig {
-    pub service_name: Option<String>,
-    pub occtl_path: Option<PathBuf>,
-    pub socket_file: Option<PathBuf>,
-    pub config_file: Option<PathBuf>,
-    pub server_cert: Option<PathBuf>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct LogsConfig {
-    pub journal_unit: Option<String>,
-    pub default_lines: Option<u32>,
-    pub max_lines: Option<u32>,
 }
 
 pub fn load_agent_config(path: &Path) -> Result<AgentConfig, ConfigError> {
@@ -130,12 +116,15 @@ pub fn validate_agent_config(config: &AgentConfig) -> Result<(), ConfigError> {
         .map_err(|e| ConfigError::Invalid(e.to_string()))?;
     validate_non_empty_path(&config.audit.path, "audit.path")
         .map_err(|e| ConfigError::Invalid(e.to_string()))?;
-    if let Some(service_name) = config
-        .ocserv
-        .as_ref()
-        .and_then(|ocserv| ocserv.service_name.as_deref())
-    {
-        validate_service_name(service_name).map_err(|e| ConfigError::Invalid(e.to_string()))?;
+    if config.ocserv.is_some() {
+        return Err(ConfigError::Invalid(
+            "[ocserv] is not part of the Phase 1 read-only MVP".to_string(),
+        ));
+    }
+    if config.logs.is_some() {
+        return Err(ConfigError::Invalid(
+            "[logs] is not part of the Phase 1 read-only MVP".to_string(),
+        ));
     }
     for controller in &config.security.controllers {
         validate_controller_endpoint_id(&controller.endpoint_id)
@@ -213,6 +202,8 @@ pub fn validate_agent_config(config: &AgentConfig) -> Result<(), ConfigError> {
             "max_live_nonces_per_controller must be <= max_live_nonces_global".to_string(),
         ));
     }
+    validate_positive_usize(config.audit.audit_queue_capacity, "audit_queue_capacity")
+        .map_err(|e| ConfigError::Invalid(e.to_string()))?;
     validate_positive_usize(
         config.audit.rejected_peer_log_burst,
         "rejected_peer_log_burst",
@@ -302,6 +293,10 @@ fn default_max_live_nonces_global() -> usize {
 
 fn default_max_live_nonces_per_controller() -> usize {
     10_000
+}
+
+fn default_audit_queue_capacity() -> usize {
+    1024
 }
 
 fn default_rejected_peer_log_burst() -> usize {

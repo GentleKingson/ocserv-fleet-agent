@@ -10,7 +10,7 @@ use ocfleet_cli::rpc_client::{
     RpcClientError, bind_controller_endpoint, build_request, call_endpoint_addr,
     validate_path_echo_result, validate_rpc_response,
 };
-use ocfleet_cli::store::{NodeInsert, NodeRecord, Store};
+use ocfleet_cli::store::{NodeInsert, NodeRecord, ProbeHistoryRecord, Store};
 use ocfleet_config::validation::{
     canonicalize_node_endpoint_id, validate_node_id, validate_region, validate_role,
 };
@@ -83,6 +83,10 @@ async fn main() -> anyhow::Result<()> {
                 ProbeCommand::History { node_id } => {
                     run_probe_history_command(&store, node_id.as_deref())?
                 }
+                ProbeCommand::Observe {
+                    source_node_id,
+                    target_node_id,
+                } => run_probe_observe_command(&store, &source_node_id, &target_node_id)?,
             }
         }
         Command::Node { command } => {
@@ -210,6 +214,146 @@ fn run_probe_history_command(store: &Store, node_filter: Option<&str>) -> anyhow
     });
     store.insert_audit(&event)?;
     Ok(())
+}
+
+fn run_probe_observe_command(
+    store: &Store,
+    source_node_id: &str,
+    target_node_id: &str,
+) -> anyhow::Result<()> {
+    validate_node_id(source_node_id)?;
+    validate_node_id(target_node_id)?;
+
+    let source = store.get_node(source_node_id)?;
+    let target = store.get_node(target_node_id)?;
+    let source_status = summary_node_status(source.as_ref());
+    let target_status = summary_node_status(target.as_ref());
+    let source_endpoint_id = source.as_ref().map(|node| node.endpoint_id.as_str());
+    let target_endpoint_id = target.as_ref().map(|node| node.endpoint_id.as_str());
+    let records = store.list_probe_history(Some(source_node_id))?;
+    let latest_match = records
+        .iter()
+        .find(|record| is_matching_path_observation(record, target_node_id, target_endpoint_id));
+
+    println!("path_observation=audit_history");
+    print_summary_node("source", source_node_id, source_status, source_endpoint_id);
+    print_summary_node("target", target_node_id, target_status, target_endpoint_id);
+
+    let mut detail_json = json!({
+        "source_node_id": source_node_id,
+        "source_endpoint_id": source_endpoint_id,
+        "source_status": source_status,
+        "target_node_id": target_node_id,
+        "target_endpoint_id": target_endpoint_id,
+        "target_status": target_status,
+        "registry_authorizes_probe": false,
+        "no_probe_executed": true,
+        "no_route_discovery": true,
+        "no_forwarding": true,
+    });
+    let detail = detail_json
+        .as_object_mut()
+        .expect("static JSON object must be an object");
+
+    if let Some(record) = latest_match {
+        let peer_request_id = record
+            .detail_json
+            .get("peer_request_id")
+            .and_then(Value::as_str);
+        println!("last_observation=found");
+        println!(
+            "root_request_id={}",
+            record.request_id.as_deref().unwrap_or("<none>")
+        );
+        println!("peer_request_id={}", peer_request_id.unwrap_or("<none>"));
+        println!(
+            "ok={}",
+            record
+                .ok
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "<none>".to_string())
+        );
+        println!(
+            "error_code={}",
+            record.error_code.as_deref().unwrap_or("<none>")
+        );
+        println!(
+            "duration_ms={}",
+            record
+                .duration_ms
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "<none>".to_string())
+        );
+        detail.insert(
+            "last_observation".to_string(),
+            Value::String("found".to_string()),
+        );
+        if let Some(root_request_id) = &record.request_id {
+            detail.insert(
+                "root_request_id".to_string(),
+                Value::String(root_request_id.clone()),
+            );
+        }
+        if let Some(peer_request_id) = peer_request_id {
+            detail.insert(
+                "peer_request_id".to_string(),
+                Value::String(peer_request_id.to_string()),
+            );
+        }
+        if let Some(ok) = record.ok {
+            detail.insert("ok".to_string(), Value::Bool(ok));
+        }
+        if let Some(error_code) = &record.error_code {
+            detail.insert("error_code".to_string(), Value::String(error_code.clone()));
+        }
+        if let Some(duration_ms) = record.duration_ms {
+            detail.insert("duration_ms".to_string(), json!(duration_ms));
+        }
+    } else {
+        println!("last_observation=missing");
+        detail.insert(
+            "last_observation".to_string(),
+            Value::String("missing".to_string()),
+        );
+    }
+
+    println!("registry_authorizes_probe=false");
+    println!("no_probe_executed=true");
+    println!("no_route_discovery=true");
+    println!("no_forwarding=true");
+
+    let mut event = AuditEvent::new(local_actor(), "probe.observe");
+    event.node_id = Some(source_node_id.to_string());
+    event.endpoint_id = source.as_ref().map(|node| node.endpoint_id.clone());
+    event.ok = Some(true);
+    event.detail_json = detail_json;
+    store.insert_audit(&event)?;
+    Ok(())
+}
+
+fn is_matching_path_observation(
+    record: &ProbeHistoryRecord,
+    target_node_id: &str,
+    target_endpoint_id: Option<&str>,
+) -> bool {
+    if record.method != PROBE_PATH_ECHO {
+        return false;
+    }
+    let matches_node_id = record
+        .detail_json
+        .get("target_node_id")
+        .and_then(Value::as_str)
+        .is_some_and(|record_target_node_id| record_target_node_id == target_node_id);
+    let matches_endpoint_id = target_endpoint_id.is_some_and(|target_endpoint_id| {
+        record
+            .detail_json
+            .get("target_endpoint_id")
+            .and_then(Value::as_str)
+            .is_some_and(|record_target_endpoint_id| {
+                record_target_endpoint_id == target_endpoint_id
+            })
+    });
+    matches_node_id || matches_endpoint_id
 }
 
 #[derive(Debug, Default)]

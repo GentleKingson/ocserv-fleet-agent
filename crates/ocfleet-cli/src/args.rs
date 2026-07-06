@@ -46,6 +46,10 @@ pub enum ProbeCommand {
     History {
         node_id: Option<String>,
     },
+    Observe {
+        source_node_id: String,
+        target_node_id: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]

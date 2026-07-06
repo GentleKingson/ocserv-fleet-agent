@@ -147,6 +147,14 @@ target/debug/ocfleet probe history source-ocserv-01
 
 Probe history is read-only audit observation. It does not schedule probes, compute behavior-affecting health scores, contact agents, or modify controller state beyond the local read audit entry.
 
+Print a read-only route/path observation from the controller registry and existing path-probe audit history without running a probe:
+
+```bash
+target/debug/ocfleet probe observe source-ocserv-01 target-ocserv-01
+```
+
+Path observation reports registry status and the most recent matching `probe.path.echo` audit result when one exists. It does not perform route discovery, traceroute, network probing, forwarding, relay, mesh, or multi-hop analysis.
+
 Phase 7 ocserv-aware read-only checks remain reserved because the current codebase has no approved safe fixed ocserv metadata source. See [`docs/direction-two-phase-7-ocserv-aware-readonly.md`](docs/direction-two-phase-7-ocserv-aware-readonly.md).
 
 Networking must allow the controller to reach the agent through iroh using the registered EndpointID.

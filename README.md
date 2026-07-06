@@ -130,6 +130,14 @@ target/debug/ocfleet probe summary source-ocserv-01 target-ocserv-01
 
 The summary is inventory/UX only. It does not authorize path probing, modify trust configuration, contact agents, or infer `security.path_probes` / `security.peers`.
 
+Print a read-only topology observation summary from the controller registry without discovery or probing:
+
+```bash
+target/debug/ocfleet probe topology
+```
+
+The topology summary groups existing registry nodes by region and role. It does not discover topology, infer trust, generate peer/path configuration, or contact agents.
+
 Networking must allow the controller to reach the agent through iroh using the registered EndpointID.
 
 ## Repository Layout

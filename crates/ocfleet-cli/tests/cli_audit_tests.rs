@@ -570,6 +570,119 @@ fn probe_summary_reports_disabled_source_without_running_rpc() {
     assert_eq!(detail["no_probe_executed"], true);
 }
 
+#[test]
+fn probe_topology_reports_empty_registry_without_secret_key_or_rpc() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let secret_key = dir.path().join("unused-controller.secret");
+    let database_arg = database.to_string_lossy().into_owned();
+    let secret_key_arg = secret_key.to_string_lossy().into_owned();
+
+    let output = run_ocfleet_output(&[
+        "--database",
+        &database_arg,
+        "--secret-key",
+        &secret_key_arg,
+        "probe",
+        "topology",
+    ]);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("topology_summary=registry_observation"));
+    assert!(stdout.contains("registered_node_count=0 enabled_node_count=0 disabled_node_count=0"));
+    assert!(stdout.contains("registry_authorizes_probe=false"));
+    assert!(stdout.contains("topology_discovery=false"));
+    assert!(stdout.contains("no_probe_executed=true"));
+    assert!(stdout.contains("no_config_generated=true"));
+    assert!(!stdout.contains("SecretKey"));
+
+    let (event, ok, detail) = latest_audit(&database);
+    assert_eq!(event, "probe.topology");
+    assert_eq!(ok, 1);
+    assert_eq!(detail["registered_node_count"], 0);
+    assert_eq!(detail["enabled_node_count"], 0);
+    assert_eq!(detail["disabled_node_count"], 0);
+    assert_eq!(detail["registry_authorizes_probe"], false);
+    assert_eq!(detail["topology_discovery"], false);
+    assert_eq!(detail["no_probe_executed"], true);
+}
+
+#[test]
+fn probe_topology_reports_region_role_groups_without_claiming_authorization() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let secret_key = dir.path().join("unused-controller.secret");
+    let hk_source_endpoint_id = iroh::SecretKey::generate().public().to_string();
+    let hk_target_endpoint_id = iroh::SecretKey::generate().public().to_string();
+    let sg_endpoint_id = iroh::SecretKey::generate().public().to_string();
+    let store = Store::open(&database).expect("store opens");
+    store
+        .add_node(&NodeInsert {
+            node_id: "hk-source".to_string(),
+            endpoint_id: hk_source_endpoint_id,
+            name: "hk-source".to_string(),
+            region: "hk".to_string(),
+            role: "ocserv".to_string(),
+        })
+        .expect("insert hk source");
+    store
+        .add_node(&NodeInsert {
+            node_id: "hk-target".to_string(),
+            endpoint_id: hk_target_endpoint_id,
+            name: "hk-target".to_string(),
+            region: "hk".to_string(),
+            role: "ocserv".to_string(),
+        })
+        .expect("insert hk target");
+    store
+        .add_node(&NodeInsert {
+            node_id: "sg-relay-observer".to_string(),
+            endpoint_id: sg_endpoint_id,
+            name: "sg-relay-observer".to_string(),
+            region: "sg".to_string(),
+            role: "observer".to_string(),
+        })
+        .expect("insert sg observer");
+    store.disable_node("hk-target").expect("disable target");
+    drop(store);
+
+    let database_arg = database.to_string_lossy().into_owned();
+    let secret_key_arg = secret_key.to_string_lossy().into_owned();
+    let output = run_ocfleet_output(&[
+        "--database",
+        &database_arg,
+        "--secret-key",
+        &secret_key_arg,
+        "probe",
+        "topology",
+    ]);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("registered_node_count=3 enabled_node_count=2 disabled_node_count=1"));
+    assert!(stdout.contains("group region=hk role=ocserv total=2 enabled=1 disabled=1"));
+    assert!(stdout.contains("group region=sg role=observer total=1 enabled=1 disabled=0"));
+    assert!(stdout.contains("node_id=hk-source region=hk role=ocserv enabled=true"));
+    assert!(stdout.contains("node_id=hk-target region=hk role=ocserv enabled=false"));
+    assert!(stdout.contains("registry_potential_pair_count=2"));
+    assert!(stdout.contains("registry_authorizes_probe=false"));
+    assert!(stdout.contains("authoritative_authorization=security.path_probes+security.peers"));
+    assert!(stdout.contains("topology_discovery=false"));
+    assert!(stdout.contains("no_probe_executed=true"));
+    assert!(stdout.contains("no_config_generated=true"));
+    assert!(!stdout.contains("SecretKey"));
+
+    let (event, ok, detail) = latest_audit(&database);
+    assert_eq!(event, "probe.topology");
+    assert_eq!(ok, 1);
+    assert_eq!(detail["registered_node_count"], 3);
+    assert_eq!(detail["enabled_node_count"], 2);
+    assert_eq!(detail["disabled_node_count"], 1);
+    assert_eq!(detail["registry_potential_pair_count"], 2);
+    assert_eq!(detail["registry_authorizes_probe"], false);
+    assert_eq!(detail["topology_discovery"], false);
+    assert_eq!(detail["no_config_generated"], true);
+}
+
 #[cfg(unix)]
 #[test]
 fn ping_with_unsafe_controller_secret_key_writes_permission_error_audit() {

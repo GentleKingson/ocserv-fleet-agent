@@ -13,7 +13,9 @@ use iroh::{Endpoint, EndpointId, RelayMode, SecretKey};
 use ocfleet_config::agent::{AgentConfig, SecurityConfig};
 use ocfleet_protocol::constants::PROTOCOL_VERSION;
 use ocfleet_protocol::error::{ErrorCode, RpcError};
-use ocfleet_protocol::method::{MethodStatus, NODE_INFO, NODE_PING, classify_phase_one_method};
+use ocfleet_protocol::method::{
+    MethodStatus, NODE_INFO, NODE_PING, PROBE_CONTROLLER_PING, classify_phase_one_method,
+};
 use ocfleet_protocol::rpc::{RpcRequest, RpcResponse};
 use serde_json::{Value, json};
 use time::OffsetDateTime;
@@ -850,7 +852,7 @@ async fn validate_and_dispatch_request(
         return Err(RequestDispatchError::new(
             Some(request_id),
             ErrorCode::ParamsInvalid,
-            "node.ping and node.info accept only null or empty object params in phase 1",
+            "node.ping, node.info, and probe.controller.ping accept only null or empty object params in phase 1",
             json!({}),
         ));
     }
@@ -886,6 +888,14 @@ async fn dispatch_allowed_method(
             "message": "pong",
             "node_id": state.config.node.id,
             "agent_version": AGENT_VERSION,
+            "time_utc": now_rfc3339(),
+        })),
+        PROBE_CONTROLLER_PING => Ok(json!({
+            "message": "pong",
+            "probe": "controller.ping",
+            "node_id": state.config.node.id,
+            "agent_version": AGENT_VERSION,
+            "agent_endpoint_id": state.agent_endpoint_id,
             "time_utc": now_rfc3339(),
         })),
         NODE_INFO => {

@@ -16,7 +16,7 @@ use ocfleet_config::agent::{
     AgentConfig, AuditConfig, ControllerConfig, IrohConfig, NodeConfig, SecurityConfig,
 };
 use ocfleet_protocol::error::ErrorCode;
-use ocfleet_protocol::method::{NODE_INFO, NODE_PING};
+use ocfleet_protocol::method::{NODE_INFO, NODE_PING, PROBE_CONTROLLER_PING};
 use ocfleet_protocol::rpc::RpcResponse;
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -87,6 +87,70 @@ async fn local_controller_can_ping_and_get_node_info() {
     .await;
     wait_for_audit_event(&harness.audit_path, |event| {
         audit_is_successful_method(event, NODE_INFO)
+    })
+    .await;
+
+    harness.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_controller_can_run_controller_probe_ping() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let controller_key = SecretKey::generate();
+    let agent_key = SecretKey::generate();
+    let harness = spawn_local_agent(controller_key, agent_key, &dir).await;
+
+    let request = build_request(
+        PROBE_CONTROLLER_PING,
+        json!({}),
+        Some("local-cli".into()),
+        5_000,
+    );
+    let response = call_endpoint_addr(
+        &harness.controller,
+        harness.agent_addr.clone(),
+        harness.agent_id,
+        harness.config.iroh.alpn.as_bytes(),
+        request,
+    )
+    .await
+    .expect("probe.controller.ping rpc");
+
+    assert!(response.ok);
+    let result = response.result.as_ref().expect("probe result");
+    assert_eq!(result["message"], "pong");
+    assert_eq!(result["probe"], "controller.ping");
+    assert_eq!(result["node_id"], "hk-ocserv-01");
+    assert_eq!(result["agent_endpoint_id"], harness.agent_id.to_string());
+    assert!(result["agent_version"].as_str().is_some());
+    assert!(
+        time::OffsetDateTime::parse(
+            result["time_utc"].as_str().expect("probe time string"),
+            &time::format_description::well_known::Rfc3339,
+        )
+        .is_ok()
+    );
+    let mut fields = result
+        .as_object()
+        .expect("probe result object")
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    fields.sort_unstable();
+    assert_eq!(
+        fields,
+        vec![
+            "agent_endpoint_id",
+            "agent_version",
+            "message",
+            "node_id",
+            "probe",
+            "time_utc"
+        ]
+    );
+
+    wait_for_audit_event(&harness.audit_path, |event| {
+        audit_is_successful_method(event, PROBE_CONTROLLER_PING)
     })
     .await;
 

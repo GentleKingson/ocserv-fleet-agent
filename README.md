@@ -20,6 +20,7 @@ It is not a production-complete ocserv management platform yet.
 - Supports Phase 1 RPC methods:
   - `node.ping`
   - `node.info`
+  - `probe.controller.ping`
 - Writes audit records for successful, failed, and rejected RPC paths.
 
 ## What It Does Not Do
@@ -31,6 +32,7 @@ Phase 1 is intentionally narrow. It does not provide:
 - ocserv reload or restart
 - configuration apply, rollback, or distribution
 - user disconnect or user management
+- agent-to-agent probes, path probes, relay probes, or mesh discovery
 - `systemctl`, `occtl`, `journalctl`, certificate, or config-summary adapters
 - enrollment tokens, TOFU, or automatic node registration
 
@@ -109,6 +111,7 @@ Call the Phase 1 RPCs:
 ```bash
 target/debug/ocfleet ping hk-ocserv-01
 target/debug/ocfleet node info hk-ocserv-01
+target/debug/ocfleet probe ping hk-ocserv-01
 ```
 
 Networking must allow the controller to reach the agent through iroh using the registered EndpointID.

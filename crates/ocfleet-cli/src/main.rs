@@ -1,7 +1,7 @@
 use anyhow::{Context, bail};
 use clap::Parser;
 use iroh::{EndpointAddr, EndpointId};
-use ocfleet_cli::args::{Cli, Command, NodeCommand};
+use ocfleet_cli::args::{Cli, Command, NodeCommand, ProbeCommand};
 use ocfleet_cli::audit::AuditEvent;
 use ocfleet_cli::identity::{
     IdentityError, load_or_create_secret_key_with_status, load_secret_key,
@@ -15,7 +15,7 @@ use ocfleet_config::validation::{
     canonicalize_node_endpoint_id, validate_node_id, validate_region, validate_role,
 };
 use ocfleet_protocol::error::ErrorCode;
-use ocfleet_protocol::method::{NODE_INFO, NODE_PING};
+use ocfleet_protocol::method::{NODE_INFO, NODE_PING, PROBE_CONTROLLER_PING};
 use ocfleet_protocol::{DEFAULT_ALPN, DEFAULT_DEADLINE_MS, RpcResponse};
 use serde_json::{Map, Value, json};
 use std::path::Path;
@@ -54,6 +54,15 @@ async fn main() -> anyhow::Result<()> {
         Command::Ping { node_id } => {
             let store = Store::open(&cli.database).context("failed to open controller database")?;
             run_node_rpc_command(&store, &cli.secret_key, &node_id, NODE_PING).await?;
+        }
+        Command::Probe { command } => {
+            let store = Store::open(&cli.database).context("failed to open controller database")?;
+            match command {
+                ProbeCommand::Ping { node_id } => {
+                    run_node_rpc_command(&store, &cli.secret_key, &node_id, PROBE_CONTROLLER_PING)
+                        .await?;
+                }
+            }
         }
         Command::Node { command } => {
             let store = Store::open(&cli.database).context("failed to open controller database")?;
@@ -322,8 +331,9 @@ fn validate_response_for_method(
     method: &str,
     node: &NodeRecord,
 ) -> Result<(), RpcCommandFailure> {
-    let expected_node_info_endpoint_id = (method == NODE_INFO).then_some(node.endpoint_id.as_str());
-    validate_rpc_response(response, request_id, expected_node_info_endpoint_id).map_err(|err| {
+    let expected_agent_endpoint_id =
+        matches!(method, NODE_INFO | PROBE_CONTROLLER_PING).then_some(node.endpoint_id.as_str());
+    validate_rpc_response(response, request_id, expected_agent_endpoint_id).map_err(|err| {
         RpcCommandFailure::new(
             err.code(),
             err.to_string(),
@@ -373,6 +383,29 @@ fn print_rpc_result(method: &str, result: &Value) {
                 .get("node_id")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown"),
+            result
+                .get("agent_version")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown"),
+            result
+                .get("time_utc")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+        ),
+        PROBE_CONTROLLER_PING => println!(
+            "message={} node_id={} probe={} agent_version={} time_utc={}",
+            result
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("pong"),
+            result
+                .get("node_id")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown"),
+            result
+                .get("probe")
+                .and_then(Value::as_str)
+                .unwrap_or("controller.ping"),
             result
                 .get("agent_version")
                 .and_then(Value::as_str)

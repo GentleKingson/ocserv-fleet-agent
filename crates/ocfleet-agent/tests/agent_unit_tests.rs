@@ -15,7 +15,7 @@ use ocfleet_config::agent::{
 };
 use ocfleet_protocol::constants::PROTOCOL_VERSION;
 use ocfleet_protocol::error::ErrorCode;
-use ocfleet_protocol::method::{NODE_INFO, NODE_PING};
+use ocfleet_protocol::method::{NODE_INFO, NODE_PING, PROBE_CONTROLLER_PING};
 use ocfleet_protocol::rpc::RpcRequest;
 use serde_json::json;
 use std::net::{IpAddr, Ipv4Addr};
@@ -525,6 +525,47 @@ async fn handle_request_classifies_phase_one_methods() {
         "agent-endpoint-1"
     );
 
+    let probe = handle_request(
+        &state,
+        "controller-1",
+        test_rpc_request(PROBE_CONTROLLER_PING, valid_nonce(13)),
+    )
+    .await;
+    assert!(probe.ok);
+    let probe_result = probe.result.as_ref().expect("probe result");
+    assert_eq!(probe_result["message"], "pong");
+    assert_eq!(probe_result["probe"], "controller.ping");
+    assert_eq!(probe_result["node_id"], "agent-1");
+    assert_eq!(probe_result["agent_version"], AGENT_VERSION);
+    assert_eq!(probe_result["agent_endpoint_id"], "agent-endpoint-1");
+    assert!(
+        OffsetDateTime::parse(
+            probe_result["time_utc"]
+                .as_str()
+                .expect("probe time string"),
+            &time::format_description::well_known::Rfc3339
+        )
+        .is_ok()
+    );
+    let mut probe_fields = probe_result
+        .as_object()
+        .expect("probe result object")
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    probe_fields.sort_unstable();
+    assert_eq!(
+        probe_fields,
+        vec![
+            "agent_endpoint_id",
+            "agent_version",
+            "message",
+            "node_id",
+            "probe",
+            "time_utc"
+        ]
+    );
+
     let denied = handle_request(
         &state,
         "controller-1",
@@ -573,6 +614,45 @@ async fn handle_request_classifies_phase_one_methods() {
             ErrorCode::MethodNotFound,
             "{method} must not dispatch in phase 1"
         );
+    }
+}
+
+#[tokio::test]
+async fn handle_request_rejects_controller_probe_ping_extension_params() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let state = test_server_state(dir.path(), "agent-endpoint-1");
+    let mut request = test_rpc_request(PROBE_CONTROLLER_PING, valid_nonce(15));
+    request.params = json!({"payload": "x"});
+
+    let response = handle_request(&state, "controller-1", request).await;
+
+    assert_eq!(
+        response.error.as_ref().expect("error").code,
+        ErrorCode::ParamsInvalid
+    );
+}
+
+#[tokio::test]
+async fn handle_request_does_not_dispatch_future_direction_two_methods() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let state = test_server_state(dir.path(), "agent-endpoint-1");
+
+    for (index, method) in [
+        "probe.peer.echo",
+        "probe.path.echo",
+        "relay.forward",
+        "mesh.status",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let response = handle_request(
+            &state,
+            "controller-1",
+            test_rpc_request(method, valid_nonce(16 + index as u8)),
+        )
+        .await;
+        assert!(!response.ok, "{method} must not dispatch");
     }
 }
 

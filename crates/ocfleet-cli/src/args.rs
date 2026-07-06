@@ -19,10 +19,19 @@ pub enum Command {
     Ping {
         node_id: String,
     },
+    Probe {
+        #[command(subcommand)]
+        command: ProbeCommand,
+    },
     Node {
         #[command(subcommand)]
         command: NodeCommand,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ProbeCommand {
+    Ping { node_id: String },
 }
 
 #[derive(Debug, Subcommand)]

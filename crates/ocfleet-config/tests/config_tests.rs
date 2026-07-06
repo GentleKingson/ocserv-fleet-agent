@@ -296,6 +296,7 @@ fn agent_config_rejects_too_small_max_response_bytes() {
 fn agent_config_defaults_include_resource_limits() {
     let config = minimal_agent_config();
 
+    assert!(config.security.peers.is_empty());
     assert_eq!(config.security.max_handshake_tasks_global, 256);
     assert_eq!(config.security.max_connections_global, 256);
     assert_eq!(config.security.max_connections_per_controller, 32);
@@ -312,6 +313,180 @@ fn agent_config_defaults_include_resource_limits() {
         config.audit.rejected_peer_log_aggregate_interval_seconds,
         60
     );
+}
+
+#[test]
+fn agent_config_accepts_peer_allowlist_with_enabled_default_true() {
+    let controller_endpoint_id = iroh::SecretKey::generate().public().to_string();
+    let peer_endpoint_id = iroh::SecretKey::generate().public().to_string();
+    let config: AgentConfig = toml::from_str(&format!(
+        r#"
+[node]
+id = "hk-ocserv-01"
+region = "hk"
+role = "ocserv"
+
+[iroh]
+secret_key_path = "/tmp/iroh.secret"
+
+[security]
+
+[[security.controllers]]
+endpoint_id = "{controller_endpoint_id}"
+role = "viewer"
+
+[[security.peers]]
+endpoint_id = "{peer_endpoint_id}"
+
+[audit]
+path = "/tmp/ocfleet-audit.log"
+"#
+    ))
+    .expect("peer config parses");
+
+    validate_agent_config(&config).expect("peer config validates");
+    assert_eq!(config.security.peers.len(), 1);
+    assert_eq!(config.security.peers[0].endpoint_id, peer_endpoint_id);
+    assert!(config.security.peers[0].enabled);
+}
+
+#[test]
+fn agent_config_accepts_disabled_peer_allowlist_entry() {
+    let peer_endpoint_id = iroh::SecretKey::generate().public().to_string();
+    let config: AgentConfig = toml::from_str(&format!(
+        r#"
+[node]
+id = "hk-ocserv-01"
+region = "hk"
+role = "ocserv"
+
+[iroh]
+secret_key_path = "/tmp/iroh.secret"
+
+[security]
+
+[[security.peers]]
+endpoint_id = "{peer_endpoint_id}"
+enabled = false
+
+[audit]
+path = "/tmp/ocfleet-audit.log"
+"#
+    ))
+    .expect("disabled peer config parses");
+
+    validate_agent_config(&config).expect("disabled peer config validates");
+    assert!(!config.security.peers[0].enabled);
+}
+
+#[test]
+fn agent_config_rejects_malformed_peer_endpoint_id() {
+    let mut config = minimal_agent_config();
+    config
+        .security
+        .peers
+        .push(ocfleet_config::agent::PeerConfig {
+            endpoint_id: "not-an-endpoint-id".into(),
+            enabled: true,
+        });
+
+    let err = validate_agent_config(&config).expect_err("malformed peer endpoint rejected");
+    assert!(matches!(
+        err,
+        ConfigError::Invalid(message)
+            if message.contains("peer endpoint_id") || message.contains("endpoint_id")
+    ));
+}
+
+#[test]
+fn agent_config_rejects_duplicate_peer_endpoint_id() {
+    let peer_endpoint_id = iroh::SecretKey::generate().public().to_string();
+    let mut config = minimal_agent_config();
+    config
+        .security
+        .peers
+        .push(ocfleet_config::agent::PeerConfig {
+            endpoint_id: peer_endpoint_id.clone(),
+            enabled: true,
+        });
+    config
+        .security
+        .peers
+        .push(ocfleet_config::agent::PeerConfig {
+            endpoint_id: peer_endpoint_id,
+            enabled: false,
+        });
+
+    let err = validate_agent_config(&config).expect_err("duplicate peer rejected");
+    assert!(matches!(
+        err,
+        ConfigError::Invalid(message) if message.contains("duplicate peer endpoint_id")
+    ));
+}
+
+#[test]
+fn agent_config_rejects_controller_peer_endpoint_overlap() {
+    let endpoint_id = iroh::SecretKey::generate().public().to_string();
+    let config: AgentConfig = toml::from_str(&format!(
+        r#"
+[node]
+id = "hk-ocserv-01"
+region = "hk"
+role = "ocserv"
+
+[iroh]
+secret_key_path = "/tmp/iroh.secret"
+
+[security]
+
+[[security.controllers]]
+endpoint_id = "{endpoint_id}"
+role = "viewer"
+
+[[security.peers]]
+endpoint_id = "{endpoint_id}"
+enabled = true
+
+[audit]
+path = "/tmp/ocfleet-audit.log"
+"#
+    ))
+    .expect("overlap config parses");
+
+    let err = validate_agent_config(&config).expect_err("controller/peer overlap rejected");
+    assert!(matches!(
+        err,
+        ConfigError::Invalid(message) if message.contains("controller") && message.contains("peer")
+    ));
+}
+
+#[test]
+fn agent_config_rejects_unknown_peer_fields() {
+    let peer_endpoint_id = iroh::SecretKey::generate().public().to_string();
+    let err = toml::from_str::<AgentConfig>(&format!(
+        r#"
+[node]
+id = "hk-ocserv-01"
+region = "hk"
+role = "ocserv"
+
+[iroh]
+secret_key_path = "/tmp/iroh.secret"
+
+[security]
+
+[[security.peers]]
+endpoint_id = "{peer_endpoint_id}"
+enabled = true
+methods = ["probe.peer.echo"]
+
+[audit]
+path = "/tmp/ocfleet-audit.log"
+"#
+    ))
+    .expect_err("unknown peer fields rejected");
+
+    assert!(err.to_string().contains("unknown field"));
 }
 
 #[test]

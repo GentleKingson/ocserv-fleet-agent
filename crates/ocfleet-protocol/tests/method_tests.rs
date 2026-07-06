@@ -1,5 +1,6 @@
 use ocfleet_protocol::method::{
-    MethodStatus, NODE_INFO, NODE_PING, PROBE_CONTROLLER_PING, classify_phase_one_method,
+    MethodStatus, NODE_INFO, NODE_PING, PROBE_CONTROLLER_PING, PROBE_PEER_ECHO,
+    classify_phase_one_method,
 };
 
 #[test]
@@ -15,10 +16,13 @@ fn future_and_dangerous_methods_are_not_allowed() {
         "relay.forward",
         "relay.raw",
         "mesh.status",
-        "probe.peer.echo",
+        PROBE_PEER_ECHO,
         "probe.path.echo",
+        "probe.path.report",
         "shell.exec",
         "command.run",
+        "file.read",
+        "systemctl.restart",
     ] {
         assert_ne!(
             classify_phase_one_method(method),

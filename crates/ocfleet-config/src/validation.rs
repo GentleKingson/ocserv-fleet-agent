@@ -94,8 +94,16 @@ pub fn validate_controller_endpoint_id(value: &str) -> Result<(), ValidationErro
     canonicalize_controller_endpoint_id(value).map(|_| ())
 }
 
+pub fn validate_peer_endpoint_id(value: &str) -> Result<(), ValidationError> {
+    canonicalize_peer_endpoint_id(value).map(|_| ())
+}
+
 pub fn canonicalize_controller_endpoint_id(value: &str) -> Result<String, ValidationError> {
     canonicalize_endpoint_id(value, "controller endpoint_id")
+}
+
+pub fn canonicalize_peer_endpoint_id(value: &str) -> Result<String, ValidationError> {
+    canonicalize_endpoint_id(value, "peer endpoint_id")
 }
 
 pub fn canonicalize_node_endpoint_id(value: &str) -> Result<String, ValidationError> {

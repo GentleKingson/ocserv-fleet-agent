@@ -5,6 +5,7 @@ use anyhow::Context;
 use clap::Parser;
 use ocfleet_agent::audit::JsonlAuditWriter;
 use ocfleet_agent::audit_limiter::RejectedAuditLimiter;
+use ocfleet_agent::authz::AgentAuthorization;
 use ocfleet_agent::identity::load_or_create_secret_key;
 use ocfleet_agent::nonce::NonceCache;
 use ocfleet_agent::server::{
@@ -36,6 +37,7 @@ async fn main() -> anyhow::Result<()> {
     let endpoint =
         bind_agent_endpoint(&config, secret_key, audit.clone(), audit_limiter.clone()).await?;
     let endpoint_id = endpoint.id().to_string();
+    let authz = Arc::new(AgentAuthorization::from_security_config(&config.security)?);
     let state = AgentServerState {
         config: config.clone(),
         audit,
@@ -45,6 +47,7 @@ async fn main() -> anyhow::Result<()> {
         ))),
         limiters: Arc::new(ServerLimiters::from_config(&config.security)),
         audit_limiter,
+        authz,
         agent_endpoint_id: endpoint_id.clone(),
     };
 

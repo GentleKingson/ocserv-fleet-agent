@@ -1,12 +1,14 @@
 use serde::Deserialize;
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 use crate::validation::{
+    canonicalize_controller_endpoint_id, canonicalize_peer_endpoint_id,
     validate_controller_endpoint_id, validate_controller_role, validate_node_id,
-    validate_non_empty_path, validate_positive_i64, validate_positive_u64, validate_positive_usize,
-    validate_region, validate_role,
+    validate_non_empty_path, validate_peer_endpoint_id, validate_positive_i64,
+    validate_positive_u64, validate_positive_usize, validate_region, validate_role,
 };
 
 #[derive(Debug, Error)]
@@ -75,6 +77,8 @@ pub struct SecurityConfig {
     pub max_live_nonces_per_controller: usize,
     #[serde(default)]
     pub controllers: Vec<ControllerConfig>,
+    #[serde(default)]
+    pub peers: Vec<PeerConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -82,6 +86,14 @@ pub struct ControllerConfig {
     pub endpoint_id: String,
     #[serde(default = "default_controller_role")]
     pub role: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeerConfig {
+    pub endpoint_id: String,
+    #[serde(default = "default_peer_enabled")]
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -126,11 +138,33 @@ pub fn validate_agent_config(config: &AgentConfig) -> Result<(), ConfigError> {
             "[logs] is not part of the Phase 1 read-only MVP".to_string(),
         ));
     }
+    let mut controller_endpoint_ids = HashSet::new();
     for controller in &config.security.controllers {
         validate_controller_endpoint_id(&controller.endpoint_id)
             .map_err(|e| ConfigError::Invalid(e.to_string()))?;
         validate_controller_role(&controller.role)
             .map_err(|e| ConfigError::Invalid(e.to_string()))?;
+        controller_endpoint_ids.insert(
+            canonicalize_controller_endpoint_id(&controller.endpoint_id)
+                .map_err(|e| ConfigError::Invalid(e.to_string()))?,
+        );
+    }
+    let mut peer_endpoint_ids = HashSet::new();
+    for peer in &config.security.peers {
+        validate_peer_endpoint_id(&peer.endpoint_id)
+            .map_err(|e| ConfigError::Invalid(e.to_string()))?;
+        let endpoint_id = canonicalize_peer_endpoint_id(&peer.endpoint_id)
+            .map_err(|e| ConfigError::Invalid(e.to_string()))?;
+        if !peer_endpoint_ids.insert(endpoint_id.clone()) {
+            return Err(ConfigError::Invalid(format!(
+                "duplicate peer endpoint_id: {endpoint_id}"
+            )));
+        }
+        if controller_endpoint_ids.contains(&endpoint_id) {
+            return Err(ConfigError::Invalid(format!(
+                "endpoint_id cannot be both controller and peer: {endpoint_id}"
+            )));
+        }
     }
     validate_positive_i64(
         config.security.allowed_clock_skew_seconds,
@@ -321,4 +355,8 @@ fn default_rejected_peer_log_aggregate_interval_seconds() -> u64 {
 
 fn default_controller_role() -> String {
     "viewer".to_string()
+}
+
+fn default_peer_enabled() -> bool {
+    true
 }

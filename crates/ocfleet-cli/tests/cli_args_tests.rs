@@ -145,6 +145,26 @@ fn probe_summary_rejects_address_flags() {
 }
 
 #[test]
+fn parses_probe_topology_command() {
+    let cli = Cli::parse_from(["ocfleet", "probe", "topology"]);
+
+    let Command::Probe {
+        command: ProbeCommand::Topology,
+    } = cli.command
+    else {
+        panic!("expected probe topology command");
+    };
+}
+
+#[test]
+fn probe_topology_rejects_address_flags() {
+    let err = Cli::try_parse_from(["ocfleet", "probe", "topology", "--host", "127.0.0.1"])
+        .expect_err("probe topology must not accept host flags");
+
+    assert!(err.to_string().contains("unexpected argument"));
+}
+
+#[test]
 fn parses_node_info_command() {
     let cli = Cli::parse_from(["ocfleet", "node", "info", "hk-ocserv-01"]);
 

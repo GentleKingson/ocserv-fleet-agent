@@ -18,6 +18,7 @@ use ocfleet_protocol::error::ErrorCode;
 use ocfleet_protocol::method::{NODE_INFO, NODE_PING, PROBE_CONTROLLER_PING, PROBE_PATH_ECHO};
 use ocfleet_protocol::{DEFAULT_ALPN, DEFAULT_DEADLINE_MS, RpcResponse};
 use serde_json::{Map, Value, json};
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::str::FromStr;
 use std::time::Instant;
@@ -78,6 +79,7 @@ async fn main() -> anyhow::Result<()> {
                     source_node_id,
                     target_node_id,
                 } => run_probe_summary_command(&store, &source_node_id, &target_node_id)?,
+                ProbeCommand::Topology => run_probe_topology_command(&store)?,
             }
         }
         Command::Node { command } => {
@@ -156,6 +158,102 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    Ok(())
+}
+
+#[derive(Debug, Default)]
+struct TopologyGroupCounts {
+    total: usize,
+    enabled: usize,
+    disabled: usize,
+}
+
+fn run_probe_topology_command(store: &Store) -> anyhow::Result<()> {
+    let nodes = store.list_nodes()?;
+    let enabled_node_count = nodes.iter().filter(|node| node.enabled).count();
+    let disabled_node_count = nodes.len().saturating_sub(enabled_node_count);
+    let registry_potential_pair_count =
+        enabled_node_count.saturating_mul(enabled_node_count.saturating_sub(1));
+
+    let mut groups: BTreeMap<(String, String), TopologyGroupCounts> = BTreeMap::new();
+    for node in &nodes {
+        let counts = groups
+            .entry((node.region.clone(), node.role.clone()))
+            .or_default();
+        counts.total += 1;
+        if node.enabled {
+            counts.enabled += 1;
+        } else {
+            counts.disabled += 1;
+        }
+    }
+
+    println!("topology_summary=registry_observation");
+    println!(
+        "registered_node_count={} enabled_node_count={} disabled_node_count={}",
+        nodes.len(),
+        enabled_node_count,
+        disabled_node_count
+    );
+    for ((region, role), counts) in &groups {
+        println!(
+            "group region={region} role={role} total={} enabled={} disabled={}",
+            counts.total, counts.enabled, counts.disabled
+        );
+    }
+    for node in &nodes {
+        println!(
+            "node_id={} region={} role={} enabled={}",
+            node.node_id, node.region, node.role, node.enabled
+        );
+    }
+    println!("registry_potential_pair_count={registry_potential_pair_count}");
+    println!("registry_authorizes_probe=false");
+    println!("authoritative_authorization=security.path_probes+security.peers");
+    println!("topology_discovery=false");
+    println!("no_probe_executed=true");
+    println!("no_config_generated=true");
+
+    let group_details = groups
+        .iter()
+        .map(|((region, role), counts)| {
+            json!({
+                "region": region,
+                "role": role,
+                "total": counts.total,
+                "enabled": counts.enabled,
+                "disabled": counts.disabled,
+            })
+        })
+        .collect::<Vec<_>>();
+    let node_details = nodes
+        .iter()
+        .map(|node| {
+            json!({
+                "node_id": node.node_id,
+                "region": node.region,
+                "role": node.role,
+                "enabled": node.enabled,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let mut event = AuditEvent::new(local_actor(), "probe.topology");
+    event.ok = Some(true);
+    event.detail_json = json!({
+        "registered_node_count": nodes.len(),
+        "enabled_node_count": enabled_node_count,
+        "disabled_node_count": disabled_node_count,
+        "registry_potential_pair_count": registry_potential_pair_count,
+        "registry_authorizes_probe": false,
+        "authoritative_authorization": "security.path_probes+security.peers",
+        "topology_discovery": false,
+        "no_probe_executed": true,
+        "no_config_generated": true,
+        "groups": group_details,
+        "nodes": node_details,
+    });
+    store.insert_audit(&event)?;
     Ok(())
 }
 

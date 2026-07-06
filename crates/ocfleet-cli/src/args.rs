@@ -42,6 +42,7 @@ pub enum ProbeCommand {
         source_node_id: String,
         target_node_id: String,
     },
+    Topology,
 }
 
 #[derive(Debug, Subcommand)]

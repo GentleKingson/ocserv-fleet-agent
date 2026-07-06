@@ -818,6 +818,159 @@ fn probe_history_filters_by_node_id() {
     assert!(!stdout.contains("request_id=target-request"));
 }
 
+#[test]
+fn probe_observe_reports_registry_status_without_history_or_rpc() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let secret_key = dir.path().join("unused-controller.secret");
+    let source_endpoint_id = iroh::SecretKey::generate().public().to_string();
+    let target_endpoint_id = iroh::SecretKey::generate().public().to_string();
+    let store = Store::open(&database).expect("store opens");
+    store
+        .add_node(&NodeInsert {
+            node_id: "source-node".to_string(),
+            endpoint_id: source_endpoint_id,
+            name: "source-node".to_string(),
+            region: "hk".to_string(),
+            role: "ocserv".to_string(),
+        })
+        .expect("insert source");
+    store
+        .add_node(&NodeInsert {
+            node_id: "target-node".to_string(),
+            endpoint_id: target_endpoint_id,
+            name: "target-node".to_string(),
+            region: "sg".to_string(),
+            role: "ocserv".to_string(),
+        })
+        .expect("insert target");
+    drop(store);
+
+    let database_arg = database.to_string_lossy().into_owned();
+    let secret_key_arg = secret_key.to_string_lossy().into_owned();
+    let output = run_ocfleet_output(&[
+        "--database",
+        &database_arg,
+        "--secret-key",
+        &secret_key_arg,
+        "probe",
+        "observe",
+        "source-node",
+        "target-node",
+    ]);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("path_observation=audit_history"));
+    assert!(stdout.contains("source_node_id=source-node source_status=enabled"));
+    assert!(stdout.contains("target_node_id=target-node target_status=enabled"));
+    assert!(stdout.contains("last_observation=missing"));
+    assert!(stdout.contains("no_probe_executed=true"));
+    assert!(stdout.contains("no_route_discovery=true"));
+    assert!(!stdout.contains("SecretKey"));
+
+    let (event, ok, detail) = latest_audit(&database);
+    assert_eq!(event, "probe.observe");
+    assert_eq!(ok, 1);
+    assert_eq!(detail["source_node_id"], "source-node");
+    assert_eq!(detail["target_node_id"], "target-node");
+    assert_eq!(detail["last_observation"], "missing");
+    assert_eq!(detail["no_probe_executed"], true);
+}
+
+#[test]
+fn probe_observe_reports_latest_matching_path_result_only() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let secret_key = dir.path().join("unused-controller.secret");
+    let source_endpoint_id = iroh::SecretKey::generate().public().to_string();
+    let target_endpoint_id = iroh::SecretKey::generate().public().to_string();
+    let other_target_endpoint_id = iroh::SecretKey::generate().public().to_string();
+    let store = Store::open(&database).expect("store opens");
+    store
+        .add_node(&NodeInsert {
+            node_id: "source-node".to_string(),
+            endpoint_id: source_endpoint_id,
+            name: "source-node".to_string(),
+            region: "hk".to_string(),
+            role: "ocserv".to_string(),
+        })
+        .expect("insert source");
+    store
+        .add_node(&NodeInsert {
+            node_id: "target-node".to_string(),
+            endpoint_id: target_endpoint_id.clone(),
+            name: "target-node".to_string(),
+            region: "sg".to_string(),
+            role: "ocserv".to_string(),
+        })
+        .expect("insert target");
+
+    let mut other_target = AuditEvent::new("seed", "rpc.completed");
+    other_target.node_id = Some("source-node".to_string());
+    other_target.method = Some(PROBE_PATH_ECHO.to_string());
+    other_target.request_id = Some("other-root".to_string());
+    other_target.ok = Some(true);
+    other_target.duration_ms = Some(10);
+    other_target.detail_json = serde_json::json!({
+        "target_node_id": "other-target",
+        "target_endpoint_id": other_target_endpoint_id,
+        "peer_request_id": "other-peer"
+    });
+    store
+        .insert_audit(&other_target)
+        .expect("insert other path audit");
+
+    let mut matching = AuditEvent::new("seed", "rpc.completed");
+    matching.node_id = Some("source-node".to_string());
+    matching.method = Some(PROBE_PATH_ECHO.to_string());
+    matching.request_id = Some("matching-root".to_string());
+    matching.ok = Some(false);
+    matching.error_code = Some("ENDPOINT_NOT_ALLOWED".to_string());
+    matching.duration_ms = Some(42);
+    matching.detail_json = serde_json::json!({
+        "target_node_id": "target-node",
+        "target_endpoint_id": target_endpoint_id,
+        "peer_request_id": "matching-peer"
+    });
+    store
+        .insert_audit(&matching)
+        .expect("insert matching path audit");
+    drop(store);
+
+    let database_arg = database.to_string_lossy().into_owned();
+    let secret_key_arg = secret_key.to_string_lossy().into_owned();
+    let output = run_ocfleet_output(&[
+        "--database",
+        &database_arg,
+        "--secret-key",
+        &secret_key_arg,
+        "probe",
+        "observe",
+        "source-node",
+        "target-node",
+    ]);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("last_observation=found"));
+    assert!(stdout.contains("root_request_id=matching-root"));
+    assert!(stdout.contains("peer_request_id=matching-peer"));
+    assert!(stdout.contains("ok=false"));
+    assert!(stdout.contains("error_code=ENDPOINT_NOT_ALLOWED"));
+    assert!(stdout.contains("duration_ms=42"));
+    assert!(!stdout.contains("other-root"));
+    assert!(!stdout.contains("other-peer"));
+    assert!(stdout.contains("no_probe_executed=true"));
+    assert!(stdout.contains("no_route_discovery=true"));
+
+    let (event, ok, detail) = latest_audit(&database);
+    assert_eq!(event, "probe.observe");
+    assert_eq!(ok, 1);
+    assert_eq!(detail["last_observation"], "found");
+    assert_eq!(detail["root_request_id"], "matching-root");
+    assert_eq!(detail["peer_request_id"], "matching-peer");
+    assert_eq!(detail["error_code"], "ENDPOINT_NOT_ALLOWED");
+}
+
 #[cfg(unix)]
 #[test]
 fn ping_with_unsafe_controller_secret_key_writes_permission_error_audit() {

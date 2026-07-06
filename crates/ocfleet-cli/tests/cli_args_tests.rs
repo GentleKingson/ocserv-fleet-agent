@@ -201,6 +201,41 @@ fn probe_history_rejects_address_flags() {
 }
 
 #[test]
+fn parses_probe_observe_command() {
+    let cli = Cli::parse_from(["ocfleet", "probe", "observe", "source-node", "target-node"]);
+
+    let Command::Probe {
+        command:
+            ProbeCommand::Observe {
+                source_node_id,
+                target_node_id,
+            },
+    } = cli.command
+    else {
+        panic!("expected probe observe command");
+    };
+
+    assert_eq!(source_node_id, "source-node");
+    assert_eq!(target_node_id, "target-node");
+}
+
+#[test]
+fn probe_observe_rejects_address_flags() {
+    let err = Cli::try_parse_from([
+        "ocfleet",
+        "probe",
+        "observe",
+        "source-node",
+        "target-node",
+        "--port",
+        "443",
+    ])
+    .expect_err("probe observe must not accept port flags");
+
+    assert!(err.to_string().contains("unexpected argument"));
+}
+
+#[test]
 fn parses_node_info_command() {
     let cli = Cli::parse_from(["ocfleet", "node", "info", "hk-ocserv-01"]);
 

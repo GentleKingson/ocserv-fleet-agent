@@ -625,9 +625,12 @@ async fn local_path_probe_target_segment_failure_is_outer_success_with_correlate
     );
     assert_eq!(result["root_request_id"], root_request_id);
     assert!(result["peer_request_id"].as_str().is_some());
-    assert!(result["error_code"].as_str().is_some());
-    assert_eq!(result["message"], "target peer echo failed");
-    assert!(result.get("target_result").is_none());
+    assert!(result.get("error_code").is_none());
+    assert!(result.get("message").is_none());
+    assert_eq!(result["target_result"]["ok"], false);
+    assert!(result["target_result"]["error_code"].as_str().is_some());
+    assert_eq!(result["target_result"]["stage"], "target_peer_echo");
+    assert_eq!(result["target_result"]["reason"], "target peer echo failed");
     let peer_request_id = result["peer_request_id"]
         .as_str()
         .expect("peer request id")

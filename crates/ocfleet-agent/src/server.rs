@@ -56,6 +56,8 @@ impl PathTargetResolver {
         }
     }
 
+    /// Local E2E-only address injection. This must not be wired into runtime
+    /// request schema, CLI UX, production config, or controller registry data.
     #[doc(hidden)]
     pub fn for_local_e2e_tests(
         entries: impl IntoIterator<Item = (EndpointId, EndpointAddr)>,
@@ -1272,8 +1274,12 @@ async fn dispatch_path_echo(
             "target_agent_endpoint_id": target_endpoint_id.to_string(),
             "root_request_id": request_id,
             "peer_request_id": err.request_id(),
-            "error_code": error_code_name(&err.code()),
-            "message": "target peer echo failed",
+            "target_result": {
+                "ok": false,
+                "error_code": error_code_name(&err.code()),
+                "stage": "target_peer_echo",
+                "reason": "target peer echo failed",
+            },
             "time_utc": now_rfc3339(),
         })),
     }

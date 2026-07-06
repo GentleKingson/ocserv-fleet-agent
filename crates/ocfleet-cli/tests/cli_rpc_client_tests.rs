@@ -139,6 +139,58 @@ fn validate_path_echo_result_rejects_raw_peer_response_forwarding() {
 }
 
 #[test]
+fn validate_path_echo_result_accepts_target_segment_failure_schema() {
+    let result = json!({
+        "probe": "path.echo",
+        "ok": false,
+        "source_agent_endpoint_id": "source-endpoint",
+        "target_agent_endpoint_id": "target-endpoint",
+        "root_request_id": "root-request",
+        "peer_request_id": "peer-request",
+        "target_result": {
+            "ok": false,
+            "error_code": "ENDPOINT_NOT_ALLOWED",
+            "stage": "target_peer_echo",
+            "reason": "target peer echo failed"
+        },
+        "time_utc": "2026-01-01T00:00:00Z"
+    });
+
+    validate_path_echo_result(
+        &result,
+        "source-endpoint",
+        "target-endpoint",
+        "root-request",
+    )
+    .expect("target segment failure schema is accepted");
+}
+
+#[test]
+fn validate_path_echo_result_rejects_top_level_target_failure_error_fields() {
+    let result = json!({
+        "probe": "path.echo",
+        "ok": false,
+        "source_agent_endpoint_id": "source-endpoint",
+        "target_agent_endpoint_id": "target-endpoint",
+        "root_request_id": "root-request",
+        "peer_request_id": "peer-request",
+        "error_code": "ENDPOINT_NOT_ALLOWED",
+        "message": "target peer echo failed",
+        "time_utc": "2026-01-01T00:00:00Z"
+    });
+
+    let err = validate_path_echo_result(
+        &result,
+        "source-endpoint",
+        "target-endpoint",
+        "root-request",
+    )
+    .expect_err("top-level target failure error fields rejected");
+
+    assert_eq!(err.code(), ErrorCode::InvalidResponse);
+}
+
+#[test]
 fn validate_error_response_rejects_result_payload() {
     let response = RpcResponse {
         version: PROTOCOL_VERSION,

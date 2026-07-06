@@ -267,7 +267,8 @@ async fn run_path_probe_command(
             } else {
                 success
                     .result
-                    .get("error_code")
+                    .get("target_result")
+                    .and_then(|target_result| target_result.get("error_code"))
                     .and_then(Value::as_str)
                     .and_then(error_code_from_name)
             };

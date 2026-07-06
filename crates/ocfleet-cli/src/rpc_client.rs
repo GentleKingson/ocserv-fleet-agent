@@ -321,8 +321,13 @@ pub fn validate_path_echo_result(
         validate_normalized_peer_echo_result(target_result)?;
     } else {
         validate_path_failure_fields(object)?;
-        require_string_field(object, "error_code")?;
-        require_string_field(object, "message")?;
+        let target_result = object.get("target_result").ok_or_else(|| {
+            RpcClientError::structured(
+                ErrorCode::InvalidResponse,
+                "failed path result must include target_result",
+            )
+        })?;
+        validate_target_segment_failure_result(target_result)?;
     }
     Ok(())
 }
@@ -357,14 +362,13 @@ fn validate_path_failure_fields(
     let mut fields = object.keys().map(String::as_str).collect::<Vec<_>>();
     fields.sort_unstable();
     let expected = [
-        "error_code",
-        "message",
         "ok",
         "peer_request_id",
         "probe",
         "root_request_id",
         "source_agent_endpoint_id",
         "target_agent_endpoint_id",
+        "target_result",
         "time_utc",
     ];
     if fields != expected {
@@ -373,6 +377,34 @@ fn validate_path_failure_fields(
             format!("path failure result fields mismatch: {fields:?}"),
         ));
     }
+    Ok(())
+}
+
+fn validate_target_segment_failure_result(result: &Value) -> Result<(), RpcClientError> {
+    let object = result.as_object().ok_or_else(|| {
+        RpcClientError::structured(
+            ErrorCode::InvalidResponse,
+            "target_result must be an object",
+        )
+    })?;
+    let mut fields = object.keys().map(String::as_str).collect::<Vec<_>>();
+    fields.sort_unstable();
+    let expected = ["error_code", "ok", "reason", "stage"];
+    if fields != expected {
+        return Err(RpcClientError::structured(
+            ErrorCode::InvalidResponse,
+            format!("target_result failure fields mismatch: {fields:?}"),
+        ));
+    }
+    if object.get("ok").and_then(Value::as_bool) != Some(false) {
+        return Err(RpcClientError::structured(
+            ErrorCode::InvalidResponse,
+            "target_result ok must be false",
+        ));
+    }
+    require_string_field(object, "error_code")?;
+    require_string_field(object, "stage")?;
+    require_string_field(object, "reason")?;
     Ok(())
 }
 

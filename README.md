@@ -138,6 +138,15 @@ target/debug/ocfleet probe topology
 
 The topology summary groups existing registry nodes by region and role. It does not discover topology, infer trust, generate peer/path configuration, or contact agents.
 
+Print recent explicit probe RPC history from existing controller audit records without running probes:
+
+```bash
+target/debug/ocfleet probe history
+target/debug/ocfleet probe history source-ocserv-01
+```
+
+Probe history is read-only audit observation. It does not schedule probes, compute behavior-affecting health scores, contact agents, or modify controller state beyond the local read audit entry.
+
 Networking must allow the controller to reach the agent through iroh using the registered EndpointID.
 
 ## Repository Layout

@@ -165,6 +165,42 @@ fn probe_topology_rejects_address_flags() {
 }
 
 #[test]
+fn parses_probe_history_command_without_filter() {
+    let cli = Cli::parse_from(["ocfleet", "probe", "history"]);
+
+    let Command::Probe {
+        command: ProbeCommand::History { node_id },
+    } = cli.command
+    else {
+        panic!("expected probe history command");
+    };
+
+    assert_eq!(node_id, None);
+}
+
+#[test]
+fn parses_probe_history_command_with_node_filter() {
+    let cli = Cli::parse_from(["ocfleet", "probe", "history", "source-node"]);
+
+    let Command::Probe {
+        command: ProbeCommand::History { node_id },
+    } = cli.command
+    else {
+        panic!("expected probe history command");
+    };
+
+    assert_eq!(node_id.as_deref(), Some("source-node"));
+}
+
+#[test]
+fn probe_history_rejects_address_flags() {
+    let err = Cli::try_parse_from(["ocfleet", "probe", "history", "--host", "127.0.0.1"])
+        .expect_err("probe history must not accept host flags");
+
+    assert!(err.to_string().contains("unexpected argument"));
+}
+
+#[test]
 fn parses_node_info_command() {
     let cli = Cli::parse_from(["ocfleet", "node", "info", "hk-ocserv-01"]);
 

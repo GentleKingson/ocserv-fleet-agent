@@ -1,4 +1,6 @@
+use ocfleet_protocol::method::{PROBE_CONTROLLER_PING, PROBE_PATH_ECHO};
 use rusqlite::{Connection, OptionalExtension, params};
+use serde_json::Value;
 use std::io;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -35,6 +37,19 @@ pub struct NodeRecord {
     pub region: String,
     pub role: String,
     pub enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeHistoryRecord {
+    pub ts: String,
+    pub node_id: Option<String>,
+    pub endpoint_id: Option<String>,
+    pub method: String,
+    pub request_id: Option<String>,
+    pub ok: Option<bool>,
+    pub error_code: Option<String>,
+    pub duration_ms: Option<u64>,
+    pub detail_json: Value,
 }
 
 pub struct Store {
@@ -160,6 +175,41 @@ impl Store {
             .map_err(StoreError::from)
     }
 
+    pub fn list_probe_history(
+        &self,
+        node_filter: Option<&str>,
+    ) -> Result<Vec<ProbeHistoryRecord>, StoreError> {
+        if let Some(node_id) = node_filter {
+            let mut stmt = self.conn.prepare(
+                "SELECT ts, node_id, endpoint_id, method, request_id, ok, error_code, duration_ms, detail_json
+                 FROM controller_audit_log
+                 WHERE method IN (?1, ?2) AND node_id = ?3
+                 ORDER BY id DESC
+                 LIMIT 50",
+            )?;
+            let rows = stmt.query_map(
+                params![PROBE_CONTROLLER_PING, PROBE_PATH_ECHO, node_id],
+                probe_history_from_row,
+            )?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(StoreError::from)
+        } else {
+            let mut stmt = self.conn.prepare(
+                "SELECT ts, node_id, endpoint_id, method, request_id, ok, error_code, duration_ms, detail_json
+                 FROM controller_audit_log
+                 WHERE method IN (?1, ?2)
+                 ORDER BY id DESC
+                 LIMIT 50",
+            )?;
+            let rows = stmt.query_map(
+                params![PROBE_CONTROLLER_PING, PROBE_PATH_ECHO],
+                probe_history_from_row,
+            )?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(StoreError::from)
+        }
+    }
+
     pub fn disable_node(&self, node_id: &str) -> Result<(), StoreError> {
         let affected = self.conn.execute(
             "UPDATE nodes SET enabled = 0, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE node_id = ?1",
@@ -274,5 +324,22 @@ fn node_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NodeRecord> {
         region: row.get(3)?,
         role: row.get(4)?,
         enabled: row.get::<_, i64>(5)? == 1,
+    })
+}
+
+fn probe_history_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProbeHistoryRecord> {
+    let ok: Option<i64> = row.get(5)?;
+    let duration_ms: Option<i64> = row.get(7)?;
+    let detail_json: String = row.get(8)?;
+    Ok(ProbeHistoryRecord {
+        ts: row.get(0)?,
+        node_id: row.get(1)?,
+        endpoint_id: row.get(2)?,
+        method: row.get(3)?,
+        request_id: row.get(4)?,
+        ok: ok.map(|value| value != 0),
+        error_code: row.get(6)?,
+        duration_ms: duration_ms.and_then(|value| u64::try_from(value).ok()),
+        detail_json: serde_json::from_str(&detail_json).unwrap_or(Value::Null),
     })
 }

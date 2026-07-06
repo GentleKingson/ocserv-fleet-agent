@@ -74,6 +74,10 @@ async fn main() -> anyhow::Result<()> {
                     )
                     .await?;
                 }
+                ProbeCommand::Summary {
+                    source_node_id,
+                    target_node_id,
+                } => run_probe_summary_command(&store, &source_node_id, &target_node_id)?,
             }
         }
         Command::Node { command } => {
@@ -153,6 +157,74 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn run_probe_summary_command(
+    store: &Store,
+    source_node_id: &str,
+    target_node_id: &str,
+) -> anyhow::Result<()> {
+    validate_node_id(source_node_id)?;
+    validate_node_id(target_node_id)?;
+
+    let source = store.get_node(source_node_id)?;
+    let target = store.get_node(target_node_id)?;
+    let source_status = summary_node_status(source.as_ref());
+    let target_status = summary_node_status(target.as_ref());
+    let source_endpoint_id = source.as_ref().map(|node| node.endpoint_id.as_str());
+    let target_endpoint_id = target.as_ref().map(|node| node.endpoint_id.as_str());
+
+    println!("probe_summary=path_observation");
+    print_summary_node("source", source_node_id, source_status, source_endpoint_id);
+    print_summary_node("target", target_node_id, target_status, target_endpoint_id);
+    println!("registry_authorizes_probe=false");
+    println!("required_source_authorization=security.path_probes");
+    println!("required_target_authorization=security.peers");
+    println!("supported_commands=probe ping,probe path");
+    println!("no_probe_executed=true");
+
+    let mut event = AuditEvent::new(local_actor(), "probe.summary");
+    event.node_id = Some(source_node_id.to_string());
+    event.endpoint_id = source.as_ref().map(|node| node.endpoint_id.clone());
+    event.ok = Some(true);
+    event.detail_json = json!({
+        "source_node_id": source_node_id,
+        "source_endpoint_id": source_endpoint_id,
+        "source_status": source_status,
+        "target_node_id": target_node_id,
+        "target_endpoint_id": target_endpoint_id,
+        "target_status": target_status,
+        "registry_authorizes_probe": false,
+        "required_source_authorization": "security.path_probes",
+        "required_target_authorization": "security.peers",
+        "supported_commands": ["probe ping", "probe path"],
+        "no_probe_executed": true,
+    });
+    store.insert_audit(&event)?;
+    Ok(())
+}
+
+fn summary_node_status(node: Option<&NodeRecord>) -> &'static str {
+    match node {
+        Some(node) if node.enabled => "enabled",
+        Some(_) => "disabled",
+        None => "missing",
+    }
+}
+
+fn print_summary_node(role: &str, node_id: &str, status: &str, endpoint_id: Option<&str>) {
+    match endpoint_id {
+        Some(endpoint_id) => {
+            println!(
+                "{role}_node_id={node_id} {role}_status={status} {role}_endpoint_id={endpoint_id}"
+            );
+        }
+        None => {
+            println!(
+                "{role}_node_id={node_id} {role}_status={status} {role}_endpoint_id=<missing>"
+            );
+        }
+    }
 }
 
 async fn run_path_probe_command(

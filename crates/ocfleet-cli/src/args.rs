@@ -38,6 +38,10 @@ pub enum ProbeCommand {
         source_node_id: String,
         target_node_id: String,
     },
+    Summary {
+        source_node_id: String,
+        target_node_id: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]

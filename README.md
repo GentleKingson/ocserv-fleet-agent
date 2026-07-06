@@ -122,6 +122,14 @@ Call a one-hop controller-orchestrated path probe only after the source agent ex
 target/debug/ocfleet probe path source-ocserv-01 target-ocserv-01
 ```
 
+Print a read-only Direction-Two path observation summary from the controller registry without running a probe:
+
+```bash
+target/debug/ocfleet probe summary source-ocserv-01 target-ocserv-01
+```
+
+The summary is inventory/UX only. It does not authorize path probing, modify trust configuration, contact agents, or infer `security.path_probes` / `security.peers`.
+
 Networking must allow the controller to reach the agent through iroh using the registered EndpointID.
 
 ## Repository Layout

@@ -19,6 +19,21 @@ fn run_ocfleet(args: &[&str]) {
     );
 }
 
+fn run_ocfleet_output(args: &[&str]) -> std::process::Output {
+    let output = Command::new(env!("CARGO_BIN_EXE_ocfleet"))
+        .args(args)
+        .env("USER", "audit-user")
+        .output()
+        .expect("run ocfleet");
+    assert!(
+        output.status.success(),
+        "ocfleet failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
+}
+
 fn run_ocfleet_failure(args: &[&str]) -> std::process::Output {
     let output = Command::new(env!("CARGO_BIN_EXE_ocfleet"))
         .args(args)
@@ -405,6 +420,154 @@ fn probe_path_missing_target_writes_failure_audit_on_source_node() {
     assert_eq!(audit.error_code.as_deref(), Some("NODE_NOT_FOUND"));
     assert_eq!(audit.detail["source_node_id"], "source-node");
     assert_eq!(audit.detail["target_node_id"], "missing-target");
+}
+
+#[test]
+fn probe_summary_reports_existing_and_disabled_nodes_without_secret_key_or_rpc() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let secret_key = dir.path().join("unused-controller.secret");
+    let source_endpoint_id = iroh::SecretKey::generate().public().to_string();
+    let target_endpoint_id = iroh::SecretKey::generate().public().to_string();
+    let store = Store::open(&database).expect("store opens");
+    store
+        .add_node(&NodeInsert {
+            node_id: "source-node".to_string(),
+            endpoint_id: source_endpoint_id.clone(),
+            name: "source-node".to_string(),
+            region: "hk".to_string(),
+            role: "ocserv".to_string(),
+        })
+        .expect("insert source node");
+    store
+        .add_node(&NodeInsert {
+            node_id: "target-node".to_string(),
+            endpoint_id: target_endpoint_id.clone(),
+            name: "target-node".to_string(),
+            region: "sg".to_string(),
+            role: "ocserv".to_string(),
+        })
+        .expect("insert target node");
+    store.disable_node("target-node").expect("disable target");
+    drop(store);
+
+    let database_arg = database.to_string_lossy().into_owned();
+    let secret_key_arg = secret_key.to_string_lossy().into_owned();
+    let output = run_ocfleet_output(&[
+        "--database",
+        &database_arg,
+        "--secret-key",
+        &secret_key_arg,
+        "probe",
+        "summary",
+        "source-node",
+        "target-node",
+    ]);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("probe_summary=path_observation"));
+    assert!(stdout.contains("source_node_id=source-node source_status=enabled"));
+    assert!(stdout.contains(source_endpoint_id.as_str()));
+    assert!(stdout.contains("target_node_id=target-node target_status=disabled"));
+    assert!(stdout.contains(target_endpoint_id.as_str()));
+    assert!(stdout.contains("registry_authorizes_probe=false"));
+    assert!(stdout.contains("required_source_authorization=security.path_probes"));
+    assert!(stdout.contains("required_target_authorization=security.peers"));
+    assert!(stdout.contains("no_probe_executed=true"));
+    assert!(!stdout.contains("SecretKey"));
+
+    let (event, ok, detail) = latest_audit(&database);
+    assert_eq!(event, "probe.summary");
+    assert_eq!(ok, 1);
+    assert_eq!(detail["source_node_id"], "source-node");
+    assert_eq!(detail["target_node_id"], "target-node");
+    assert_eq!(detail["source_status"], "enabled");
+    assert_eq!(detail["target_status"], "disabled");
+    assert_eq!(detail["registry_authorizes_probe"], false);
+    assert_eq!(detail["no_probe_executed"], true);
+}
+
+#[test]
+fn probe_summary_reports_missing_nodes_without_failure() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let database_arg = database.to_string_lossy().into_owned();
+
+    let output = run_ocfleet_output(&[
+        "--database",
+        &database_arg,
+        "probe",
+        "summary",
+        "missing-source",
+        "missing-target",
+    ]);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("source_node_id=missing-source source_status=missing"));
+    assert!(stdout.contains("target_node_id=missing-target target_status=missing"));
+    assert!(stdout.contains("registry_authorizes_probe=false"));
+    assert!(stdout.contains("no_probe_executed=true"));
+
+    let (event, ok, detail) = latest_audit(&database);
+    assert_eq!(event, "probe.summary");
+    assert_eq!(ok, 1);
+    assert_eq!(detail["source_status"], "missing");
+    assert_eq!(detail["target_status"], "missing");
+}
+
+#[test]
+fn probe_summary_reports_disabled_source_without_running_rpc() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let secret_key = dir.path().join("unused-controller.secret");
+    let source_endpoint_id = iroh::SecretKey::generate().public().to_string();
+    let target_endpoint_id = iroh::SecretKey::generate().public().to_string();
+    let store = Store::open(&database).expect("store opens");
+    store
+        .add_node(&NodeInsert {
+            node_id: "source-node".to_string(),
+            endpoint_id: source_endpoint_id,
+            name: "source-node".to_string(),
+            region: "hk".to_string(),
+            role: "ocserv".to_string(),
+        })
+        .expect("insert source node");
+    store
+        .add_node(&NodeInsert {
+            node_id: "target-node".to_string(),
+            endpoint_id: target_endpoint_id,
+            name: "target-node".to_string(),
+            region: "sg".to_string(),
+            role: "ocserv".to_string(),
+        })
+        .expect("insert target node");
+    store.disable_node("source-node").expect("disable source");
+    drop(store);
+
+    let database_arg = database.to_string_lossy().into_owned();
+    let secret_key_arg = secret_key.to_string_lossy().into_owned();
+    let output = run_ocfleet_output(&[
+        "--database",
+        &database_arg,
+        "--secret-key",
+        &secret_key_arg,
+        "probe",
+        "summary",
+        "source-node",
+        "target-node",
+    ]);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("source_node_id=source-node source_status=disabled"));
+    assert!(stdout.contains("target_node_id=target-node target_status=enabled"));
+    assert!(stdout.contains("no_probe_executed=true"));
+
+    let (event, ok, detail) = latest_audit(&database);
+    assert_eq!(event, "probe.summary");
+    assert_eq!(ok, 1);
+    assert_eq!(detail["source_status"], "disabled");
+    assert_eq!(detail["target_status"], "enabled");
+    assert_eq!(detail["no_probe_executed"], true);
 }
 
 #[cfg(unix)]

@@ -110,6 +110,41 @@ fn parses_probe_path_command() {
 }
 
 #[test]
+fn parses_probe_summary_command() {
+    let cli = Cli::parse_from(["ocfleet", "probe", "summary", "source-01", "target-01"]);
+
+    let Command::Probe {
+        command:
+            ProbeCommand::Summary {
+                source_node_id,
+                target_node_id,
+            },
+    } = cli.command
+    else {
+        panic!("expected probe summary command");
+    };
+
+    assert_eq!(source_node_id, "source-01");
+    assert_eq!(target_node_id, "target-01");
+}
+
+#[test]
+fn probe_summary_rejects_address_flags() {
+    let err = Cli::try_parse_from([
+        "ocfleet",
+        "probe",
+        "summary",
+        "source-01",
+        "target-01",
+        "--host",
+        "127.0.0.1",
+    ])
+    .expect_err("probe summary must not accept host flags");
+
+    assert!(err.to_string().contains("unexpected argument"));
+}
+
+#[test]
 fn parses_node_info_command() {
     let cli = Cli::parse_from(["ocfleet", "node", "info", "hk-ocserv-01"]);
 

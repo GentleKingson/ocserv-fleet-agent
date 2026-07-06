@@ -80,6 +80,9 @@ async fn main() -> anyhow::Result<()> {
                     target_node_id,
                 } => run_probe_summary_command(&store, &source_node_id, &target_node_id)?,
                 ProbeCommand::Topology => run_probe_topology_command(&store)?,
+                ProbeCommand::History { node_id } => {
+                    run_probe_history_command(&store, node_id.as_deref())?
+                }
             }
         }
         Command::Node { command } => {
@@ -158,6 +161,54 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    Ok(())
+}
+
+fn run_probe_history_command(store: &Store, node_filter: Option<&str>) -> anyhow::Result<()> {
+    if let Some(node_id) = node_filter {
+        validate_node_id(node_id)?;
+    }
+
+    let records = store.list_probe_history(node_filter)?;
+    println!("probe_history=controller_audit");
+    println!("node_filter={}", node_filter.unwrap_or("<all>"));
+    println!("record_count={}", records.len());
+    for record in &records {
+        let peer_request_id = record
+            .detail_json
+            .get("peer_request_id")
+            .and_then(Value::as_str);
+        println!(
+            "record ts={} node_id={} method={} ok={} error_code={} duration_ms={} request_id={} peer_request_id={}",
+            record.ts,
+            record.node_id.as_deref().unwrap_or("<none>"),
+            record.method,
+            record
+                .ok
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "<none>".to_string()),
+            record.error_code.as_deref().unwrap_or("<none>"),
+            record
+                .duration_ms
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "<none>".to_string()),
+            record.request_id.as_deref().unwrap_or("<none>"),
+            peer_request_id.unwrap_or("<none>"),
+        );
+    }
+    println!("no_probe_executed=true");
+    println!("health_score=false");
+
+    let mut event = AuditEvent::new(local_actor(), "probe.history");
+    event.node_id = node_filter.map(ToOwned::to_owned);
+    event.ok = Some(true);
+    event.detail_json = json!({
+        "node_filter": node_filter,
+        "record_count": records.len(),
+        "no_probe_executed": true,
+        "health_score": false,
+    });
+    store.insert_audit(&event)?;
     Ok(())
 }
 

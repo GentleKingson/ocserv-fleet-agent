@@ -1,3 +1,4 @@
+use ocfleet_cli::audit::AuditEvent;
 use ocfleet_cli::store::{NodeInsert, Store};
 use ocfleet_protocol::method::{NODE_PING, PROBE_CONTROLLER_PING, PROBE_PATH_ECHO};
 use rusqlite::Connection;
@@ -681,6 +682,140 @@ fn probe_topology_reports_region_role_groups_without_claiming_authorization() {
     assert_eq!(detail["registry_authorizes_probe"], false);
     assert_eq!(detail["topology_discovery"], false);
     assert_eq!(detail["no_config_generated"], true);
+}
+
+#[test]
+fn probe_history_reports_empty_existing_audit_without_secret_key_or_rpc() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let secret_key = dir.path().join("unused-controller.secret");
+    let database_arg = database.to_string_lossy().into_owned();
+    let secret_key_arg = secret_key.to_string_lossy().into_owned();
+
+    let output = run_ocfleet_output(&[
+        "--database",
+        &database_arg,
+        "--secret-key",
+        &secret_key_arg,
+        "probe",
+        "history",
+    ]);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("probe_history=controller_audit"));
+    assert!(stdout.contains("record_count=0"));
+    assert!(stdout.contains("no_probe_executed=true"));
+    assert!(stdout.contains("health_score=false"));
+    assert!(!stdout.contains("SecretKey"));
+
+    let (event, ok, detail) = latest_audit(&database);
+    assert_eq!(event, "probe.history");
+    assert_eq!(ok, 1);
+    assert_eq!(detail["record_count"], 0);
+    assert_eq!(detail["no_probe_executed"], true);
+}
+
+#[test]
+fn probe_history_reports_probe_rpc_records_and_peer_request_id() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let secret_key = dir.path().join("unused-controller.secret");
+    let store = Store::open(&database).expect("store opens");
+
+    let mut ping = AuditEvent::new("seed", "rpc.completed");
+    ping.node_id = Some("source-node".to_string());
+    ping.endpoint_id = Some("source-endpoint".to_string());
+    ping.method = Some(PROBE_CONTROLLER_PING.to_string());
+    ping.request_id = Some("root-request-1".to_string());
+    ping.ok = Some(true);
+    ping.duration_ms = Some(12);
+    ping.detail_json = serde_json::json!({"result": "pong"});
+    store.insert_audit(&ping).expect("insert ping audit");
+
+    let mut path = AuditEvent::new("seed", "rpc.completed");
+    path.node_id = Some("source-node".to_string());
+    path.endpoint_id = Some("source-endpoint".to_string());
+    path.method = Some(PROBE_PATH_ECHO.to_string());
+    path.request_id = Some("root-request-2".to_string());
+    path.ok = Some(false);
+    path.error_code = Some("ENDPOINT_NOT_ALLOWED".to_string());
+    path.duration_ms = Some(34);
+    path.detail_json = serde_json::json!({"peer_request_id": "peer-request-2"});
+    store.insert_audit(&path).expect("insert path audit");
+
+    let mut node_ping = AuditEvent::new("seed", "rpc.completed");
+    node_ping.node_id = Some("source-node".to_string());
+    node_ping.method = Some(NODE_PING.to_string());
+    node_ping.ok = Some(true);
+    store
+        .insert_audit(&node_ping)
+        .expect("insert non-probe audit");
+    drop(store);
+
+    let database_arg = database.to_string_lossy().into_owned();
+    let secret_key_arg = secret_key.to_string_lossy().into_owned();
+    let output = run_ocfleet_output(&[
+        "--database",
+        &database_arg,
+        "--secret-key",
+        &secret_key_arg,
+        "probe",
+        "history",
+    ]);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("record_count=2"));
+    assert!(stdout.contains("method=probe.controller.ping ok=true"));
+    assert!(stdout.contains("request_id=root-request-1"));
+    assert!(stdout.contains("method=probe.path.echo ok=false"));
+    assert!(stdout.contains("error_code=ENDPOINT_NOT_ALLOWED"));
+    assert!(stdout.contains("peer_request_id=peer-request-2"));
+    assert!(!stdout.contains("method=node.ping"));
+    assert!(stdout.contains("no_probe_executed=true"));
+
+    let (event, ok, detail) = latest_audit(&database);
+    assert_eq!(event, "probe.history");
+    assert_eq!(ok, 1);
+    assert_eq!(detail["record_count"], 2);
+    assert_eq!(detail["node_filter"], serde_json::Value::Null);
+    assert_eq!(detail["no_probe_executed"], true);
+}
+
+#[test]
+fn probe_history_filters_by_node_id() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let store = Store::open(&database).expect("store opens");
+
+    for (node_id, request_id) in [
+        ("source-node", "source-request"),
+        ("target-node", "target-request"),
+    ] {
+        let mut event = AuditEvent::new("seed", "rpc.completed");
+        event.node_id = Some(node_id.to_string());
+        event.method = Some(PROBE_PATH_ECHO.to_string());
+        event.request_id = Some(request_id.to_string());
+        event.ok = Some(true);
+        event.duration_ms = Some(5);
+        event.detail_json = serde_json::json!({});
+        store.insert_audit(&event).expect("insert probe audit");
+    }
+    drop(store);
+
+    let database_arg = database.to_string_lossy().into_owned();
+    let output = run_ocfleet_output(&[
+        "--database",
+        &database_arg,
+        "probe",
+        "history",
+        "source-node",
+    ]);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("node_filter=source-node"));
+    assert!(stdout.contains("record_count=1"));
+    assert!(stdout.contains("request_id=source-request"));
+    assert!(!stdout.contains("request_id=target-request"));
 }
 
 #[cfg(unix)]

@@ -5,7 +5,9 @@ use std::time::{Duration, Instant};
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 use ocfleet_agent::audit::JsonlAuditWriter;
 use ocfleet_agent::audit_limiter::RejectedAuditLimiter;
+use ocfleet_agent::authz::AgentAuthorization;
 use ocfleet_agent::nonce::NonceCache;
+use ocfleet_agent::peer_echo::{PeerEchoCall, PeerEchoLimits, call_peer_echo};
 use ocfleet_agent::server::{
     AgentServerState, ServerLimiters, bind_agent_endpoint_local_only, serve_endpoint,
 };
@@ -13,10 +15,10 @@ use ocfleet_cli::rpc_client::{
     bind_controller_endpoint_local_only, build_request, call_endpoint_addr,
 };
 use ocfleet_config::agent::{
-    AgentConfig, AuditConfig, ControllerConfig, IrohConfig, NodeConfig, SecurityConfig,
+    AgentConfig, AuditConfig, ControllerConfig, IrohConfig, NodeConfig, PeerConfig, SecurityConfig,
 };
 use ocfleet_protocol::error::ErrorCode;
-use ocfleet_protocol::method::{NODE_INFO, NODE_PING, PROBE_CONTROLLER_PING};
+use ocfleet_protocol::method::{NODE_INFO, NODE_PING, PROBE_CONTROLLER_PING, PROBE_PEER_ECHO};
 use ocfleet_protocol::rpc::RpcResponse;
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -245,6 +247,203 @@ async fn local_agent_rejects_unauthorized_controller() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_agent_rejects_disabled_peer_at_connection_admission() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let controller_key = SecretKey::generate();
+    let disabled_peer_key = SecretKey::generate();
+    let harness = spawn_local_agent_with_peers(
+        controller_key,
+        SecretKey::generate(),
+        vec![PeerConfig {
+            endpoint_id: disabled_peer_key.public().to_string(),
+            enabled: false,
+        }],
+        &dir,
+    )
+    .await;
+    let disabled_peer = bind_controller_endpoint_local_only(disabled_peer_key)
+        .await
+        .expect("disabled peer endpoint");
+    let request = build_request(NODE_PING, json!({}), Some("local-peer".into()), 5_000);
+
+    let result = call_endpoint_addr(
+        &disabled_peer,
+        harness.agent_addr.clone(),
+        harness.agent_id,
+        harness.config.iroh.alpn.as_bytes(),
+        request,
+    )
+    .await;
+
+    assert!(
+        result.as_ref().map(|response| !response.ok).unwrap_or(true),
+        "disabled peer must not receive a successful response: {result:?}"
+    );
+    wait_for_audit_event(&harness.audit_path, |event| {
+        event["event"] == "rpc_rejected"
+            && event["allowed"] == false
+            && event["error_code"] == "ENDPOINT_NOT_ALLOWED"
+            && event["stage"] == "connection_admission"
+            && event["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("disabled peer"))
+            && event.get("request_id").is_none_or(Value::is_null)
+            && event.get("method").is_none_or(Value::is_null)
+            && event.get("params_hash").is_none_or(Value::is_null)
+            && event.get("nonce_hash").is_none_or(Value::is_null)
+    })
+    .await;
+
+    disabled_peer.close().await;
+    harness.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_peer_echo_helper_calls_authorized_target_and_writes_both_audits() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let controller_key = SecretKey::generate();
+    let target_key = SecretKey::generate();
+    let source_key = SecretKey::generate();
+    let source_id = source_key.public();
+    let harness = spawn_local_agent_with_peers(
+        controller_key,
+        target_key,
+        vec![PeerConfig {
+            endpoint_id: source_id.to_string(),
+            enabled: true,
+        }],
+        &dir,
+    )
+    .await;
+    let source_endpoint = bind_controller_endpoint_local_only(source_key)
+        .await
+        .expect("bind local-only source peer endpoint");
+    let source_audit_path = dir.path().join("source-peer-audit.jsonl");
+    let source_audit = JsonlAuditWriter::new(source_audit_path.clone());
+
+    let output = call_peer_echo(PeerEchoCall {
+        endpoint: &source_endpoint,
+        target: harness.agent_addr.clone(),
+        expected_target_endpoint_id: harness.agent_id,
+        source_endpoint_id: source_id,
+        alpn: harness.config.iroh.alpn.as_bytes(),
+        audit: &source_audit,
+        limits: PeerEchoLimits::default(),
+    })
+    .await
+    .expect("peer echo helper succeeds");
+
+    let result = &output.result;
+    assert_eq!(result["message"], "pong");
+    assert_eq!(result["probe"], "peer.echo");
+    assert_eq!(result["source_agent_endpoint_id"], source_id.to_string());
+    assert_eq!(
+        result["target_agent_endpoint_id"],
+        harness.agent_id.to_string()
+    );
+    assert_eq!(result["target_node_id"], "hk-ocserv-01");
+    assert!(result["agent_version"].as_str().is_some());
+    assert!(
+        time::OffsetDateTime::parse(
+            result["time_utc"].as_str().expect("peer echo time"),
+            &time::format_description::well_known::Rfc3339,
+        )
+        .is_ok()
+    );
+    let mut fields = result
+        .as_object()
+        .expect("peer echo result object")
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    fields.sort_unstable();
+    assert_eq!(
+        fields,
+        vec![
+            "agent_version",
+            "message",
+            "probe",
+            "source_agent_endpoint_id",
+            "target_agent_endpoint_id",
+            "target_node_id",
+            "time_utc"
+        ]
+    );
+
+    wait_for_audit_event(&source_audit_path, |event| {
+        event.get("stage").and_then(Value::as_str) == Some("source_peer_echo")
+            && event.get("method").and_then(Value::as_str) == Some(PROBE_PEER_ECHO)
+            && event.get("remote_endpoint_id").and_then(Value::as_str)
+                == Some(harness.agent_id.to_string().as_str())
+            && event.get("request_id").and_then(Value::as_str) == Some(output.request_id.as_str())
+            && event.get("ok").and_then(Value::as_bool) == Some(true)
+    })
+    .await;
+
+    wait_for_audit_event(&harness.audit_path, |event| {
+        event.get("stage").and_then(Value::as_str) == Some("dispatch")
+            && event.get("method").and_then(Value::as_str) == Some(PROBE_PEER_ECHO)
+            && event.get("remote_endpoint_id").and_then(Value::as_str)
+                == Some(source_id.to_string().as_str())
+            && event.get("request_id").and_then(Value::as_str) == Some(output.request_id.as_str())
+            && event.get("ok").and_then(Value::as_bool) == Some(true)
+    })
+    .await;
+
+    source_endpoint.close().await;
+    harness.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_peer_connection_cannot_call_controller_only_method() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let source_key = SecretKey::generate();
+    let source_id = source_key.public();
+    let harness = spawn_local_agent_with_peers(
+        SecretKey::generate(),
+        SecretKey::generate(),
+        vec![PeerConfig {
+            endpoint_id: source_id.to_string(),
+            enabled: true,
+        }],
+        &dir,
+    )
+    .await;
+    let source_endpoint = bind_controller_endpoint_local_only(source_key)
+        .await
+        .expect("bind local-only source peer endpoint");
+    let request = build_request(NODE_PING, json!({}), Some("local-peer".into()), 5_000);
+
+    let response = call_endpoint_addr(
+        &source_endpoint,
+        harness.agent_addr.clone(),
+        harness.agent_id,
+        harness.config.iroh.alpn.as_bytes(),
+        request,
+    )
+    .await
+    .expect("peer receives structured method authorization response");
+
+    assert!(!response.ok);
+    assert_eq!(
+        response.error.as_ref().expect("method auth error").code,
+        ErrorCode::MethodNotAllowed
+    );
+    wait_for_audit_event(&harness.audit_path, |event| {
+        event.get("stage").and_then(Value::as_str) == Some("dispatch")
+            && event.get("method").and_then(Value::as_str) == Some(NODE_PING)
+            && event.get("remote_endpoint_id").and_then(Value::as_str)
+                == Some(source_id.to_string().as_str())
+            && event.get("ok").and_then(Value::as_bool) == Some(false)
+            && event.get("error_code").and_then(Value::as_str) == Some("METHOD_NOT_ALLOWED")
+    })
+    .await;
+
+    source_endpoint.close().await;
+    harness.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_client_detects_endpoint_mismatch_before_sending_rpc() {
     let dir = tempfile::tempdir().expect("temp dir");
     let harness = spawn_local_agent(SecretKey::generate(), SecretKey::generate(), &dir).await;
@@ -287,15 +486,25 @@ async fn spawn_local_agent(
     agent_key: SecretKey,
     dir: &TempDir,
 ) -> LocalAgentHarness {
+    spawn_local_agent_with_peers(controller_key, agent_key, Vec::new(), dir).await
+}
+
+async fn spawn_local_agent_with_peers(
+    controller_key: SecretKey,
+    agent_key: SecretKey,
+    peers: Vec<PeerConfig>,
+    dir: &TempDir,
+) -> LocalAgentHarness {
     let controller = bind_controller_endpoint_local_only(controller_key.clone())
         .await
         .expect("bind local-only controller endpoint");
     let audit_path = dir.path().join("agent-audit.jsonl");
-    let config = test_config(
+    let mut config = test_config(
         controller_key.public(),
         audit_path.clone(),
         dir.path().join("agent.secret"),
     );
+    config.security.peers = peers;
     let audit = JsonlAuditWriter::new(audit_path.clone());
     let audit_limiter = Arc::new(Mutex::new(RejectedAuditLimiter::new(&config.audit)));
     let agent =
@@ -313,6 +522,9 @@ async fn spawn_local_agent(
         ))),
         limiters: Arc::new(ServerLimiters::from_config(&config.security)),
         audit_limiter,
+        authz: Arc::new(
+            AgentAuthorization::from_security_config(&config.security).expect("authz table builds"),
+        ),
         agent_endpoint_id: agent_id.to_string(),
     };
     let server_task = tokio::spawn(serve_endpoint(agent.clone(), state));
@@ -363,6 +575,7 @@ fn test_config(
                 endpoint_id: controller_endpoint_id.to_string(),
                 role: "viewer".to_string(),
             }],
+            peers: Vec::new(),
         },
         audit: AuditConfig {
             path: audit_path,

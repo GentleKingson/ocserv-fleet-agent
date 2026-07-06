@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
@@ -14,7 +14,8 @@ use ocfleet_config::agent::{AgentConfig, SecurityConfig};
 use ocfleet_protocol::constants::PROTOCOL_VERSION;
 use ocfleet_protocol::error::{ErrorCode, RpcError};
 use ocfleet_protocol::method::{
-    MethodStatus, NODE_INFO, NODE_PING, PROBE_CONTROLLER_PING, classify_phase_one_method,
+    MethodStatus, NODE_INFO, NODE_PING, PROBE_CONTROLLER_PING, PROBE_PEER_ECHO,
+    classify_phase_one_method,
 };
 use ocfleet_protocol::rpc::{RpcRequest, RpcResponse};
 use serde_json::{Value, json};
@@ -25,6 +26,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use crate::AGENT_VERSION;
 use crate::audit::{AgentAuditEvent, JsonlAuditWriter};
 use crate::audit_limiter::{AuditLimitDecision, RejectedAuditLimiter};
+use crate::authz::{AgentAuthorization, CallerClass};
 use crate::node_info::collect_node_info;
 use crate::nonce::{NonceCache, NonceDecision, NonceLimitScope};
 
@@ -35,6 +37,7 @@ pub struct AgentServerState {
     pub nonce_cache: Arc<Mutex<NonceCache>>,
     pub limiters: Arc<ServerLimiters>,
     pub audit_limiter: Arc<Mutex<RejectedAuditLimiter>>,
+    pub authz: Arc<AgentAuthorization>,
     pub agent_endpoint_id: String,
 }
 
@@ -164,19 +167,19 @@ impl RpcServerError {
 
 #[derive(Debug, Clone)]
 pub struct AllowlistHook {
-    allowed: HashSet<EndpointId>,
+    authz: Arc<AgentAuthorization>,
     audit: JsonlAuditWriter,
     audit_limiter: Arc<Mutex<RejectedAuditLimiter>>,
 }
 
 impl AllowlistHook {
     pub fn new(
-        allowed: HashSet<EndpointId>,
+        authz: Arc<AgentAuthorization>,
         audit: JsonlAuditWriter,
         audit_limiter: Arc<Mutex<RejectedAuditLimiter>>,
     ) -> Self {
         Self {
-            allowed,
+            authz,
             audit,
             audit_limiter,
         }
@@ -190,12 +193,19 @@ impl EndpointHooks for AllowlistHook {
         }
 
         let remote_endpoint_id = conn.remote_id();
-        if self.allowed.contains(&remote_endpoint_id) {
+        let caller_class = self.authz.classify(&remote_endpoint_id);
+        if self.authz.is_connection_admitted(&remote_endpoint_id) {
             return AfterHandshakeOutcome::Accept;
         }
 
         let alpn = String::from_utf8_lossy(conn.alpn());
-        let reason = format!("endpoint not allowed for ALPN {alpn}");
+        let reason = match caller_class {
+            CallerClass::DisabledPeer => format!("disabled peer not allowed for ALPN {alpn}"),
+            CallerClass::Unknown => format!("endpoint not allowed for ALPN {alpn}"),
+            CallerClass::Controller | CallerClass::Peer => {
+                format!("endpoint not admitted for ALPN {alpn}")
+            }
+        };
         write_limited_audit_event(
             &self.audit,
             &self.audit_limiter,
@@ -205,7 +215,7 @@ impl EndpointHooks for AllowlistHook {
             |suppressed_count, limit_key| {
                 let mut event = AgentAuditEvent::new("rpc_rejected");
                 event.remote_endpoint_id = Some(remote_endpoint_id.to_string());
-                event.stage = Some("endpoint_allowlist".to_string());
+                event.stage = Some("connection_admission".to_string());
                 event.allowed = Some(false);
                 event.ok = Some(false);
                 event.error_code = Some("ENDPOINT_NOT_ALLOWED".to_string());
@@ -427,24 +437,12 @@ fn agent_endpoint_builder(
     audit: JsonlAuditWriter,
     audit_limiter: Arc<Mutex<RejectedAuditLimiter>>,
 ) -> Result<iroh::endpoint::Builder> {
-    let allowed = config
-        .security
-        .controllers
-        .iter()
-        .map(|controller| {
-            parse_endpoint_id(&controller.endpoint_id).with_context(|| {
-                format!(
-                    "invalid allowed controller endpoint id: {}",
-                    controller.endpoint_id
-                )
-            })
-        })
-        .collect::<Result<HashSet<_>>>()?;
+    let authz = Arc::new(AgentAuthorization::from_security_config(&config.security)?);
 
     Ok(Endpoint::builder(presets::N0)
         .secret_key(secret_key)
         .alpns(vec![config.iroh.alpn.as_bytes().to_vec()])
-        .hooks(AllowlistHook::new(allowed, audit, audit_limiter)))
+        .hooks(AllowlistHook::new(authz, audit, audit_limiter)))
 }
 
 async fn serve_connection(
@@ -814,45 +812,14 @@ async fn validate_and_dispatch_request(
         }
     }
 
-    match classify_phase_one_method(&request.method) {
-        MethodStatus::KnownButNotAllowed => {
-            return Err(RequestDispatchError::new(
-                Some(request_id),
-                ErrorCode::MethodNotAllowed,
-                format!(
-                    "method is known but not allowed in phase 1: {}",
-                    request.method
-                ),
-                json!({"method": request.method}),
-            ));
-        }
-        MethodStatus::Unknown if request.method.starts_with("ocserv.") => {
-            return Err(RequestDispatchError::new(
-                Some(request_id),
-                ErrorCode::MethodNotAllowed,
-                format!(
-                    "method is known but not allowed in phase 1: {}",
-                    request.method
-                ),
-                json!({"method": request.method}),
-            ));
-        }
-        MethodStatus::Unknown => {
-            return Err(RequestDispatchError::new(
-                Some(request_id),
-                ErrorCode::MethodNotFound,
-                format!("method not found: {}", request.method),
-                json!({"method": request.method}),
-            ));
-        }
-        MethodStatus::Allowed => {}
-    }
+    let caller_class = classify_request_caller(state, remote_endpoint_id);
+    authorize_request_method(caller_class, &request.method, &request_id)?;
 
     if !params_are_empty(&request.params) {
         return Err(RequestDispatchError::new(
             Some(request_id),
             ErrorCode::ParamsInvalid,
-            "node.ping, node.info, and probe.controller.ping accept only null or empty object params in phase 1",
+            "node.ping, node.info, probe.controller.ping, and probe.peer.echo accept only null or empty object params",
             json!({}),
         ));
     }
@@ -864,7 +831,7 @@ async fn validate_and_dispatch_request(
     );
     match tokio::time::timeout(
         timeout,
-        dispatch_allowed_method(state, &request.method, &request_id),
+        dispatch_allowed_method(state, remote_endpoint_id, &request.method, &request_id),
     )
     .await
     {
@@ -878,8 +845,109 @@ async fn validate_and_dispatch_request(
     }
 }
 
+fn classify_request_caller(state: &AgentServerState, remote_endpoint_id: &str) -> CallerClass {
+    parse_endpoint_id(remote_endpoint_id)
+        .map(|endpoint_id| state.authz.classify(&endpoint_id))
+        .unwrap_or(CallerClass::Unknown)
+}
+
+fn authorize_request_method(
+    caller_class: CallerClass,
+    method: &str,
+    request_id: &str,
+) -> std::result::Result<(), RequestDispatchError> {
+    if matches!(
+        caller_class,
+        CallerClass::DisabledPeer | CallerClass::Unknown
+    ) {
+        return Err(RequestDispatchError::new(
+            Some(request_id.to_string()),
+            ErrorCode::EndpointNotAllowed,
+            "remote endpoint is not authorized",
+            json!({"method": method}),
+        ));
+    }
+
+    if AgentAuthorization::method_allowed(caller_class, method) {
+        return Ok(());
+    }
+
+    match caller_class {
+        CallerClass::Controller if method == PROBE_PEER_ECHO => Err(method_not_allowed_for_caller(
+            request_id,
+            method,
+            caller_class,
+        )),
+        CallerClass::Controller => authorize_controller_method(method, request_id),
+        CallerClass::Peer => authorize_peer_method(method, request_id),
+        CallerClass::DisabledPeer | CallerClass::Unknown => unreachable!(),
+    }
+}
+
+fn authorize_controller_method(
+    method: &str,
+    request_id: &str,
+) -> std::result::Result<(), RequestDispatchError> {
+    match classify_phase_one_method(method) {
+        MethodStatus::KnownButNotAllowed => Err(known_but_not_allowed(request_id, method)),
+        MethodStatus::Unknown if method.starts_with("ocserv.") => {
+            Err(known_but_not_allowed(request_id, method))
+        }
+        MethodStatus::Unknown => Err(RequestDispatchError::new(
+            Some(request_id.to_string()),
+            ErrorCode::MethodNotFound,
+            format!("method not found: {method}"),
+            json!({"method": method}),
+        )),
+        MethodStatus::Allowed => Ok(()),
+    }
+}
+
+fn authorize_peer_method(
+    method: &str,
+    request_id: &str,
+) -> std::result::Result<(), RequestDispatchError> {
+    match classify_phase_one_method(method) {
+        MethodStatus::Allowed | MethodStatus::KnownButNotAllowed => Err(
+            method_not_allowed_for_caller(request_id, method, CallerClass::Peer),
+        ),
+        MethodStatus::Unknown if method.starts_with("ocserv.") => Err(
+            method_not_allowed_for_caller(request_id, method, CallerClass::Peer),
+        ),
+        MethodStatus::Unknown => Err(RequestDispatchError::new(
+            Some(request_id.to_string()),
+            ErrorCode::MethodNotFound,
+            format!("method not found: {method}"),
+            json!({"method": method}),
+        )),
+    }
+}
+
+fn known_but_not_allowed(request_id: &str, method: &str) -> RequestDispatchError {
+    RequestDispatchError::new(
+        Some(request_id.to_string()),
+        ErrorCode::MethodNotAllowed,
+        format!("method is known but not allowed in phase 1: {method}"),
+        json!({"method": method}),
+    )
+}
+
+fn method_not_allowed_for_caller(
+    request_id: &str,
+    method: &str,
+    caller_class: CallerClass,
+) -> RequestDispatchError {
+    RequestDispatchError::new(
+        Some(request_id.to_string()),
+        ErrorCode::MethodNotAllowed,
+        format!("method is not allowed for {caller_class:?}: {method}"),
+        json!({"method": method}),
+    )
+}
+
 async fn dispatch_allowed_method(
     state: &AgentServerState,
+    remote_endpoint_id: &str,
     method: &str,
     request_id: &str,
 ) -> std::result::Result<Value, RequestDispatchError> {
@@ -896,6 +964,15 @@ async fn dispatch_allowed_method(
             "node_id": state.config.node.id,
             "agent_version": AGENT_VERSION,
             "agent_endpoint_id": state.agent_endpoint_id,
+            "time_utc": now_rfc3339(),
+        })),
+        PROBE_PEER_ECHO => Ok(json!({
+            "message": "pong",
+            "probe": "peer.echo",
+            "source_agent_endpoint_id": remote_endpoint_id,
+            "target_agent_endpoint_id": state.agent_endpoint_id,
+            "target_node_id": state.config.node.id,
+            "agent_version": AGENT_VERSION,
             "time_utc": now_rfc3339(),
         })),
         NODE_INFO => {
@@ -1166,14 +1243,16 @@ mod tests {
     #[tokio::test]
     async fn response_too_large_fallback_audit_matches_actual_response() {
         let dir = tempfile::tempdir().expect("temp dir");
+        let config = test_agent_config(dir.path());
+        let authz =
+            AgentAuthorization::from_security_config(&config.security).expect("authz table builds");
         let state = AgentServerState {
-            config: test_agent_config(dir.path()),
+            config: config.clone(),
             audit: JsonlAuditWriter::new(dir.path().join("audit.log")),
             nonce_cache: Arc::new(Mutex::new(NonceCache::new())),
             limiters: Arc::new(ServerLimiters::new(256, 256, 32, 1024, 128)),
-            audit_limiter: Arc::new(Mutex::new(RejectedAuditLimiter::new(
-                &test_agent_config(dir.path()).audit,
-            ))),
+            audit_limiter: Arc::new(Mutex::new(RejectedAuditLimiter::new(&config.audit))),
+            authz: Arc::new(authz),
             agent_endpoint_id: "agent-endpoint-1".to_string(),
         };
         let response = ok_response(
@@ -1212,14 +1291,15 @@ mod tests {
         std::fs::create_dir(&audit_directory).expect("audit directory");
         let mut config = test_agent_config(dir.path());
         config.audit.path = audit_directory.clone();
+        let authz =
+            AgentAuthorization::from_security_config(&config.security).expect("authz table builds");
         let state = AgentServerState {
-            config,
+            config: config.clone(),
             audit: JsonlAuditWriter::new(audit_directory),
             nonce_cache: Arc::new(Mutex::new(NonceCache::new())),
             limiters: Arc::new(ServerLimiters::new(256, 256, 32, 1024, 128)),
-            audit_limiter: Arc::new(Mutex::new(RejectedAuditLimiter::new(
-                &test_agent_config(dir.path()).audit,
-            ))),
+            audit_limiter: Arc::new(Mutex::new(RejectedAuditLimiter::new(&config.audit))),
+            authz: Arc::new(authz),
             agent_endpoint_id: "agent-endpoint-1".to_string(),
         };
         let response = ok_response(
@@ -1287,6 +1367,7 @@ mod tests {
                 max_live_nonces_global: 100_000,
                 max_live_nonces_per_controller: 10_000,
                 controllers: Vec::<ControllerConfig>::new(),
+                peers: Vec::new(),
             },
             audit: AuditConfig {
                 path: dir.join("audit.log"),

@@ -21,6 +21,7 @@ time.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 ocfleet-cli = { path = "../ocfleet-cli" }

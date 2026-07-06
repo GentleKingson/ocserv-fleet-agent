@@ -9,7 +9,7 @@ use ocfleet_agent::authz::AgentAuthorization;
 use ocfleet_agent::identity::load_or_create_secret_key;
 use ocfleet_agent::nonce::NonceCache;
 use ocfleet_agent::server::{
-    AgentServerState, ServerLimiters, bind_agent_endpoint, serve_endpoint,
+    AgentServerState, PathTargetResolver, ServerLimiters, bind_agent_endpoint, serve_endpoint,
 };
 use ocfleet_config::agent::load_agent_config;
 
@@ -49,6 +49,8 @@ async fn main() -> anyhow::Result<()> {
         audit_limiter,
         authz,
         agent_endpoint_id: endpoint_id.clone(),
+        outbound_endpoint: Some(endpoint.clone()),
+        path_target_resolver: PathTargetResolver::endpoint_id_only(),
     };
 
     println!("agent_endpoint_id={endpoint_id}");

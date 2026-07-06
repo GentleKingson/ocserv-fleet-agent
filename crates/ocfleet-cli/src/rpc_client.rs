@@ -274,6 +274,154 @@ pub fn validate_rpc_response(
     ))
 }
 
+pub fn validate_path_echo_result(
+    result: &Value,
+    expected_source_endpoint_id: &str,
+    expected_target_endpoint_id: &str,
+    expected_root_request_id: &str,
+) -> Result<(), RpcClientError> {
+    let object = result.as_object().ok_or_else(|| {
+        RpcClientError::structured(ErrorCode::InvalidResponse, "path result must be an object")
+    })?;
+    require_str(object, "probe", "path.echo")?;
+    require_str(
+        object,
+        "source_agent_endpoint_id",
+        expected_source_endpoint_id,
+    )?;
+    require_str(
+        object,
+        "target_agent_endpoint_id",
+        expected_target_endpoint_id,
+    )?;
+    require_str(object, "root_request_id", expected_root_request_id)?;
+    require_string_field(object, "peer_request_id")?;
+    let time_utc = require_string_field(object, "time_utc")?;
+    OffsetDateTime::parse(time_utc, &time::format_description::well_known::Rfc3339).map_err(
+        |err| {
+            RpcClientError::structured(
+                ErrorCode::InvalidResponse,
+                format!("invalid path time_utc: {err}"),
+            )
+        },
+    )?;
+
+    let ok = object
+        .get("ok")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| RpcClientError::structured(ErrorCode::InvalidResponse, "ok must be bool"))?;
+    if ok {
+        validate_path_success_fields(object)?;
+        let target_result = object.get("target_result").ok_or_else(|| {
+            RpcClientError::structured(
+                ErrorCode::InvalidResponse,
+                "successful path result must include target_result",
+            )
+        })?;
+        validate_normalized_peer_echo_result(target_result)?;
+    } else {
+        validate_path_failure_fields(object)?;
+        require_string_field(object, "error_code")?;
+        require_string_field(object, "message")?;
+    }
+    Ok(())
+}
+
+fn validate_path_success_fields(
+    object: &serde_json::Map<String, Value>,
+) -> Result<(), RpcClientError> {
+    let mut fields = object.keys().map(String::as_str).collect::<Vec<_>>();
+    fields.sort_unstable();
+    let expected = [
+        "ok",
+        "peer_request_id",
+        "probe",
+        "root_request_id",
+        "source_agent_endpoint_id",
+        "target_agent_endpoint_id",
+        "target_result",
+        "time_utc",
+    ];
+    if fields != expected {
+        return Err(RpcClientError::structured(
+            ErrorCode::InvalidResponse,
+            format!("path success result fields mismatch: {fields:?}"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_path_failure_fields(
+    object: &serde_json::Map<String, Value>,
+) -> Result<(), RpcClientError> {
+    let mut fields = object.keys().map(String::as_str).collect::<Vec<_>>();
+    fields.sort_unstable();
+    let expected = [
+        "error_code",
+        "message",
+        "ok",
+        "peer_request_id",
+        "probe",
+        "root_request_id",
+        "source_agent_endpoint_id",
+        "target_agent_endpoint_id",
+        "time_utc",
+    ];
+    if fields != expected {
+        return Err(RpcClientError::structured(
+            ErrorCode::InvalidResponse,
+            format!("path failure result fields mismatch: {fields:?}"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_normalized_peer_echo_result(result: &Value) -> Result<(), RpcClientError> {
+    let object = result.as_object().ok_or_else(|| {
+        RpcClientError::structured(
+            ErrorCode::InvalidResponse,
+            "target_result must be an object",
+        )
+    })?;
+    let mut fields = object.keys().map(String::as_str).collect::<Vec<_>>();
+    fields.sort_unstable();
+    if fields != ["message", "probe"] {
+        return Err(RpcClientError::structured(
+            ErrorCode::InvalidResponse,
+            format!("target_result fields mismatch: {fields:?}"),
+        ));
+    }
+    require_str(object, "probe", "peer.echo")?;
+    require_str(object, "message", "pong")
+}
+
+fn require_str(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+    expected: &str,
+) -> Result<(), RpcClientError> {
+    let actual = require_string_field(object, field)?;
+    if actual != expected {
+        return Err(RpcClientError::structured(
+            ErrorCode::InvalidResponse,
+            format!("{field} mismatch: expected={expected} actual={actual}"),
+        ));
+    }
+    Ok(())
+}
+
+fn require_string_field<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<&'a str, RpcClientError> {
+    object.get(field).and_then(Value::as_str).ok_or_else(|| {
+        RpcClientError::structured(
+            ErrorCode::InvalidResponse,
+            format!("{field} must be a string"),
+        )
+    })
+}
+
 async fn write_request_frame<W>(writer: &mut W, request: &RpcRequest) -> Result<(), RpcClientError>
 where
     W: AsyncWrite + Unpin,

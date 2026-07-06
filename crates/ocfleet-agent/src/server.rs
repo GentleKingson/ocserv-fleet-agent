@@ -9,12 +9,12 @@ use base64::Engine;
 use iroh::endpoint::{
     AfterHandshakeOutcome, Connection, EndpointHooks, RecvStream, SendStream, Side, presets,
 };
-use iroh::{Endpoint, EndpointId, RelayMode, SecretKey};
+use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey};
 use ocfleet_config::agent::{AgentConfig, SecurityConfig};
 use ocfleet_protocol::constants::PROTOCOL_VERSION;
 use ocfleet_protocol::error::{ErrorCode, RpcError};
 use ocfleet_protocol::method::{
-    MethodStatus, NODE_INFO, NODE_PING, PROBE_CONTROLLER_PING, PROBE_PEER_ECHO,
+    MethodStatus, NODE_INFO, NODE_PING, PROBE_CONTROLLER_PING, PROBE_PATH_ECHO, PROBE_PEER_ECHO,
     classify_phase_one_method,
 };
 use ocfleet_protocol::rpc::{RpcRequest, RpcResponse};
@@ -26,9 +26,10 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use crate::AGENT_VERSION;
 use crate::audit::{AgentAuditEvent, JsonlAuditWriter};
 use crate::audit_limiter::{AuditLimitDecision, RejectedAuditLimiter};
-use crate::authz::{AgentAuthorization, CallerClass};
+use crate::authz::{AgentAuthorization, CallerClass, PathProbeDecision};
 use crate::node_info::collect_node_info;
 use crate::nonce::{NonceCache, NonceDecision, NonceLimitScope};
+use crate::peer_echo::{PeerEchoAuditContext, PeerEchoCall, PeerEchoLimits, call_peer_echo};
 
 #[derive(Debug, Clone)]
 pub struct AgentServerState {
@@ -39,6 +40,37 @@ pub struct AgentServerState {
     pub audit_limiter: Arc<Mutex<RejectedAuditLimiter>>,
     pub authz: Arc<AgentAuthorization>,
     pub agent_endpoint_id: String,
+    pub outbound_endpoint: Option<Endpoint>,
+    pub path_target_resolver: PathTargetResolver,
+}
+
+#[derive(Debug, Clone)]
+pub struct PathTargetResolver {
+    test_addrs: Arc<HashMap<EndpointId, EndpointAddr>>,
+}
+
+impl PathTargetResolver {
+    pub fn endpoint_id_only() -> Self {
+        Self {
+            test_addrs: Arc::new(HashMap::new()),
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn for_local_e2e_tests(
+        entries: impl IntoIterator<Item = (EndpointId, EndpointAddr)>,
+    ) -> Self {
+        Self {
+            test_addrs: Arc::new(entries.into_iter().collect()),
+        }
+    }
+
+    fn resolve(&self, target_endpoint_id: EndpointId) -> EndpointAddr {
+        self.test_addrs
+            .get(&target_endpoint_id)
+            .cloned()
+            .unwrap_or_else(|| EndpointAddr::new(target_endpoint_id))
+    }
 }
 
 #[derive(Debug)]
@@ -583,12 +615,14 @@ async fn handle_bi_stream(
     let response = handle_request(&state, &remote_endpoint_id, request.clone()).await;
     let mut event = base_audit_event(&remote_endpoint_id, "dispatch", started);
     event.request_id = response.request_id.clone();
-    event.method = Some(request.method);
+    let method = request.method.clone();
+    event.method = Some(method.clone());
     event.params_hash = Some(hash_json_value(&request.params));
     event.nonce_hash = Some(hash_string(&request.nonce));
     event.allowed = Some(response.ok);
     event.ok = Some(response.ok);
     event.error_code = response_error_code(&response);
+    sync_path_audit_fields(&mut event, &method, &request.params, &response);
     audit_then_write_response(&state, &mut send, response, event, max_response_bytes).await?;
     Ok(())
 }
@@ -642,6 +676,43 @@ fn sync_audit_event_with_response(
     event.allowed = Some(response.ok);
     event.error_code = response_error_code(response);
     event.response_bytes = Some(response_bytes);
+}
+
+fn sync_path_audit_fields(
+    event: &mut AgentAuditEvent,
+    method: &str,
+    params: &Value,
+    response: &RpcResponse,
+) {
+    if method != PROBE_PATH_ECHO {
+        return;
+    }
+
+    event.root_request_id = event.request_id.clone();
+    if let Some(target) = params
+        .get("target_agent_endpoint_id")
+        .and_then(Value::as_str)
+        .and_then(|value| parse_endpoint_id(value).ok())
+    {
+        event.path_target_endpoint_id = Some(target.to_string());
+    }
+
+    let Some(result) = response.result.as_ref().and_then(Value::as_object) else {
+        return;
+    };
+    if let Some(root_request_id) = result.get("root_request_id").and_then(Value::as_str) {
+        event.root_request_id = Some(root_request_id.to_string());
+    }
+    if let Some(peer_request_id) = result.get("peer_request_id").and_then(Value::as_str) {
+        event.peer_request_id = Some(peer_request_id.to_string());
+    }
+    if let Some(target_endpoint_id) = result
+        .get("target_agent_endpoint_id")
+        .and_then(Value::as_str)
+        .and_then(|value| parse_endpoint_id(value).ok())
+    {
+        event.path_target_endpoint_id = Some(target_endpoint_id.to_string());
+    }
 }
 
 fn serialize_response(
@@ -706,6 +777,11 @@ impl RequestDispatchError {
             details,
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct ValidatedPathProbe {
+    target_endpoint_id: EndpointId,
 }
 
 async fn validate_and_dispatch_request(
@@ -815,14 +891,21 @@ async fn validate_and_dispatch_request(
     let caller_class = classify_request_caller(state, remote_endpoint_id);
     authorize_request_method(caller_class, &request.method, &request_id)?;
 
-    if !params_are_empty(&request.params) {
-        return Err(RequestDispatchError::new(
-            Some(request_id),
-            ErrorCode::ParamsInvalid,
-            "node.ping, node.info, probe.controller.ping, and probe.peer.echo accept only null or empty object params",
-            json!({}),
-        ));
-    }
+    let path_probe = if request.method == PROBE_PATH_ECHO {
+        let target_endpoint_id = validate_path_echo_params(&request.params, &request_id)?;
+        authorize_path_probe_target(state, remote_endpoint_id, target_endpoint_id, &request_id)?;
+        Some(ValidatedPathProbe { target_endpoint_id })
+    } else {
+        if !params_are_empty(&request.params) {
+            return Err(RequestDispatchError::new(
+                Some(request_id),
+                ErrorCode::ParamsInvalid,
+                "node.ping, node.info, probe.controller.ping, and probe.peer.echo accept only null or empty object params",
+                json!({}),
+            ));
+        }
+        None
+    };
 
     let timeout = StdDuration::from_millis(
         request
@@ -831,7 +914,13 @@ async fn validate_and_dispatch_request(
     );
     match tokio::time::timeout(
         timeout,
-        dispatch_allowed_method(state, remote_endpoint_id, &request.method, &request_id),
+        dispatch_allowed_method(
+            state,
+            remote_endpoint_id,
+            &request.method,
+            &request_id,
+            path_probe,
+        ),
     )
     .await
     {
@@ -841,6 +930,103 @@ async fn validate_and_dispatch_request(
             ErrorCode::RpcTimeout,
             "rpc execution exceeded timeout",
             json!({"timeout_ms": timeout.as_millis()}),
+        )),
+    }
+}
+
+fn validate_path_echo_params(
+    params: &Value,
+    request_id: &str,
+) -> std::result::Result<EndpointId, RequestDispatchError> {
+    let object = params.as_object().ok_or_else(|| {
+        RequestDispatchError::new(
+            Some(request_id.to_string()),
+            ErrorCode::ParamsInvalid,
+            "probe.path.echo params must be an object with target_agent_endpoint_id",
+            json!({}),
+        )
+    })?;
+    if object.len() != 1 || !object.contains_key("target_agent_endpoint_id") {
+        return Err(RequestDispatchError::new(
+            Some(request_id.to_string()),
+            ErrorCode::ParamsInvalid,
+            "probe.path.echo params must contain only target_agent_endpoint_id",
+            json!({}),
+        ));
+    }
+    let target = object
+        .get("target_agent_endpoint_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            RequestDispatchError::new(
+                Some(request_id.to_string()),
+                ErrorCode::ParamsInvalid,
+                "target_agent_endpoint_id must be a string",
+                json!({}),
+            )
+        })?;
+    parse_endpoint_id(target).map_err(|err| {
+        RequestDispatchError::new(
+            Some(request_id.to_string()),
+            ErrorCode::ParamsInvalid,
+            format!("invalid target_agent_endpoint_id: {err}"),
+            json!({}),
+        )
+    })
+}
+
+fn authorize_path_probe_target(
+    state: &AgentServerState,
+    remote_endpoint_id: &str,
+    target_endpoint_id: EndpointId,
+    request_id: &str,
+) -> std::result::Result<(), RequestDispatchError> {
+    let controller_endpoint_id = parse_endpoint_id(remote_endpoint_id).map_err(|err| {
+        RequestDispatchError::new(
+            Some(request_id.to_string()),
+            ErrorCode::EndpointNotAllowed,
+            format!("invalid controller EndpointID: {err}"),
+            json!({}),
+        )
+    })?;
+    let source_endpoint_id = parse_endpoint_id(&state.agent_endpoint_id).map_err(|err| {
+        RequestDispatchError::new(
+            Some(request_id.to_string()),
+            ErrorCode::InternalError,
+            format!("invalid source agent EndpointID: {err}"),
+            json!({}),
+        )
+    })?;
+
+    match state.authz.path_probe_decision(
+        &controller_endpoint_id,
+        &target_endpoint_id,
+        &source_endpoint_id,
+    ) {
+        PathProbeDecision::Allowed => Ok(()),
+        PathProbeDecision::SelfTarget => Err(RequestDispatchError::new(
+            Some(request_id.to_string()),
+            ErrorCode::ParamsInvalid,
+            "probe.path.echo target must not be the source agent",
+            json!({"target_agent_endpoint_id": target_endpoint_id.to_string()}),
+        )),
+        PathProbeDecision::TargetIsController => Err(RequestDispatchError::new(
+            Some(request_id.to_string()),
+            ErrorCode::EndpointNotAllowed,
+            "probe.path.echo target must not be a controller EndpointID",
+            json!({"target_agent_endpoint_id": target_endpoint_id.to_string()}),
+        )),
+        PathProbeDecision::Disabled => Err(RequestDispatchError::new(
+            Some(request_id.to_string()),
+            ErrorCode::EndpointNotAllowed,
+            "probe.path.echo authorization is disabled",
+            json!({"target_agent_endpoint_id": target_endpoint_id.to_string()}),
+        )),
+        PathProbeDecision::Missing => Err(RequestDispatchError::new(
+            Some(request_id.to_string()),
+            ErrorCode::EndpointNotAllowed,
+            "probe.path.echo authorization is missing",
+            json!({"target_agent_endpoint_id": target_endpoint_id.to_string()}),
         )),
     }
 }
@@ -911,6 +1097,11 @@ fn authorize_peer_method(
         MethodStatus::Allowed | MethodStatus::KnownButNotAllowed => Err(
             method_not_allowed_for_caller(request_id, method, CallerClass::Peer),
         ),
+        MethodStatus::Unknown if method == PROBE_PATH_ECHO => Err(method_not_allowed_for_caller(
+            request_id,
+            method,
+            CallerClass::Peer,
+        )),
         MethodStatus::Unknown if method.starts_with("ocserv.") => Err(
             method_not_allowed_for_caller(request_id, method, CallerClass::Peer),
         ),
@@ -950,6 +1141,7 @@ async fn dispatch_allowed_method(
     remote_endpoint_id: &str,
     method: &str,
     request_id: &str,
+    path_probe: Option<ValidatedPathProbe>,
 ) -> std::result::Result<Value, RequestDispatchError> {
     match method {
         NODE_PING => Ok(json!({
@@ -975,6 +1167,17 @@ async fn dispatch_allowed_method(
             "agent_version": AGENT_VERSION,
             "time_utc": now_rfc3339(),
         })),
+        PROBE_PATH_ECHO => {
+            let path_probe = path_probe.ok_or_else(|| {
+                RequestDispatchError::new(
+                    Some(request_id.to_string()),
+                    ErrorCode::InternalError,
+                    "missing validated path probe params",
+                    json!({}),
+                )
+            })?;
+            dispatch_path_echo(state, request_id, path_probe).await
+        }
         NODE_INFO => {
             let info = collect_node_info(
                 state.config.node.id.clone(),
@@ -999,6 +1202,106 @@ async fn dispatch_allowed_method(
             json!({"method": method}),
         )),
     }
+}
+
+async fn dispatch_path_echo(
+    state: &AgentServerState,
+    request_id: &str,
+    path_probe: ValidatedPathProbe,
+) -> std::result::Result<Value, RequestDispatchError> {
+    let source_endpoint_id = parse_endpoint_id(&state.agent_endpoint_id).map_err(|err| {
+        RequestDispatchError::new(
+            Some(request_id.to_string()),
+            ErrorCode::InternalError,
+            format!("invalid source agent EndpointID: {err}"),
+            json!({}),
+        )
+    })?;
+    let Some(endpoint) = state.outbound_endpoint.as_ref() else {
+        return Err(RequestDispatchError::new(
+            Some(request_id.to_string()),
+            ErrorCode::InternalError,
+            "source agent outbound endpoint is unavailable",
+            json!({}),
+        ));
+    };
+
+    let target_endpoint_id = path_probe.target_endpoint_id;
+    let target = state.path_target_resolver.resolve(target_endpoint_id);
+    let limits = PeerEchoLimits {
+        deadline_ms: state.config.security.max_rpc_timeout_ms,
+        max_request_bytes: state.config.security.max_request_bytes,
+        max_response_bytes: state.config.security.max_response_bytes,
+    };
+    let output = call_peer_echo(PeerEchoCall {
+        endpoint,
+        target,
+        expected_target_endpoint_id: target_endpoint_id,
+        source_endpoint_id,
+        alpn: state.config.iroh.alpn.as_bytes(),
+        audit: &state.audit,
+        limits,
+        audit_context: PeerEchoAuditContext {
+            root_request_id: Some(request_id.to_string()),
+            path_target_endpoint_id: Some(target_endpoint_id.to_string()),
+        },
+    })
+    .await;
+
+    match output {
+        Ok(output) => Ok(json!({
+            "probe": "path.echo",
+            "ok": true,
+            "source_agent_endpoint_id": source_endpoint_id.to_string(),
+            "target_agent_endpoint_id": target_endpoint_id.to_string(),
+            "root_request_id": request_id,
+            "peer_request_id": output.request_id,
+            "target_result": normalize_peer_echo_result(&output.result, request_id)?,
+            "time_utc": now_rfc3339(),
+        })),
+        Err(err) if err.code() == ErrorCode::AuditWriteFailed => Err(RequestDispatchError::new(
+            Some(request_id.to_string()),
+            err.code(),
+            err.to_string(),
+            err.details().clone(),
+        )),
+        Err(err) => Ok(json!({
+            "probe": "path.echo",
+            "ok": false,
+            "source_agent_endpoint_id": source_endpoint_id.to_string(),
+            "target_agent_endpoint_id": target_endpoint_id.to_string(),
+            "root_request_id": request_id,
+            "peer_request_id": err.request_id(),
+            "error_code": error_code_name(&err.code()),
+            "message": "target peer echo failed",
+            "time_utc": now_rfc3339(),
+        })),
+    }
+}
+
+fn normalize_peer_echo_result(
+    result: &Value,
+    request_id: &str,
+) -> std::result::Result<Value, RequestDispatchError> {
+    let object = result.as_object().ok_or_else(|| {
+        RequestDispatchError::new(
+            Some(request_id.to_string()),
+            ErrorCode::InvalidResponse,
+            "peer echo result must be an object",
+            json!({}),
+        )
+    })?;
+    let probe = object.get("probe").and_then(Value::as_str);
+    let message = object.get("message").and_then(Value::as_str);
+    if probe != Some("peer.echo") || message != Some("pong") {
+        return Err(RequestDispatchError::new(
+            Some(request_id.to_string()),
+            ErrorCode::InvalidResponse,
+            "peer echo result did not contain expected fixed response",
+            json!({}),
+        ));
+    }
+    Ok(json!({"probe": "peer.echo", "message": "pong"}))
 }
 
 fn valid_request_id(value: &str) -> bool {
@@ -1188,6 +1491,13 @@ fn response_error_code(response: &RpcResponse) -> Option<String> {
     })
 }
 
+fn error_code_name(code: &ErrorCode) -> String {
+    serde_json::to_value(code)
+        .ok()
+        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+        .unwrap_or_else(|| format!("{code:?}"))
+}
+
 fn hash_json_value(value: &Value) -> String {
     let bytes = serde_json::to_vec(value).unwrap_or_else(|_| b"null".to_vec());
     blake3::hash(&bytes).to_hex().to_string()
@@ -1254,6 +1564,8 @@ mod tests {
             audit_limiter: Arc::new(Mutex::new(RejectedAuditLimiter::new(&config.audit))),
             authz: Arc::new(authz),
             agent_endpoint_id: "agent-endpoint-1".to_string(),
+            outbound_endpoint: None,
+            path_target_resolver: PathTargetResolver::endpoint_id_only(),
         };
         let response = ok_response(
             "00000000-0000-4000-8000-000000000001".to_string(),
@@ -1301,6 +1613,8 @@ mod tests {
             audit_limiter: Arc::new(Mutex::new(RejectedAuditLimiter::new(&config.audit))),
             authz: Arc::new(authz),
             agent_endpoint_id: "agent-endpoint-1".to_string(),
+            outbound_endpoint: None,
+            path_target_resolver: PathTargetResolver::endpoint_id_only(),
         };
         let response = ok_response(
             "00000000-0000-4000-8000-000000000001".to_string(),
@@ -1368,6 +1682,7 @@ mod tests {
                 max_live_nonces_per_controller: 10_000,
                 controllers: Vec::<ControllerConfig>::new(),
                 peers: Vec::new(),
+                path_probes: Vec::new(),
             },
             audit: AuditConfig {
                 path: dir.join("audit.log"),

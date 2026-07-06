@@ -12,6 +12,7 @@ pub const NODE_PING: &str = "node.ping";
 pub const NODE_INFO: &str = "node.info";
 pub const PROBE_CONTROLLER_PING: &str = "probe.controller.ping";
 pub const PROBE_PEER_ECHO: &str = "probe.peer.echo";
+pub const PROBE_PATH_ECHO: &str = "probe.path.echo";
 
 pub fn classify_phase_one_method(method: &str) -> MethodStatus {
     match method {

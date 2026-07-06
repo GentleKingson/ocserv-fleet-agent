@@ -7,18 +7,24 @@ use ocfleet_agent::audit::JsonlAuditWriter;
 use ocfleet_agent::audit_limiter::RejectedAuditLimiter;
 use ocfleet_agent::authz::AgentAuthorization;
 use ocfleet_agent::nonce::NonceCache;
-use ocfleet_agent::peer_echo::{PeerEchoCall, PeerEchoLimits, call_peer_echo};
+use ocfleet_agent::peer_echo::{
+    PeerEchoAuditContext, PeerEchoCall, PeerEchoLimits, call_peer_echo,
+};
 use ocfleet_agent::server::{
-    AgentServerState, ServerLimiters, bind_agent_endpoint_local_only, serve_endpoint,
+    AgentServerState, PathTargetResolver, ServerLimiters, bind_agent_endpoint_local_only,
+    serve_endpoint,
 };
 use ocfleet_cli::rpc_client::{
     bind_controller_endpoint_local_only, build_request, call_endpoint_addr,
 };
 use ocfleet_config::agent::{
-    AgentConfig, AuditConfig, ControllerConfig, IrohConfig, NodeConfig, PeerConfig, SecurityConfig,
+    AgentConfig, AuditConfig, ControllerConfig, IrohConfig, NodeConfig, PathProbeConfig,
+    PeerConfig, SecurityConfig,
 };
 use ocfleet_protocol::error::ErrorCode;
-use ocfleet_protocol::method::{NODE_INFO, NODE_PING, PROBE_CONTROLLER_PING, PROBE_PEER_ECHO};
+use ocfleet_protocol::method::{
+    NODE_INFO, NODE_PING, PROBE_CONTROLLER_PING, PROBE_PATH_ECHO, PROBE_PEER_ECHO,
+};
 use ocfleet_protocol::rpc::RpcResponse;
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -32,6 +38,32 @@ struct LocalAgentHarness {
     config: AgentConfig,
     audit_path: PathBuf,
     server_task: JoinHandle<anyhow::Result<()>>,
+}
+
+struct LocalPathProbeHarness {
+    controller: Endpoint,
+    source: Endpoint,
+    target: Endpoint,
+    source_addr: EndpointAddr,
+    source_id: EndpointId,
+    target_id: EndpointId,
+    source_config: AgentConfig,
+    source_audit_path: PathBuf,
+    target_audit_path: PathBuf,
+    source_task: JoinHandle<anyhow::Result<()>>,
+    target_task: JoinHandle<anyhow::Result<()>>,
+}
+
+impl LocalPathProbeHarness {
+    async fn shutdown(self) {
+        self.source.close().await;
+        self.target.close().await;
+        self.controller.close().await;
+        self.source_task.abort();
+        self.target_task.abort();
+        let _ = self.source_task.await;
+        let _ = self.target_task.await;
+    }
 }
 
 impl LocalAgentHarness {
@@ -329,6 +361,7 @@ async fn local_peer_echo_helper_calls_authorized_target_and_writes_both_audits()
         alpn: harness.config.iroh.alpn.as_bytes(),
         audit: &source_audit,
         limits: PeerEchoLimits::default(),
+        audit_context: PeerEchoAuditContext::default(),
     })
     .await
     .expect("peer echo helper succeeds");
@@ -444,6 +477,202 @@ async fn local_peer_connection_cannot_call_controller_only_method() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_controller_can_run_one_hop_path_probe_and_link_three_audits() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let harness = spawn_local_path_probe_agents(&dir, true).await;
+    let request = build_request(
+        PROBE_PATH_ECHO,
+        json!({"target_agent_endpoint_id": harness.target_id.to_string()}),
+        Some("local-cli".into()),
+        5_000,
+    );
+    let root_request_id = request.request_id.clone();
+
+    let response = call_endpoint_addr(
+        &harness.controller,
+        harness.source_addr.clone(),
+        harness.source_id,
+        harness.source_config.iroh.alpn.as_bytes(),
+        request,
+    )
+    .await
+    .expect("probe.path.echo rpc");
+
+    assert!(response.ok, "{response:#?}");
+    let result = response.result.as_ref().expect("path result");
+    assert_eq!(result["probe"], "path.echo");
+    assert_eq!(result["ok"], true);
+    assert_eq!(
+        result["source_agent_endpoint_id"],
+        harness.source_id.to_string()
+    );
+    assert_eq!(
+        result["target_agent_endpoint_id"],
+        harness.target_id.to_string()
+    );
+    assert_eq!(result["root_request_id"], root_request_id);
+    let peer_request_id = result["peer_request_id"]
+        .as_str()
+        .expect("peer_request_id")
+        .to_string();
+    assert_eq!(
+        result["target_result"],
+        json!({"probe": "peer.echo", "message": "pong"})
+    );
+    assert!(
+        time::OffsetDateTime::parse(
+            result["time_utc"].as_str().expect("path time"),
+            &time::format_description::well_known::Rfc3339,
+        )
+        .is_ok()
+    );
+    let mut fields = result
+        .as_object()
+        .expect("path result object")
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    fields.sort_unstable();
+    assert_eq!(
+        fields,
+        vec![
+            "ok",
+            "peer_request_id",
+            "probe",
+            "root_request_id",
+            "source_agent_endpoint_id",
+            "target_agent_endpoint_id",
+            "target_result",
+            "time_utc"
+        ]
+    );
+
+    wait_for_audit_event(&harness.source_audit_path, |event| {
+        event.get("stage").and_then(Value::as_str) == Some("dispatch")
+            && event.get("method").and_then(Value::as_str) == Some(PROBE_PATH_ECHO)
+            && event.get("request_id").and_then(Value::as_str) == Some(root_request_id.as_str())
+            && event.get("root_request_id").and_then(Value::as_str)
+                == Some(root_request_id.as_str())
+            && event.get("peer_request_id").and_then(Value::as_str)
+                == Some(peer_request_id.as_str())
+            && event.get("path_target_endpoint_id").and_then(Value::as_str)
+                == Some(harness.target_id.to_string().as_str())
+            && event.get("ok").and_then(Value::as_bool) == Some(true)
+    })
+    .await;
+
+    wait_for_audit_event(&harness.source_audit_path, |event| {
+        event.get("stage").and_then(Value::as_str) == Some("source_peer_echo")
+            && event.get("method").and_then(Value::as_str) == Some(PROBE_PEER_ECHO)
+            && event.get("request_id").and_then(Value::as_str) == Some(peer_request_id.as_str())
+            && event.get("root_request_id").and_then(Value::as_str)
+                == Some(root_request_id.as_str())
+            && event.get("peer_request_id").and_then(Value::as_str)
+                == Some(peer_request_id.as_str())
+            && event.get("path_target_endpoint_id").and_then(Value::as_str)
+                == Some(harness.target_id.to_string().as_str())
+            && event.get("ok").and_then(Value::as_bool) == Some(true)
+    })
+    .await;
+
+    wait_for_audit_event(&harness.target_audit_path, |event| {
+        event.get("stage").and_then(Value::as_str) == Some("dispatch")
+            && event.get("method").and_then(Value::as_str) == Some(PROBE_PEER_ECHO)
+            && event.get("remote_endpoint_id").and_then(Value::as_str)
+                == Some(harness.source_id.to_string().as_str())
+            && event.get("request_id").and_then(Value::as_str) == Some(peer_request_id.as_str())
+            && event.get("root_request_id").is_none_or(Value::is_null)
+            && event.get("ok").and_then(Value::as_bool) == Some(true)
+    })
+    .await;
+
+    harness.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_path_probe_target_segment_failure_is_outer_success_with_correlated_source_audit() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let harness = spawn_local_path_probe_agents(&dir, false).await;
+    let request = build_request(
+        PROBE_PATH_ECHO,
+        json!({"target_agent_endpoint_id": harness.target_id.to_string()}),
+        Some("local-cli".into()),
+        5_000,
+    );
+    let root_request_id = request.request_id.clone();
+
+    let response = call_endpoint_addr(
+        &harness.controller,
+        harness.source_addr.clone(),
+        harness.source_id,
+        harness.source_config.iroh.alpn.as_bytes(),
+        request,
+    )
+    .await
+    .expect("probe.path.echo rpc");
+
+    assert!(response.ok, "{response:#?}");
+    let result = response.result.as_ref().expect("path result");
+    assert_eq!(result["probe"], "path.echo");
+    assert_eq!(result["ok"], false);
+    assert_eq!(
+        result["source_agent_endpoint_id"],
+        harness.source_id.to_string()
+    );
+    assert_eq!(
+        result["target_agent_endpoint_id"],
+        harness.target_id.to_string()
+    );
+    assert_eq!(result["root_request_id"], root_request_id);
+    assert!(result["peer_request_id"].as_str().is_some());
+    assert!(result["error_code"].as_str().is_some());
+    assert_eq!(result["message"], "target peer echo failed");
+    assert!(result.get("target_result").is_none());
+    let peer_request_id = result["peer_request_id"]
+        .as_str()
+        .expect("peer request id")
+        .to_string();
+
+    wait_for_audit_event(&harness.source_audit_path, |event| {
+        event.get("stage").and_then(Value::as_str) == Some("source_peer_echo")
+            && event.get("method").and_then(Value::as_str) == Some(PROBE_PEER_ECHO)
+            && event.get("request_id").and_then(Value::as_str) == Some(peer_request_id.as_str())
+            && event.get("root_request_id").and_then(Value::as_str)
+                == Some(root_request_id.as_str())
+            && event.get("peer_request_id").and_then(Value::as_str)
+                == Some(peer_request_id.as_str())
+            && event.get("path_target_endpoint_id").and_then(Value::as_str)
+                == Some(harness.target_id.to_string().as_str())
+            && event.get("ok").and_then(Value::as_bool) == Some(false)
+    })
+    .await;
+
+    wait_for_audit_event(&harness.source_audit_path, |event| {
+        event.get("stage").and_then(Value::as_str) == Some("dispatch")
+            && event.get("method").and_then(Value::as_str) == Some(PROBE_PATH_ECHO)
+            && event.get("request_id").and_then(Value::as_str) == Some(root_request_id.as_str())
+            && event.get("root_request_id").and_then(Value::as_str)
+                == Some(root_request_id.as_str())
+            && event.get("peer_request_id").and_then(Value::as_str)
+                == Some(peer_request_id.as_str())
+            && event.get("path_target_endpoint_id").and_then(Value::as_str)
+                == Some(harness.target_id.to_string().as_str())
+    })
+    .await;
+
+    wait_for_audit_event(&harness.target_audit_path, |event| {
+        event.get("event").and_then(Value::as_str) == Some("rpc_rejected")
+            && event.get("stage").and_then(Value::as_str) == Some("connection_admission")
+            && event.get("request_id").is_none_or(Value::is_null)
+            && event.get("root_request_id").is_none_or(Value::is_null)
+            && event.get("peer_request_id").is_none_or(Value::is_null)
+    })
+    .await;
+
+    harness.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_client_detects_endpoint_mismatch_before_sending_rpc() {
     let dir = tempfile::tempdir().expect("temp dir");
     let harness = spawn_local_agent(SecretKey::generate(), SecretKey::generate(), &dir).await;
@@ -526,6 +755,8 @@ async fn spawn_local_agent_with_peers(
             AgentAuthorization::from_security_config(&config.security).expect("authz table builds"),
         ),
         agent_endpoint_id: agent_id.to_string(),
+        outbound_endpoint: Some(agent.clone()),
+        path_target_resolver: PathTargetResolver::endpoint_id_only(),
     };
     let server_task = tokio::spawn(serve_endpoint(agent.clone(), state));
 
@@ -539,6 +770,128 @@ async fn spawn_local_agent_with_peers(
         config,
         audit_path,
         server_task,
+    }
+}
+
+async fn spawn_local_path_probe_agents(
+    dir: &TempDir,
+    target_allows_source: bool,
+) -> LocalPathProbeHarness {
+    let controller_key = SecretKey::generate();
+    let source_key = SecretKey::generate();
+    let target_key = SecretKey::generate();
+    let controller_id = controller_key.public();
+    let source_id = source_key.public();
+    let controller = bind_controller_endpoint_local_only(controller_key.clone())
+        .await
+        .expect("bind local-only controller endpoint");
+
+    let target_audit_path = dir.path().join("target-agent-audit.jsonl");
+    let mut target_config = test_config(
+        controller_id,
+        target_audit_path.clone(),
+        dir.path().join("target.secret"),
+    );
+    target_config.node.id = "target-ocserv-01".to_string();
+    if target_allows_source {
+        target_config.security.peers = vec![PeerConfig {
+            endpoint_id: source_id.to_string(),
+            enabled: true,
+        }];
+    }
+    let target_audit = JsonlAuditWriter::new(target_audit_path.clone());
+    let target_audit_limiter =
+        Arc::new(Mutex::new(RejectedAuditLimiter::new(&target_config.audit)));
+    let target = bind_agent_endpoint_local_only(
+        &target_config,
+        target_key,
+        target_audit.clone(),
+        target_audit_limiter.clone(),
+    )
+    .await
+    .expect("bind local-only target endpoint");
+    let target_addr = target.addr();
+    let target_id = target.id();
+    let target_state = AgentServerState {
+        config: target_config.clone(),
+        audit: target_audit,
+        nonce_cache: Arc::new(Mutex::new(NonceCache::with_limits(
+            target_config.security.max_live_nonces_global,
+            target_config.security.max_live_nonces_per_controller,
+        ))),
+        limiters: Arc::new(ServerLimiters::from_config(&target_config.security)),
+        audit_limiter: target_audit_limiter,
+        authz: Arc::new(
+            AgentAuthorization::from_security_config(&target_config.security)
+                .expect("target authz table builds"),
+        ),
+        agent_endpoint_id: target_id.to_string(),
+        outbound_endpoint: Some(target.clone()),
+        path_target_resolver: PathTargetResolver::endpoint_id_only(),
+    };
+    let target_task = tokio::spawn(serve_endpoint(target.clone(), target_state));
+
+    let source_audit_path = dir.path().join("source-agent-audit.jsonl");
+    let mut source_config = test_config(
+        controller_id,
+        source_audit_path.clone(),
+        dir.path().join("source.secret"),
+    );
+    source_config.node.id = "source-ocserv-01".to_string();
+    source_config.security.path_probes = vec![PathProbeConfig {
+        controller_endpoint_id: controller_id.to_string(),
+        target_endpoint_id: target_id.to_string(),
+        enabled: true,
+    }];
+    let source_audit = JsonlAuditWriter::new(source_audit_path.clone());
+    let source_audit_limiter =
+        Arc::new(Mutex::new(RejectedAuditLimiter::new(&source_config.audit)));
+    let source = bind_agent_endpoint_local_only(
+        &source_config,
+        source_key,
+        source_audit.clone(),
+        source_audit_limiter.clone(),
+    )
+    .await
+    .expect("bind local-only source endpoint");
+    let source_addr = source.addr();
+    let source_id = source.id();
+    let source_state = AgentServerState {
+        config: source_config.clone(),
+        audit: source_audit,
+        nonce_cache: Arc::new(Mutex::new(NonceCache::with_limits(
+            source_config.security.max_live_nonces_global,
+            source_config.security.max_live_nonces_per_controller,
+        ))),
+        limiters: Arc::new(ServerLimiters::from_config(&source_config.security)),
+        audit_limiter: source_audit_limiter,
+        authz: Arc::new(
+            AgentAuthorization::from_security_config(&source_config.security)
+                .expect("source authz table builds"),
+        ),
+        agent_endpoint_id: source_id.to_string(),
+        outbound_endpoint: Some(source.clone()),
+        path_target_resolver: PathTargetResolver::for_local_e2e_tests([(
+            target_id,
+            target_addr.clone(),
+        )]),
+    };
+    let source_task = tokio::spawn(serve_endpoint(source.clone(), source_state));
+
+    tokio::task::yield_now().await;
+
+    LocalPathProbeHarness {
+        controller,
+        source,
+        target,
+        source_addr,
+        source_id,
+        target_id,
+        source_config,
+        source_audit_path,
+        target_audit_path,
+        source_task,
+        target_task,
     }
 }
 
@@ -576,6 +929,7 @@ fn test_config(
                 role: "viewer".to_string(),
             }],
             peers: Vec::new(),
+            path_probes: Vec::new(),
         },
         audit: AuditConfig {
             path: audit_path,

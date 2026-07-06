@@ -1,5 +1,6 @@
 use ocfleet_cli::rpc_client::{
-    RpcClientError, read_response_frame, read_response_frame_with_timeout, validate_rpc_response,
+    RpcClientError, read_response_frame, read_response_frame_with_timeout,
+    validate_path_echo_result, validate_rpc_response,
 };
 use ocfleet_protocol::constants::PROTOCOL_VERSION;
 use ocfleet_protocol::error::{ErrorCode, RpcError};
@@ -83,6 +84,58 @@ fn validate_probe_ping_response_rejects_endpoint_mismatch() {
 
     assert_eq!(err.code(), ErrorCode::InvalidResponse);
     assert!(err.to_string().contains("agent_endpoint_id mismatch"));
+}
+
+#[test]
+fn validate_path_echo_result_rejects_target_endpoint_mismatch() {
+    let result = json!({
+        "probe": "path.echo",
+        "ok": true,
+        "source_agent_endpoint_id": "source-endpoint",
+        "target_agent_endpoint_id": "wrong-target",
+        "root_request_id": "root-request",
+        "peer_request_id": "peer-request",
+        "target_result": {"probe": "peer.echo", "message": "pong"},
+        "time_utc": "2026-01-01T00:00:00Z"
+    });
+
+    let err = validate_path_echo_result(
+        &result,
+        "source-endpoint",
+        "target-endpoint",
+        "root-request",
+    )
+    .expect_err("target mismatch rejected");
+
+    assert_eq!(err.code(), ErrorCode::InvalidResponse);
+}
+
+#[test]
+fn validate_path_echo_result_rejects_raw_peer_response_forwarding() {
+    let result = json!({
+        "probe": "path.echo",
+        "ok": true,
+        "source_agent_endpoint_id": "source-endpoint",
+        "target_agent_endpoint_id": "target-endpoint",
+        "root_request_id": "root-request",
+        "peer_request_id": "peer-request",
+        "target_result": {
+            "probe": "peer.echo",
+            "message": "pong",
+            "agent_version": "0.1.0"
+        },
+        "time_utc": "2026-01-01T00:00:00Z"
+    });
+
+    let err = validate_path_echo_result(
+        &result,
+        "source-endpoint",
+        "target-endpoint",
+        "root-request",
+    )
+    .expect_err("raw peer response fields rejected");
+
+    assert_eq!(err.code(), ErrorCode::InvalidResponse);
 }
 
 #[test]

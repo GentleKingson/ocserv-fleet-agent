@@ -1,5 +1,5 @@
 use ocfleet_protocol::method::{
-    MethodStatus, NODE_INFO, NODE_PING, PROBE_CONTROLLER_PING, PROBE_PEER_ECHO,
+    MethodStatus, NODE_INFO, NODE_PING, PROBE_CONTROLLER_PING, PROBE_PATH_ECHO, PROBE_PEER_ECHO,
     classify_phase_one_method,
 };
 
@@ -17,8 +17,10 @@ fn future_and_dangerous_methods_are_not_allowed() {
         "relay.raw",
         "mesh.status",
         PROBE_PEER_ECHO,
-        "probe.path.echo",
+        PROBE_PATH_ECHO,
         "probe.path.report",
+        "proxy.open",
+        "tunnel.open",
         "shell.exec",
         "command.run",
         "file.read",

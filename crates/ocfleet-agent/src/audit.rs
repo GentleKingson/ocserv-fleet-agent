@@ -17,6 +17,12 @@ pub struct AgentAuditEvent {
     pub ts: String,
     pub event: String,
     pub request_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub root_request_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peer_request_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path_target_endpoint_id: Option<String>,
     pub remote_endpoint_id: Option<String>,
     pub method: Option<String>,
     pub params_hash: Option<String>,
@@ -41,6 +47,9 @@ impl AgentAuditEvent {
                 .expect("RFC3339 formatting succeeds"),
             event: event.into(),
             request_id: None,
+            root_request_id: None,
+            peer_request_id: None,
+            path_target_endpoint_id: None,
             remote_endpoint_id: None,
             method: None,
             params_hash: None,
@@ -208,6 +217,45 @@ mod tests {
             .expect("write task joined")
             .expect("audit write succeeded");
         assert_eq!(storage.writes.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn phase_three_correlation_fields_are_optional_and_low_sensitive() {
+        let base = AgentAuditEvent::new("rpc_request");
+        let base_json = serde_json::to_value(&base).expect("base audit json");
+        assert!(base_json.get("root_request_id").is_none());
+        assert!(base_json.get("peer_request_id").is_none());
+        assert!(base_json.get("path_target_endpoint_id").is_none());
+
+        let mut path = AgentAuditEvent::new("rpc_request");
+        path.root_request_id = Some("00000000-0000-4000-8000-000000000001".to_string());
+        path.peer_request_id = Some("00000000-0000-4000-8000-000000000002".to_string());
+        path.path_target_endpoint_id = Some("target-endpoint".to_string());
+        let path_json = serde_json::to_value(&path).expect("path audit json");
+
+        assert_eq!(
+            path_json["root_request_id"],
+            "00000000-0000-4000-8000-000000000001"
+        );
+        assert_eq!(
+            path_json["peer_request_id"],
+            "00000000-0000-4000-8000-000000000002"
+        );
+        assert_eq!(path_json["path_target_endpoint_id"], "target-endpoint");
+        for forbidden in [
+            "host",
+            "port",
+            "endpoint_addr",
+            "route",
+            "relay_url",
+            "mesh_hint",
+            "payload",
+        ] {
+            assert!(
+                path_json.get(forbidden).is_none(),
+                "audit must not serialize {forbidden}"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -297,6 +297,7 @@ fn agent_config_defaults_include_resource_limits() {
     let config = minimal_agent_config();
 
     assert!(config.security.peers.is_empty());
+    assert!(config.security.path_probes.is_empty());
     assert_eq!(config.security.max_handshake_tasks_global, 256);
     assert_eq!(config.security.max_connections_global, 256);
     assert_eq!(config.security.max_connections_per_controller, 32);
@@ -487,6 +488,214 @@ path = "/tmp/ocfleet-audit.log"
     .expect_err("unknown peer fields rejected");
 
     assert!(err.to_string().contains("unknown field"));
+}
+
+#[test]
+fn agent_config_accepts_path_probe_with_enabled_default_true() {
+    let controller_endpoint_id = iroh::SecretKey::generate().public().to_string();
+    let target_endpoint_id = iroh::SecretKey::generate().public().to_string();
+    let config: AgentConfig = toml::from_str(&format!(
+        r#"
+[node]
+id = "hk-ocserv-01"
+region = "hk"
+role = "ocserv"
+
+[iroh]
+secret_key_path = "/tmp/iroh.secret"
+
+[security]
+
+[[security.controllers]]
+endpoint_id = "{controller_endpoint_id}"
+role = "viewer"
+
+[[security.path_probes]]
+controller_endpoint_id = "{controller_endpoint_id}"
+target_endpoint_id = "{target_endpoint_id}"
+
+[audit]
+path = "/tmp/ocfleet-audit.log"
+"#
+    ))
+    .expect("path probe config parses");
+
+    validate_agent_config(&config).expect("path probe config validates");
+    assert_eq!(config.security.path_probes.len(), 1);
+    assert_eq!(
+        config.security.path_probes[0].controller_endpoint_id,
+        controller_endpoint_id
+    );
+    assert_eq!(
+        config.security.path_probes[0].target_endpoint_id,
+        target_endpoint_id
+    );
+    assert!(config.security.path_probes[0].enabled);
+}
+
+#[test]
+fn agent_config_accepts_disabled_path_probe_entry() {
+    let controller_endpoint_id = iroh::SecretKey::generate().public().to_string();
+    let target_endpoint_id = iroh::SecretKey::generate().public().to_string();
+    let config: AgentConfig = toml::from_str(&format!(
+        r#"
+[node]
+id = "hk-ocserv-01"
+region = "hk"
+role = "ocserv"
+
+[iroh]
+secret_key_path = "/tmp/iroh.secret"
+
+[security]
+
+[[security.controllers]]
+endpoint_id = "{controller_endpoint_id}"
+role = "viewer"
+
+[[security.path_probes]]
+controller_endpoint_id = "{controller_endpoint_id}"
+target_endpoint_id = "{target_endpoint_id}"
+enabled = false
+
+[audit]
+path = "/tmp/ocfleet-audit.log"
+"#
+    ))
+    .expect("disabled path probe config parses");
+
+    validate_agent_config(&config).expect("disabled path probe config validates");
+    assert!(!config.security.path_probes[0].enabled);
+}
+
+#[test]
+fn agent_config_rejects_unknown_path_probe_fields() {
+    let controller_endpoint_id = iroh::SecretKey::generate().public().to_string();
+    let target_endpoint_id = iroh::SecretKey::generate().public().to_string();
+    let err = toml::from_str::<AgentConfig>(&format!(
+        r#"
+[node]
+id = "hk-ocserv-01"
+region = "hk"
+role = "ocserv"
+
+[iroh]
+secret_key_path = "/tmp/iroh.secret"
+
+[security]
+
+[[security.controllers]]
+endpoint_id = "{controller_endpoint_id}"
+role = "viewer"
+
+[[security.path_probes]]
+controller_endpoint_id = "{controller_endpoint_id}"
+target_endpoint_id = "{target_endpoint_id}"
+host = "127.0.0.1"
+
+[audit]
+path = "/tmp/ocfleet-audit.log"
+"#
+    ))
+    .expect_err("unknown path probe fields rejected");
+
+    assert!(err.to_string().contains("unknown field"));
+}
+
+#[test]
+fn agent_config_rejects_duplicate_path_probe_entry() {
+    let controller_endpoint_id = iroh::SecretKey::generate().public().to_string();
+    let target_endpoint_id = iroh::SecretKey::generate().public().to_string();
+    let mut config = minimal_agent_config();
+    config
+        .security
+        .controllers
+        .push(ocfleet_config::agent::ControllerConfig {
+            endpoint_id: controller_endpoint_id.clone(),
+            role: "viewer".into(),
+        });
+    config
+        .security
+        .path_probes
+        .push(ocfleet_config::agent::PathProbeConfig {
+            controller_endpoint_id: controller_endpoint_id.clone(),
+            target_endpoint_id: target_endpoint_id.clone(),
+            enabled: true,
+        });
+    config
+        .security
+        .path_probes
+        .push(ocfleet_config::agent::PathProbeConfig {
+            controller_endpoint_id,
+            target_endpoint_id,
+            enabled: false,
+        });
+
+    let err = validate_agent_config(&config).expect_err("duplicate path probe rejected");
+    assert!(matches!(
+        err,
+        ConfigError::Invalid(message) if message.contains("duplicate path probe")
+    ));
+}
+
+#[test]
+fn agent_config_rejects_path_probe_controller_not_in_controllers() {
+    let controller_endpoint_id = iroh::SecretKey::generate().public().to_string();
+    let target_endpoint_id = iroh::SecretKey::generate().public().to_string();
+    let mut config = minimal_agent_config();
+    config
+        .security
+        .path_probes
+        .push(ocfleet_config::agent::PathProbeConfig {
+            controller_endpoint_id,
+            target_endpoint_id,
+            enabled: true,
+        });
+
+    let err = validate_agent_config(&config).expect_err("unknown controller rejected");
+    assert!(matches!(
+        err,
+        ConfigError::Invalid(message)
+            if message.contains("path probe controller")
+                && message.contains("security.controllers")
+    ));
+}
+
+#[test]
+fn agent_config_rejects_path_probe_target_that_is_controller() {
+    let controller_endpoint_id = iroh::SecretKey::generate().public().to_string();
+    let target_endpoint_id = iroh::SecretKey::generate().public().to_string();
+    let mut config = minimal_agent_config();
+    config
+        .security
+        .controllers
+        .push(ocfleet_config::agent::ControllerConfig {
+            endpoint_id: controller_endpoint_id.clone(),
+            role: "viewer".into(),
+        });
+    config
+        .security
+        .controllers
+        .push(ocfleet_config::agent::ControllerConfig {
+            endpoint_id: target_endpoint_id.clone(),
+            role: "viewer".into(),
+        });
+    config
+        .security
+        .path_probes
+        .push(ocfleet_config::agent::PathProbeConfig {
+            controller_endpoint_id,
+            target_endpoint_id,
+            enabled: true,
+        });
+
+    let err = validate_agent_config(&config).expect_err("controller target rejected");
+    assert!(matches!(
+        err,
+        ConfigError::Invalid(message)
+            if message.contains("path probe target")
+                && message.contains("security.controllers")
+    ));
 }
 
 #[test]

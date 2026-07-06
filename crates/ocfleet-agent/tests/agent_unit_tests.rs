@@ -3,20 +3,23 @@ use ocfleet_agent::{
     AGENT_VERSION,
     audit::{AgentAuditEvent, JsonlAuditWriter},
     audit_limiter::{AuditLimitDecision, RejectedAuditLimiter},
-    authz::{AgentAuthorization, CallerClass},
+    authz::{AgentAuthorization, CallerClass, PathProbeDecision},
     node_info::collect_node_info,
     nonce::{NonceCache, NonceDecision, NonceLimitScope},
     server::{
-        AgentServerState, ServerLimiters, bind_agent_endpoint_local_only, handle_request,
-        parse_endpoint_id, read_frame,
+        AgentServerState, PathTargetResolver, ServerLimiters, bind_agent_endpoint_local_only,
+        handle_request, parse_endpoint_id, read_frame,
     },
 };
 use ocfleet_config::agent::{
-    AgentConfig, AuditConfig, ControllerConfig, IrohConfig, NodeConfig, PeerConfig, SecurityConfig,
+    AgentConfig, AuditConfig, ControllerConfig, IrohConfig, NodeConfig, PathProbeConfig,
+    PeerConfig, SecurityConfig,
 };
 use ocfleet_protocol::constants::PROTOCOL_VERSION;
 use ocfleet_protocol::error::ErrorCode;
-use ocfleet_protocol::method::{NODE_INFO, NODE_PING, PROBE_CONTROLLER_PING, PROBE_PEER_ECHO};
+use ocfleet_protocol::method::{
+    NODE_INFO, NODE_PING, PROBE_CONTROLLER_PING, PROBE_PATH_ECHO, PROBE_PEER_ECHO,
+};
 use ocfleet_protocol::rpc::RpcRequest;
 use serde_json::json;
 use std::net::{IpAddr, Ipv4Addr};
@@ -487,6 +490,10 @@ fn authorization_enforces_caller_aware_method_matrix() {
         CallerClass::Controller,
         PROBE_CONTROLLER_PING
     ));
+    assert!(AgentAuthorization::method_allowed(
+        CallerClass::Controller,
+        PROBE_PATH_ECHO
+    ));
     assert!(!AgentAuthorization::method_allowed(
         CallerClass::Controller,
         PROBE_PEER_ECHO
@@ -496,7 +503,7 @@ fn authorization_enforces_caller_aware_method_matrix() {
         CallerClass::Peer,
         PROBE_PEER_ECHO
     ));
-    for method in [NODE_PING, NODE_INFO, PROBE_CONTROLLER_PING] {
+    for method in [NODE_PING, NODE_INFO, PROBE_CONTROLLER_PING, PROBE_PATH_ECHO] {
         assert!(
             !AgentAuthorization::method_allowed(CallerClass::Peer, method),
             "peer caller must not call {method}"
@@ -509,6 +516,7 @@ fn authorization_enforces_caller_aware_method_matrix() {
             NODE_INFO,
             PROBE_CONTROLLER_PING,
             PROBE_PEER_ECHO,
+            PROBE_PATH_ECHO,
             "relay.forward",
             "mesh.status",
             "probe.path.echo",
@@ -521,6 +529,89 @@ fn authorization_enforces_caller_aware_method_matrix() {
             );
         }
     }
+}
+
+#[test]
+fn authorization_enforces_source_side_path_probe_allowlist() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let controller_id = iroh::SecretKey::generate().public();
+    let allowed_target_id = iroh::SecretKey::generate().public();
+    let disabled_target_id = iroh::SecretKey::generate().public();
+    let unknown_target_id = iroh::SecretKey::generate().public();
+    let source_id = iroh::SecretKey::generate().public();
+    let mut config = test_agent_config(
+        dir.path(),
+        vec![ControllerConfig {
+            endpoint_id: controller_id.to_string(),
+            role: "viewer".to_string(),
+        }],
+    );
+    config.security.path_probes = vec![
+        PathProbeConfig {
+            controller_endpoint_id: controller_id.to_string(),
+            target_endpoint_id: allowed_target_id.to_string(),
+            enabled: true,
+        },
+        PathProbeConfig {
+            controller_endpoint_id: controller_id.to_string(),
+            target_endpoint_id: disabled_target_id.to_string(),
+            enabled: false,
+        },
+    ];
+
+    let authz = AgentAuthorization::from_security_config(&config.security)
+        .expect("authorization table builds");
+
+    assert_eq!(
+        authz.path_probe_decision(&controller_id, &allowed_target_id, &source_id),
+        PathProbeDecision::Allowed
+    );
+    assert_eq!(
+        authz.path_probe_decision(&controller_id, &disabled_target_id, &source_id),
+        PathProbeDecision::Disabled
+    );
+    assert_eq!(
+        authz.path_probe_decision(&controller_id, &unknown_target_id, &source_id),
+        PathProbeDecision::Missing
+    );
+    assert_eq!(
+        authz.path_probe_decision(&controller_id, &source_id, &source_id),
+        PathProbeDecision::SelfTarget
+    );
+}
+
+#[test]
+fn authorization_rejects_path_probe_target_that_is_controller() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let controller_id = iroh::SecretKey::generate().public();
+    let target_controller_id = iroh::SecretKey::generate().public();
+    let source_id = iroh::SecretKey::generate().public();
+    let mut config = test_agent_config(
+        dir.path(),
+        vec![
+            ControllerConfig {
+                endpoint_id: controller_id.to_string(),
+                role: "viewer".to_string(),
+            },
+            ControllerConfig {
+                endpoint_id: target_controller_id.to_string(),
+                role: "viewer".to_string(),
+            },
+        ],
+    );
+    config.security.path_probes = vec![PathProbeConfig {
+        controller_endpoint_id: controller_id.to_string(),
+        target_endpoint_id: target_controller_id.to_string(),
+        enabled: true,
+    }];
+
+    let authz = AgentAuthorization::from_security_config(&config.security)
+        .expect("authorization table builds");
+
+    assert_eq!(
+        authz.path_probe_decision(&controller_id, &target_controller_id, &source_id),
+        PathProbeDecision::TargetIsController
+    );
 }
 
 #[tokio::test]
@@ -810,6 +901,105 @@ async fn handle_request_rejects_peer_calling_controller_method() {
 }
 
 #[tokio::test]
+async fn handle_request_rejects_peer_calling_path_echo() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let peer_id = iroh::SecretKey::generate().public();
+    let target_id = iroh::SecretKey::generate().public();
+    let mut config = test_agent_config(dir.path(), Vec::new());
+    config.security.peers = vec![PeerConfig {
+        endpoint_id: peer_id.to_string(),
+        enabled: true,
+    }];
+    let state = test_server_state_from_config(config, "agent-endpoint-1");
+    let mut request = test_rpc_request(PROBE_PATH_ECHO, valid_nonce(22));
+    request.params = json!({"target_agent_endpoint_id": target_id.to_string()});
+
+    let response = handle_request(&state, &peer_id.to_string(), request).await;
+
+    assert!(!response.ok);
+    assert_eq!(
+        response.error.as_ref().expect("error").code,
+        ErrorCode::MethodNotAllowed
+    );
+}
+
+#[tokio::test]
+async fn handle_request_rejects_path_echo_without_source_authorization_before_outbound_endpoint() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let controller_id = iroh::SecretKey::generate().public();
+    let target_id = iroh::SecretKey::generate().public();
+    let source_id = iroh::SecretKey::generate().public();
+    let config = test_agent_config(
+        dir.path(),
+        vec![ControllerConfig {
+            endpoint_id: controller_id.to_string(),
+            role: "viewer".to_string(),
+        }],
+    );
+    let state = test_server_state_from_config(config, &source_id.to_string());
+    let mut request = test_rpc_request(PROBE_PATH_ECHO, valid_nonce(23));
+    request.params = json!({"target_agent_endpoint_id": target_id.to_string()});
+
+    let response = handle_request(&state, &controller_id.to_string(), request).await;
+
+    assert!(!response.ok);
+    assert_eq!(
+        response.error.as_ref().expect("error").code,
+        ErrorCode::EndpointNotAllowed
+    );
+}
+
+#[tokio::test]
+async fn handle_request_rejects_path_echo_self_target_before_outbound_endpoint() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let controller_id = iroh::SecretKey::generate().public();
+    let source_id = iroh::SecretKey::generate().public();
+    let mut config = test_agent_config(
+        dir.path(),
+        vec![ControllerConfig {
+            endpoint_id: controller_id.to_string(),
+            role: "viewer".to_string(),
+        }],
+    );
+    config.security.path_probes = vec![PathProbeConfig {
+        controller_endpoint_id: controller_id.to_string(),
+        target_endpoint_id: source_id.to_string(),
+        enabled: true,
+    }];
+    let state = test_server_state_from_config(config, &source_id.to_string());
+    let mut request = test_rpc_request(PROBE_PATH_ECHO, valid_nonce(24));
+    request.params = json!({"target_agent_endpoint_id": source_id.to_string()});
+
+    let response = handle_request(&state, &controller_id.to_string(), request).await;
+
+    assert!(!response.ok);
+    assert_eq!(
+        response.error.as_ref().expect("error").code,
+        ErrorCode::ParamsInvalid
+    );
+}
+
+#[tokio::test]
+async fn handle_request_rejects_path_echo_extension_params() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let state = test_server_state(dir.path(), "agent-endpoint-1");
+    let controller = test_controller_remote(&state);
+    let target_id = iroh::SecretKey::generate().public();
+    let mut request = test_rpc_request(PROBE_PATH_ECHO, valid_nonce(25));
+    request.params = json!({
+        "target_agent_endpoint_id": target_id.to_string(),
+        "host": "127.0.0.1"
+    });
+
+    let response = handle_request(&state, &controller, request).await;
+
+    assert_eq!(
+        response.error.as_ref().expect("error").code,
+        ErrorCode::ParamsInvalid
+    );
+}
+
+#[tokio::test]
 async fn handle_request_rejects_peer_echo_extension_params() {
     let dir = tempfile::tempdir().expect("temp dir");
     let peer_id = iroh::SecretKey::generate().public();
@@ -852,14 +1042,9 @@ async fn handle_request_does_not_dispatch_future_direction_two_methods() {
     let state = test_server_state(dir.path(), "agent-endpoint-1");
     let controller = test_controller_remote(&state);
 
-    for (index, method) in [
-        "probe.peer.echo",
-        "probe.path.echo",
-        "relay.forward",
-        "mesh.status",
-    ]
-    .iter()
-    .enumerate()
+    for (index, method) in ["probe.peer.echo", "relay.forward", "mesh.status"]
+        .iter()
+        .enumerate()
     {
         let response = handle_request(
             &state,
@@ -1028,6 +1213,7 @@ fn test_agent_config(dir: &Path, controllers: Vec<ControllerConfig>) -> AgentCon
             max_live_nonces_per_controller: 10_000,
             controllers,
             peers: Vec::new(),
+            path_probes: Vec::new(),
         },
         audit: AuditConfig {
             path: dir.join("audit.log"),
@@ -1074,6 +1260,8 @@ fn test_server_state_from_config(config: AgentConfig, agent_endpoint_id: &str) -
         ))),
         authz: std::sync::Arc::new(authz),
         agent_endpoint_id: agent_endpoint_id.to_string(),
+        outbound_endpoint: None,
+        path_target_resolver: PathTargetResolver::endpoint_id_only(),
     }
 }
 

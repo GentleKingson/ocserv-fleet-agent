@@ -5,10 +5,11 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 use crate::validation::{
-    canonicalize_controller_endpoint_id, canonicalize_peer_endpoint_id,
-    validate_controller_endpoint_id, validate_controller_role, validate_node_id,
-    validate_non_empty_path, validate_peer_endpoint_id, validate_positive_i64,
-    validate_positive_u64, validate_positive_usize, validate_region, validate_role,
+    canonicalize_controller_endpoint_id, canonicalize_path_probe_endpoint_id,
+    canonicalize_peer_endpoint_id, validate_controller_endpoint_id, validate_controller_role,
+    validate_node_id, validate_non_empty_path, validate_path_probe_endpoint_id,
+    validate_peer_endpoint_id, validate_positive_i64, validate_positive_u64,
+    validate_positive_usize, validate_region, validate_role,
 };
 
 #[derive(Debug, Error)]
@@ -79,6 +80,8 @@ pub struct SecurityConfig {
     pub controllers: Vec<ControllerConfig>,
     #[serde(default)]
     pub peers: Vec<PeerConfig>,
+    #[serde(default)]
+    pub path_probes: Vec<PathProbeConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -93,6 +96,15 @@ pub struct ControllerConfig {
 pub struct PeerConfig {
     pub endpoint_id: String,
     #[serde(default = "default_peer_enabled")]
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PathProbeConfig {
+    pub controller_endpoint_id: String,
+    pub target_endpoint_id: String,
+    #[serde(default = "default_path_probe_enabled")]
     pub enabled: bool,
 }
 
@@ -163,6 +175,36 @@ pub fn validate_agent_config(config: &AgentConfig) -> Result<(), ConfigError> {
         if controller_endpoint_ids.contains(&endpoint_id) {
             return Err(ConfigError::Invalid(format!(
                 "endpoint_id cannot be both controller and peer: {endpoint_id}"
+            )));
+        }
+    }
+    let mut path_probe_pairs = HashSet::new();
+    for path_probe in &config.security.path_probes {
+        validate_path_probe_endpoint_id(&path_probe.controller_endpoint_id)
+            .map_err(|e| ConfigError::Invalid(e.to_string()))?;
+        validate_path_probe_endpoint_id(&path_probe.target_endpoint_id)
+            .map_err(|e| ConfigError::Invalid(e.to_string()))?;
+        let controller_endpoint_id =
+            canonicalize_path_probe_endpoint_id(&path_probe.controller_endpoint_id)
+                .map_err(|e| ConfigError::Invalid(e.to_string()))?;
+        let target_endpoint_id =
+            canonicalize_path_probe_endpoint_id(&path_probe.target_endpoint_id)
+                .map_err(|e| ConfigError::Invalid(e.to_string()))?;
+        if !controller_endpoint_ids.contains(&controller_endpoint_id) {
+            return Err(ConfigError::Invalid(format!(
+                "path probe controller_endpoint_id must exist in security.controllers: {controller_endpoint_id}"
+            )));
+        }
+        if controller_endpoint_ids.contains(&target_endpoint_id) {
+            return Err(ConfigError::Invalid(format!(
+                "path probe target_endpoint_id must not exist in security.controllers: {target_endpoint_id}"
+            )));
+        }
+        let pair = (controller_endpoint_id, target_endpoint_id);
+        if !path_probe_pairs.insert(pair.clone()) {
+            return Err(ConfigError::Invalid(format!(
+                "duplicate path probe authorization entry: controller_endpoint_id={} target_endpoint_id={}",
+                pair.0, pair.1
             )));
         }
     }
@@ -358,5 +400,9 @@ fn default_controller_role() -> String {
 }
 
 fn default_peer_enabled() -> bool {
+    true
+}
+
+fn default_path_probe_enabled() -> bool {
     true
 }

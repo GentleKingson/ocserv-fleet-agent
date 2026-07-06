@@ -91,6 +91,25 @@ fn parses_probe_ping_command() {
 }
 
 #[test]
+fn parses_probe_path_command() {
+    let cli = Cli::parse_from(["ocfleet", "probe", "path", "source-01", "target-01"]);
+
+    let Command::Probe {
+        command:
+            ProbeCommand::Path {
+                source_node_id,
+                target_node_id,
+            },
+    } = cli.command
+    else {
+        panic!("expected probe path command");
+    };
+
+    assert_eq!(source_node_id, "source-01");
+    assert_eq!(target_node_id, "target-01");
+}
+
+#[test]
 fn parses_node_info_command() {
     let cli = Cli::parse_from(["ocfleet", "node", "info", "hk-ocserv-01"]);
 

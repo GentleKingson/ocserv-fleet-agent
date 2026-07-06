@@ -37,6 +37,12 @@ pub struct PeerEchoOutput {
     pub result: Value,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct PeerEchoAuditContext {
+    pub root_request_id: Option<String>,
+    pub path_target_endpoint_id: Option<String>,
+}
+
 pub struct PeerEchoCall<'a> {
     pub endpoint: &'a Endpoint,
     pub target: EndpointAddr,
@@ -45,6 +51,7 @@ pub struct PeerEchoCall<'a> {
     pub alpn: &'a [u8],
     pub audit: &'a JsonlAuditWriter,
     pub limits: PeerEchoLimits,
+    pub audit_context: PeerEchoAuditContext,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -53,6 +60,7 @@ pub struct PeerEchoError {
     code: ErrorCode,
     message: String,
     details: Value,
+    request_id: Option<String>,
 }
 
 impl PeerEchoError {
@@ -64,12 +72,24 @@ impl PeerEchoError {
         &self.details
     }
 
+    pub fn request_id(&self) -> Option<&str> {
+        self.request_id.as_deref()
+    }
+
     fn structured(code: ErrorCode, message: impl Into<String>, details: Value) -> Self {
         Self {
             code,
             message: message.into(),
             details,
+            request_id: None,
         }
+    }
+
+    fn with_request_id(mut self, request_id: String) -> Self {
+        if self.request_id.is_none() {
+            self.request_id = Some(request_id);
+        }
+        self
     }
 }
 
@@ -82,6 +102,7 @@ pub async fn call_peer_echo(call: PeerEchoCall<'_>) -> Result<PeerEchoOutput, Pe
         alpn,
         audit,
         limits,
+        audit_context,
     } = call;
     let request = build_peer_echo_request(limits.deadline_ms);
     let started = Instant::now();
@@ -109,8 +130,10 @@ pub async fn call_peer_echo(call: PeerEchoCall<'_>) -> Result<PeerEchoOutput, Pe
             ErrorCode::RpcTimeout,
             format!("peer echo timed out after {} ms", timeout.as_millis()),
             json!({}),
-        )),
+        )
+        .with_request_id(request_id.clone())),
     };
+    let result = result.map_err(|err| err.with_request_id(request_id.clone()));
 
     let mut event = AgentAuditEvent::new("peer_echo");
     event.request_id = Some(request_id.clone());
@@ -120,6 +143,11 @@ pub async fn call_peer_echo(call: PeerEchoCall<'_>) -> Result<PeerEchoOutput, Pe
     event.nonce_hash = Some(nonce_hash);
     event.stage = Some("source_peer_echo".to_string());
     event.duration_ms = Some(started.elapsed().as_millis() as u64);
+    if audit_context.root_request_id.is_some() || audit_context.path_target_endpoint_id.is_some() {
+        event.root_request_id = audit_context.root_request_id;
+        event.peer_request_id = Some(request_id.clone());
+        event.path_target_endpoint_id = audit_context.path_target_endpoint_id;
+    }
     match &result {
         Ok(success) => {
             event.allowed = Some(true);

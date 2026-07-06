@@ -3,7 +3,9 @@ use std::collections::HashSet;
 use anyhow::{Context, Result};
 use iroh::EndpointId;
 use ocfleet_config::agent::SecurityConfig;
-use ocfleet_protocol::method::{NODE_INFO, NODE_PING, PROBE_CONTROLLER_PING, PROBE_PEER_ECHO};
+use ocfleet_protocol::method::{
+    NODE_INFO, NODE_PING, PROBE_CONTROLLER_PING, PROBE_PATH_ECHO, PROBE_PEER_ECHO,
+};
 
 use crate::server::parse_endpoint_id;
 
@@ -15,11 +17,22 @@ pub enum CallerClass {
     Unknown,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathProbeDecision {
+    Allowed,
+    Disabled,
+    Missing,
+    TargetIsController,
+    SelfTarget,
+}
+
 #[derive(Debug, Clone)]
 pub struct AgentAuthorization {
     controllers: HashSet<EndpointId>,
     enabled_peers: HashSet<EndpointId>,
     disabled_peers: HashSet<EndpointId>,
+    enabled_path_probes: HashSet<(EndpointId, EndpointId)>,
+    disabled_path_probes: HashSet<(EndpointId, EndpointId)>,
 }
 
 impl AgentAuthorization {
@@ -50,10 +63,37 @@ impl AgentAuthorization {
             }
         }
 
+        let mut enabled_path_probes = HashSet::new();
+        let mut disabled_path_probes = HashSet::new();
+        for path_probe in &config.path_probes {
+            let controller_endpoint_id = parse_endpoint_id(&path_probe.controller_endpoint_id)
+                .with_context(|| {
+                    format!(
+                        "invalid path probe controller endpoint id: {}",
+                        path_probe.controller_endpoint_id
+                    )
+                })?;
+            let target_endpoint_id = parse_endpoint_id(&path_probe.target_endpoint_id)
+                .with_context(|| {
+                    format!(
+                        "invalid path probe target endpoint id: {}",
+                        path_probe.target_endpoint_id
+                    )
+                })?;
+            let pair = (controller_endpoint_id, target_endpoint_id);
+            if path_probe.enabled {
+                enabled_path_probes.insert(pair);
+            } else {
+                disabled_path_probes.insert(pair);
+            }
+        }
+
         Ok(Self {
             controllers,
             enabled_peers,
             disabled_peers,
+            enabled_path_probes,
+            disabled_path_probes,
         })
     }
 
@@ -79,10 +119,35 @@ impl AgentAuthorization {
     pub fn method_allowed(caller: CallerClass, method: &str) -> bool {
         match caller {
             CallerClass::Controller => {
-                matches!(method, NODE_PING | NODE_INFO | PROBE_CONTROLLER_PING)
+                matches!(
+                    method,
+                    NODE_PING | NODE_INFO | PROBE_CONTROLLER_PING | PROBE_PATH_ECHO
+                )
             }
             CallerClass::Peer => method == PROBE_PEER_ECHO,
             CallerClass::DisabledPeer | CallerClass::Unknown => false,
+        }
+    }
+
+    pub fn path_probe_decision(
+        &self,
+        controller_endpoint_id: &EndpointId,
+        target_endpoint_id: &EndpointId,
+        source_endpoint_id: &EndpointId,
+    ) -> PathProbeDecision {
+        if target_endpoint_id == source_endpoint_id {
+            return PathProbeDecision::SelfTarget;
+        }
+        if self.controllers.contains(target_endpoint_id) {
+            return PathProbeDecision::TargetIsController;
+        }
+        let pair = (*controller_endpoint_id, *target_endpoint_id);
+        if self.enabled_path_probes.contains(&pair) {
+            PathProbeDecision::Allowed
+        } else if self.disabled_path_probes.contains(&pair) {
+            PathProbeDecision::Disabled
+        } else {
+            PathProbeDecision::Missing
         }
     }
 }

@@ -31,7 +31,13 @@ pub enum Command {
 
 #[derive(Debug, Subcommand)]
 pub enum ProbeCommand {
-    Ping { node_id: String },
+    Ping {
+        node_id: String,
+    },
+    Path {
+        source_node_id: String,
+        target_node_id: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]

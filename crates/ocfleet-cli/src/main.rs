@@ -8,14 +8,14 @@ use ocfleet_cli::identity::{
 };
 use ocfleet_cli::rpc_client::{
     RpcClientError, bind_controller_endpoint, build_request, call_endpoint_addr,
-    validate_rpc_response,
+    validate_path_echo_result, validate_rpc_response,
 };
 use ocfleet_cli::store::{NodeInsert, NodeRecord, Store};
 use ocfleet_config::validation::{
     canonicalize_node_endpoint_id, validate_node_id, validate_region, validate_role,
 };
 use ocfleet_protocol::error::ErrorCode;
-use ocfleet_protocol::method::{NODE_INFO, NODE_PING, PROBE_CONTROLLER_PING};
+use ocfleet_protocol::method::{NODE_INFO, NODE_PING, PROBE_CONTROLLER_PING, PROBE_PATH_ECHO};
 use ocfleet_protocol::{DEFAULT_ALPN, DEFAULT_DEADLINE_MS, RpcResponse};
 use serde_json::{Map, Value, json};
 use std::path::Path;
@@ -61,6 +61,18 @@ async fn main() -> anyhow::Result<()> {
                 ProbeCommand::Ping { node_id } => {
                     run_node_rpc_command(&store, &cli.secret_key, &node_id, PROBE_CONTROLLER_PING)
                         .await?;
+                }
+                ProbeCommand::Path {
+                    source_node_id,
+                    target_node_id,
+                } => {
+                    run_path_probe_command(
+                        &store,
+                        &cli.secret_key,
+                        &source_node_id,
+                        &target_node_id,
+                    )
+                    .await?;
                 }
             }
         }
@@ -141,6 +153,170 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+async fn run_path_probe_command(
+    store: &Store,
+    secret_key_path: &Path,
+    source_node_id: &str,
+    target_node_id: &str,
+) -> anyhow::Result<()> {
+    validate_node_id(source_node_id)?;
+    validate_node_id(target_node_id)?;
+    let actor = local_actor();
+    let started = Instant::now();
+    let source = match store.get_node(source_node_id)? {
+        Some(node) => node,
+        None => {
+            let message = format!("node not found: {source_node_id}");
+            write_rpc_audit(
+                store,
+                RpcAuditRecord {
+                    actor,
+                    node_id: source_node_id.to_string(),
+                    endpoint_id: None,
+                    method: PROBE_PATH_ECHO.to_string(),
+                    request_id: None,
+                    params_hash: hash_json_value(&json!({})),
+                    ok: false,
+                    error_code: Some(ErrorCode::NodeNotFound),
+                    duration_ms: elapsed_ms(started),
+                    detail_json: json!({"message": message, "source_node_id": source_node_id, "target_node_id": target_node_id}),
+                },
+            )?;
+            bail!(message);
+        }
+    };
+    if !source.enabled {
+        let message = format!("node disabled: {source_node_id}");
+        write_rpc_audit(
+            store,
+            RpcAuditRecord {
+                actor,
+                node_id: source.node_id.clone(),
+                endpoint_id: Some(source.endpoint_id.clone()),
+                method: PROBE_PATH_ECHO.to_string(),
+                request_id: None,
+                params_hash: hash_json_value(&json!({})),
+                ok: false,
+                error_code: Some(ErrorCode::NodeDisabled),
+                duration_ms: elapsed_ms(started),
+                detail_json: json!({"message": message, "source_node_id": source_node_id, "target_node_id": target_node_id}),
+            },
+        )?;
+        bail!(message);
+    }
+    let target = match store.get_node(target_node_id)? {
+        Some(node) => node,
+        None => {
+            let message = format!("node not found: {target_node_id}");
+            write_rpc_audit(
+                store,
+                RpcAuditRecord {
+                    actor,
+                    node_id: source.node_id.clone(),
+                    endpoint_id: Some(source.endpoint_id.clone()),
+                    method: PROBE_PATH_ECHO.to_string(),
+                    request_id: None,
+                    params_hash: hash_json_value(&json!({})),
+                    ok: false,
+                    error_code: Some(ErrorCode::NodeNotFound),
+                    duration_ms: elapsed_ms(started),
+                    detail_json: json!({"message": message, "source_node_id": source_node_id, "target_node_id": target_node_id}),
+                },
+            )?;
+            bail!(message);
+        }
+    };
+    if !target.enabled {
+        let message = format!("node disabled: {target_node_id}");
+        write_rpc_audit(
+            store,
+            RpcAuditRecord {
+                actor,
+                node_id: source.node_id.clone(),
+                endpoint_id: Some(source.endpoint_id.clone()),
+                method: PROBE_PATH_ECHO.to_string(),
+                request_id: None,
+                params_hash: hash_json_value(&json!({})),
+                ok: false,
+                error_code: Some(ErrorCode::NodeDisabled),
+                duration_ms: elapsed_ms(started),
+                detail_json: json!({"message": message, "source_node_id": source_node_id, "target_node_id": target_node_id}),
+            },
+        )?;
+        bail!(message);
+    }
+
+    let params = json!({"target_agent_endpoint_id": target.endpoint_id.clone()});
+    let params_hash = hash_json_value(&params);
+    match execute_node_rpc(secret_key_path, &source, PROBE_PATH_ECHO, params).await {
+        Ok(success) => {
+            let peer_request_id = success
+                .result
+                .get("peer_request_id")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            let path_ok = success
+                .result
+                .get("ok")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            let path_error_code = if path_ok {
+                None
+            } else {
+                success
+                    .result
+                    .get("target_result")
+                    .and_then(|target_result| target_result.get("error_code"))
+                    .and_then(Value::as_str)
+                    .and_then(error_code_from_name)
+            };
+            write_rpc_audit(
+                store,
+                RpcAuditRecord {
+                    actor,
+                    node_id: source.node_id.clone(),
+                    endpoint_id: Some(source.endpoint_id.clone()),
+                    method: PROBE_PATH_ECHO.to_string(),
+                    request_id: Some(success.request_id.clone()),
+                    params_hash,
+                    ok: path_ok,
+                    error_code: path_error_code,
+                    duration_ms: elapsed_ms(started),
+                    detail_json: json!({
+                        "source_node_id": source.node_id,
+                        "source_endpoint_id": source.endpoint_id,
+                        "target_node_id": target.node_id,
+                        "target_endpoint_id": target.endpoint_id,
+                        "root_request_id": success.request_id,
+                        "peer_request_id": peer_request_id,
+                        "result": success.result,
+                    }),
+                },
+            )?;
+            print_rpc_result(PROBE_PATH_ECHO, &success.result);
+            Ok(())
+        }
+        Err(failure) => {
+            write_rpc_audit(
+                store,
+                RpcAuditRecord {
+                    actor,
+                    node_id: source.node_id.clone(),
+                    endpoint_id: Some(source.endpoint_id.clone()),
+                    method: PROBE_PATH_ECHO.to_string(),
+                    request_id: failure.request_id.clone(),
+                    params_hash,
+                    ok: false,
+                    error_code: Some(failure.code),
+                    duration_ms: elapsed_ms(started),
+                    detail_json: failure.detail_json.clone(),
+                },
+            )?;
+            bail!(failure.message);
+        }
+    }
 }
 
 async fn run_node_rpc_command(
@@ -301,6 +477,7 @@ async fn execute_node_rpc(
     })?;
     let request = build_request(method, params, Some(local_actor()), DEFAULT_DEADLINE_MS);
     let request_id = request.request_id.clone();
+    let params_for_validation = request.params.clone();
     let response = call_endpoint_addr(
         &endpoint,
         EndpointAddr::new(expected_endpoint_id),
@@ -318,7 +495,7 @@ async fn execute_node_rpc(
         )
     })?;
 
-    validate_response_for_method(&response, &request_id, method, node)?;
+    validate_response_for_method(&response, &request_id, method, node, &params_for_validation)?;
     Ok(RpcCommandSuccess {
         request_id,
         result: response.result.unwrap_or_else(|| json!({})),
@@ -330,6 +507,7 @@ fn validate_response_for_method(
     request_id: &str,
     method: &str,
     node: &NodeRecord,
+    params: &Value,
 ) -> Result<(), RpcCommandFailure> {
     let expected_agent_endpoint_id =
         matches!(method, NODE_INFO | PROBE_CONTROLLER_PING).then_some(node.endpoint_id.as_str());
@@ -340,7 +518,38 @@ fn validate_response_for_method(
             Some(request_id.to_string()),
             rpc_client_error_detail_json(&err),
         )
-    })
+    })?;
+    if method == PROBE_PATH_ECHO {
+        let target_endpoint_id = params
+            .get("target_agent_endpoint_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                RpcCommandFailure::new(
+                    ErrorCode::ParamsInvalid,
+                    "probe.path.echo missing target_agent_endpoint_id",
+                    Some(request_id.to_string()),
+                    json!({}),
+                )
+            })?;
+        let result = response.result.as_ref().ok_or_else(|| {
+            RpcCommandFailure::new(
+                ErrorCode::InvalidResponse,
+                "path response missing result",
+                Some(request_id.to_string()),
+                json!({}),
+            )
+        })?;
+        validate_path_echo_result(result, &node.endpoint_id, target_endpoint_id, request_id)
+            .map_err(|err| {
+                RpcCommandFailure::new(
+                    err.code(),
+                    err.to_string(),
+                    Some(request_id.to_string()),
+                    rpc_client_error_detail_json(&err),
+                )
+            })?;
+    }
+    Ok(())
 }
 
 struct RpcAuditRecord {
@@ -415,6 +624,30 @@ fn print_rpc_result(method: &str, result: &Value) {
                 .and_then(Value::as_str)
                 .unwrap_or("unknown")
         ),
+        PROBE_PATH_ECHO => println!(
+            "probe={} ok={} source_agent_endpoint_id={} target_agent_endpoint_id={} root_request_id={} peer_request_id={}",
+            result
+                .get("probe")
+                .and_then(Value::as_str)
+                .unwrap_or("path.echo"),
+            result.get("ok").and_then(Value::as_bool).unwrap_or(false),
+            result
+                .get("source_agent_endpoint_id")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown"),
+            result
+                .get("target_agent_endpoint_id")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown"),
+            result
+                .get("root_request_id")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown"),
+            result
+                .get("peer_request_id")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+        ),
         NODE_INFO => {
             for field in [
                 "node_id",
@@ -456,6 +689,10 @@ fn error_code_name(code: &ErrorCode) -> String {
         .ok()
         .and_then(|value| value.as_str().map(ToOwned::to_owned))
         .unwrap_or_else(|| format!("{code:?}"))
+}
+
+fn error_code_from_name(value: &str) -> Option<ErrorCode> {
+    serde_json::from_value(Value::String(value.to_string())).ok()
 }
 
 fn elapsed_ms(started: Instant) -> u64 {

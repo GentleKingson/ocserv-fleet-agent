@@ -1,5 +1,5 @@
 use ocfleet_cli::store::{NodeInsert, Store};
-use ocfleet_protocol::method::NODE_PING;
+use ocfleet_protocol::method::{NODE_PING, PROBE_CONTROLLER_PING};
 use rusqlite::Connection;
 use serde_json::Value;
 use std::path::Path;
@@ -250,6 +250,79 @@ fn ping_disabled_node_writes_failure_audit() {
     assert_eq!(audit.node_id.as_deref(), Some("hk-ocserv-01"));
     assert_eq!(audit.endpoint_id.as_deref(), Some(endpoint_id.as_str()));
     assert_eq!(audit.method.as_deref(), Some(NODE_PING));
+    assert_eq!(audit.ok, 0);
+    assert_eq!(audit.error_code.as_deref(), Some("NODE_DISABLED"));
+    assert_eq!(audit.detail["message"], "node disabled: hk-ocserv-01");
+}
+
+#[test]
+fn probe_ping_missing_node_writes_failure_audit() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let secret_key = dir.path().join("controller.secret");
+    let database_arg = database.to_string_lossy().into_owned();
+    let secret_key_arg = secret_key.to_string_lossy().into_owned();
+
+    let output = run_ocfleet_failure(&[
+        "--database",
+        &database_arg,
+        "--secret-key",
+        &secret_key_arg,
+        "probe",
+        "ping",
+        "missing-node",
+    ]);
+
+    assert!(String::from_utf8_lossy(&output.stderr).contains("node not found"));
+    let audit = latest_rpc_audit(&database);
+    assert_eq!(audit.event, "rpc.completed");
+    assert_eq!(audit.actor, "audit-user");
+    assert_eq!(audit.node_id.as_deref(), Some("missing-node"));
+    assert_eq!(audit.endpoint_id, None);
+    assert_eq!(audit.method.as_deref(), Some(PROBE_CONTROLLER_PING));
+    assert_eq!(audit.ok, 0);
+    assert_eq!(audit.error_code.as_deref(), Some("NODE_NOT_FOUND"));
+    assert_eq!(audit.detail["message"], "node not found: missing-node");
+}
+
+#[test]
+fn probe_ping_disabled_node_writes_failure_audit() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let secret_key = dir.path().join("controller.secret");
+    let endpoint_id = iroh::SecretKey::generate().public().to_string();
+    let store = Store::open(&database).expect("store opens");
+    store
+        .add_node(&NodeInsert {
+            node_id: "hk-ocserv-01".to_string(),
+            endpoint_id: endpoint_id.clone(),
+            name: "hk-ocserv-01".to_string(),
+            region: "hk".to_string(),
+            role: "ocserv".to_string(),
+        })
+        .expect("insert node");
+    store.disable_node("hk-ocserv-01").expect("disable node");
+    drop(store);
+
+    let database_arg = database.to_string_lossy().into_owned();
+    let secret_key_arg = secret_key.to_string_lossy().into_owned();
+    let output = run_ocfleet_failure(&[
+        "--database",
+        &database_arg,
+        "--secret-key",
+        &secret_key_arg,
+        "probe",
+        "ping",
+        "hk-ocserv-01",
+    ]);
+
+    assert!(String::from_utf8_lossy(&output.stderr).contains("node disabled"));
+    let audit = latest_rpc_audit(&database);
+    assert_eq!(audit.event, "rpc.completed");
+    assert_eq!(audit.actor, "audit-user");
+    assert_eq!(audit.node_id.as_deref(), Some("hk-ocserv-01"));
+    assert_eq!(audit.endpoint_id.as_deref(), Some(endpoint_id.as_str()));
+    assert_eq!(audit.method.as_deref(), Some(PROBE_CONTROLLER_PING));
     assert_eq!(audit.ok, 0);
     assert_eq!(audit.error_code.as_deref(), Some("NODE_DISABLED"));
     assert_eq!(audit.detail["message"], "node disabled: hk-ocserv-01");

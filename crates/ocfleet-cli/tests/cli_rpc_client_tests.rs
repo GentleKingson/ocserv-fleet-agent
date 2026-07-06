@@ -59,6 +59,33 @@ fn validate_node_info_response_rejects_endpoint_mismatch() {
 }
 
 #[test]
+fn validate_probe_ping_response_rejects_endpoint_mismatch() {
+    let response = RpcResponse {
+        version: PROTOCOL_VERSION,
+        request_id: Some("request-1".to_string()),
+        ok: true,
+        result: Some(json!({
+            "message": "pong",
+            "probe": "controller.ping",
+            "node_id": "hk-ocserv-01",
+            "agent_version": "0.1.0",
+            "agent_endpoint_id": "actual-endpoint",
+            "time_utc": "2026-01-01T00:00:00Z"
+        })),
+        error: None,
+        started_at: "2026-01-01T00:00:00Z".to_string(),
+        finished_at: "2026-01-01T00:00:00Z".to_string(),
+        duration_ms: 0,
+    };
+
+    let err = validate_rpc_response(&response, "request-1", Some("expected-endpoint"))
+        .expect_err("endpoint mismatch rejected");
+
+    assert_eq!(err.code(), ErrorCode::InvalidResponse);
+    assert!(err.to_string().contains("agent_endpoint_id mismatch"));
+}
+
+#[test]
 fn validate_error_response_rejects_result_payload() {
     let response = RpcResponse {
         version: PROTOCOL_VERSION,

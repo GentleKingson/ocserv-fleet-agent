@@ -10,10 +10,11 @@ pub enum MethodStatus {
 
 pub const NODE_PING: &str = "node.ping";
 pub const NODE_INFO: &str = "node.info";
+pub const PROBE_CONTROLLER_PING: &str = "probe.controller.ping";
 
 pub fn classify_phase_one_method(method: &str) -> MethodStatus {
     match method {
-        NODE_PING | NODE_INFO => MethodStatus::Allowed,
+        NODE_PING | NODE_INFO | PROBE_CONTROLLER_PING => MethodStatus::Allowed,
         "ocserv.service.status"
         | "ocserv.status"
         | "ocserv.users.list"

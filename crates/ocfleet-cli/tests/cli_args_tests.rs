@@ -1,5 +1,5 @@
 use clap::Parser;
-use ocfleet_cli::args::{Cli, Command, NodeCommand};
+use ocfleet_cli::args::{Cli, Command, NodeCommand, ProbeCommand};
 use std::path::PathBuf;
 
 #[test]
@@ -71,6 +71,20 @@ fn parses_top_level_ping_command() {
 
     let Command::Ping { node_id } = cli.command else {
         panic!("expected ping command");
+    };
+
+    assert_eq!(node_id, "hk-ocserv-01");
+}
+
+#[test]
+fn parses_probe_ping_command() {
+    let cli = Cli::parse_from(["ocfleet", "probe", "ping", "hk-ocserv-01"]);
+
+    let Command::Probe {
+        command: ProbeCommand::Ping { node_id },
+    } = cli.command
+    else {
+        panic!("expected probe ping command");
     };
 
     assert_eq!(node_id, "hk-ocserv-01");

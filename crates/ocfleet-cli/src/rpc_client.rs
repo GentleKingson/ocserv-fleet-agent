@@ -214,7 +214,7 @@ where
 pub fn validate_rpc_response(
     response: &RpcResponse,
     expected_request_id: &str,
-    expected_node_info_endpoint_id: Option<&str>,
+    expected_agent_endpoint_id: Option<&str>,
 ) -> Result<(), RpcClientError> {
     if response.version != PROTOCOL_VERSION {
         return Err(RpcClientError::structured(
@@ -240,7 +240,7 @@ pub fn validate_rpc_response(
                 "ok response must include result and omit error".to_string(),
             ));
         }
-        if let Some(expected_endpoint_id) = expected_node_info_endpoint_id {
+        if let Some(expected_endpoint_id) = expected_agent_endpoint_id {
             let actual = response
                 .result
                 .as_ref()
@@ -250,7 +250,7 @@ pub fn validate_rpc_response(
                 return Err(RpcClientError::structured(
                     ErrorCode::InvalidResponse,
                     format!(
-                        "node.info endpoint mismatch: expected={expected_endpoint_id} actual={}",
+                        "agent_endpoint_id mismatch: expected={expected_endpoint_id} actual={}",
                         actual.unwrap_or("<missing>")
                     ),
                 ));

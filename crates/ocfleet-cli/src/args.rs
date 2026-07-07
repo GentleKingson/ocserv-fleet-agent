@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
@@ -31,6 +31,18 @@ pub enum Command {
     Node {
         #[command(subcommand)]
         command: NodeCommand,
+    },
+    Enroll {
+        #[command(subcommand)]
+        command: EnrollCommand,
+    },
+    Endpoint {
+        #[command(subcommand)]
+        command: EndpointCommand,
+    },
+    Trust {
+        #[command(subcommand)]
+        command: TrustCommand,
     },
 }
 
@@ -82,5 +94,93 @@ pub enum NodeCommand {
         node_id: String,
         #[arg(long)]
         yes: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum EnrollCommand {
+    Token {
+        #[command(subcommand)]
+        command: EnrollTokenCommand,
+    },
+    Request {
+        #[command(subcommand)]
+        command: EnrollRequestCommand,
+    },
+    Approve {
+        join_request_id: String,
+        #[arg(long)]
+        endpoint_id: String,
+        #[arg(long)]
+        reason: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum EnrollTokenCommand {
+    Create {
+        #[arg(long, default_value = "24h")]
+        ttl: String,
+        #[arg(long, default_value_t = 1)]
+        max_uses: u32,
+        #[arg(long)]
+        description: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum EnrollRequestCommand {
+    Create {
+        #[arg(long)]
+        token: String,
+        #[arg(long)]
+        agent_public_key: String,
+        #[arg(long)]
+        fingerprint: String,
+        #[arg(long)]
+        requested_endpoint_id: Option<String>,
+        #[arg(long)]
+        hostname: String,
+        #[arg(long)]
+        agent_version: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum EndpointCommand {
+    Rotate {
+        old_endpoint_id: String,
+        #[arg(long)]
+        new_endpoint_id: String,
+        #[arg(long)]
+        reason: String,
+    },
+    Revoke {
+        endpoint_id: String,
+        #[arg(long)]
+        reason: String,
+    },
+    Quarantine {
+        endpoint_id: String,
+        #[arg(long)]
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum TrustDiffFormat {
+    Human,
+    Json,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TrustCommand {
+    Diff {
+        #[arg(long)]
+        endpoint: Option<String>,
+        #[arg(long, value_enum, default_value = "human")]
+        format: TrustDiffFormat,
+        #[arg(long)]
+        strict: bool,
     },
 }

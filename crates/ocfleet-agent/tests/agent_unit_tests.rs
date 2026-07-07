@@ -4,6 +4,7 @@ use ocfleet_agent::{
     audit::{AgentAuditEvent, JsonlAuditWriter},
     audit_limiter::{AuditLimitDecision, RejectedAuditLimiter},
     authz::{AgentAuthorization, CallerClass, PathProbeDecision},
+    enrollment::{AgentEnrollment, AgentEnrollmentStateExt},
     node_info::collect_node_info,
     nonce::{NonceCache, NonceDecision, NonceLimitScope},
     server::{
@@ -16,6 +17,7 @@ use ocfleet_config::agent::{
     PeerConfig, SecurityConfig,
 };
 use ocfleet_protocol::constants::PROTOCOL_VERSION;
+use ocfleet_protocol::enrollment::{EndpointStatus, TrustBundle};
 use ocfleet_protocol::error::ErrorCode;
 use ocfleet_protocol::method::{
     NODE_INFO, NODE_PING, PROBE_CONTROLLER_PING, PROBE_PATH_ECHO, PROBE_PEER_ECHO,
@@ -641,6 +643,47 @@ fn authorization_rejects_path_probe_target_that_is_controller() {
         authz.path_probe_decision(&controller_id, &target_controller_id, &source_id),
         PathProbeDecision::TargetIsController
     );
+}
+
+#[test]
+fn pending_enrollment_state_does_not_grant_runtime_trust() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let state_path = dir.path().join("enrollment-state.json");
+
+    let state = AgentEnrollment::load_or_create_pending(&state_path, "join-request-1", "token-1")
+        .expect("pending state written");
+
+    assert!(state.is_pending());
+    assert!(!state.is_active());
+
+    let config = test_agent_config(dir.path(), Vec::new());
+    let authz =
+        AgentAuthorization::from_security_config(&config.security).expect("empty authz builds");
+    let unknown = iroh::SecretKey::generate().public();
+
+    assert_eq!(authz.classify(&unknown), CallerClass::Unknown);
+    assert!(!authz.is_connection_admitted(&unknown));
+}
+
+#[test]
+fn approved_enrollment_state_persists_trust_bundle() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let state_path = dir.path().join("enrollment-state.json");
+    let bundle = TrustBundle {
+        endpoint_id: "endpoint-active".to_string(),
+        generation: 3,
+        status: EndpointStatus::Active,
+        trusted_controllers: vec!["controller-one".to_string()],
+        trusted_peers: vec!["peer-one".to_string()],
+        authorized_path_probes: vec![("controller-one".to_string(), "peer-one".to_string())],
+    };
+
+    let state =
+        AgentEnrollment::activate(&state_path, bundle.clone()).expect("active state written");
+    let loaded = AgentEnrollment::load(&state_path).expect("active state loaded");
+
+    assert!(state.is_active());
+    assert_eq!(loaded.trust_bundle(), Some(&bundle));
 }
 
 #[tokio::test]

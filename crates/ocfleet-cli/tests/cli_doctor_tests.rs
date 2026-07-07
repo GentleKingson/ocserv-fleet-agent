@@ -3,7 +3,7 @@ use ocfleet_cli::doctor::{
     DOCTOR_EXIT_OK, DOCTOR_EXIT_UNHEALTHY, DoctorOptions, DoctorStatus, run_doctor,
 };
 use ocfleet_cli::identity::load_or_create_secret_key_with_status;
-use ocfleet_cli::store::{NodeInsert, Store};
+use ocfleet_cli::store::{CURRENT_SCHEMA_VERSION, NodeInsert, Store};
 
 #[test]
 fn doctor_reports_ok_for_initialized_controller_state() {
@@ -30,7 +30,7 @@ fn doctor_reports_ok_for_initialized_controller_state() {
 
     assert_eq!(report.status, DoctorStatus::Ok);
     assert_eq!(report.exit_code, DOCTOR_EXIT_OK);
-    assert_eq!(report.schema_version_actual, Some(1));
+    assert_eq!(report.schema_version_actual, Some(CURRENT_SCHEMA_VERSION));
     assert!(report.checks.iter().all(|check| !check.status.is_error()));
 }
 

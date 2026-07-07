@@ -1,7 +1,10 @@
 use anyhow::{Context, bail};
 use clap::Parser;
 use iroh::{EndpointAddr, EndpointId};
-use ocfleet_cli::args::{Cli, Command, NodeCommand, ProbeCommand};
+use ocfleet_cli::args::{
+    Cli, Command, EndpointCommand, EnrollCommand, EnrollRequestCommand, EnrollTokenCommand,
+    NodeCommand, ProbeCommand, TrustCommand, TrustDiffFormat,
+};
 use ocfleet_cli::audit::AuditEvent;
 use ocfleet_cli::doctor::{DoctorOptions, format_human, run_doctor};
 use ocfleet_cli::identity::{
@@ -11,10 +14,14 @@ use ocfleet_cli::rpc_client::{
     RpcClientError, bind_controller_endpoint, build_request, call_endpoint_addr,
     validate_path_echo_result, validate_rpc_response,
 };
-use ocfleet_cli::store::{NodeInsert, NodeRecord, ProbeHistoryRecord, Store};
+use ocfleet_cli::store::{
+    ApprovalInput, EndpointTrustRecord, EnrollmentTokenInsert, JoinRequestInsert, NodeInsert,
+    NodeRecord, ProbeHistoryRecord, Store,
+};
 use ocfleet_config::validation::{
     canonicalize_node_endpoint_id, validate_node_id, validate_region, validate_role,
 };
+use ocfleet_protocol::enrollment::{EndpointStatus, TrustBundle};
 use ocfleet_protocol::error::ErrorCode;
 use ocfleet_protocol::method::{NODE_INFO, NODE_PING, PROBE_CONTROLLER_PING, PROBE_PATH_ECHO};
 use ocfleet_protocol::{DEFAULT_ALPN, DEFAULT_DEADLINE_MS, RpcResponse};
@@ -23,6 +30,8 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::str::FromStr;
 use std::time::Instant;
+use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
+use uuid::Uuid;
 
 fn local_actor() -> String {
     match std::env::var("USER") {
@@ -178,8 +187,370 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
+        Command::Enroll { command } => {
+            let store = Store::open(&cli.database).context("failed to open controller database")?;
+            match command {
+                EnrollCommand::Token { command } => match command {
+                    EnrollTokenCommand::Create {
+                        ttl,
+                        max_uses,
+                        description,
+                    } => run_enroll_token_create(&store, &ttl, max_uses, description)?,
+                },
+                EnrollCommand::Request { command } => match command {
+                    EnrollRequestCommand::Create {
+                        token,
+                        agent_public_key,
+                        fingerprint,
+                        requested_endpoint_id,
+                        hostname,
+                        agent_version,
+                    } => run_enroll_request_create(
+                        &store,
+                        token,
+                        agent_public_key,
+                        fingerprint,
+                        requested_endpoint_id,
+                        hostname,
+                        agent_version,
+                    )?,
+                },
+                EnrollCommand::Approve {
+                    join_request_id,
+                    endpoint_id,
+                    reason,
+                } => run_enroll_approve(&store, &join_request_id, &endpoint_id, &reason)?,
+            }
+        }
+        Command::Endpoint { command } => {
+            let store = Store::open(&cli.database).context("failed to open controller database")?;
+            match command {
+                EndpointCommand::Rotate {
+                    old_endpoint_id,
+                    new_endpoint_id,
+                    reason,
+                } => {
+                    let endpoint = store.rotate_endpoint(
+                        &old_endpoint_id,
+                        &new_endpoint_id,
+                        &local_actor(),
+                        &reason,
+                    )?;
+                    println!("endpoint_id={}", endpoint.endpoint_id);
+                    println!("status={}", endpoint.status.as_str());
+                    println!("generation={}", endpoint.generation);
+                    println!(
+                        "previous_endpoint_id={}",
+                        endpoint.previous_endpoint_id.as_deref().unwrap_or("<none>")
+                    );
+                }
+                EndpointCommand::Revoke {
+                    endpoint_id,
+                    reason,
+                } => {
+                    let endpoint = store.revoke_endpoint(&endpoint_id, &local_actor(), &reason)?;
+                    println!("endpoint_id={}", endpoint.endpoint_id);
+                    println!("status={}", endpoint.status.as_str());
+                    println!("generation={}", endpoint.generation);
+                }
+                EndpointCommand::Quarantine {
+                    endpoint_id,
+                    reason,
+                } => {
+                    let endpoint =
+                        store.quarantine_endpoint(&endpoint_id, &local_actor(), &reason)?;
+                    println!("endpoint_id={}", endpoint.endpoint_id);
+                    println!("status={}", endpoint.status.as_str());
+                    println!("generation={}", endpoint.generation);
+                }
+            }
+        }
+        Command::Trust { command } => {
+            let store = Store::open(&cli.database).context("failed to open controller database")?;
+            match command {
+                TrustCommand::Diff {
+                    endpoint,
+                    format,
+                    strict,
+                } => run_trust_diff_command(&store, endpoint.as_deref(), format, strict)?,
+            }
+        }
     }
 
+    Ok(())
+}
+
+fn run_enroll_token_create(
+    store: &Store,
+    ttl: &str,
+    max_uses: u32,
+    description: Option<String>,
+) -> anyhow::Result<()> {
+    if max_uses == 0 {
+        bail!("--max-uses must be greater than zero");
+    }
+    let ttl = parse_ttl(ttl)?;
+    let token_id = format!("tok-{}", Uuid::new_v4());
+    let token = format!("ocfleet_enroll_{}", Uuid::new_v4().simple());
+    let expires_at = (OffsetDateTime::now_utc() + ttl)
+        .format(&Rfc3339)
+        .expect("RFC3339 formatting succeeds");
+    let actor = local_actor();
+    store.create_enrollment_token(
+        &EnrollmentTokenInsert {
+            token_id: token_id.clone(),
+            token_hash: Store::hash_enrollment_token(&token),
+            created_by: actor.clone(),
+            expires_at: expires_at.clone(),
+            max_uses,
+            description,
+            labels_json: json!({}),
+            scope_json: json!({}),
+        },
+        &actor,
+    )?;
+
+    println!("token_id={token_id}");
+    println!("token={token}");
+    println!("expires_at={expires_at}");
+    println!("max_uses={max_uses}");
+    println!("plaintext_visible_once=true");
+    Ok(())
+}
+
+fn run_enroll_approve(
+    store: &Store,
+    join_request_id: &str,
+    endpoint_id: &str,
+    reason: &str,
+) -> anyhow::Result<()> {
+    let approved = store.approve_join_request(&ApprovalInput {
+        request_id: join_request_id.to_string(),
+        endpoint_id: endpoint_id.to_string(),
+        approved_by: local_actor(),
+        reason: reason.to_string(),
+        approved_labels_json: json!({}),
+    })?;
+    println!("join_request_id={}", approved.request_id);
+    println!("status={}", approved.status.as_str());
+    println!(
+        "assigned_endpoint_id={}",
+        approved.assigned_endpoint_id.as_deref().unwrap_or("<none>")
+    );
+    Ok(())
+}
+
+fn run_enroll_request_create(
+    store: &Store,
+    token: String,
+    agent_public_key: String,
+    fingerprint: String,
+    requested_endpoint_id: Option<String>,
+    hostname: String,
+    agent_version: String,
+) -> anyhow::Result<()> {
+    let join = store.submit_join_request(
+        &JoinRequestInsert {
+            token_plaintext: token,
+            agent_public_key,
+            fingerprint,
+            requested_endpoint_id,
+            hostname,
+            agent_version,
+            requested_labels_json: json!({}),
+        },
+        "agent",
+    )?;
+    println!("join_request_id={}", join.request_id);
+    println!("token_id={}", join.token_id);
+    println!("status={}", join.status.as_str());
+    println!("hostname={}", join.hostname);
+    Ok(())
+}
+
+fn parse_ttl(value: &str) -> anyhow::Result<Duration> {
+    let (number, unit) = value.split_at(value.len().saturating_sub(1));
+    let amount: i64 = number
+        .parse()
+        .with_context(|| format!("invalid ttl value: {value}"))?;
+    if amount <= 0 {
+        bail!("--ttl must be greater than zero");
+    }
+    match unit {
+        "s" => Ok(Duration::seconds(amount)),
+        "m" => Ok(Duration::minutes(amount)),
+        "h" => Ok(Duration::hours(amount)),
+        "d" => Ok(Duration::days(amount)),
+        _ => bail!("--ttl must use s, m, h, or d suffix"),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TrustDiff {
+    code: &'static str,
+    severity: &'static str,
+    endpoint_id: String,
+    message: String,
+}
+
+fn run_trust_diff_command(
+    store: &Store,
+    endpoint_filter: Option<&str>,
+    format: TrustDiffFormat,
+    strict: bool,
+) -> anyhow::Result<()> {
+    let snapshot = store.trust_snapshot(endpoint_filter)?;
+    let diffs = compute_trust_diffs(&snapshot.endpoints);
+    match format {
+        TrustDiffFormat::Human => {
+            print_trust_diff_human(endpoint_filter, &snapshot.endpoints, &diffs)
+        }
+        TrustDiffFormat::Json => {
+            print_trust_diff_json(endpoint_filter, &snapshot.endpoints, &diffs)?
+        }
+    }
+    if strict && diffs.iter().any(|diff| diff.severity == "high") {
+        std::process::exit(2);
+    }
+    Ok(())
+}
+
+fn compute_trust_diffs(endpoints: &[EndpointTrustRecord]) -> Vec<TrustDiff> {
+    let mut diffs = Vec::new();
+    for endpoint in endpoints {
+        let bundle: Option<TrustBundle> =
+            serde_json::from_value(endpoint.trust_bundle_json.clone()).ok();
+        if matches!(endpoint.status, EndpointStatus::Revoked) {
+            diffs.push(TrustDiff {
+                code: "REVOKED_PEER_STILL_TRUSTED",
+                severity: "high",
+                endpoint_id: endpoint.endpoint_id.clone(),
+                message: "revoked endpoint remains present in trust registry".to_string(),
+            });
+        }
+        if matches!(endpoint.status, EndpointStatus::Quarantined) {
+            diffs.push(TrustDiff {
+                code: "QUARANTINED_PEER_STILL_ALLOWED",
+                severity: "high",
+                endpoint_id: endpoint.endpoint_id.clone(),
+                message: "quarantined endpoint remains present in trust registry".to_string(),
+            });
+        }
+        if let Some(bundle) = bundle {
+            if bundle.generation < endpoint.generation {
+                diffs.push(TrustDiff {
+                    code: "TRUST_GENERATION_STALE",
+                    severity: "high",
+                    endpoint_id: endpoint.endpoint_id.clone(),
+                    message: format!(
+                        "agent trust generation {} is behind controller generation {}",
+                        bundle.generation, endpoint.generation
+                    ),
+                });
+            }
+            for peer in &bundle.trusted_peers {
+                if peer == &endpoint.endpoint_id && endpoint.status == EndpointStatus::Revoked {
+                    diffs.push(TrustDiff {
+                        code: "REVOKED_PEER_STILL_TRUSTED",
+                        severity: "high",
+                        endpoint_id: endpoint.endpoint_id.clone(),
+                        message: format!("revoked endpoint {peer} is still trusted as a peer"),
+                    });
+                }
+                if peer == &endpoint.endpoint_id && endpoint.status == EndpointStatus::Quarantined {
+                    diffs.push(TrustDiff {
+                        code: "QUARANTINED_PEER_STILL_ALLOWED",
+                        severity: "high",
+                        endpoint_id: endpoint.endpoint_id.clone(),
+                        message: format!("quarantined endpoint {peer} is still trusted as a peer"),
+                    });
+                }
+            }
+        }
+    }
+    diffs
+}
+
+fn print_trust_diff_human(
+    endpoint_filter: Option<&str>,
+    endpoints: &[EndpointTrustRecord],
+    diffs: &[TrustDiff],
+) {
+    println!("trust_diff=controller_registry");
+    println!("endpoint_filter={}", endpoint_filter.unwrap_or("<all>"));
+    println!("endpoint_count={}", endpoints.len());
+    for endpoint in endpoints {
+        println!(
+            "endpoint_id={} status={} generation={} previous_endpoint_id={} rotated_to={}",
+            endpoint.endpoint_id,
+            endpoint.status.as_str(),
+            endpoint.generation,
+            endpoint.previous_endpoint_id.as_deref().unwrap_or("<none>"),
+            endpoint.rotated_to.as_deref().unwrap_or("<none>")
+        );
+    }
+    println!("diff_count={}", diffs.len());
+    for diff in diffs {
+        println!(
+            "diff code={} severity={} endpoint_id={} message={}",
+            diff.code, diff.severity, diff.endpoint_id, diff.message
+        );
+    }
+}
+
+fn print_trust_diff_json(
+    endpoint_filter: Option<&str>,
+    endpoints: &[EndpointTrustRecord],
+    diffs: &[TrustDiff],
+) -> anyhow::Result<()> {
+    let registry = endpoints
+        .iter()
+        .map(|endpoint| {
+            json!({
+                "endpoint_id": endpoint.endpoint_id.clone(),
+                "status": endpoint.status.as_str(),
+                "generation": endpoint.generation,
+                "previous_endpoint_id": endpoint.previous_endpoint_id.clone(),
+                "rotated_to": endpoint.rotated_to.clone(),
+                "agent_controllers": endpoint
+                    .trust_bundle_json
+                    .get("trusted_controllers")
+                    .cloned()
+                    .unwrap_or_else(|| json!([])),
+                "agent_peers": endpoint
+                    .trust_bundle_json
+                    .get("trusted_peers")
+                    .cloned()
+                    .unwrap_or_else(|| json!([])),
+                "agent_path_probes": endpoint
+                    .trust_bundle_json
+                    .get("authorized_path_probes")
+                    .cloned()
+                    .unwrap_or_else(|| json!([])),
+            })
+        })
+        .collect::<Vec<_>>();
+    let diffs = diffs
+        .iter()
+        .map(|diff| {
+            json!({
+                "code": diff.code,
+                "severity": diff.severity,
+                "endpoint_id": diff.endpoint_id,
+                "message": diff.message,
+            })
+        })
+        .collect::<Vec<_>>();
+    let diff_count = diffs.len();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "endpoint_filter": endpoint_filter,
+            "registry": registry,
+            "diff_count": diff_count,
+            "diffs": diffs,
+        }))?
+    );
     Ok(())
 }
 
@@ -535,6 +906,16 @@ fn print_summary_node(role: &str, node_id: &str, status: &str, endpoint_id: Opti
     }
 }
 
+fn inactive_endpoint_status(
+    store: &Store,
+    endpoint_id: &str,
+) -> anyhow::Result<Option<EndpointStatus>> {
+    Ok(store
+        .get_endpoint_trust(endpoint_id)?
+        .map(|endpoint| endpoint.status)
+        .filter(|status| *status != EndpointStatus::Active))
+}
+
 async fn run_path_probe_command(
     store: &Store,
     secret_key_path: &Path,
@@ -586,6 +967,30 @@ async fn run_path_probe_command(
         )?;
         bail!(message);
     }
+    if let Some(status) = inactive_endpoint_status(store, &source.endpoint_id)? {
+        let message = format!(
+            "endpoint not active: node_id={} endpoint_id={} status={}",
+            source.node_id,
+            source.endpoint_id,
+            status.as_str()
+        );
+        write_rpc_audit(
+            store,
+            RpcAuditRecord {
+                actor,
+                node_id: source.node_id.clone(),
+                endpoint_id: Some(source.endpoint_id.clone()),
+                method: PROBE_PATH_ECHO.to_string(),
+                request_id: None,
+                params_hash: hash_json_value(&json!({})),
+                ok: false,
+                error_code: Some(ErrorCode::EndpointNotAllowed),
+                duration_ms: elapsed_ms(started),
+                detail_json: json!({"message": message, "source_node_id": source_node_id, "target_node_id": target_node_id, "endpoint_status": status.as_str()}),
+            },
+        )?;
+        bail!(message);
+    }
     let target = match store.get_node(target_node_id)? {
         Some(node) => node,
         None => {
@@ -623,6 +1028,30 @@ async fn run_path_probe_command(
                 error_code: Some(ErrorCode::NodeDisabled),
                 duration_ms: elapsed_ms(started),
                 detail_json: json!({"message": message, "source_node_id": source_node_id, "target_node_id": target_node_id}),
+            },
+        )?;
+        bail!(message);
+    }
+    if let Some(status) = inactive_endpoint_status(store, &target.endpoint_id)? {
+        let message = format!(
+            "endpoint not active: node_id={} endpoint_id={} status={}",
+            target.node_id,
+            target.endpoint_id,
+            status.as_str()
+        );
+        write_rpc_audit(
+            store,
+            RpcAuditRecord {
+                actor,
+                node_id: source.node_id.clone(),
+                endpoint_id: Some(source.endpoint_id.clone()),
+                method: PROBE_PATH_ECHO.to_string(),
+                request_id: None,
+                params_hash: hash_json_value(&json!({})),
+                ok: false,
+                error_code: Some(ErrorCode::EndpointNotAllowed),
+                duration_ms: elapsed_ms(started),
+                detail_json: json!({"message": message, "source_node_id": source_node_id, "target_node_id": target_node_id, "target_endpoint_status": status.as_str()}),
             },
         )?;
         bail!(message);
@@ -747,6 +1176,30 @@ async fn run_node_rpc_command(
                 error_code: Some(ErrorCode::NodeDisabled),
                 duration_ms: elapsed_ms(started),
                 detail_json: json!({ "message": message }),
+            },
+        )?;
+        bail!(message);
+    }
+    if let Some(status) = inactive_endpoint_status(store, &node.endpoint_id)? {
+        let message = format!(
+            "endpoint not active: node_id={} endpoint_id={} status={}",
+            node.node_id,
+            node.endpoint_id,
+            status.as_str()
+        );
+        write_rpc_audit(
+            store,
+            RpcAuditRecord {
+                actor,
+                node_id: node.node_id.clone(),
+                endpoint_id: Some(node.endpoint_id.clone()),
+                method: method.to_string(),
+                request_id: None,
+                params_hash,
+                ok: false,
+                error_code: Some(ErrorCode::EndpointNotAllowed),
+                duration_ms: elapsed_ms(started),
+                detail_json: json!({ "message": message, "endpoint_status": status.as_str() }),
             },
         )?;
         bail!(message);

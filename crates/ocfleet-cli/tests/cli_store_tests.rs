@@ -1,5 +1,9 @@
 use ocfleet_cli::audit::AuditEvent;
-use ocfleet_cli::store::{NodeInsert, Store, StoreError};
+use ocfleet_cli::store::{
+    ApprovalInput, EnrollmentTokenInsert, JoinRequestInsert, NodeInsert, Store, StoreError,
+};
+use ocfleet_protocol::enrollment::{EndpointStatus, EnrollmentTokenStatus, JoinRequestStatus};
+use rusqlite::Connection;
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
@@ -38,7 +42,7 @@ fn initializes_schema_and_migration_version() {
     let dir = tempfile::tempdir().expect("temp dir");
     let db = dir.path().join("controller.sqlite");
     let store = Store::open(&db).expect("store opens");
-    assert_eq!(store.current_schema_version().expect("version"), 1);
+    assert_eq!(store.current_schema_version().expect("version"), 2);
 }
 
 #[test]
@@ -48,12 +52,12 @@ fn open_with_status_reports_database_creation() {
 
     let first = Store::open_with_status(&db).expect("create store with status");
     assert!(first.created_database);
-    assert_eq!(first.store.current_schema_version().expect("version"), 1);
+    assert_eq!(first.store.current_schema_version().expect("version"), 2);
     drop(first);
 
     let second = Store::open_with_status(&db).expect("reopen store with status");
     assert!(!second.created_database);
-    assert_eq!(second.store.current_schema_version().expect("version"), 1);
+    assert_eq!(second.store.current_schema_version().expect("version"), 2);
 }
 
 #[test]
@@ -269,4 +273,290 @@ fn removed_node_does_not_remove_audit_rows() {
     store.remove_node("hk-ocserv-01").expect("remove");
     assert!(store.get_node("hk-ocserv-01").expect("load").is_none());
     assert_eq!(store.audit_count().expect("count"), 1);
+}
+
+fn future_time() -> String {
+    "2099-01-01T00:00:00Z".to_string()
+}
+
+fn past_time() -> String {
+    "2000-01-01T00:00:00Z".to_string()
+}
+
+fn latest_audit_event(database: &Path) -> (String, serde_json::Value) {
+    let conn = Connection::open(database).expect("open db");
+    let (event, detail): (String, String) = conn
+        .query_row(
+            "SELECT event, detail_json FROM controller_audit_log ORDER BY id DESC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("latest audit");
+    (
+        event,
+        serde_json::from_str(&detail).expect("parse audit detail"),
+    )
+}
+
+#[test]
+fn enrollment_token_is_hash_only_and_use_creates_pending_join_request() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("controller.sqlite");
+    let store = Store::open(&db).expect("store opens");
+    let token_plaintext = "ocfleet_enroll_test_secret";
+    let token_hash = Store::hash_enrollment_token(token_plaintext);
+
+    store
+        .create_enrollment_token(
+            &EnrollmentTokenInsert {
+                token_id: "tok-1".to_string(),
+                token_hash: token_hash.clone(),
+                created_by: "operator".to_string(),
+                expires_at: future_time(),
+                max_uses: 1,
+                description: Some("prod node onboarding".to_string()),
+                labels_json: serde_json::json!({"env": "prod"}),
+                scope_json: serde_json::json!({"region": "hk"}),
+            },
+            "operator",
+        )
+        .expect("token created");
+
+    let stored = store
+        .get_enrollment_token("tok-1")
+        .expect("load token")
+        .expect("token exists");
+    assert_eq!(stored.token_hash, token_hash);
+    assert_ne!(stored.token_hash, token_plaintext);
+    assert_eq!(stored.status, EnrollmentTokenStatus::Active);
+    assert_eq!(stored.used_count, 0);
+
+    let join = store
+        .submit_join_request(
+            &JoinRequestInsert {
+                token_plaintext: token_plaintext.to_string(),
+                agent_public_key: "agent-public-key".to_string(),
+                fingerprint: "agent-fingerprint".to_string(),
+                requested_endpoint_id: None,
+                hostname: "hk-ocserv-01".to_string(),
+                agent_version: "0.1.0".to_string(),
+                requested_labels_json: serde_json::json!({"role": "ocserv"}),
+            },
+            "agent",
+        )
+        .expect("join request created");
+
+    assert_eq!(join.token_id, "tok-1");
+    assert_eq!(join.status, JoinRequestStatus::Pending);
+    assert_eq!(join.hostname, "hk-ocserv-01");
+
+    let stored_after_use = store
+        .get_enrollment_token("tok-1")
+        .expect("load token after use")
+        .expect("token exists");
+    assert_eq!(stored_after_use.used_count, 1);
+}
+
+#[test]
+fn enrollment_token_rejects_expired_or_overused_tokens_and_audits_rejection() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("controller.sqlite");
+    let store = Store::open(&db).expect("store opens");
+    let token_plaintext = "ocfleet_enroll_single_use";
+
+    store
+        .create_enrollment_token(
+            &EnrollmentTokenInsert {
+                token_id: "tok-1".to_string(),
+                token_hash: Store::hash_enrollment_token(token_plaintext),
+                created_by: "operator".to_string(),
+                expires_at: future_time(),
+                max_uses: 1,
+                description: None,
+                labels_json: serde_json::json!({}),
+                scope_json: serde_json::json!({}),
+            },
+            "operator",
+        )
+        .expect("token created");
+    store
+        .submit_join_request(
+            &JoinRequestInsert {
+                token_plaintext: token_plaintext.to_string(),
+                agent_public_key: "agent-public-key".to_string(),
+                fingerprint: "agent-fingerprint".to_string(),
+                requested_endpoint_id: None,
+                hostname: "hk-ocserv-01".to_string(),
+                agent_version: "0.1.0".to_string(),
+                requested_labels_json: serde_json::json!({}),
+            },
+            "agent",
+        )
+        .expect("first use succeeds");
+
+    let second_use = store.submit_join_request(
+        &JoinRequestInsert {
+            token_plaintext: token_plaintext.to_string(),
+            agent_public_key: "agent-public-key-2".to_string(),
+            fingerprint: "agent-fingerprint-2".to_string(),
+            requested_endpoint_id: None,
+            hostname: "hk-ocserv-02".to_string(),
+            agent_version: "0.1.0".to_string(),
+            requested_labels_json: serde_json::json!({}),
+        },
+        "agent",
+    );
+    assert!(matches!(second_use, Err(StoreError::EnrollmentRejected(_))));
+
+    let (event, detail) = latest_audit_event(&db);
+    assert_eq!(event, "enrollment.token.reject");
+    assert_eq!(detail["reason"], "max_uses_exhausted");
+
+    store
+        .create_enrollment_token(
+            &EnrollmentTokenInsert {
+                token_id: "tok-expired".to_string(),
+                token_hash: Store::hash_enrollment_token("expired-token"),
+                created_by: "operator".to_string(),
+                expires_at: past_time(),
+                max_uses: 1,
+                description: None,
+                labels_json: serde_json::json!({}),
+                scope_json: serde_json::json!({}),
+            },
+            "operator",
+        )
+        .expect("expired token inserted for test");
+
+    let expired = store.submit_join_request(
+        &JoinRequestInsert {
+            token_plaintext: "expired-token".to_string(),
+            agent_public_key: "agent-public-key-3".to_string(),
+            fingerprint: "agent-fingerprint-3".to_string(),
+            requested_endpoint_id: None,
+            hostname: "hk-ocserv-03".to_string(),
+            agent_version: "0.1.0".to_string(),
+            requested_labels_json: serde_json::json!({}),
+        },
+        "agent",
+    );
+    assert!(matches!(expired, Err(StoreError::EnrollmentRejected(_))));
+}
+
+#[test]
+fn approving_join_request_creates_active_endpoint_and_audit_before_after() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("controller.sqlite");
+    let store = Store::open(&db).expect("store opens");
+    let token_plaintext = "ocfleet_enroll_approval";
+
+    store
+        .create_enrollment_token(
+            &EnrollmentTokenInsert {
+                token_id: "tok-approval".to_string(),
+                token_hash: Store::hash_enrollment_token(token_plaintext),
+                created_by: "operator".to_string(),
+                expires_at: future_time(),
+                max_uses: 1,
+                description: None,
+                labels_json: serde_json::json!({}),
+                scope_json: serde_json::json!({}),
+            },
+            "operator",
+        )
+        .expect("token created");
+    let join = store
+        .submit_join_request(
+            &JoinRequestInsert {
+                token_plaintext: token_plaintext.to_string(),
+                agent_public_key: "agent-public-key".to_string(),
+                fingerprint: "agent-fingerprint".to_string(),
+                requested_endpoint_id: None,
+                hostname: "hk-ocserv-01".to_string(),
+                agent_version: "0.1.0".to_string(),
+                requested_labels_json: serde_json::json!({"region": "hk"}),
+            },
+            "agent",
+        )
+        .expect("join request created");
+
+    let approved = store
+        .approve_join_request(&ApprovalInput {
+            request_id: join.request_id.clone(),
+            endpoint_id: "endpoint-approved".to_string(),
+            approved_by: "operator".to_string(),
+            reason: "ticket-123".to_string(),
+            approved_labels_json: serde_json::json!({"region": "hk", "role": "ocserv"}),
+        })
+        .expect("join request approved");
+
+    assert_eq!(approved.status, JoinRequestStatus::Approved);
+    assert_eq!(
+        approved.assigned_endpoint_id.as_deref(),
+        Some("endpoint-approved")
+    );
+
+    let endpoint = store
+        .get_endpoint_trust("endpoint-approved")
+        .expect("load endpoint")
+        .expect("endpoint exists");
+    assert_eq!(endpoint.status, EndpointStatus::Active);
+    assert_eq!(endpoint.generation, 1);
+    assert_eq!(endpoint.fingerprint.as_deref(), Some("agent-fingerprint"));
+
+    let (event, detail) = latest_audit_event(&db);
+    assert_eq!(event, "enrollment.approve");
+    assert_eq!(detail["before"]["status"], "pending");
+    assert_eq!(detail["after"]["status"], "approved");
+    assert_eq!(detail["reason"], "ticket-123");
+}
+
+#[test]
+fn endpoint_lifecycle_rotate_revoke_and_quarantine_update_status_and_generation() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("controller.sqlite");
+    let store = Store::open(&db).expect("store opens");
+    let node = NodeInsert {
+        node_id: "hk-ocserv-01".into(),
+        endpoint_id: "endpoint-one".into(),
+        name: "hk-ocserv-01".into(),
+        region: "hk".into(),
+        role: "ocserv".into(),
+    };
+    store
+        .add_node(&node)
+        .expect("insert node and endpoint trust");
+
+    let rotated = store
+        .rotate_endpoint("endpoint-one", "endpoint-two", "operator", "key rotation")
+        .expect("rotate endpoint");
+    assert_eq!(rotated.status, EndpointStatus::Active);
+    assert_eq!(rotated.generation, 2);
+    assert_eq!(
+        rotated.previous_endpoint_id.as_deref(),
+        Some("endpoint-one")
+    );
+    let old = store
+        .get_endpoint_trust("endpoint-one")
+        .expect("load old endpoint")
+        .expect("old endpoint exists");
+    assert_eq!(old.status, EndpointStatus::Rotated);
+    assert_eq!(old.rotated_to.as_deref(), Some("endpoint-two"));
+
+    let revoked = store
+        .revoke_endpoint("endpoint-two", "operator", "lost host")
+        .expect("revoke endpoint");
+    assert_eq!(revoked.status, EndpointStatus::Revoked);
+    assert_eq!(revoked.generation, 3);
+
+    let quarantined = store
+        .quarantine_endpoint("endpoint-two", "operator", "suspicious traffic")
+        .expect("quarantine endpoint");
+    assert_eq!(quarantined.status, EndpointStatus::Quarantined);
+    assert_eq!(quarantined.generation, 4);
+
+    let (event, detail) = latest_audit_event(&db);
+    assert_eq!(event, "endpoint.quarantine");
+    assert_eq!(detail["target_id"], "endpoint-two");
+    assert_eq!(detail["reason"], "suspicious traffic");
 }

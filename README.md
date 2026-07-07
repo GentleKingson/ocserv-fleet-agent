@@ -17,6 +17,11 @@ It is not a production-complete ocserv management platform yet.
 - Requires explicit bidirectional trust:
   - the controller registers the agent EndpointID.
   - the agent allowlists trusted controller EndpointIDs.
+- Supports Phase 10 enrollment and trust management:
+  - one-time enrollment tokens stored as hashes.
+  - pending join requests with manual approval.
+  - EndpointID rotate, revoke, and quarantine lifecycle states.
+  - controller-side trust diff reporting.
 - Supports fixed RPC methods:
   - `node.ping`
   - `node.info`
@@ -37,7 +42,7 @@ The current implementation is intentionally narrow. It does not provide:
 - user disconnect or user management
 - generic agent-to-agent payloads, relay probes, mesh discovery, or multi-hop path probes
 - `systemctl`, `occtl`, `journalctl`, certificate, or config-summary adapters
-- enrollment tokens, TOFU, or automatic node registration
+- automatic active trust on first contact or TOFU registration
 
 All local capabilities must be exposed through fixed RPC methods. There is no `shell.exec`, `command.run`, `occtl.raw`, `journalctl.raw`, or equivalent generic execution interface.
 
@@ -116,6 +121,29 @@ target/debug/ocfleet node add hk-ocserv-01 \
   --role ocserv
 ```
 
+Or use the Phase 10 approval flow:
+
+```bash
+target/debug/ocfleet enroll token create \
+  --ttl 24h \
+  --max-uses 1 \
+  --description "prod node onboarding"
+
+target/debug/ocfleet enroll request create \
+  --token <plaintext-token> \
+  --agent-public-key <agent-public-key> \
+  --fingerprint <agent-fingerprint> \
+  --hostname hk-ocserv-01 \
+  --agent-version 0.1.0
+
+target/debug/ocfleet enroll approve <join-request-id> \
+  --endpoint-id <agent_endpoint_id> \
+  --reason "ticket-123"
+```
+
+Enrollment tokens only create pending join requests. Agents do not receive
+peer or path-probe authorization until approval.
+
 Call the Phase 1 RPCs:
 
 ```bash
@@ -163,6 +191,31 @@ target/debug/ocfleet probe observe source-ocserv-01 target-ocserv-01
 
 Path observation reports registry status and the most recent matching `probe.path.echo` audit result when one exists. It does not perform route discovery, traceroute, network probing, forwarding, relay, mesh, or multi-hop analysis.
 
+Inspect controller trust drift:
+
+```bash
+target/debug/ocfleet trust diff
+target/debug/ocfleet trust diff --endpoint <endpoint-id>
+target/debug/ocfleet trust diff --endpoint <endpoint-id> --format json
+target/debug/ocfleet trust diff --strict
+```
+
+Manage EndpointID lifecycle:
+
+```bash
+target/debug/ocfleet endpoint rotate <old-endpoint-id> \
+  --new-endpoint-id <new-endpoint-id> \
+  --reason "key rotation"
+
+target/debug/ocfleet endpoint revoke <endpoint-id> --reason "lost host"
+target/debug/ocfleet endpoint quarantine <endpoint-id> --reason "suspicious traffic"
+```
+
+Rotated, revoked, and quarantined endpoints are rejected for normal controller
+RPC and path-probe authorization. These lifecycle commands are registry/trust
+operations only; they do not add diagnostic shell or service-control entry
+points.
+
 Phase 7 ocserv-aware read-only checks remain reserved because the current codebase has no approved safe fixed ocserv metadata source. See [`docs/direction-two-phase-7-ocserv-aware-readonly.md`](docs/direction-two-phase-7-ocserv-aware-readonly.md).
 
 Networking must allow the controller to reach the agent through iroh using the registered EndpointID.
@@ -176,6 +229,7 @@ Networking must allow the controller to reach the agent through iroh using the r
 - `docs/install.md`: install, upgrade, SecretKey, systemd, and smoke-test guide.
 - `docs/troubleshooting.md`: operational failure modes and `ocfleet doctor` interpretation.
 - `docs/release-notes/v0.1.0.md`: v0.1.0 release notes and known limitations.
+- `docs/phase-10-enrollment-trust.md`: Phase 10 onboarding and trust lifecycle guide.
 
 ## Security Notes
 

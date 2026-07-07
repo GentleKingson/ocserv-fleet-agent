@@ -1,6 +1,7 @@
 pub mod audit;
 pub mod audit_limiter;
 pub mod authz;
+pub mod enrollment;
 pub mod identity;
 pub mod node_info;
 pub mod nonce;

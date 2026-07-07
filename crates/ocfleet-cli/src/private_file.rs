@@ -58,7 +58,7 @@ fn open_existing_private_read_impl(path: &Path) -> Result<File, PrivateFileError
 #[cfg(unix)]
 pub fn ensure_private_parent(path: &Path) -> Result<(), PrivateFileError> {
     let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) else {
-        return Ok(());
+        return ensure_private_directory(Path::new("."));
     };
     ensure_private_directory(parent)
 }
@@ -102,7 +102,7 @@ fn create_private_directory(directory: &Path) -> Result<(), PrivateFileError> {
 #[cfg(unix)]
 fn validate_parent_for_existing_file(path: &Path) -> Result<(), PrivateFileError> {
     let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) else {
-        return Ok(());
+        return validate_private_parent(Path::new("."));
     };
     if !parent.exists() {
         return Err(PrivateFileError::MissingParent);

@@ -71,6 +71,24 @@ fn open_with_status_supports_single_file_relative_path() {
 
 #[cfg(unix)]
 #[test]
+fn open_with_status_rejects_single_file_relative_path_in_unsafe_current_directory() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _guard = cwd_lock().lock().expect("cwd lock");
+    let dir = tempfile::tempdir().expect("temp dir");
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777))
+        .expect("chmod unsafe cwd");
+    let _cwd = CurrentDirGuard::enter(dir.path());
+
+    let result = Store::open_with_status(Path::new("controller.sqlite"));
+
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+        .expect("restore tempdir permissions");
+    assert!(matches!(result, Err(StoreError::UnsafePermissions)));
+}
+
+#[cfg(unix)]
+#[test]
 fn open_with_status_creates_private_database_and_parent_directory() {
     use std::os::unix::fs::PermissionsExt;
 

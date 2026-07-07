@@ -125,19 +125,7 @@ test "$decoded_secret_bytes" = "32"
 
 ocfleet --database "$database" --secret-key "$secret_key" doctor >/dev/null
 ocfleet --database "$database" --secret-key "$secret_key" doctor --json > "$json_report"
-python3 - "$json_report" <<'PY'
-import json
-import sys
-
-with open(sys.argv[1], "r", encoding="utf-8") as handle:
-    report = json.load(handle)
-
-assert report["status"] in {"ok", "warning"}
-assert report["exit_code"] == 0
-assert report["schema_version_expected"] == 1
-assert report["schema_version_actual"] == 1
-assert isinstance(report["checks"], list)
-PY
+python3 "$repo_root/scripts/validate-doctor-report.py" "$json_report"
 
 printf 'install smoke passed for %s %s\n' "$version" "$artifact_arch"
 SMOKE

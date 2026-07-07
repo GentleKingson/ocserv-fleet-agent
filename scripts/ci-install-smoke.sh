@@ -63,7 +63,7 @@ apt-get install -y --no-install-recommends \
   coreutils \
   file \
   passwd \
-  python3-minimal \
+  python3 \
   sqlite3 \
   systemd
 rm -rf /var/lib/apt/lists/*

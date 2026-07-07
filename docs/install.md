@@ -1,0 +1,279 @@
+# Install Guide
+
+This guide installs the `v0.1.0` read-only MVP on Linux with systemd. Commands assume two hosts:
+
+- controller host: runs the `ocfleet` CLI and stores controller SQLite state.
+- agent host: runs `ocfleet-agent` on an ocserv node.
+
+Replace placeholder EndpointIDs before running RPC smoke tests.
+
+## Build And Verify Release Artifacts
+
+```bash
+git clone https://github.com/GentleKingson/ocserv-fleet-agent.git
+cd ocserv-fleet-agent
+./scripts/build-release.sh v0.1.0
+./scripts/verify-checksums.sh dist/v0.1.0/SHA256SUMS
+cat dist/v0.1.0/SHA256SUMS
+```
+
+Install binaries:
+
+```bash
+OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
+ARCH="$(uname -m)"
+case "$ARCH" in arm64) ARCH="aarch64";; amd64) ARCH="x86_64";; esac
+sudo install -m 0755 "dist/v0.1.0/ocfleet-v0.1.0-$OS-$ARCH" /usr/local/bin/ocfleet
+sudo install -m 0755 "dist/v0.1.0/ocfleet-agent-v0.1.0-$OS-$ARCH" /usr/local/bin/ocfleet-agent
+ocfleet --help
+ocfleet-agent --help
+```
+
+## CI Install Smoke Coverage
+
+The release binaries are smoke-tested in GitHub Actions on Debian Trixie and Ubuntu 24.04 for both `linux-x86_64` and `linux-aarch64` artifacts. The CI gate builds the binaries, verifies `SHA256SUMS`, installs them into minimal distro containers, and checks the install layout, directory permissions, SecretKey file mode, `ocfleet doctor`, JSON doctor output parsing, reusable systemd unit syntax, and basic binary executability.
+
+This is not `.deb` package support. The smoke containers do not run `systemctl start`; they only use `systemd-analyze verify` for the checked-in unit file because systemd is not PID 1 in the containers.
+
+## Controller Setup
+
+Create a locked-down runtime area:
+
+```bash
+sudo useradd --system --home-dir /var/lib/ocfleet-controller --shell /usr/sbin/nologin ocfleet || true
+sudo install -d -o "$USER" -g "$USER" -m 0700 /var/lib/ocfleet-controller
+```
+
+Initialize the controller database and SecretKey:
+
+```bash
+ocfleet \
+  --database /var/lib/ocfleet-controller/controller.sqlite \
+  --secret-key /var/lib/ocfleet-controller/controller.secret \
+  init
+```
+
+Save the printed value:
+
+```bash
+CONTROLLER_ENDPOINT_ID="<controller_endpoint_id_from_init>"
+```
+
+Verify the controller state:
+
+```bash
+ocfleet \
+  --database /var/lib/ocfleet-controller/controller.sqlite \
+  --secret-key /var/lib/ocfleet-controller/controller.secret \
+  doctor
+
+ocfleet \
+  --database /var/lib/ocfleet-controller/controller.sqlite \
+  --secret-key /var/lib/ocfleet-controller/controller.secret \
+  doctor --json
+```
+
+## Agent Setup
+
+Create the agent user and directories:
+
+```bash
+sudo useradd --system --home-dir /var/lib/ocfleet-agent --shell /usr/sbin/nologin ocfleet || true
+sudo install -d -o ocfleet -g ocfleet -m 0700 /etc/ocfleet-agent /var/lib/ocfleet-agent /var/log/ocfleet-agent
+```
+
+Generate an agent SecretKey:
+
+```bash
+sudo sh -c 'umask 077; openssl rand -base64 32 > /var/lib/ocfleet-agent/iroh.secret'
+sudo chown ocfleet:ocfleet /var/lib/ocfleet-agent/iroh.secret
+sudo chmod 0600 /var/lib/ocfleet-agent/iroh.secret
+```
+
+Create `/etc/ocfleet-agent/agent.toml`:
+
+```bash
+sudo tee /etc/ocfleet-agent/agent.toml >/dev/null <<EOF
+[node]
+id = "hk-ocserv-01"
+region = "hk"
+role = "ocserv"
+
+[iroh]
+secret_key_path = "/var/lib/ocfleet-agent/iroh.secret"
+
+[audit]
+path = "/var/log/ocfleet-agent/audit.jsonl"
+spool_path = "/var/lib/ocfleet-agent/audit.spool.jsonl"
+metrics_path = "/var/lib/ocfleet-agent/audit.metrics.json"
+spool_max_events = 10000
+audit_queue_capacity = 1024
+
+[security]
+allowed_clock_skew_seconds = 60
+default_deadline_ms = 5000
+max_deadline_ms = 10000
+max_rpc_timeout_ms = 5000
+
+[[security.controllers]]
+endpoint_id = "$CONTROLLER_ENDPOINT_ID"
+role = "viewer"
+EOF
+sudo chown root:ocfleet /etc/ocfleet-agent/agent.toml
+sudo chmod 0640 /etc/ocfleet-agent/agent.toml
+```
+
+Install the systemd unit:
+
+```bash
+sudo install -m 0644 deploy/systemd/ocfleet-agent.service /etc/systemd/system/ocfleet-agent.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now ocfleet-agent
+sudo systemctl status ocfleet-agent --no-pager
+```
+
+Capture the agent EndpointID:
+
+```bash
+journalctl -u ocfleet-agent -n 50 --no-pager | grep 'agent_endpoint_id='
+AGENT_ENDPOINT_ID="<agent_endpoint_id_from_journal>"
+```
+
+Register the node on the controller:
+
+```bash
+ocfleet \
+  --database /var/lib/ocfleet-controller/controller.sqlite \
+  --secret-key /var/lib/ocfleet-controller/controller.secret \
+  node add hk-ocserv-01 \
+  --endpoint-id "$AGENT_ENDPOINT_ID" \
+  --region hk \
+  --role ocserv
+
+ocfleet \
+  --database /var/lib/ocfleet-controller/controller.sqlite \
+  --secret-key /var/lib/ocfleet-controller/controller.secret \
+  node list
+```
+
+## Systemd Drop-In Examples
+
+Increase audit spool capacity:
+
+```bash
+sudo install -d -m 0755 /etc/systemd/system/ocfleet-agent.service.d
+sudo tee /etc/systemd/system/ocfleet-agent.service.d/10-audit.conf >/dev/null <<'EOF'
+[Service]
+Environment=RUST_LOG=info
+ReadWritePaths=/var/lib/ocfleet-agent /var/log/ocfleet-agent
+EOF
+sudo systemctl daemon-reload
+sudo systemctl restart ocfleet-agent
+```
+
+Optional controller doctor one-shot:
+
+```bash
+CONTROLLER_STATE_USER="$(id -un)"
+sudo tee /etc/systemd/system/ocfleet-controller-doctor.service >/dev/null <<EOF
+[Unit]
+Description=ocfleet controller doctor
+
+[Service]
+Type=oneshot
+User=$CONTROLLER_STATE_USER
+ExecStart=/usr/local/bin/ocfleet --database /var/lib/ocfleet-controller/controller.sqlite --secret-key /var/lib/ocfleet-controller/controller.secret doctor
+EOF
+sudo systemctl daemon-reload
+sudo systemctl start ocfleet-controller-doctor.service
+```
+
+## SecretKey Backup, Restore, And Rotation
+
+Back up SecretKeys and the controller DB:
+
+```bash
+sudo install -d -m 0700 /var/backups/ocfleet
+sudo cp -a /var/lib/ocfleet-controller/controller.secret /var/backups/ocfleet/controller.secret.$(date -u +%Y%m%dT%H%M%SZ)
+sudo cp -a /var/lib/ocfleet-controller/controller.sqlite /var/backups/ocfleet/controller.sqlite.$(date -u +%Y%m%dT%H%M%SZ)
+sudo cp -a /var/lib/ocfleet-agent/iroh.secret /var/backups/ocfleet/agent.$(hostname).iroh.secret.$(date -u +%Y%m%dT%H%M%SZ)
+```
+
+Restore a SecretKey:
+
+```bash
+sudo install -o ocfleet -g ocfleet -m 0600 /var/backups/ocfleet/agent.HOST.iroh.secret.TIMESTAMP /var/lib/ocfleet-agent/iroh.secret
+sudo systemctl restart ocfleet-agent
+```
+
+Rotating a SecretKey changes that node or controller EndpointID. Update every allowlist and controller registry entry before relying on RPCs again:
+
+```bash
+sudo systemctl stop ocfleet-agent
+sudo mv /var/lib/ocfleet-agent/iroh.secret /var/lib/ocfleet-agent/iroh.secret.old
+sudo sh -c 'umask 077; openssl rand -base64 32 > /var/lib/ocfleet-agent/iroh.secret'
+sudo chown ocfleet:ocfleet /var/lib/ocfleet-agent/iroh.secret
+sudo systemctl start ocfleet-agent
+journalctl -u ocfleet-agent -n 20 --no-pager | grep 'agent_endpoint_id='
+```
+
+## Database Upgrade And Backup
+
+`v0.1.0` uses schema version `1`. Before upgrades:
+
+```bash
+ocfleet --database /var/lib/ocfleet-controller/controller.sqlite --secret-key /var/lib/ocfleet-controller/controller.secret doctor
+sqlite3 /var/lib/ocfleet-controller/controller.sqlite 'PRAGMA integrity_check;'
+sudo cp -a /var/lib/ocfleet-controller/controller.sqlite /var/backups/ocfleet/controller.sqlite.pre-upgrade.$(date -u +%Y%m%dT%H%M%SZ)
+```
+
+After installing a new binary:
+
+```bash
+ocfleet --database /var/lib/ocfleet-controller/controller.sqlite --secret-key /var/lib/ocfleet-controller/controller.secret doctor --json
+```
+
+## Smoke Tests
+
+Controller-only smoke:
+
+```bash
+ocfleet --database /var/lib/ocfleet-controller/controller.sqlite --secret-key /var/lib/ocfleet-controller/controller.secret doctor
+ocfleet --database /var/lib/ocfleet-controller/controller.sqlite --secret-key /var/lib/ocfleet-controller/controller.secret node list
+```
+
+Agent smoke:
+
+```bash
+systemctl is-active ocfleet-agent
+test -s /var/lib/ocfleet-agent/iroh.secret
+test -s /var/log/ocfleet-agent/audit.metrics.json || true
+journalctl -u ocfleet-agent -n 50 --no-pager
+```
+
+RPC smoke where endpoint addressing is available in your deployment:
+
+```bash
+ocfleet --database /var/lib/ocfleet-controller/controller.sqlite --secret-key /var/lib/ocfleet-controller/controller.secret ping hk-ocserv-01
+ocfleet --database /var/lib/ocfleet-controller/controller.sqlite --secret-key /var/lib/ocfleet-controller/controller.secret node info hk-ocserv-01
+ocfleet --database /var/lib/ocfleet-controller/controller.sqlite --secret-key /var/lib/ocfleet-controller/controller.secret probe ping hk-ocserv-01
+```
+
+The production CLI intentionally does not accept host, port, relay, or arbitrary address flags in `v0.1.0`.
+
+## Uninstall And Cleanup
+
+```bash
+sudo systemctl disable --now ocfleet-agent || true
+sudo rm -f /etc/systemd/system/ocfleet-agent.service
+sudo rm -rf /etc/systemd/system/ocfleet-agent.service.d
+sudo systemctl daemon-reload
+sudo rm -f /usr/local/bin/ocfleet /usr/local/bin/ocfleet-agent
+```
+
+Remove state only after backups are confirmed:
+
+```bash
+sudo rm -rf /etc/ocfleet-agent /var/lib/ocfleet-agent /var/log/ocfleet-agent
+sudo rm -rf /var/lib/ocfleet-controller
+```

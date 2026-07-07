@@ -14,6 +14,10 @@ pub fn open_existing_private_read(path: &Path) -> io::Result<File> {
     open_existing_private_read_impl(path)
 }
 
+pub fn write_private_replace(path: &Path, payload: &[u8]) -> io::Result<()> {
+    write_private_replace_impl(path, payload)
+}
+
 #[cfg(unix)]
 fn open_private_append_impl(path: &Path) -> io::Result<File> {
     use std::os::unix::fs::OpenOptionsExt;
@@ -55,6 +59,69 @@ fn open_existing_private_read_impl(path: &Path) -> io::Result<File> {
         .open(path)?;
     validate_private_file_handle(&file)?;
     Ok(file)
+}
+
+#[cfg(unix)]
+fn write_private_replace_impl(path: &Path, payload: &[u8]) -> io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    ensure_private_parent(path)?;
+    match open_existing_private_read(path) {
+        Ok(_) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing file name"))?
+        .to_string_lossy();
+
+    let mut last_error = None;
+    for attempt in 0..100 {
+        let tmp_path = parent.join(format!(".{file_name}.tmp-{}-{attempt}", std::process::id()));
+        let mut file = match fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&tmp_path)
+        {
+            Ok(file) => file,
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                last_error = Some(err);
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
+        let result = (|| {
+            validate_private_file_handle(&file)?;
+            file.write_all(payload)?;
+            file.sync_all()?;
+            drop(file);
+            fs::rename(&tmp_path, path)?;
+            if let Ok(directory) = File::open(parent) {
+                let _ = directory.sync_all();
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&tmp_path);
+        }
+        return result;
+    }
+
+    Err(last_error.unwrap_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not allocate private replacement temp file",
+        )
+    }))
 }
 
 #[cfg(unix)]
@@ -174,4 +241,21 @@ fn open_private_create_new_impl(path: &Path) -> io::Result<File> {
 #[cfg(not(unix))]
 fn open_existing_private_read_impl(path: &Path) -> io::Result<File> {
     fs::OpenOptions::new().read(true).open(path)
+}
+
+#[cfg(not(unix))]
+fn write_private_replace_impl(path: &Path, payload: &[u8]) -> io::Result<()> {
+    use std::io::Write;
+
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)?;
+    file.write_all(payload)?;
+    file.sync_all()?;
+    Ok(())
 }

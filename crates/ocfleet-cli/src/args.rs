@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
 #[command(name = "ocfleet")]
+#[command(version)]
 #[command(about = "Read-only ocserv fleet controller")]
 pub struct Cli {
     #[arg(long, default_value = "controller.sqlite")]
@@ -16,6 +17,10 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     Init,
+    Doctor {
+        #[arg(long)]
+        json: bool,
+    },
     Ping {
         node_id: String,
     },

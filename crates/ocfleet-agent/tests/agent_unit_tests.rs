@@ -94,6 +94,22 @@ fn agent_binary_reports_config_load_context_for_missing_config() {
 }
 
 #[test]
+fn agent_binary_reports_version() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_ocfleet-agent"))
+        .arg("--version")
+        .output()
+        .expect("run ocfleet-agent binary");
+
+    assert!(
+        output.status.success(),
+        "stderr was: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("ocfleet-agent"), "stdout was: {stdout}");
+}
+
+#[test]
 fn deleting_secret_key_changes_endpoint_identity() {
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("iroh.secret");
@@ -262,14 +278,17 @@ fn jsonl_audit_writer_rejects_existing_world_readable_file_without_writing() {
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
     let writer = JsonlAuditWriter::new(path.clone());
 
-    assert!(
-        writer
-            .write(&AgentAuditEvent::new("request.completed"))
-            .is_err()
-    );
+    writer
+        .write(&AgentAuditEvent::new("request.completed"))
+        .expect("unsafe primary path falls back to durable spool");
     assert_eq!(
-        std::fs::read_to_string(path).expect("audit file"),
+        std::fs::read_to_string(&path).expect("audit file"),
         "existing\n"
+    );
+    assert!(
+        std::fs::read_to_string(dir.path().join("agent.jsonl.spool.jsonl"))
+            .expect("spool file")
+            .contains("request.completed")
     );
 }
 
@@ -281,12 +300,16 @@ fn jsonl_audit_writer_rejects_final_path_symlink() {
     let link_path = dir.path().join("agent.jsonl");
     std::fs::write(&real_path, "").expect("write real audit");
     std::os::unix::fs::symlink(&real_path, &link_path).expect("symlink");
-    let writer = JsonlAuditWriter::new(link_path);
+    let writer = JsonlAuditWriter::new(link_path.clone());
 
+    writer
+        .write(&AgentAuditEvent::new("request.completed"))
+        .expect("symlink primary path falls back to durable spool");
+    assert_eq!(std::fs::read_to_string(real_path).expect("real audit"), "");
     assert!(
-        writer
-            .write(&AgentAuditEvent::new("request.completed"))
-            .is_err()
+        std::fs::read_to_string(dir.path().join("agent.jsonl.spool.jsonl"))
+            .expect("spool file")
+            .contains("request.completed")
     );
 }
 
@@ -296,6 +319,9 @@ fn rejected_audit_limiter_suppresses_repeated_resource_rejections_and_bounds_buc
     let config = AuditConfig {
         path: dir.path().join("audit.log"),
         audit_queue_capacity: 1024,
+        spool_path: None,
+        metrics_path: None,
+        spool_max_events: 10_000,
         rejected_peer_log_burst: 1,
         rejected_peer_log_refill_per_sec: 1,
         rejected_peer_log_max_buckets: 2,
@@ -336,6 +362,9 @@ fn rejected_audit_limiter_does_not_write_aggregate_before_interval() {
     let config = AuditConfig {
         path: dir.path().join("audit.log"),
         audit_queue_capacity: 1024,
+        spool_path: None,
+        metrics_path: None,
+        spool_max_events: 10_000,
         rejected_peer_log_burst: 1,
         rejected_peer_log_refill_per_sec: 1,
         rejected_peer_log_max_buckets: 4,
@@ -1220,6 +1249,9 @@ fn test_agent_config(dir: &Path, controllers: Vec<ControllerConfig>) -> AgentCon
         audit: AuditConfig {
             path: dir.join("audit.log"),
             audit_queue_capacity: 1024,
+            spool_path: None,
+            metrics_path: None,
+            spool_max_events: 10_000,
             rejected_peer_log_burst: 10,
             rejected_peer_log_refill_per_sec: 1,
             rejected_peer_log_max_buckets: 4096,

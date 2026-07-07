@@ -3,6 +3,7 @@ use clap::Parser;
 use iroh::{EndpointAddr, EndpointId};
 use ocfleet_cli::args::{Cli, Command, NodeCommand, ProbeCommand};
 use ocfleet_cli::audit::AuditEvent;
+use ocfleet_cli::doctor::{DoctorOptions, format_human, run_doctor};
 use ocfleet_cli::identity::{
     IdentityError, load_or_create_secret_key_with_status, load_secret_key,
 };
@@ -51,6 +52,20 @@ async fn main() -> anyhow::Result<()> {
             });
             store.insert_audit(&event)?;
             println!("controller_endpoint_id={}", secret_key.secret_key.public());
+        }
+        Command::Doctor { json } => {
+            let report = run_doctor(&DoctorOptions {
+                database: cli.database,
+                secret_key: cli.secret_key,
+            });
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", format_human(&report));
+            }
+            if report.exit_code != 0 {
+                std::process::exit(report.exit_code);
+            }
         }
         Command::Ping { node_id } => {
             let store = Store::open(&cli.database).context("failed to open controller database")?;

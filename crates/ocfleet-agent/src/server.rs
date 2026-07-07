@@ -1728,14 +1728,23 @@ mod tests {
     async fn audit_write_failure_response_does_not_expose_local_error_details() {
         let dir = tempfile::tempdir().expect("temp dir");
         let audit_directory = dir.path().join("audit-directory");
+        let spool_directory = dir.path().join("audit-spool-directory");
         std::fs::create_dir(&audit_directory).expect("audit directory");
+        std::fs::create_dir(&spool_directory).expect("spool directory");
         let mut config = test_agent_config(dir.path());
         config.audit.path = audit_directory.clone();
+        config.audit.spool_path = Some(spool_directory.clone());
         let authz =
             AgentAuthorization::from_security_config(&config.security).expect("authz table builds");
         let state = AgentServerState {
             config: config.clone(),
-            audit: JsonlAuditWriter::new(audit_directory),
+            audit: JsonlAuditWriter::with_durability(
+                audit_directory,
+                1024,
+                spool_directory,
+                None,
+                1,
+            ),
             nonce_cache: Arc::new(Mutex::new(NonceCache::new())),
             limiters: Arc::new(ServerLimiters::new(256, 256, 32, 1024, 128)),
             audit_limiter: Arc::new(Mutex::new(RejectedAuditLimiter::new(&config.audit))),
@@ -1877,6 +1886,9 @@ mod tests {
             audit: AuditConfig {
                 path: dir.join("audit.log"),
                 audit_queue_capacity: 1024,
+                spool_path: None,
+                metrics_path: None,
+                spool_max_events: 10_000,
                 rejected_peer_log_burst: 10,
                 rejected_peer_log_refill_per_sec: 1,
                 rejected_peer_log_max_buckets: 4096,

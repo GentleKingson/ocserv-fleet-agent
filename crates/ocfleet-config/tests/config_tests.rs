@@ -337,6 +337,9 @@ fn agent_config_defaults_include_resource_limits() {
     assert_eq!(config.security.max_live_nonces_global, 100_000);
     assert_eq!(config.security.max_live_nonces_per_controller, 10_000);
     assert_eq!(config.audit.audit_queue_capacity, 1024);
+    assert_eq!(config.audit.spool_path, None);
+    assert_eq!(config.audit.metrics_path, None);
+    assert_eq!(config.audit.spool_max_events, 10_000);
     assert_eq!(config.audit.rejected_peer_log_burst, 10);
     assert_eq!(config.audit.rejected_peer_log_refill_per_sec, 1);
     assert_eq!(config.audit.rejected_peer_log_max_buckets, 4096);
@@ -345,6 +348,22 @@ fn agent_config_defaults_include_resource_limits() {
         config.audit.rejected_peer_log_aggregate_interval_seconds,
         60
     );
+}
+
+#[test]
+fn agent_config_accepts_audit_durability_paths_and_rejects_zero_spool_capacity() {
+    let mut config = valid_agent_config();
+    config.audit.spool_path = Some("/var/lib/ocfleet-agent/audit.spool.jsonl".into());
+    config.audit.metrics_path = Some("/var/lib/ocfleet-agent/audit.metrics.json".into());
+    config.audit.spool_max_events = 10;
+    validate_agent_config(&config).expect("audit durability settings validate");
+
+    config.audit.spool_max_events = 0;
+    let err = validate_agent_config(&config).expect_err("zero spool capacity rejected");
+    assert!(matches!(
+        err,
+        ConfigError::Invalid(message) if message.contains("audit.spool_max_events")
+    ));
 }
 
 #[test]

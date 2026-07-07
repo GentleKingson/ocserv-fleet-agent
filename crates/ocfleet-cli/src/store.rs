@@ -8,6 +8,8 @@ use thiserror::Error;
 use crate::audit::AuditEvent;
 use crate::private_file::{self, PrivateFileError};
 
+pub const CURRENT_SCHEMA_VERSION: i64 = 1;
+
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("sqlite error: {0}")]
@@ -126,8 +128,8 @@ impl Store {
             "#,
         )?;
         self.conn.execute(
-            "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (1, strftime('%Y-%m-%dT%H:%M:%SZ','now'))",
-            [],
+            "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, strftime('%Y-%m-%dT%H:%M:%SZ','now'))",
+            [CURRENT_SCHEMA_VERSION],
         )?;
         Ok(())
     }

@@ -118,6 +118,12 @@ pub struct AuditConfig {
     pub path: PathBuf,
     #[serde(default = "default_audit_queue_capacity")]
     pub audit_queue_capacity: usize,
+    #[serde(default)]
+    pub spool_path: Option<PathBuf>,
+    #[serde(default)]
+    pub metrics_path: Option<PathBuf>,
+    #[serde(default = "default_audit_spool_max_events")]
+    pub spool_max_events: usize,
     #[serde(default = "default_rejected_peer_log_burst")]
     pub rejected_peer_log_burst: usize,
     #[serde(default = "default_rejected_peer_log_refill_per_sec")]
@@ -295,6 +301,16 @@ pub fn validate_agent_config(config: &AgentConfig) -> Result<(), ConfigError> {
     }
     validate_positive_usize(config.audit.audit_queue_capacity, "audit_queue_capacity")
         .map_err(|e| ConfigError::Invalid(e.to_string()))?;
+    if let Some(path) = &config.audit.spool_path {
+        validate_non_empty_path(path, "audit.spool_path")
+            .map_err(|e| ConfigError::Invalid(e.to_string()))?;
+    }
+    if let Some(path) = &config.audit.metrics_path {
+        validate_non_empty_path(path, "audit.metrics_path")
+            .map_err(|e| ConfigError::Invalid(e.to_string()))?;
+    }
+    validate_positive_usize(config.audit.spool_max_events, "audit.spool_max_events")
+        .map_err(|e| ConfigError::Invalid(e.to_string()))?;
     validate_positive_usize(
         config.audit.rejected_peer_log_burst,
         "rejected_peer_log_burst",
@@ -396,6 +412,10 @@ fn default_max_live_nonces_per_controller() -> usize {
 
 fn default_audit_queue_capacity() -> usize {
     1024
+}
+
+fn default_audit_spool_max_events() -> usize {
+    10_000
 }
 
 fn default_rejected_peer_log_burst() -> usize {

@@ -15,6 +15,7 @@ use ocfleet_config::agent::load_agent_config;
 
 #[derive(Debug, Parser)]
 #[command(name = "ocfleet-agent")]
+#[command(version)]
 #[command(about = "Read-only ocserv fleet node agent")]
 struct AgentCli {
     #[arg(long, default_value = "/etc/ocfleet-agent/config.toml")]
@@ -29,9 +30,22 @@ async fn main() -> anyhow::Result<()> {
     let config = load_agent_config(&args.config).context("failed to load agent config")?;
     let secret_key = load_or_create_secret_key(&config.iroh.secret_key_path, true)
         .context("failed to load or create agent SecretKey")?;
-    let audit = JsonlAuditWriter::with_queue_capacity(
+    let audit = JsonlAuditWriter::with_durability(
         config.audit.path.clone(),
         config.audit.audit_queue_capacity,
+        config
+            .audit
+            .spool_path
+            .clone()
+            .unwrap_or_else(|| JsonlAuditWriter::default_spool_path(&config.audit.path)),
+        config
+            .audit
+            .metrics_path
+            .clone()
+            .or(Some(JsonlAuditWriter::default_metrics_path(
+                &config.audit.path,
+            ))),
+        config.audit.spool_max_events,
     );
     let audit_limiter = Arc::new(Mutex::new(RejectedAuditLimiter::new(&config.audit)));
     let endpoint =

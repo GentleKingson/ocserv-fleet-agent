@@ -1,0 +1,95 @@
+name: Install Smoke
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version to build and smoke test
+        required: false
+        default: v0.1.0
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  install-smoke:
+    name: ${{ matrix.distro }} ${{ matrix.artifact_arch }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            distro: debian-trixie
+            distro_image: debian:trixie-slim
+            artifact_arch: linux-x86_64
+          - runner: ubuntu-24.04
+            distro: ubuntu-24.04
+            distro_image: ubuntu:24.04
+            artifact_arch: linux-x86_64
+          - runner: ubuntu-24.04-arm
+            distro: debian-trixie
+            distro_image: debian:trixie-slim
+            artifact_arch: linux-aarch64
+          - runner: ubuntu-24.04-arm
+            distro: ubuntu-24.04
+            distro_image: ubuntu:24.04
+            artifact_arch: linux-aarch64
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Resolve release version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            version="${GITHUB_REF_NAME}"
+          elif [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            version="${{ inputs.version }}"
+          else
+            version="v0.1.0"
+          fi
+          case "$version" in
+            v*) ;;
+            *) version="v$version" ;;
+          esac
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+          printf 'Resolved release version: %s\n' "$version"
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Build release binaries
+        run: ./scripts/build-release.sh "${{ steps.version.outputs.version }}"
+
+      - name: Verify release checksums
+        run: ./scripts/verify-checksums.sh "dist/${{ steps.version.outputs.version }}/SHA256SUMS"
+
+      - name: Check matrix release artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          artifact_arch="${{ matrix.artifact_arch }}"
+          test -x "dist/$version/ocfleet-$version-$artifact_arch"
+          test -x "dist/$version/ocfleet-agent-$version-$artifact_arch"
+
+      - name: Run install smoke
+        run: ./scripts/ci-install-smoke.sh "${{ steps.version.outputs.version }}" "${{ matrix.artifact_arch }}" "${{ matrix.distro_image }}"

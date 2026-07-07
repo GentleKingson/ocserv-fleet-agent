@@ -69,12 +69,15 @@ are accepted or persisted.
 
 ## Audit Policy
 
-Agent audit records are security-relevant. The agent uses a bounded audit queue
-and a dedicated writer thread so disk I/O does not block async RPC handling.
+Agent audit records are security-relevant. The agent uses a bounded audit queue,
+a dedicated writer thread, and a bounded local durability spool so disk I/O does
+not block async RPC handling and temporary primary audit sink failures do not
+silently lose events.
 
-If an audit write fails, the RPC must fail closed with a generic remote error.
-Local filesystem paths and operating-system error details may be logged locally,
-but must not be returned to the remote caller.
+If both the primary audit sink and local durability spool fail, the RPC must fail
+closed with a generic remote error. Local filesystem paths and operating-system
+error details may be logged locally, but must not be returned to the remote
+caller.
 
 ## CI Security Gates
 

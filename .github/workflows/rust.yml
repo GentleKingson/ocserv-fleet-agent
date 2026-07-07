@@ -8,6 +8,10 @@ on:
       - '**/Cargo.toml'
       - '**/Cargo.lock'
       - 'deny.toml'
+      - 'CHANGELOG.md'
+      - 'docs/**'
+      - 'scripts/**'
+      - 'deploy/**'
       - 'rust-toolchain'
       - 'rust-toolchain.toml'
       - '.cargo/**'
@@ -19,6 +23,10 @@ on:
       - '**/Cargo.toml'
       - '**/Cargo.lock'
       - 'deny.toml'
+      - 'CHANGELOG.md'
+      - 'docs/**'
+      - 'scripts/**'
+      - 'deploy/**'
       - 'rust-toolchain'
       - 'rust-toolchain.toml'
       - '.cargo/**'
@@ -56,6 +64,12 @@ jobs:
 
       - name: Run tests
         run: cargo test --workspace -j1 -- --test-threads=1
+
+      - name: Build release artifacts and checksums
+        run: ./scripts/build-release.sh v0.1.0
+
+      - name: Verify release checksums
+        run: ./scripts/verify-checksums.sh dist/v0.1.0/SHA256SUMS
 
   supply-chain:
     name: Supply-chain checks

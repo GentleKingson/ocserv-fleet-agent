@@ -246,6 +246,41 @@ async fn local_agent_rejects_replayed_nonce() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_agent_rejects_expired_request() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let harness = spawn_local_agent(SecretKey::generate(), SecretKey::generate(), &dir).await;
+    let mut request = build_request(NODE_PING, json!({}), Some("local-cli".into()), 5_000);
+    request.issued_at = (time::OffsetDateTime::now_utc() - time::Duration::seconds(6))
+        .format(&time::format_description::well_known::Rfc3339)
+        .expect("format expired issued_at");
+
+    let response = call_endpoint_addr(
+        &harness.controller,
+        harness.agent_addr.clone(),
+        harness.agent_id,
+        harness.config.iroh.alpn.as_bytes(),
+        request,
+    )
+    .await
+    .expect("expired request rpc response");
+
+    assert!(!response.ok);
+    assert_eq!(
+        response.error.as_ref().expect("expired request error").code,
+        ErrorCode::RequestExpired
+    );
+    wait_for_audit_event(&harness.audit_path, |event| {
+        event.get("stage").and_then(Value::as_str) == Some("dispatch")
+            && event.get("method").and_then(Value::as_str) == Some(NODE_PING)
+            && event.get("ok").and_then(Value::as_bool) == Some(false)
+            && event.get("error_code").and_then(Value::as_str) == Some("REQUEST_EXPIRED")
+    })
+    .await;
+
+    harness.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_agent_rejects_unauthorized_controller() {
     let dir = tempfile::tempdir().expect("temp dir");
     let authorized_controller_key = SecretKey::generate();
@@ -479,7 +514,7 @@ async fn local_peer_connection_cannot_call_controller_only_method() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_controller_can_run_one_hop_path_probe_and_link_three_audits() {
     let dir = tempfile::tempdir().expect("temp dir");
-    let harness = spawn_local_path_probe_agents(&dir, true).await;
+    let harness = spawn_local_path_probe_agents(&dir, true, true).await;
     let request = build_request(
         PROBE_PATH_ECHO,
         json!({"target_agent_endpoint_id": harness.target_id.to_string()}),
@@ -592,7 +627,7 @@ async fn local_controller_can_run_one_hop_path_probe_and_link_three_audits() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_path_probe_target_segment_failure_is_outer_success_with_correlated_source_audit() {
     let dir = tempfile::tempdir().expect("temp dir");
-    let harness = spawn_local_path_probe_agents(&dir, false).await;
+    let harness = spawn_local_path_probe_agents(&dir, true, false).await;
     let request = build_request(
         PROBE_PATH_ECHO,
         json!({"target_agent_endpoint_id": harness.target_id.to_string()}),
@@ -669,6 +704,47 @@ async fn local_path_probe_target_segment_failure_is_outer_success_with_correlate
             && event.get("request_id").is_none_or(Value::is_null)
             && event.get("root_request_id").is_none_or(Value::is_null)
             && event.get("peer_request_id").is_none_or(Value::is_null)
+    })
+    .await;
+
+    harness.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_path_probe_rejects_missing_source_authorization() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let harness = spawn_local_path_probe_agents(&dir, false, true).await;
+    let request = build_request(
+        PROBE_PATH_ECHO,
+        json!({"target_agent_endpoint_id": harness.target_id.to_string()}),
+        Some("local-cli".into()),
+        5_000,
+    );
+    let root_request_id = request.request_id.clone();
+
+    let response = call_endpoint_addr(
+        &harness.controller,
+        harness.source_addr.clone(),
+        harness.source_id,
+        harness.source_config.iroh.alpn.as_bytes(),
+        request,
+    )
+    .await
+    .expect("probe.path.echo missing auth rpc");
+
+    assert!(!response.ok, "{response:#?}");
+    let error = response.error.as_ref().expect("path auth error");
+    assert_eq!(error.code, ErrorCode::EndpointNotAllowed);
+    assert!(error.message.contains("authorization is missing"));
+
+    wait_for_audit_event(&harness.source_audit_path, |event| {
+        event.get("stage").and_then(Value::as_str) == Some("dispatch")
+            && event.get("method").and_then(Value::as_str) == Some(PROBE_PATH_ECHO)
+            && event.get("request_id").and_then(Value::as_str) == Some(root_request_id.as_str())
+            && event.get("path_target_endpoint_id").and_then(Value::as_str)
+                == Some(harness.target_id.to_string().as_str())
+            && event.get("ok").and_then(Value::as_bool) == Some(false)
+            && event.get("error_code").and_then(Value::as_str) == Some("ENDPOINT_NOT_ALLOWED")
     })
     .await;
 
@@ -778,6 +854,7 @@ async fn spawn_local_agent_with_peers(
 
 async fn spawn_local_path_probe_agents(
     dir: &TempDir,
+    source_authorizes_target: bool,
     target_allows_source: bool,
 ) -> LocalPathProbeHarness {
     let controller_key = SecretKey::generate();
@@ -841,11 +918,13 @@ async fn spawn_local_path_probe_agents(
         dir.path().join("source.secret"),
     );
     source_config.node.id = "source-ocserv-01".to_string();
-    source_config.security.path_probes = vec![PathProbeConfig {
-        controller_endpoint_id: controller_id.to_string(),
-        target_endpoint_id: target_id.to_string(),
-        enabled: true,
-    }];
+    if source_authorizes_target {
+        source_config.security.path_probes = vec![PathProbeConfig {
+            controller_endpoint_id: controller_id.to_string(),
+            target_endpoint_id: target_id.to_string(),
+            enabled: true,
+        }];
+    }
     let source_audit = JsonlAuditWriter::new(source_audit_path.clone());
     let source_audit_limiter =
         Arc::new(Mutex::new(RejectedAuditLimiter::new(&source_config.audit)));
@@ -939,6 +1018,9 @@ fn test_config(
         audit: AuditConfig {
             path: audit_path,
             audit_queue_capacity: 1024,
+            spool_path: None,
+            metrics_path: None,
+            spool_max_events: 10_000,
             rejected_peer_log_burst: 10,
             rejected_peer_log_refill_per_sec: 1,
             rejected_peer_log_max_buckets: 4096,

@@ -24,6 +24,7 @@ It is not a production-complete ocserv management platform yet.
   - `probe.peer.echo`
   - `probe.path.echo`
 - Writes audit records for successful, failed, and rejected RPC paths.
+- Falls back to an append-only agent audit spool when the primary audit log is temporarily unavailable.
 
 ## What It Does Not Do
 
@@ -63,6 +64,13 @@ It also prints the controller EndpointID:
 
 ```text
 controller_endpoint_id=<controller_endpoint_id>
+```
+
+Run read-only diagnostics:
+
+```bash
+target/debug/ocfleet doctor
+target/debug/ocfleet doctor --json
 ```
 
 Create an agent config:
@@ -165,6 +173,9 @@ Networking must allow the controller to reach the agent through iroh using the r
 - `crates/ocfleet-config`: static TOML config loading and validation.
 - `crates/ocfleet-agent`: node-side agent, iroh server, allowlist, RPC handling, nonce checks, and JSONL audit.
 - `crates/ocfleet-cli`: controller CLI, SQLite state, controller audit, and RPC client.
+- `docs/install.md`: install, upgrade, SecretKey, systemd, and smoke-test guide.
+- `docs/troubleshooting.md`: operational failure modes and `ocfleet doctor` interpretation.
+- `docs/release-notes/v0.1.0.md`: v0.1.0 release notes and known limitations.
 
 ## Security Notes
 
@@ -173,6 +184,7 @@ Networking must allow the controller to reach the agent through iroh using the r
 - SecretKey, SQLite, and agent audit files are expected to be private on Unix systems.
 - Unsafe existing sensitive files fail closed instead of being automatically chmodded.
 - Resource limits protect handshake tasks, connections, streams, nonce cache size, and repeated rejection audit logs.
+- Agent audit durability metrics are written to the configured metrics path. The default runtime path is derived from `audit.path`.
 
 ## Development
 

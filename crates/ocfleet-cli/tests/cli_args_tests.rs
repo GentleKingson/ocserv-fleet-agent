@@ -1,6 +1,16 @@
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use ocfleet_cli::args::{Cli, Command, NodeCommand, ProbeCommand};
 use std::path::PathBuf;
+
+#[test]
+fn exposes_controller_version_flag() {
+    let err = Cli::command()
+        .try_get_matches_from(["ocfleet", "--version"])
+        .expect_err("version flag exits before command parsing");
+
+    assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+    assert!(err.to_string().contains("ocfleet"));
+}
 
 #[test]
 fn parses_global_defaults_and_init_command() {
@@ -74,6 +84,21 @@ fn parses_top_level_ping_command() {
     };
 
     assert_eq!(node_id, "hk-ocserv-01");
+}
+
+#[test]
+fn parses_doctor_human_and_json_modes() {
+    let cli = Cli::parse_from(["ocfleet", "doctor"]);
+    let Command::Doctor { json } = cli.command else {
+        panic!("expected doctor command");
+    };
+    assert!(!json);
+
+    let cli = Cli::parse_from(["ocfleet", "doctor", "--json"]);
+    let Command::Doctor { json } = cli.command else {
+        panic!("expected doctor command");
+    };
+    assert!(json);
 }
 
 #[test]

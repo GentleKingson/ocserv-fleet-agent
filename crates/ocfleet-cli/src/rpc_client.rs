@@ -65,8 +65,10 @@ impl RpcClientError {
 }
 
 pub async fn bind_controller_endpoint(secret_key: SecretKey) -> Result<Endpoint, RpcClientError> {
-    Endpoint::builder(presets::N0)
+    Endpoint::builder(presets::Minimal)
         .secret_key(secret_key)
+        .relay_mode(RelayMode::Disabled)
+        .clear_address_lookup()
         .bind()
         .await
         .map_err(|err| RpcClientError::structured(ErrorCode::ConnectFailed, err.to_string()))
@@ -75,7 +77,7 @@ pub async fn bind_controller_endpoint(secret_key: SecretKey) -> Result<Endpoint,
 pub async fn bind_controller_endpoint_local_only(
     secret_key: SecretKey,
 ) -> Result<Endpoint, RpcClientError> {
-    Endpoint::builder(presets::N0)
+    Endpoint::builder(presets::Minimal)
         .secret_key(secret_key)
         .relay_mode(RelayMode::Disabled)
         .clear_address_lookup()

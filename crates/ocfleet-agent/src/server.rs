@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::Ipv4Addr;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
@@ -385,6 +386,35 @@ where
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TimeoutElapsed {
+    resource: &'static str,
+    timeout: StdDuration,
+}
+
+impl TimeoutElapsed {
+    fn resource(&self) -> &'static str {
+        self.resource
+    }
+
+    fn timeout(&self) -> StdDuration {
+        self.timeout
+    }
+}
+
+async fn timeout_boundary<F, T>(
+    resource: &'static str,
+    timeout: StdDuration,
+    future: F,
+) -> std::result::Result<T, TimeoutElapsed>
+where
+    F: Future<Output = T>,
+{
+    tokio::time::timeout(timeout, future)
+        .await
+        .map_err(|_| TimeoutElapsed { resource, timeout })
+}
+
 pub async fn write_response<W>(
     writer: &mut W,
     response: &RpcResponse,
@@ -436,28 +466,50 @@ pub async fn serve_endpoint(endpoint: Endpoint, state: AgentServerState) -> Resu
                     return;
                 }
             };
+            let handshake_timeout =
+                StdDuration::from_millis(state.config.security.max_handshake_duration_ms);
 
-            match connecting.await {
+            match timeout_boundary("handshake", handshake_timeout, connecting).await {
                 Ok(conn) => {
                     drop(handshake_permit);
-                    let remote_endpoint_id = conn.remote_id().to_string();
-                    let Some(connection_permits) =
-                        state.limiters.try_acquire_connection(&remote_endpoint_id)
-                    else {
-                        audit_resource_rejection(
-                            &state,
-                            Some(&remote_endpoint_id),
-                            "connection",
-                            "connection_admission",
-                            "connection limit exceeded",
-                        )
-                        .await;
-                        return;
-                    };
-                    serve_connection(state, conn, connection_permits).await
+                    match conn {
+                        Ok(conn) => {
+                            let remote_endpoint_id = conn.remote_id().to_string();
+                            let Some(connection_permits) =
+                                state.limiters.try_acquire_connection(&remote_endpoint_id)
+                            else {
+                                audit_resource_rejection(
+                                    &state,
+                                    Some(&remote_endpoint_id),
+                                    "connection",
+                                    "connection_admission",
+                                    "connection limit exceeded",
+                                )
+                                .await;
+                                return;
+                            };
+                            serve_connection(state, conn, connection_permits).await
+                        }
+                        Err(err) => {
+                            tracing::warn!(error = %err, "incoming iroh handshake failed");
+                        }
+                    }
                 }
                 Err(err) => {
-                    tracing::warn!(error = %err, "incoming iroh handshake failed");
+                    drop(handshake_permit);
+                    tracing::warn!(
+                        resource = err.resource(),
+                        timeout_ms = err.timeout().as_millis(),
+                        "incoming iroh handshake timed out"
+                    );
+                    audit_timeout_rejection(
+                        &state,
+                        None,
+                        "handshake",
+                        "handshake_timeout",
+                        &format!("handshake timed out after {} ms", err.timeout().as_millis()),
+                    )
+                    .await;
                 }
             }
         });
@@ -473,8 +525,10 @@ fn agent_endpoint_builder(
 ) -> Result<iroh::endpoint::Builder> {
     let authz = Arc::new(AgentAuthorization::from_security_config(&config.security)?);
 
-    Ok(Endpoint::builder(presets::N0)
+    Ok(Endpoint::builder(presets::Minimal)
         .secret_key(secret_key)
+        .relay_mode(RelayMode::Disabled)
+        .clear_address_lookup()
         .alpns(vec![config.iroh.alpn.as_bytes().to_vec()])
         .hooks(AllowlistHook::new(authz, audit, audit_limiter)))
 }
@@ -485,7 +539,34 @@ async fn serve_connection(
     _connection_permits: ConnectionPermits,
 ) {
     let remote_endpoint_id = conn.remote_id().to_string();
-    while let Ok((send, recv)) = conn.accept_bi().await {
+    loop {
+        let idle_timeout = StdDuration::from_millis(state.config.security.max_connection_idle_ms);
+        let accepted = timeout_boundary("connection", idle_timeout, conn.accept_bi()).await;
+        let (send, recv) = match accepted {
+            Ok(Ok(streams)) => streams,
+            Ok(Err(_)) => break,
+            Err(err) => {
+                tracing::warn!(
+                    remote_endpoint_id = %remote_endpoint_id,
+                    resource = err.resource(),
+                    timeout_ms = err.timeout().as_millis(),
+                    "iroh connection closed after idle timeout"
+                );
+                audit_timeout_rejection(
+                    &state,
+                    Some(&remote_endpoint_id),
+                    "connection",
+                    "connection_idle_timeout",
+                    &format!(
+                        "connection idle timed out after {} ms",
+                        err.timeout().as_millis()
+                    ),
+                )
+                .await;
+                break;
+            }
+        };
+
         let Some(stream_permits) = state.limiters.try_acquire_stream(&remote_endpoint_id) else {
             let mut send = send;
             audit_resource_rejection(
@@ -1436,19 +1517,60 @@ async fn audit_resource_rejection(
     stage: &str,
     reason: &str,
 ) {
+    audit_limited_rejection(
+        state,
+        remote_endpoint_id,
+        resource,
+        stage,
+        "RESOURCE_EXHAUSTED",
+        reason,
+        "resource_rejected",
+    )
+    .await;
+}
+
+async fn audit_timeout_rejection(
+    state: &AgentServerState,
+    remote_endpoint_id: Option<&str>,
+    resource: &str,
+    stage: &str,
+    reason: &str,
+) {
+    let error_code = error_code_name(&ErrorCode::RpcTimeout);
+    audit_limited_rejection(
+        state,
+        remote_endpoint_id,
+        resource,
+        stage,
+        &error_code,
+        reason,
+        "rpc_rejected",
+    )
+    .await;
+}
+
+async fn audit_limited_rejection(
+    state: &AgentServerState,
+    remote_endpoint_id: Option<&str>,
+    resource: &str,
+    stage: &str,
+    error_code: &str,
+    reason: &str,
+    event_name: &str,
+) {
     write_limited_audit_event(
         &state.audit,
         &state.audit_limiter,
         remote_endpoint_id,
         resource,
-        "RESOURCE_EXHAUSTED",
+        error_code,
         |suppressed_count, limit_key| {
-            let mut event = AgentAuditEvent::new("resource_rejected");
+            let mut event = AgentAuditEvent::new(event_name);
             event.remote_endpoint_id = remote_endpoint_id.map(ToOwned::to_owned);
             event.stage = Some(stage.to_string());
             event.allowed = Some(false);
             event.ok = Some(false);
-            event.error_code = Some("RESOURCE_EXHAUSTED".to_string());
+            event.error_code = Some(error_code.to_string());
             event.reason = Some(reason.to_string());
             event.resource = Some(resource.to_string());
             event.suppressed_count = Some(suppressed_count);
@@ -1661,6 +1783,66 @@ mod tests {
         assert_eq!(err.code(), ErrorCode::RpcTimeout);
     }
 
+    #[tokio::test]
+    async fn timeout_boundary_rejects_pending_operation() {
+        let err = timeout_boundary(
+            "handshake",
+            StdDuration::from_millis(10),
+            std::future::pending::<()>(),
+        )
+        .await
+        .expect_err("pending operation times out");
+
+        assert_eq!(err.resource(), "handshake");
+        assert_eq!(err.timeout(), StdDuration::from_millis(10));
+    }
+
+    #[tokio::test]
+    async fn timeout_boundary_returns_ready_operation() {
+        let result = timeout_boundary("connection", StdDuration::from_millis(10), async { 42 })
+            .await
+            .expect("ready operation succeeds");
+
+        assert_eq!(result, 42);
+    }
+
+    #[tokio::test]
+    async fn timeout_rejection_audit_records_rpc_timeout() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config = test_agent_config(dir.path());
+        let authz =
+            AgentAuthorization::from_security_config(&config.security).expect("authz table builds");
+        let state = AgentServerState {
+            config: config.clone(),
+            audit: JsonlAuditWriter::new(dir.path().join("audit.log")),
+            nonce_cache: Arc::new(Mutex::new(NonceCache::new())),
+            limiters: Arc::new(ServerLimiters::new(256, 256, 32, 1024, 128)),
+            audit_limiter: Arc::new(Mutex::new(RejectedAuditLimiter::new(&config.audit))),
+            authz: Arc::new(authz),
+            agent_endpoint_id: "agent-endpoint-1".to_string(),
+            outbound_endpoint: None,
+            path_target_resolver: PathTargetResolver::endpoint_id_only(),
+        };
+
+        audit_timeout_rejection(
+            &state,
+            Some("remote-1"),
+            "connection",
+            "connection_idle_timeout",
+            "connection idle timed out after 10 ms",
+        )
+        .await;
+
+        let audit_text = std::fs::read_to_string(dir.path().join("audit.log")).expect("audit log");
+        let audit_json: Value = serde_json::from_str(audit_text.trim()).expect("audit json");
+        assert_eq!(audit_json["event"], "rpc_rejected");
+        assert_eq!(audit_json["remote_endpoint_id"], "remote-1");
+        assert_eq!(audit_json["stage"], "connection_idle_timeout");
+        assert_eq!(audit_json["error_code"], "RPC_TIMEOUT");
+        assert_eq!(audit_json["resource"], "connection");
+        assert_eq!(audit_json["ok"], false);
+    }
+
     fn test_agent_config(dir: &std::path::Path) -> AgentConfig {
         AgentConfig {
             node: NodeConfig {
@@ -1677,6 +1859,8 @@ mod tests {
                 default_deadline_ms: 5_000,
                 max_deadline_ms: 10_000,
                 max_rpc_timeout_ms: 5_000,
+                max_handshake_duration_ms: 5_000,
+                max_connection_idle_ms: 5_000,
                 max_request_bytes: 65_536,
                 max_response_bytes: 512,
                 max_handshake_tasks_global: 256,

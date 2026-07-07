@@ -243,6 +243,35 @@ fn agent_config_rejects_non_viewer_controller_role() {
 }
 
 #[test]
+fn agent_config_rejects_unknown_controller_fields() {
+    let controller_endpoint_id = iroh::SecretKey::generate().public().to_string();
+    let err = toml::from_str::<AgentConfig>(&format!(
+        r#"
+[node]
+id = "hk-ocserv-01"
+region = "hk"
+role = "ocserv"
+
+[iroh]
+secret_key_path = "/tmp/iroh.secret"
+
+[security]
+
+[[security.controllers]]
+endpoint_id = "{controller_endpoint_id}"
+role = "viewer"
+enabled = false
+
+[audit]
+path = "/tmp/ocfleet-audit.log"
+"#
+    ))
+    .expect_err("unknown controller fields rejected");
+
+    assert!(err.to_string().contains("unknown field"));
+}
+
+#[test]
 fn agent_config_rejects_non_positive_allowed_clock_skew() {
     for value in [0, -1] {
         let mut config = valid_agent_config();
@@ -298,6 +327,8 @@ fn agent_config_defaults_include_resource_limits() {
 
     assert!(config.security.peers.is_empty());
     assert!(config.security.path_probes.is_empty());
+    assert_eq!(config.security.max_handshake_duration_ms, 5_000);
+    assert_eq!(config.security.max_connection_idle_ms, 5_000);
     assert_eq!(config.security.max_handshake_tasks_global, 256);
     assert_eq!(config.security.max_connections_global, 256);
     assert_eq!(config.security.max_connections_per_controller, 32);
@@ -314,6 +345,25 @@ fn agent_config_defaults_include_resource_limits() {
         config.audit.rejected_peer_log_aggregate_interval_seconds,
         60
     );
+}
+
+#[test]
+fn agent_config_rejects_zero_connection_timeouts() {
+    let mut config = valid_agent_config();
+    config.security.max_handshake_duration_ms = 0;
+    let err = validate_agent_config(&config).expect_err("zero max_handshake_duration_ms rejected");
+    assert!(matches!(
+        err,
+        ConfigError::Invalid(message) if message.contains("max_handshake_duration_ms")
+    ));
+
+    let mut config = valid_agent_config();
+    config.security.max_connection_idle_ms = 0;
+    let err = validate_agent_config(&config).expect_err("zero max_connection_idle_ms rejected");
+    assert!(matches!(
+        err,
+        ConfigError::Invalid(message) if message.contains("max_connection_idle_ms")
+    ));
 }
 
 #[test]

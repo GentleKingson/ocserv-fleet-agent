@@ -1202,6 +1202,8 @@ fn test_agent_config(dir: &Path, controllers: Vec<ControllerConfig>) -> AgentCon
             default_deadline_ms: 5_000,
             max_deadline_ms: 10_000,
             max_rpc_timeout_ms: 5_000,
+            max_handshake_duration_ms: 5_000,
+            max_connection_idle_ms: 5_000,
             max_request_bytes: 65_536,
             max_response_bytes: 2_097_152,
             max_handshake_tasks_global: 256,

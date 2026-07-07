@@ -58,6 +58,10 @@ pub struct SecurityConfig {
     pub max_deadline_ms: u64,
     #[serde(default = "default_max_rpc_timeout_ms")]
     pub max_rpc_timeout_ms: u64,
+    #[serde(default = "default_max_handshake_duration_ms")]
+    pub max_handshake_duration_ms: u64,
+    #[serde(default = "default_max_connection_idle_ms")]
+    pub max_connection_idle_ms: u64,
     #[serde(default = "default_max_request_bytes")]
     pub max_request_bytes: usize,
     #[serde(default = "default_max_response_bytes")]
@@ -85,6 +89,7 @@ pub struct SecurityConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ControllerConfig {
     pub endpoint_id: String,
     #[serde(default = "default_controller_role")]
@@ -217,6 +222,16 @@ pub fn validate_agent_config(config: &AgentConfig) -> Result<(), ConfigError> {
         .map_err(|e| ConfigError::Invalid(e.to_string()))?;
     validate_positive_u64(config.security.max_rpc_timeout_ms, "max_rpc_timeout_ms")
         .map_err(|e| ConfigError::Invalid(e.to_string()))?;
+    validate_positive_u64(
+        config.security.max_handshake_duration_ms,
+        "max_handshake_duration_ms",
+    )
+    .map_err(|e| ConfigError::Invalid(e.to_string()))?;
+    validate_positive_u64(
+        config.security.max_connection_idle_ms,
+        "max_connection_idle_ms",
+    )
+    .map_err(|e| ConfigError::Invalid(e.to_string()))?;
     if config.security.max_deadline_ms < config.security.default_deadline_ms {
         return Err(ConfigError::Invalid(
             "max_deadline_ms must be >= default_deadline_ms".into(),
@@ -332,6 +347,14 @@ fn default_max_deadline_ms() -> u64 {
 }
 
 fn default_max_rpc_timeout_ms() -> u64 {
+    5_000
+}
+
+fn default_max_handshake_duration_ms() -> u64 {
+    5_000
+}
+
+fn default_max_connection_idle_ms() -> u64 {
     5_000
 }
 

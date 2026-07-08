@@ -17,7 +17,8 @@ use crate::audit::AuditEvent;
 use crate::controller_rpc::{
     CONTROLLER_RPC_RESULT_CLASS, ControllerRpcOutcome, ControllerRpcRunner, FixedControllerRpc,
     OCSERV_RESULT_CLASS, OcservRpcOutcome, elapsed_ms, error_code_name, execute_fixed_node_rpc,
-    hash_json_value, inactive_endpoint_status, write_rpc_audit,
+    hash_json_value, inactive_endpoint_status, low_sensitive_ocserv_observation_summary,
+    write_rpc_audit,
 };
 use crate::store::{ObservabilityJobRecord, ObservabilityRunInsert, ProbeObservationInsert, Store};
 
@@ -29,6 +30,7 @@ const MAX_INTERVAL_SECONDS: u64 = 24 * 60 * 60;
 const MIN_TICK_SECONDS: u64 = 10;
 const MAX_TICK_SECONDS: u64 = 60 * 60;
 const MAX_SUPPORTED_CONCURRENCY: usize = 1;
+const MAX_TARGETS_PER_JOB: usize = 50;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StoredJobKind {
@@ -735,21 +737,17 @@ fn build_selectors(
     source_node_id: Option<String>,
     target_node_id: Option<String>,
 ) -> anyhow::Result<(String, Option<Value>)> {
-    let selector = selector.unwrap_or_else(|| {
-        if kind == ScheduleJobKind::PathProbe {
-            EXPLICIT_PAIR_SELECTOR.to_string()
-        } else {
-            DEFAULT_SELECTOR.to_string()
-        }
-    });
     match kind {
         ScheduleJobKind::PathProbe => {
+            if selector.is_some() {
+                bail!("--selector is not valid for path-probe jobs");
+            }
             let source_node_id = source_node_id.context("path-probe requires --source-node-id")?;
             let target_node_id = target_node_id.context("path-probe requires --target-node-id")?;
             validate_node_id(&source_node_id)?;
             validate_node_id(&target_node_id)?;
             Ok((
-                selector,
+                EXPLICIT_PAIR_SELECTOR.to_string(),
                 Some(json!({
                     "source_node_id": source_node_id,
                     "target_node_id": target_node_id,
@@ -760,6 +758,7 @@ fn build_selectors(
             if source_node_id.is_some() || target_node_id.is_some() {
                 bail!("--source-node-id and --target-node-id are only valid for path-probe jobs");
             }
+            let selector = selector.unwrap_or_else(|| DEFAULT_SELECTOR.to_string());
             Ok((selector, None))
         }
     }
@@ -787,7 +786,13 @@ fn resolve_node_targets(store: &Store, selector: &str) -> anyhow::Result<Vec<Tar
             .map(|node| TargetNode {
                 node_id: node.node_id.clone(),
             })
-            .collect();
+            .collect::<Vec<_>>();
+        if targets.len() > MAX_TARGETS_PER_JOB {
+            bail!(
+                "selector role={role} matched too many targets: {} > {MAX_TARGETS_PER_JOB}",
+                targets.len()
+            );
+        }
         return Ok(targets);
     }
     bail!("selector must use role=<role> or node_id=<node-id>")
@@ -825,7 +830,14 @@ where
     T: Serialize,
 {
     let (ok, error_code, summary_json) = match outcome {
-        OcservRpcOutcome::Available(value) => (true, None, serde_json::to_value(value)?),
+        OcservRpcOutcome::Available(value) => {
+            let value = serde_json::to_value(value)?;
+            (
+                true,
+                None,
+                low_sensitive_ocserv_observation_summary(method, &value)?,
+            )
+        }
         OcservRpcOutcome::Unavailable { code, .. } => (
             false,
             Some(error_code_name(code)),

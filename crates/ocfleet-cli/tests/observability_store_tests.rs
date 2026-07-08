@@ -20,7 +20,7 @@ fn observability_store_tests_new_database_uses_schema_version_4() {
         store.current_schema_version().expect("version"),
         CURRENT_SCHEMA_VERSION
     );
-    assert_eq!(CURRENT_SCHEMA_VERSION, 4);
+    assert_eq!(CURRENT_SCHEMA_VERSION, 5);
 }
 
 #[test]

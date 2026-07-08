@@ -1,5 +1,6 @@
 use anyhow::Context;
 use ocfleet_config::validation::validate_node_id;
+use ocfleet_protocol::enrollment::EndpointStatus;
 use ocfleet_protocol::method::{
     OCSERV_CERT_EXPIRY, OCSERV_CONFIG_FINGERPRINT, OCSERV_SERVICE_SUMMARY, OCSERV_SESSIONS_SUMMARY,
     OCSERV_VERSION, PROBE_CONTROLLER_PING,
@@ -85,6 +86,7 @@ impl HealthCounts {
 struct NodeHealth {
     node_id: String,
     endpoint_id: String,
+    endpoint_status: Option<String>,
     region: String,
     role: String,
     status: HealthStatus,
@@ -100,6 +102,7 @@ impl NodeHealth {
         json!({
             "node_id": self.node_id,
             "endpoint_id": self.endpoint_id,
+            "endpoint_status": self.endpoint_status,
             "region": self.region,
             "role": self.role,
             "status": self.status.as_str(),
@@ -147,7 +150,10 @@ fn compute_node_health(
     node: &NodeRecord,
     generated_at: &str,
 ) -> anyhow::Result<NodeHealth> {
-    let _endpoint_status = store.get_endpoint_trust(&node.endpoint_id)?;
+    let endpoint_status = store
+        .get_endpoint_trust(&node.endpoint_id)?
+        .map(|endpoint| endpoint.status);
+    let endpoint_error_code = inactive_endpoint_error_code(endpoint_status);
     let observations =
         store.list_probe_observations(Some(&node.node_id), OBSERVATION_READ_LIMIT)?;
     let freshness_seconds = latest_observation(&observations)
@@ -157,11 +163,17 @@ fn compute_node_health(
     let last_failure_at = last_failure
         .as_ref()
         .map(|record| record.observed_at.clone());
-    let last_error_code = last_failure.and_then(|record| record.error_code);
+    let last_error_code = endpoint_error_code.map(ToOwned::to_owned).or_else(|| {
+        last_failure
+            .as_ref()
+            .and_then(|record| record.error_code.clone())
+    });
     let degraded_methods = degraded_methods(&observations);
 
     let status = if !node.enabled {
         HealthStatus::Disabled
+    } else if endpoint_error_code.is_some() {
+        HealthStatus::Unreachable
     } else if observations.is_empty() {
         HealthStatus::Unknown
     } else if latest_is_stale_or_expired(generated_at, &observations) {
@@ -177,6 +189,7 @@ fn compute_node_health(
     Ok(NodeHealth {
         node_id: node.node_id.clone(),
         endpoint_id: node.endpoint_id.clone(),
+        endpoint_status: endpoint_status.map(|status| status.as_str().to_string()),
         region: node.region.clone(),
         role: node.role.clone(),
         status,
@@ -192,6 +205,16 @@ fn latest_observation(observations: &[ProbeObservationRecord]) -> Option<&ProbeO
     observations
         .iter()
         .max_by(|left, right| left.observed_at.cmp(&right.observed_at))
+}
+
+fn inactive_endpoint_error_code(status: Option<EndpointStatus>) -> Option<&'static str> {
+    match status {
+        None => Some("ENDPOINT_TRUST_MISSING"),
+        Some(EndpointStatus::Active) => None,
+        Some(EndpointStatus::Revoked) => Some("ENDPOINT_REVOKED"),
+        Some(EndpointStatus::Quarantined) => Some("ENDPOINT_QUARANTINED"),
+        Some(EndpointStatus::Rotated) => Some("ENDPOINT_ROTATED"),
+    }
 }
 
 fn latest_with_ok(
@@ -256,6 +279,10 @@ fn is_unreachable_error_code(code: &str) -> bool {
             | "FRAME_READ_FAILED"
             | "NODE_NOT_FOUND"
             | "NODE_DISABLED"
+            | "ENDPOINT_REVOKED"
+            | "ENDPOINT_QUARANTINED"
+            | "ENDPOINT_ROTATED"
+            | "ENDPOINT_TRUST_MISSING"
     )
 }
 
@@ -360,6 +387,7 @@ fn upsert_health_snapshot(
             "region": row.region,
             "role": row.role,
             "status": row.status.as_str(),
+            "endpoint_status": row.endpoint_status,
         }),
     })?;
     Ok(())
@@ -394,9 +422,10 @@ fn print_health_output(
         );
         for row in rows {
             println!(
-                "node_id={} endpoint_id={} region={} role={} status={} freshness_seconds={} last_success_at={} last_failure_at={} last_error_code={} degraded_methods={}",
+                "node_id={} endpoint_id={} endpoint_status={} region={} role={} status={} freshness_seconds={} last_success_at={} last_failure_at={} last_error_code={} degraded_methods={}",
                 row.node_id,
                 row.endpoint_id,
+                row.endpoint_status.as_deref().unwrap_or("<none>"),
                 row.region,
                 row.role,
                 row.status.as_str(),

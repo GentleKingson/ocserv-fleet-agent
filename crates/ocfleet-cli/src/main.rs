@@ -513,6 +513,9 @@ fn run_retention_apply(store: &Store, dry_run: bool) -> anyhow::Result<()> {
                 "observations" => {
                     store.prune_probe_observations(cutoff.as_deref(), policy.max_rows)?
                 }
+                "observability-runs" => {
+                    store.prune_observability_runs(cutoff.as_deref(), policy.max_rows)?
+                }
                 "health-snapshots" => {
                     store.prune_health_snapshots(cutoff.as_deref(), policy.max_rows)?
                 }
@@ -541,11 +544,17 @@ fn run_retention_apply(store: &Store, dry_run: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-const RETENTION_SCOPES: &[&str] = &["observations", "health-snapshots", "alert-events"];
+const RETENTION_SCOPES: &[&str] = &[
+    "observations",
+    "observability-runs",
+    "health-snapshots",
+    "alert-events",
+];
 
 fn retention_scope_name(scope: RetentionScope) -> &'static str {
     match scope {
         RetentionScope::Observations => "observations",
+        RetentionScope::ObservabilityRuns => "observability-runs",
         RetentionScope::HealthSnapshots => "health-snapshots",
         RetentionScope::AlertEvents => "alert-events",
     }
@@ -554,6 +563,7 @@ fn retention_scope_name(scope: RetentionScope) -> &'static str {
 fn default_retention_policy(scope: &str) -> RetentionPolicyRecord {
     let (max_age_days, max_rows) = match scope {
         "observations" => (Some(30), Some(100_000)),
+        "observability-runs" => (Some(30), Some(100_000)),
         "health-snapshots" => (Some(30), None),
         "alert-events" => (Some(180), None),
         _ => (None, None),

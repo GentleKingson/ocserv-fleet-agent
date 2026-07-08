@@ -1099,4 +1099,11 @@ fn ping_with_unsafe_controller_secret_key_writes_permission_error_audit() {
         audit.error_code.as_deref(),
         Some("SECRET_KEY_PERMISSION_INVALID")
     );
+    assert_eq!(audit.detail["message"], "controller SecretKey unavailable");
+    assert_eq!(audit.detail["error_code"], "SECRET_KEY_PERMISSION_INVALID");
+    assert!(audit.detail.get("error").is_none());
+    assert!(audit.detail.get("details").is_none());
+    let detail_text = audit.detail.to_string();
+    assert!(!detail_text.contains(secret_key.to_string_lossy().as_ref()));
+    assert!(!detail_text.contains("InvalidPermissions"));
 }

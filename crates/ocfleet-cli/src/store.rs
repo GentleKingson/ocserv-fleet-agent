@@ -14,7 +14,7 @@ use uuid::Uuid;
 use crate::audit::AuditEvent;
 use crate::private_file::{self, PrivateFileError};
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 4;
+pub const CURRENT_SCHEMA_VERSION: i64 = 5;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -440,7 +440,7 @@ impl Store {
             );
 
             CREATE TABLE IF NOT EXISTS retention_policies (
-              scope TEXT PRIMARY KEY CHECK (scope IN ('observations', 'health-snapshots', 'alert-events')),
+              scope TEXT PRIMARY KEY CHECK (scope IN ('observations', 'observability-runs', 'health-snapshots', 'alert-events')),
               max_age_days INTEGER CHECK (max_age_days IS NULL OR max_age_days >= 1),
               max_rows INTEGER CHECK (max_rows IS NULL OR max_rows >= 1),
               updated_at TEXT NOT NULL
@@ -947,6 +947,14 @@ impl Store {
         max_rows: Option<u64>,
     ) -> Result<u64, StoreError> {
         self.prune_retention_scope("observations", cutoff, max_rows)
+    }
+
+    pub fn prune_observability_runs(
+        &self,
+        cutoff: Option<&str>,
+        max_rows: Option<u64>,
+    ) -> Result<u64, StoreError> {
+        self.prune_retention_scope("observability-runs", cutoff, max_rows)
     }
 
     pub fn prune_health_snapshots(
@@ -1481,7 +1489,7 @@ fn rebuild_observability_v4_tables_if_needed(tx: &Transaction<'_>) -> Result<(),
         ),
         (
             "retention_policies",
-            "scope TEXT PRIMARY KEY CHECK",
+            "observability-runs",
             "retention scope",
         ),
     ];
@@ -1631,7 +1639,7 @@ DROP TABLE alert_events_legacy_v3;
 
 ALTER TABLE retention_policies RENAME TO retention_policies_legacy_v3;
 CREATE TABLE retention_policies (
-  scope TEXT PRIMARY KEY CHECK (scope IN ('observations', 'health-snapshots', 'alert-events')),
+  scope TEXT PRIMARY KEY CHECK (scope IN ('observations', 'observability-runs', 'health-snapshots', 'alert-events')),
   max_age_days INTEGER CHECK (max_age_days IS NULL OR max_age_days >= 1),
   max_rows INTEGER CHECK (max_rows IS NULL OR max_rows >= 1),
   updated_at TEXT NOT NULL
@@ -1640,7 +1648,7 @@ INSERT INTO retention_policies
   (scope, max_age_days, max_rows, updated_at)
 SELECT scope, max_age_days, max_rows, updated_at
 FROM retention_policies_legacy_v3
-WHERE scope IN ('observations', 'health-snapshots', 'alert-events')
+WHERE scope IN ('observations', 'observability-runs', 'health-snapshots', 'alert-events')
   AND (max_age_days IS NULL OR max_age_days >= 1)
   AND (max_rows IS NULL OR max_rows >= 1);
 DROP TABLE retention_policies_legacy_v3;
@@ -1986,6 +1994,10 @@ fn retention_target(scope: &str) -> Result<RetentionTarget, StoreError> {
         "observations" => Ok(RetentionTarget {
             table: "probe_observations",
             timestamp_column: "observed_at",
+        }),
+        "observability-runs" => Ok(RetentionTarget {
+            table: "observability_runs",
+            timestamp_column: "started_at",
         }),
         "health-snapshots" => Ok(RetentionTarget {
             table: "health_snapshots",

@@ -1,9 +1,12 @@
 use ocfleet_cli::controller_rpc::{
     CONTROLLER_RPC_RESULT_CLASS, ControllerRpcRunner, FixedControllerRpc,
-    low_sensitive_fixed_rpc_summary,
+    low_sensitive_fixed_rpc_summary, low_sensitive_ocserv_observation_summary,
 };
 use ocfleet_cli::store::Store;
-use ocfleet_protocol::method::{PROBE_CONTROLLER_PING, PROBE_PATH_ECHO};
+use ocfleet_protocol::method::{
+    OCSERV_CONFIG_FINGERPRINT, OCSERV_SERVICE_SUMMARY, OCSERV_SESSIONS_SUMMARY, OCSERV_VERSION,
+    PROBE_CONTROLLER_PING, PROBE_PATH_ECHO,
+};
 use serde_json::json;
 
 #[tokio::test]
@@ -113,4 +116,79 @@ fn controller_rpc_fixed_rpc_variants_define_method_and_params() {
     assert!(allowlist.contains(&PROBE_CONTROLLER_PING));
     assert!(allowlist.contains(&PROBE_PATH_ECHO));
     assert!(!allowlist.contains(&"shell.exec"));
+}
+
+#[test]
+fn controller_rpc_ocserv_observation_summary_drops_raw_dto_fields() {
+    let service = low_sensitive_ocserv_observation_summary(
+        OCSERV_SERVICE_SUMMARY,
+        &json!({
+            "service": {"state": "running", "enabled": "enabled", "since": "2026-07-08T00:00:00Z"},
+            "meta": {"source": "provider", "collected_at": "2026-07-08T00:00:00Z", "freshness": "live"},
+            "username": "alice",
+            "client_ip": "10.0.0.2",
+            "config_path": "/etc/ocserv/ocserv.conf"
+        }),
+    )
+    .expect("service summary");
+    assert_eq!(service["result_class"], "low_sensitive_summary");
+    assert_eq!(service["service_state"], "running");
+    assert_eq!(service["service_enabled"], "enabled");
+    assert!(service.get("service").is_none());
+    assert!(service.get("meta").is_none());
+
+    let version = low_sensitive_ocserv_observation_summary(
+        OCSERV_VERSION,
+        &json!({
+            "version": "1.2.3",
+            "status": "available",
+            "meta": {"source": "provider", "collected_at": "2026-07-08T00:00:00Z", "freshness": "live"},
+            "stdout": "secret"
+        }),
+    )
+    .expect("version summary");
+    assert_eq!(version["version"], "1.2.3");
+    assert_eq!(version["status"], "available");
+    assert!(version.get("meta").is_none());
+
+    let sessions = low_sensitive_ocserv_observation_summary(
+        OCSERV_SESSIONS_SUMMARY,
+        &json!({
+            "sessions": {"total": 12, "status": "available", "users": ["alice"]},
+            "meta": {"source": "provider", "collected_at": "2026-07-08T00:00:00Z", "freshness": "live"}
+        }),
+    )
+    .expect("sessions summary");
+    assert_eq!(sessions["sessions_total"], 12);
+    assert_eq!(sessions["sessions_status"], "available");
+    assert!(sessions.get("users").is_none());
+
+    let fingerprint = low_sensitive_ocserv_observation_summary(
+        OCSERV_CONFIG_FINGERPRINT,
+        &json!({
+            "fingerprint": {
+                "algorithm": "sha256",
+                "hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "status": "available",
+                "path": "/etc/ocserv/ocserv.conf"
+            },
+            "meta": {"source": "provider", "collected_at": "2026-07-08T00:00:00Z", "freshness": "live"}
+        }),
+    )
+    .expect("fingerprint summary");
+    assert_eq!(fingerprint["config_fingerprint_algorithm"], "sha256");
+    assert_eq!(fingerprint["config_fingerprint_prefix"], "aaaaaaaaaaaa");
+    assert_eq!(fingerprint["config_fingerprint_status"], "available");
+    assert!(fingerprint.get("hash").is_none());
+
+    let combined = json!([service, version, sessions, fingerprint]).to_string();
+    for marker in [
+        "alice",
+        "10.0.0.2",
+        "/etc/ocserv",
+        "stdout",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    ] {
+        assert!(!combined.contains(marker), "raw marker leaked: {marker}");
+    }
 }

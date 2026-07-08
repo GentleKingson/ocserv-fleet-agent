@@ -1,4 +1,4 @@
-use ocfleet_cli::store::{AlertEventRecord, HealthSnapshotRecord, Store};
+use ocfleet_cli::store::{AlertEventRecord, HealthSnapshotRecord, NodeInsert, Store};
 use rusqlite::Connection;
 use serde_json::{Value, json};
 use std::path::Path;
@@ -196,6 +196,69 @@ fn alert_hooks_tests_silence_writes_audit() {
     assert_eq!(event, "alert.silence");
     assert_eq!(detail["dedupe_key"], "node:hk-ocserv-01:node_stale");
     assert_eq!(detail["reason"], "maintenance");
+}
+
+#[test]
+fn alert_hooks_tests_silenced_alert_stays_silenced_while_active_candidate_exists() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let database_arg = database.to_string_lossy().into_owned();
+    let store = Store::open(&database).expect("open store");
+    seed_stale_health_snapshot(&store);
+    drop(store);
+
+    run_ocfleet(&["--database", &database_arg, "alert", "list"]);
+    run_ocfleet(&[
+        "--database",
+        &database_arg,
+        "alert",
+        "silence",
+        "node:hk-ocserv-01:node_stale",
+        "--for-duration",
+        "1h",
+        "--reason",
+        "maintenance",
+    ]);
+    run_ocfleet(&["--database", &database_arg, "alert", "list"]);
+
+    let store = Store::open(&database).expect("reopen store");
+    let alerts = store.list_alert_events().expect("list alerts");
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].state, "silenced");
+}
+
+#[test]
+fn alert_hooks_tests_rotated_endpoint_generates_inactive_alert() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let database_arg = database.to_string_lossy().into_owned();
+    let store = Store::open(&database).expect("open store");
+    let endpoint_id = iroh::SecretKey::generate().public().to_string();
+    let new_endpoint_id = iroh::SecretKey::generate().public().to_string();
+    store
+        .add_node(&NodeInsert {
+            node_id: "hk-ocserv-01".to_string(),
+            endpoint_id: endpoint_id.clone(),
+            name: "hk-ocserv-01".to_string(),
+            region: "hk".to_string(),
+            role: "ocserv".to_string(),
+        })
+        .expect("add node");
+    store
+        .rotate_endpoint(&endpoint_id, &new_endpoint_id, "operator", "test rotate")
+        .expect("rotate endpoint");
+    drop(store);
+
+    let output = run_ocfleet(&["--database", &database_arg, "alert", "list", "--json"]);
+    let payload: Value = serde_json::from_slice(&output.stdout).expect("valid payload");
+    let inactive = payload["alerts"]
+        .as_array()
+        .expect("alerts array")
+        .iter()
+        .find(|alert| alert["reason_code"] == "ENDPOINT_INACTIVE")
+        .expect("inactive endpoint alert");
+    assert_eq!(inactive["severity"], "critical");
+    assert_eq!(inactive["summary"]["endpoint_status"], "rotated");
 }
 
 #[test]

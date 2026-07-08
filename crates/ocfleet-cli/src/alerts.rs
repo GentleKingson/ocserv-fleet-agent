@@ -101,6 +101,8 @@ fn run_alert_silence(
         "silence_reason".to_string(),
         Value::String(reason.to_string()),
     );
+    alert.state = "silenced".to_string();
+    alert.resolved_at = None;
     alert.detail_json = Value::Object(detail);
     store.upsert_alert_event(&alert)?;
     write_alert_audit(
@@ -309,10 +311,7 @@ fn cert_expiry_candidates(observations: &[ProbeObservationRecord]) -> Vec<AlertC
 fn candidates_from_endpoint_trust(store: &Store) -> anyhow::Result<Vec<AlertCandidate>> {
     let mut candidates = Vec::new();
     for endpoint in store.trust_snapshot(None)?.endpoints {
-        if matches!(
-            endpoint.status,
-            EndpointStatus::Revoked | EndpointStatus::Quarantined
-        ) {
+        if endpoint.status != EndpointStatus::Active {
             candidates.push(AlertCandidate {
                 dedupe_key: format!("endpoint:{}:endpoint_inactive", endpoint.endpoint_id),
                 node_id: endpoint.node_id.clone(),
@@ -338,7 +337,10 @@ fn upsert_candidate(
     let existing = existing_alerts
         .iter()
         .find(|alert| alert.dedupe_key == candidate.dedupe_key);
-    let mut detail = Map::new();
+    let keep_silenced = existing.is_some_and(|alert| alert_is_silenced(alert, now));
+    let mut detail = existing
+        .map(|alert| object_from_value(alert.detail_json.clone()))
+        .unwrap_or_default();
     detail.insert("methods".to_string(), json!(candidate.methods));
     detail.insert("summary".to_string(), safe_summary(&candidate.summary));
     let record = AlertEventRecord {
@@ -348,18 +350,39 @@ fn upsert_candidate(
         dedupe_key: candidate.dedupe_key,
         node_id: candidate.node_id,
         severity: candidate.severity.to_string(),
-        state: "open".to_string(),
+        state: if keep_silenced { "silenced" } else { "open" }.to_string(),
         reason_code: candidate.reason_code.to_string(),
         first_seen_at: existing
             .map(|alert| alert.first_seen_at.clone())
             .unwrap_or_else(|| now.to_string()),
         last_seen_at: now.to_string(),
         last_sent_at: existing.and_then(|alert| alert.last_sent_at.clone()),
-        resolved_at: None,
+        resolved_at: if keep_silenced {
+            existing.and_then(|alert| alert.resolved_at.clone())
+        } else {
+            None
+        },
         detail_json: Value::Object(detail),
     };
     store.upsert_alert_event(&record)?;
     Ok(record)
+}
+
+fn alert_is_silenced(alert: &AlertEventRecord, now: &str) -> bool {
+    if alert.state != "silenced" {
+        return false;
+    }
+    alert
+        .detail_json
+        .get("silenced_until")
+        .and_then(Value::as_str)
+        .is_some_and(|until| timestamp_after(until, now).unwrap_or(false))
+}
+
+fn timestamp_after(left: &str, right: &str) -> anyhow::Result<bool> {
+    let left = OffsetDateTime::parse(left, &Rfc3339)?;
+    let right = OffsetDateTime::parse(right, &Rfc3339)?;
+    Ok(left > right)
 }
 
 fn reject_disabled_alert_hook(value: &str) -> anyhow::Result<()> {

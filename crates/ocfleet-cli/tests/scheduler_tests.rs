@@ -191,6 +191,33 @@ fn scheduler_tests_path_probe_without_explicit_pair_rejected() {
 }
 
 #[test]
+fn scheduler_tests_path_probe_rejects_user_selector() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let database_arg = database.to_string_lossy().into_owned();
+
+    let output = run_ocfleet_failure(&[
+        "--database",
+        &database_arg,
+        "schedule",
+        "job",
+        "add",
+        "--kind",
+        "path-probe",
+        "--interval",
+        "60s",
+        "--source-node-id",
+        "hk-ocserv-01",
+        "--target-node-id",
+        "sg-ocserv-01",
+        "--selector",
+        "role=ocserv",
+    ]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--selector is not valid for path-probe"));
+}
+
+#[test]
 fn scheduler_tests_non_path_job_with_pair_rejected() {
     let dir = tempfile::tempdir().expect("temp dir");
     let database = dir.path().join("controller.sqlite");
@@ -213,6 +240,50 @@ fn scheduler_tests_non_path_job_with_pair_rejected() {
     ]);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("only valid for path-probe jobs"));
+}
+
+#[test]
+fn scheduler_tests_role_selector_rejects_too_many_targets_before_rpc() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let database_arg = database.to_string_lossy().into_owned();
+    {
+        let store = Store::open(&database).expect("open store");
+        for index in 0..51 {
+            add_node_with_generated_endpoint(&store, &format!("node-{index:02}"));
+        }
+    }
+
+    run_ocfleet(&[
+        "--database",
+        &database_arg,
+        "schedule",
+        "job",
+        "add",
+        "--kind",
+        "controller-ping",
+        "--interval",
+        "60s",
+        "--selector",
+        "role=ocserv",
+    ]);
+
+    let output = run_ocfleet(&["--database", &database_arg, "schedule", "run", "--once"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("status=ok"));
+    assert!(stdout.contains("observations=1"));
+    assert!(stdout.contains("failed_observations=1"));
+    assert!(!stdout.contains("observations=51"));
+
+    let store = Store::open(&database).expect("open store");
+    let observations = store
+        .list_probe_observations(None, 10)
+        .expect("list observations");
+    assert_eq!(observations.len(), 1);
+    assert_eq!(
+        observations[0].error_code.as_deref(),
+        Some("SCHEDULER_JOB_INVALID")
+    );
 }
 
 #[test]

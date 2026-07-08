@@ -316,6 +316,8 @@ pub enum RetentionCommand {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum RetentionScope {
     Observations,
+    #[value(name = "observability-runs")]
+    ObservabilityRuns,
     #[value(name = "health-snapshots")]
     HealthSnapshots,
     #[value(name = "alert-events")]

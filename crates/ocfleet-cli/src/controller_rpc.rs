@@ -807,11 +807,16 @@ async fn execute_node_rpc_raw(
             IdentityError::InvalidPermissions => ErrorCode::SecretKeyPermissionInvalid,
             _ => ErrorCode::SecretKeyLoadFailed,
         };
+        let error_code = error_code_name(&code);
         RpcCommandFailure::new(
             code,
-            format!("failed to load controller SecretKey: {err}"),
+            "failed to load controller SecretKey",
             None,
-            json!({ "error": err.to_string() }),
+            json!({
+                "message": "controller SecretKey unavailable",
+                "result_class": CONTROLLER_RPC_RESULT_CLASS,
+                "error_code": error_code,
+            }),
         )
     })?;
     let endpoint = bind_controller_endpoint(secret_key).await.map_err(|err| {
@@ -921,12 +926,94 @@ pub fn low_sensitive_fixed_rpc_summary(method: &str, result: &Value) -> Result<V
         | OCSERV_SESSIONS_SUMMARY
         | OCSERV_CERT_EXPIRY
         | OCSERV_CONFIG_FINGERPRINT => {
-            summary.insert(
-                "result_class".to_string(),
-                Value::String(OCSERV_RESULT_CLASS.to_string()),
-            );
+            return low_sensitive_ocserv_observation_summary(method, result);
         }
         _ => bail!("unsupported fixed RPC method for summary: {method}"),
+    }
+    Ok(Value::Object(summary))
+}
+
+pub fn low_sensitive_ocserv_observation_summary(method: &str, result: &Value) -> Result<Value> {
+    let mut summary = Map::new();
+    summary.insert(
+        "result_class".to_string(),
+        Value::String(OCSERV_RESULT_CLASS.to_string()),
+    );
+    match method {
+        OCSERV_SERVICE_SUMMARY => {
+            copy_nested_string_field(result, &mut summary, &["service", "state"], "service_state");
+            copy_nested_string_field(
+                result,
+                &mut summary,
+                &["service", "enabled"],
+                "service_enabled",
+            );
+        }
+        OCSERV_VERSION => {
+            copy_string_field(result, &mut summary, "version");
+            copy_string_field(result, &mut summary, "status");
+        }
+        OCSERV_SESSIONS_SUMMARY => {
+            copy_nested_u64_field(
+                result,
+                &mut summary,
+                &["sessions", "total"],
+                "sessions_total",
+            );
+            copy_nested_string_field(
+                result,
+                &mut summary,
+                &["sessions", "status"],
+                "sessions_status",
+            );
+        }
+        OCSERV_CERT_EXPIRY => {
+            if let Some(certs) = result.get("certs").and_then(Value::as_array) {
+                summary.insert("cert_count".to_string(), json!(certs.len()));
+                if let Some(days_remaining) = certs
+                    .iter()
+                    .filter_map(|cert| cert.get("days_remaining").and_then(Value::as_i64))
+                    .min()
+                {
+                    summary.insert("min_days_remaining".to_string(), json!(days_remaining));
+                }
+                if let Some(status) = certs
+                    .iter()
+                    .filter_map(|cert| cert.get("status").and_then(Value::as_str))
+                    .find(|status| {
+                        matches!(
+                            *status,
+                            "expired" | "expiring_soon" | "unreadable" | "invalid" | "unknown"
+                        )
+                    })
+                {
+                    summary.insert("cert_status".to_string(), Value::String(status.to_string()));
+                }
+            }
+        }
+        OCSERV_CONFIG_FINGERPRINT => {
+            copy_nested_string_field(
+                result,
+                &mut summary,
+                &["fingerprint", "algorithm"],
+                "config_fingerprint_algorithm",
+            );
+            copy_nested_string_field(
+                result,
+                &mut summary,
+                &["fingerprint", "status"],
+                "config_fingerprint_status",
+            );
+            if let Some(hash) =
+                nested_value(result, &["fingerprint", "hash"]).and_then(Value::as_str)
+            {
+                summary.insert(
+                    "config_fingerprint_prefix".to_string(),
+                    Value::String(hash.chars().take(12).collect()),
+                );
+            }
+        }
+        _ => bail!("unsupported ocserv observation method: {method}"),
     }
     Ok(Value::Object(summary))
 }
@@ -935,6 +1022,36 @@ fn copy_string_field(source: &Value, target: &mut Map<String, Value>, field: &st
     if let Some(value) = source.get(field).and_then(Value::as_str) {
         target.insert(field.to_string(), Value::String(value.to_string()));
     }
+}
+
+fn copy_nested_string_field(
+    source: &Value,
+    target: &mut Map<String, Value>,
+    path: &[&str],
+    target_field: &str,
+) {
+    if let Some(value) = nested_value(source, path).and_then(Value::as_str) {
+        target.insert(target_field.to_string(), Value::String(value.to_string()));
+    }
+}
+
+fn copy_nested_u64_field(
+    source: &Value,
+    target: &mut Map<String, Value>,
+    path: &[&str],
+    target_field: &str,
+) {
+    if let Some(value) = nested_value(source, path).and_then(Value::as_u64) {
+        target.insert(target_field.to_string(), json!(value));
+    }
+}
+
+fn nested_value<'a>(source: &'a Value, path: &[&str]) -> Option<&'a Value> {
+    let mut value = source;
+    for field in path {
+        value = value.get(*field)?;
+    }
+    Some(value)
 }
 
 #[derive(Debug, Clone)]
@@ -1106,16 +1223,11 @@ fn validate_response_for_method(
 }
 
 fn rpc_client_error_detail_json(err: &RpcClientError) -> Value {
-    let mut detail = Map::new();
-    let details = err.details().clone();
-    detail.insert("error".to_string(), Value::String(err.to_string()));
-    detail.insert("details".to_string(), details.clone());
-    if let Value::Object(details) = details {
-        for (key, value) in details {
-            detail.entry(key).or_insert(value);
-        }
-    }
-    Value::Object(detail)
+    json!({
+        "message": "controller RPC request failed",
+        "result_class": CONTROLLER_RPC_RESULT_CLASS,
+        "error_code": error_code_name(&err.code()),
+    })
 }
 
 fn failure_to_outcome(

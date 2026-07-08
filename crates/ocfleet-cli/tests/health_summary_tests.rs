@@ -1,5 +1,6 @@
 use ocfleet_cli::audit::AuditEvent;
 use ocfleet_cli::store::{NodeInsert, ProbeObservationInsert, Store};
+use ocfleet_protocol::enrollment::EndpointStatus;
 use ocfleet_protocol::method::{OCSERV_SERVICE_SUMMARY, OCSERV_VERSION, PROBE_CONTROLLER_PING};
 use serde_json::{Value, json};
 use std::process::{Command, Output};
@@ -153,6 +154,68 @@ fn health_summary_tests_recent_controller_ping_ok_reports_healthy_without_agent_
     assert!(stdout.contains("node_id=hk-ocserv-01"));
     assert!(stdout.contains("status=healthy"));
     assert!(stdout.contains("healthy=1"));
+}
+
+#[test]
+fn health_summary_tests_inactive_endpoint_overrides_recent_success() {
+    for (status, expected_code) in [
+        (EndpointStatus::Revoked, "ENDPOINT_REVOKED"),
+        (EndpointStatus::Quarantined, "ENDPOINT_QUARANTINED"),
+        (EndpointStatus::Rotated, "ENDPOINT_ROTATED"),
+    ] {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let database = dir.path().join("controller.sqlite");
+        let database_arg = database.to_string_lossy().into_owned();
+        let store = Store::open(&database).expect("open store");
+        add_node(&store, "hk-ocserv-01");
+        let endpoint_id = store
+            .get_node("hk-ocserv-01")
+            .expect("get node")
+            .expect("node exists")
+            .endpoint_id;
+        match status {
+            EndpointStatus::Revoked => {
+                store
+                    .revoke_endpoint(&endpoint_id, "operator", "test revoke")
+                    .expect("revoke endpoint");
+            }
+            EndpointStatus::Quarantined => {
+                store
+                    .quarantine_endpoint(&endpoint_id, "operator", "test quarantine")
+                    .expect("quarantine endpoint");
+            }
+            EndpointStatus::Rotated => {
+                let new_endpoint_id = iroh::SecretKey::generate().public().to_string();
+                store
+                    .rotate_endpoint(&endpoint_id, &new_endpoint_id, "operator", "test rotate")
+                    .expect("rotate endpoint");
+            }
+            EndpointStatus::Active => panic!("active endpoint is not a rejection case"),
+        }
+        let observed_at = now_rfc3339();
+        insert_observation(
+            &store,
+            ObservationFixture {
+                observation_id: "obs-ping-ok",
+                node_id: "hk-ocserv-01",
+                method: PROBE_CONTROLLER_PING,
+                ok: true,
+                error_code: None,
+                observed_at: &observed_at,
+                summary_json: json!({"message": "pong"}),
+            },
+        );
+        drop(store);
+
+        let output = run_ocfleet(&["--database", &database_arg, "health", "summary"]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !stdout.contains("status=healthy"),
+            "inactive {status:?} endpoint must not be healthy: {stdout}"
+        );
+        assert!(stdout.contains("status=unreachable"));
+        assert!(stdout.contains(expected_code));
+    }
 }
 
 #[test]

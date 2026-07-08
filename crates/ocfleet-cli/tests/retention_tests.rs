@@ -1,5 +1,7 @@
 use ocfleet_cli::audit::AuditEvent;
-use ocfleet_cli::store::{AlertEventRecord, HealthSnapshotRecord, ProbeObservationInsert, Store};
+use ocfleet_cli::store::{
+    AlertEventRecord, HealthSnapshotRecord, ObservabilityRunInsert, ProbeObservationInsert, Store,
+};
 use rusqlite::Connection;
 use serde_json::{Value, json};
 use std::path::Path;
@@ -95,6 +97,15 @@ fn audit_count(database: &Path) -> i64 {
         .expect("count audit")
 }
 
+fn run_count(database: &Path) -> i64 {
+    Connection::open(database)
+        .expect("open db")
+        .query_row("SELECT count(*) FROM observability_runs", [], |row| {
+            row.get(0)
+        })
+        .expect("count runs")
+}
+
 fn latest_audit(database: &Path) -> (String, Value) {
     let (event, detail): (String, String) = Connection::open(database)
         .expect("open db")
@@ -122,6 +133,7 @@ fn retention_tests_show_outputs_default_policies() {
     assert!(stdout.contains("scope=observations"));
     assert!(stdout.contains("max_age_days=30"));
     assert!(stdout.contains("max_rows=100000"));
+    assert!(stdout.contains("scope=observability-runs"));
     assert!(stdout.contains("scope=health-snapshots"));
     assert!(stdout.contains("scope=alert-events"));
     assert!(stdout.contains("max_age_days=180"));
@@ -161,6 +173,51 @@ fn retention_tests_set_writes_policy() {
     assert_eq!(detail["scope"], "observations");
     assert_eq!(detail["max_age_days"], 7);
     assert_eq!(detail["max_rows"], 10);
+}
+
+#[test]
+fn retention_tests_apply_deletes_expired_observability_runs() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let database_arg = database.to_string_lossy().into_owned();
+    let store = Store::open(&database).expect("open store");
+    for (run_id, started_at) in [
+        ("run-old", "2026-01-01T00:00:00Z"),
+        ("run-new", "2026-07-08T00:00:00Z"),
+    ] {
+        store
+            .insert_observability_run(&ObservabilityRunInsert {
+                run_id: run_id.to_string(),
+                job_id: None,
+                started_at: started_at.to_string(),
+                finished_at: Some(started_at.to_string()),
+                status: "succeeded".to_string(),
+                triggered_by: "scheduler.run.once".to_string(),
+                summary_json: json!({"result_class": "scheduler_summary"}),
+            })
+            .expect("insert run");
+    }
+    drop(store);
+
+    run_ocfleet(&[
+        "--database",
+        &database_arg,
+        "retention",
+        "set",
+        "observability-runs",
+        "--max-age",
+        "7d",
+    ]);
+    run_ocfleet(&["--database", &database_arg, "retention", "apply"]);
+
+    assert_eq!(run_count(&database), 1);
+    let remaining: String = Connection::open(&database)
+        .expect("open db")
+        .query_row("SELECT run_id FROM observability_runs", [], |row| {
+            row.get(0)
+        })
+        .expect("remaining run");
+    assert_eq!(remaining, "run-new");
 }
 
 #[test]

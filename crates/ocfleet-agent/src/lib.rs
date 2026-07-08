@@ -5,6 +5,7 @@ pub mod enrollment;
 pub mod identity;
 pub mod node_info;
 pub mod nonce;
+pub mod ocserv;
 #[doc(hidden)]
 pub mod peer_echo;
 pub mod private_file;

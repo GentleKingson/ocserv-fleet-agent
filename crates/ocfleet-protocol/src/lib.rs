@@ -4,6 +4,7 @@ pub mod error;
 pub mod frame;
 pub mod metadata;
 pub mod method;
+pub mod ocserv;
 pub mod rpc;
 
 pub use constants::*;

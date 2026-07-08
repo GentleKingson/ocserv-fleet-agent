@@ -3,12 +3,16 @@ use clap::Parser;
 use iroh::{EndpointAddr, EndpointId};
 use ocfleet_cli::args::{
     Cli, Command, EndpointCommand, EnrollCommand, EnrollRequestCommand, EnrollTokenCommand,
-    NodeCommand, ProbeCommand, TrustCommand, TrustDiffFormat,
+    NodeCommand, OcservCommand, OcservSessionsCommand, ProbeCommand, TrustCommand, TrustDiffFormat,
 };
 use ocfleet_cli::audit::AuditEvent;
 use ocfleet_cli::doctor::{DoctorOptions, format_human, run_doctor};
 use ocfleet_cli::identity::{
     IdentityError, load_or_create_secret_key_with_status, load_secret_key,
+};
+use ocfleet_cli::ocserv_output::{
+    assert_low_sensitive_ocserv_output, format_cert_human, format_sessions_human,
+    format_status_human,
 };
 use ocfleet_cli::rpc_client::{
     RpcClientError, bind_controller_endpoint, build_request, call_endpoint_addr,
@@ -23,8 +27,16 @@ use ocfleet_config::validation::{
 };
 use ocfleet_protocol::enrollment::{EndpointStatus, TrustBundle};
 use ocfleet_protocol::error::ErrorCode;
-use ocfleet_protocol::method::{NODE_INFO, NODE_PING, PROBE_CONTROLLER_PING, PROBE_PATH_ECHO};
+use ocfleet_protocol::method::{
+    NODE_INFO, NODE_PING, OCSERV_CERT_EXPIRY, OCSERV_CONFIG_FINGERPRINT, OCSERV_SERVICE_SUMMARY,
+    OCSERV_SESSIONS_SUMMARY, OCSERV_VERSION, PROBE_CONTROLLER_PING, PROBE_PATH_ECHO,
+};
+use ocfleet_protocol::ocserv::{
+    OcservCertExpiryResponse, OcservConfigFingerprintResponse, OcservServiceSummaryResponse,
+    OcservSessionsSummaryResponse, OcservVersionResponse,
+};
 use ocfleet_protocol::{DEFAULT_ALPN, DEFAULT_DEADLINE_MS, RpcResponse};
+use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -273,6 +285,23 @@ async fn main() -> anyhow::Result<()> {
                     format,
                     strict,
                 } => run_trust_diff_command(&store, endpoint.as_deref(), format, strict)?,
+            }
+        }
+        Command::Ocserv { command } => {
+            let store = Store::open(&cli.database).context("failed to open controller database")?;
+            match command {
+                OcservCommand::Status { node, json } => {
+                    run_ocserv_status_command(&store, &cli.secret_key, &node, json).await?
+                }
+                OcservCommand::Cert { node, json } => {
+                    run_ocserv_cert_command(&store, &cli.secret_key, &node, json).await?
+                }
+                OcservCommand::Sessions { command } => match command {
+                    OcservSessionsCommand::Summary { node, json } => {
+                        run_ocserv_sessions_summary_command(&store, &cli.secret_key, &node, json)
+                            .await?
+                    }
+                },
             }
         }
     }
@@ -1244,6 +1273,551 @@ async fn run_node_rpc_command(
             bail!(failure.message);
         }
     }
+}
+
+async fn run_ocserv_status_command(
+    store: &Store,
+    secret_key_path: &Path,
+    node_id: &str,
+    json_output: bool,
+) -> anyhow::Result<()> {
+    let actor = local_actor();
+    let started = Instant::now();
+    let node = match load_ocserv_rpc_node(store, node_id) {
+        Ok(node) => node,
+        Err(failure) => {
+            write_ocserv_command_audit(
+                store,
+                OcservCommandAudit {
+                    actor,
+                    event: "ocserv.status",
+                    node_id: node_id.to_string(),
+                    endpoint_id: known_endpoint_id(store, node_id),
+                    method: OCSERV_SERVICE_SUMMARY,
+                    ok: false,
+                    error_code: Some(failure.code),
+                    duration_ms: elapsed_ms(started),
+                    detail_json: low_sensitive_detail(&failure.message),
+                },
+            )?;
+            bail!(failure.message);
+        }
+    };
+
+    let service = match execute_ocserv_rpc::<OcservServiceSummaryResponse>(
+        store,
+        secret_key_path,
+        &node,
+        OCSERV_SERVICE_SUMMARY,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(failure) => {
+            write_ocserv_command_failure(
+                store,
+                "ocserv.status",
+                &node,
+                OCSERV_SERVICE_SUMMARY,
+                failure,
+                started,
+            )?;
+            return Err(anyhow::anyhow!("ocserv status failed"));
+        }
+    };
+    let version = match execute_ocserv_rpc::<OcservVersionResponse>(
+        store,
+        secret_key_path,
+        &node,
+        OCSERV_VERSION,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(failure) => {
+            write_ocserv_command_failure(
+                store,
+                "ocserv.status",
+                &node,
+                OCSERV_VERSION,
+                failure,
+                started,
+            )?;
+            return Err(anyhow::anyhow!("ocserv status failed"));
+        }
+    };
+    let sessions = match execute_ocserv_rpc::<OcservSessionsSummaryResponse>(
+        store,
+        secret_key_path,
+        &node,
+        OCSERV_SESSIONS_SUMMARY,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(failure) => {
+            write_ocserv_command_failure(
+                store,
+                "ocserv.status",
+                &node,
+                OCSERV_SESSIONS_SUMMARY,
+                failure,
+                started,
+            )?;
+            return Err(anyhow::anyhow!("ocserv status failed"));
+        }
+    };
+    let fingerprint = match execute_ocserv_rpc::<OcservConfigFingerprintResponse>(
+        store,
+        secret_key_path,
+        &node,
+        OCSERV_CONFIG_FINGERPRINT,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(failure) => {
+            write_ocserv_command_failure(
+                store,
+                "ocserv.status",
+                &node,
+                OCSERV_CONFIG_FINGERPRINT,
+                failure,
+                started,
+            )?;
+            return Err(anyhow::anyhow!("ocserv status failed"));
+        }
+    };
+
+    let output = if json_output {
+        serde_json::to_string_pretty(&json!({
+            "node_id": node.node_id,
+            "service": service.service,
+            "version": version.version,
+            "version_status": version.status,
+            "sessions": sessions.sessions,
+            "config_fingerprint": fingerprint.fingerprint,
+        }))? + "\n"
+    } else {
+        format_status_human(&node.node_id, &service, &version, &sessions, &fingerprint)?
+    };
+    assert_low_sensitive_ocserv_output(&output)?;
+    print!("{output}");
+    write_ocserv_command_audit(
+        store,
+        OcservCommandAudit {
+            actor,
+            event: "ocserv.status",
+            node_id: node.node_id.clone(),
+            endpoint_id: Some(node.endpoint_id.clone()),
+            method: OCSERV_SERVICE_SUMMARY,
+            ok: true,
+            error_code: None,
+            duration_ms: elapsed_ms(started),
+            detail_json: json!({
+                "node_id": node.node_id,
+                "endpoint_id": node.endpoint_id,
+                "result_class": "low_sensitive_summary",
+                "rpc_methods": [
+                    OCSERV_SERVICE_SUMMARY,
+                    OCSERV_VERSION,
+                    OCSERV_SESSIONS_SUMMARY,
+                    OCSERV_CONFIG_FINGERPRINT
+                ],
+            }),
+        },
+    )?;
+    Ok(())
+}
+
+async fn run_ocserv_cert_command(
+    store: &Store,
+    secret_key_path: &Path,
+    node_id: &str,
+    json_output: bool,
+) -> anyhow::Result<()> {
+    let actor = local_actor();
+    let started = Instant::now();
+    let node = match load_ocserv_rpc_node(store, node_id) {
+        Ok(node) => node,
+        Err(failure) => {
+            write_ocserv_command_audit(
+                store,
+                OcservCommandAudit {
+                    actor,
+                    event: "ocserv.cert",
+                    node_id: node_id.to_string(),
+                    endpoint_id: known_endpoint_id(store, node_id),
+                    method: OCSERV_CERT_EXPIRY,
+                    ok: false,
+                    error_code: Some(failure.code),
+                    duration_ms: elapsed_ms(started),
+                    detail_json: low_sensitive_detail(&failure.message),
+                },
+            )?;
+            bail!(failure.message);
+        }
+    };
+    let response = match execute_ocserv_rpc::<OcservCertExpiryResponse>(
+        store,
+        secret_key_path,
+        &node,
+        OCSERV_CERT_EXPIRY,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(failure) => {
+            write_ocserv_command_failure(
+                store,
+                "ocserv.cert",
+                &node,
+                OCSERV_CERT_EXPIRY,
+                failure,
+                started,
+            )?;
+            return Err(anyhow::anyhow!("ocserv cert failed"));
+        }
+    };
+    let output = if json_output {
+        serde_json::to_string_pretty(&json!({
+            "node_id": node.node_id,
+            "certs": response.certs,
+        }))? + "\n"
+    } else {
+        format_cert_human(&node.node_id, &response)?
+    };
+    assert_low_sensitive_ocserv_output(&output)?;
+    print!("{output}");
+    write_ocserv_command_audit(
+        store,
+        OcservCommandAudit {
+            actor,
+            event: "ocserv.cert",
+            node_id: node.node_id.clone(),
+            endpoint_id: Some(node.endpoint_id.clone()),
+            method: OCSERV_CERT_EXPIRY,
+            ok: true,
+            error_code: None,
+            duration_ms: elapsed_ms(started),
+            detail_json: json!({
+                "node_id": node.node_id,
+                "endpoint_id": node.endpoint_id,
+                "result_class": "low_sensitive_summary",
+                "cert_count": response.certs.len(),
+            }),
+        },
+    )?;
+    Ok(())
+}
+
+async fn run_ocserv_sessions_summary_command(
+    store: &Store,
+    secret_key_path: &Path,
+    node_id: &str,
+    json_output: bool,
+) -> anyhow::Result<()> {
+    let actor = local_actor();
+    let started = Instant::now();
+    let node = match load_ocserv_rpc_node(store, node_id) {
+        Ok(node) => node,
+        Err(failure) => {
+            write_ocserv_command_audit(
+                store,
+                OcservCommandAudit {
+                    actor,
+                    event: "ocserv.sessions.summary",
+                    node_id: node_id.to_string(),
+                    endpoint_id: known_endpoint_id(store, node_id),
+                    method: OCSERV_SESSIONS_SUMMARY,
+                    ok: false,
+                    error_code: Some(failure.code),
+                    duration_ms: elapsed_ms(started),
+                    detail_json: low_sensitive_detail(&failure.message),
+                },
+            )?;
+            bail!(failure.message);
+        }
+    };
+    let response = match execute_ocserv_rpc::<OcservSessionsSummaryResponse>(
+        store,
+        secret_key_path,
+        &node,
+        OCSERV_SESSIONS_SUMMARY,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(failure) => {
+            write_ocserv_command_failure(
+                store,
+                "ocserv.sessions.summary",
+                &node,
+                OCSERV_SESSIONS_SUMMARY,
+                failure,
+                started,
+            )?;
+            return Err(anyhow::anyhow!("ocserv sessions summary failed"));
+        }
+    };
+    let output = if json_output {
+        serde_json::to_string_pretty(&json!({
+            "node_id": node.node_id,
+            "sessions": response.sessions,
+        }))? + "\n"
+    } else {
+        format_sessions_human(&node.node_id, &response)?
+    };
+    assert_low_sensitive_ocserv_output(&output)?;
+    print!("{output}");
+    write_ocserv_command_audit(
+        store,
+        OcservCommandAudit {
+            actor,
+            event: "ocserv.sessions.summary",
+            node_id: node.node_id.clone(),
+            endpoint_id: Some(node.endpoint_id.clone()),
+            method: OCSERV_SESSIONS_SUMMARY,
+            ok: true,
+            error_code: None,
+            duration_ms: elapsed_ms(started),
+            detail_json: json!({
+                "node_id": node.node_id,
+                "endpoint_id": node.endpoint_id,
+                "result_class": "low_sensitive_summary",
+            }),
+        },
+    )?;
+    Ok(())
+}
+
+fn load_ocserv_rpc_node(store: &Store, node_id: &str) -> Result<NodeRecord, RpcCommandFailure> {
+    validate_node_id(node_id).map_err(|err| {
+        RpcCommandFailure::new(
+            ErrorCode::ParamsInvalid,
+            err.to_string(),
+            None,
+            low_sensitive_detail(&err.to_string()),
+        )
+    })?;
+    let node = store.get_node(node_id).map_err(|err| {
+        RpcCommandFailure::new(
+            ErrorCode::SqliteError,
+            err.to_string(),
+            None,
+            low_sensitive_detail("controller registry read failed"),
+        )
+    })?;
+    let Some(node) = node else {
+        let message = format!("node not found: {node_id}");
+        return Err(RpcCommandFailure::new(
+            ErrorCode::NodeNotFound,
+            message.clone(),
+            None,
+            low_sensitive_detail(&message),
+        ));
+    };
+    if !node.enabled {
+        let message = format!("node disabled: {node_id}");
+        return Err(RpcCommandFailure::new(
+            ErrorCode::NodeDisabled,
+            message.clone(),
+            None,
+            low_sensitive_detail(&message),
+        ));
+    }
+    if let Some(status) = inactive_endpoint_status(store, &node.endpoint_id).map_err(|err| {
+        RpcCommandFailure::new(
+            ErrorCode::SqliteError,
+            err.to_string(),
+            None,
+            low_sensitive_detail("controller endpoint trust read failed"),
+        )
+    })? {
+        let message = format!(
+            "endpoint not active: node_id={} endpoint_id={} status={}",
+            node.node_id,
+            node.endpoint_id,
+            status.as_str()
+        );
+        return Err(RpcCommandFailure::new(
+            ErrorCode::EndpointNotAllowed,
+            message.clone(),
+            None,
+            json!({
+                "message": "endpoint is not active",
+                "result_class": "low_sensitive_summary",
+                "endpoint_status": status.as_str(),
+            }),
+        ));
+    }
+    Ok(node)
+}
+
+fn known_endpoint_id(store: &Store, node_id: &str) -> Option<String> {
+    store
+        .get_node(node_id)
+        .ok()
+        .flatten()
+        .map(|node| node.endpoint_id)
+}
+
+async fn execute_ocserv_rpc<T>(
+    store: &Store,
+    secret_key_path: &Path,
+    node: &NodeRecord,
+    method: &str,
+) -> Result<T, RpcCommandFailure>
+where
+    T: DeserializeOwned,
+{
+    let started = Instant::now();
+    let params = json!({});
+    let params_hash = hash_json_value(&params);
+    let result = execute_node_rpc(secret_key_path, node, method, params).await;
+    match result {
+        Ok(success) => {
+            let typed = match serde_json::from_value::<T>(success.result.clone()) {
+                Ok(typed) => typed,
+                Err(err) => {
+                    let failure = RpcCommandFailure::new(
+                        ErrorCode::InvalidResponse,
+                        "ocserv readonly response schema is invalid",
+                        Some(success.request_id.clone()),
+                        json!({
+                            "message": "ocserv readonly response schema is invalid",
+                            "result_class": "low_sensitive_summary",
+                            "error": err.to_string(),
+                        }),
+                    );
+                    let _ = write_rpc_audit(
+                        store,
+                        RpcAuditRecord {
+                            actor: local_actor(),
+                            node_id: node.node_id.clone(),
+                            endpoint_id: Some(node.endpoint_id.clone()),
+                            method: method.to_string(),
+                            request_id: Some(success.request_id),
+                            params_hash,
+                            ok: false,
+                            error_code: Some(ErrorCode::InvalidResponse),
+                            duration_ms: elapsed_ms(started),
+                            detail_json: ocserv_failure_detail(&failure),
+                        },
+                    );
+                    return Err(failure);
+                }
+            };
+            write_rpc_audit(
+                store,
+                RpcAuditRecord {
+                    actor: local_actor(),
+                    node_id: node.node_id.clone(),
+                    endpoint_id: Some(node.endpoint_id.clone()),
+                    method: method.to_string(),
+                    request_id: Some(success.request_id),
+                    params_hash,
+                    ok: true,
+                    error_code: None,
+                    duration_ms: elapsed_ms(started),
+                    detail_json: json!({"result_class": "low_sensitive_summary"}),
+                },
+            )
+            .map_err(|err| {
+                RpcCommandFailure::new(
+                    ErrorCode::AuditWriteFailed,
+                    err.to_string(),
+                    None,
+                    low_sensitive_detail("controller audit write failed"),
+                )
+            })?;
+            Ok(typed)
+        }
+        Err(failure) => {
+            let _ = write_rpc_audit(
+                store,
+                RpcAuditRecord {
+                    actor: local_actor(),
+                    node_id: node.node_id.clone(),
+                    endpoint_id: Some(node.endpoint_id.clone()),
+                    method: method.to_string(),
+                    request_id: failure.request_id.clone(),
+                    params_hash,
+                    ok: false,
+                    error_code: Some(failure.code.clone()),
+                    duration_ms: elapsed_ms(started),
+                    detail_json: ocserv_failure_detail(&failure),
+                },
+            );
+            Err(failure)
+        }
+    }
+}
+
+struct OcservCommandAudit {
+    actor: String,
+    event: &'static str,
+    node_id: String,
+    endpoint_id: Option<String>,
+    method: &'static str,
+    ok: bool,
+    error_code: Option<ErrorCode>,
+    duration_ms: u64,
+    detail_json: Value,
+}
+
+fn write_ocserv_command_audit(store: &Store, record: OcservCommandAudit) -> anyhow::Result<()> {
+    let mut event = AuditEvent::new(record.actor, record.event);
+    event.node_id = Some(record.node_id);
+    event.endpoint_id = record.endpoint_id;
+    event.method = Some(record.method.to_string());
+    event.ok = Some(record.ok);
+    event.error_code = record.error_code.as_ref().map(error_code_name);
+    event.duration_ms = Some(record.duration_ms);
+    event.detail_json = record.detail_json;
+    store.insert_audit(&event)?;
+    Ok(())
+}
+
+fn write_ocserv_command_failure(
+    store: &Store,
+    event: &'static str,
+    node: &NodeRecord,
+    method: &'static str,
+    failure: RpcCommandFailure,
+    started: Instant,
+) -> anyhow::Result<()> {
+    let message = failure.message.clone();
+    write_ocserv_command_audit(
+        store,
+        OcservCommandAudit {
+            actor: local_actor(),
+            event,
+            node_id: node.node_id.clone(),
+            endpoint_id: Some(node.endpoint_id.clone()),
+            method,
+            ok: false,
+            error_code: Some(failure.code.clone()),
+            duration_ms: elapsed_ms(started),
+            detail_json: ocserv_failure_detail(&failure),
+        },
+    )?;
+    bail!(message)
+}
+
+fn low_sensitive_detail(message: &str) -> Value {
+    json!({
+        "message": message,
+        "result_class": "low_sensitive_summary",
+    })
+}
+
+fn ocserv_failure_detail(failure: &RpcCommandFailure) -> Value {
+    json!({
+        "message": failure.message,
+        "result_class": "low_sensitive_summary",
+        "error_code": error_code_name(&failure.code),
+    })
 }
 
 struct RpcCommandSuccess {

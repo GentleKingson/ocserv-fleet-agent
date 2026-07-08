@@ -15,8 +15,9 @@ use ocfleet_config::agent::{AgentConfig, SecurityConfig};
 use ocfleet_protocol::constants::PROTOCOL_VERSION;
 use ocfleet_protocol::error::{ErrorCode, RpcError};
 use ocfleet_protocol::method::{
-    MethodStatus, NODE_INFO, NODE_PING, PROBE_CONTROLLER_PING, PROBE_PATH_ECHO, PROBE_PEER_ECHO,
-    classify_phase_one_method,
+    MethodStatus, NODE_INFO, NODE_PING, OCSERV_CERT_EXPIRY, OCSERV_CONFIG_FINGERPRINT,
+    OCSERV_SERVICE_SUMMARY, OCSERV_SESSIONS_SUMMARY, OCSERV_VERSION, PROBE_CONTROLLER_PING,
+    PROBE_PATH_ECHO, PROBE_PEER_ECHO, classify_phase_one_method,
 };
 use ocfleet_protocol::rpc::{RpcRequest, RpcResponse};
 use serde_json::{Value, json};
@@ -30,6 +31,7 @@ use crate::audit_limiter::{AuditLimitDecision, RejectedAuditLimiter};
 use crate::authz::{AgentAuthorization, CallerClass, PathProbeDecision};
 use crate::node_info::collect_node_info;
 use crate::nonce::{NonceCache, NonceDecision, NonceLimitScope};
+use crate::ocserv::{OcservReadonlyError, provider_from_config};
 use crate::peer_echo::{PeerEchoAuditContext, PeerEchoCall, PeerEchoLimits, call_peer_echo};
 
 #[derive(Debug, Clone)]
@@ -705,6 +707,9 @@ async fn handle_bi_stream(
     event.allowed = Some(response.ok);
     event.ok = Some(response.ok);
     event.error_code = response_error_code(&response);
+    if is_ocserv_readonly_method(&method) {
+        event.result_class = Some("low_sensitive_summary".to_string());
+    }
     sync_path_audit_fields(&mut event, &method, &request.params, &response);
     audit_then_write_response(&state, &mut send, response, event, max_response_bytes).await?;
     Ok(())
@@ -983,7 +988,7 @@ async fn validate_and_dispatch_request(
             return Err(RequestDispatchError::new(
                 Some(request_id),
                 ErrorCode::ParamsInvalid,
-                "node.ping, node.info, probe.controller.ping, and probe.peer.echo accept only null or empty object params",
+                "this fixed rpc method accepts only null or empty object params",
                 json!({}),
             ));
         }
@@ -1278,6 +1283,11 @@ async fn dispatch_allowed_method(
                 )
             })
         }
+        OCSERV_SERVICE_SUMMARY
+        | OCSERV_VERSION
+        | OCSERV_SESSIONS_SUMMARY
+        | OCSERV_CERT_EXPIRY
+        | OCSERV_CONFIG_FINGERPRINT => dispatch_ocserv_readonly(state, method, request_id),
         _ => Err(RequestDispatchError::new(
             Some(request_id.to_string()),
             ErrorCode::MethodNotFound,
@@ -1285,6 +1295,71 @@ async fn dispatch_allowed_method(
             json!({"method": method}),
         )),
     }
+}
+
+fn dispatch_ocserv_readonly(
+    state: &AgentServerState,
+    method: &str,
+    request_id: &str,
+) -> std::result::Result<Value, RequestDispatchError> {
+    let provider = provider_from_config(&state.config.ocserv_readonly);
+    let value = match method {
+        OCSERV_SERVICE_SUMMARY => serde_json::to_value(
+            provider
+                .service_summary()
+                .map_err(|err| ocserv_provider_error(request_id, err))?,
+        ),
+        OCSERV_VERSION => serde_json::to_value(
+            provider
+                .version()
+                .map_err(|err| ocserv_provider_error(request_id, err))?,
+        ),
+        OCSERV_SESSIONS_SUMMARY => serde_json::to_value(
+            provider
+                .sessions_summary()
+                .map_err(|err| ocserv_provider_error(request_id, err))?,
+        ),
+        OCSERV_CERT_EXPIRY => serde_json::to_value(
+            provider
+                .cert_expiry()
+                .map_err(|err| ocserv_provider_error(request_id, err))?,
+        ),
+        OCSERV_CONFIG_FINGERPRINT => serde_json::to_value(
+            provider
+                .config_fingerprint()
+                .map_err(|err| ocserv_provider_error(request_id, err))?,
+        ),
+        _ => unreachable!("caller only passes fixed ocserv methods"),
+    }
+    .map_err(|_| {
+        RequestDispatchError::new(
+            Some(request_id.to_string()),
+            ErrorCode::InvalidResponse,
+            "ocserv readonly response could not be encoded",
+            json!({}),
+        )
+    })?;
+    Ok(value)
+}
+
+fn is_ocserv_readonly_method(method: &str) -> bool {
+    matches!(
+        method,
+        OCSERV_SERVICE_SUMMARY
+            | OCSERV_VERSION
+            | OCSERV_SESSIONS_SUMMARY
+            | OCSERV_CERT_EXPIRY
+            | OCSERV_CONFIG_FINGERPRINT
+    )
+}
+
+fn ocserv_provider_error(request_id: &str, err: OcservReadonlyError) -> RequestDispatchError {
+    RequestDispatchError::new(
+        Some(request_id.to_string()),
+        err.code(),
+        err.message().to_string(),
+        json!({"result_class": "low_sensitive_summary"}),
+    )
 }
 
 async fn dispatch_path_echo(
@@ -1895,6 +1970,7 @@ mod tests {
                 rejected_peer_log_bucket_ttl_seconds: 3600,
                 rejected_peer_log_aggregate_interval_seconds: 60,
             },
+            ocserv_readonly: Default::default(),
             ocserv: None,
             logs: None,
         }

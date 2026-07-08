@@ -22,6 +22,12 @@ It is not a production-complete ocserv management platform yet.
   - pending join requests with manual approval.
   - EndpointID rotate, revoke, and quarantine lifecycle states.
   - controller-side trust diff reporting.
+- Supports Phase 11 fixed low-sensitive ocserv read-only RPCs:
+  - service summary
+  - version
+  - sessions summary
+  - certificate expiry
+  - config fingerprint
 - Supports fixed RPC methods:
   - `node.ping`
   - `node.info`
@@ -41,7 +47,8 @@ The current implementation is intentionally narrow. It does not provide:
 - configuration apply, rollback, or distribution
 - user disconnect or user management
 - generic agent-to-agent payloads, relay probes, mesh discovery, or multi-hop path probes
-- `systemctl`, `occtl`, `journalctl`, certificate, or config-summary adapters
+- `systemctl`, `occtl`, or `journalctl` passthrough adapters
+- certificate or config content output
 - automatic active trust on first contact or TOFU registration
 
 All local capabilities must be exposed through fixed RPC methods. There is no `shell.exec`, `command.run`, `occtl.raw`, `journalctl.raw`, or equivalent generic execution interface.
@@ -191,6 +198,19 @@ target/debug/ocfleet probe observe source-ocserv-01 target-ocserv-01
 
 Path observation reports registry status and the most recent matching `probe.path.echo` audit result when one exists. It does not perform route discovery, traceroute, network probing, forwarding, relay, mesh, or multi-hop analysis.
 
+Call the Phase 11 low-sensitive ocserv read-only RPCs:
+
+```bash
+target/debug/ocfleet ocserv status hk-ocserv-01
+target/debug/ocfleet ocserv cert hk-ocserv-01
+target/debug/ocfleet ocserv sessions summary hk-ocserv-01
+```
+
+Phase 11 uses fixed RPC methods only. It does not add shell execution, raw
+command execution, raw file read RPCs, service reload/restart, session details,
+or `systemctl` / `occtl` / `journalctl` passthrough output. See
+[`docs/ocserv-readonly-spec.md`](docs/ocserv-readonly-spec.md).
+
 Inspect controller trust drift:
 
 ```bash
@@ -230,6 +250,7 @@ Networking must allow the controller to reach the agent through iroh using the r
 - `docs/troubleshooting.md`: operational failure modes and `ocfleet doctor` interpretation.
 - `docs/release-notes/v0.1.0.md`: v0.1.0 release notes and known limitations.
 - `docs/phase-10-enrollment-trust.md`: Phase 10 onboarding and trust lifecycle guide.
+- `docs/ocserv-readonly-spec.md`: Phase 11 ocserv read-only RPC contract.
 
 ## Security Notes
 

@@ -48,6 +48,22 @@ pub enum Command {
         #[command(subcommand)]
         command: OcservCommand,
     },
+    Schedule {
+        #[command(subcommand)]
+        command: ScheduleCommand,
+    },
+    Retention {
+        #[command(subcommand)]
+        command: RetentionCommand,
+    },
+    Health {
+        #[command(subcommand)]
+        command: HealthCommand,
+    },
+    Alert {
+        #[command(subcommand)]
+        command: AlertCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -66,6 +82,12 @@ pub enum ProbeCommand {
     Topology,
     History {
         node_id: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        #[arg(long)]
+        since: Option<String>,
+        #[arg(long)]
+        json: bool,
     },
     Observe {
         source_node_id: String,
@@ -213,5 +235,127 @@ pub enum OcservSessionsCommand {
         node: String,
         #[arg(long)]
         json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ScheduleCommand {
+    Job {
+        #[command(subcommand)]
+        command: ScheduleJobCommand,
+    },
+    Run {
+        #[arg(long)]
+        once: bool,
+        #[arg(long, default_value_t = 1)]
+        max_concurrency: usize,
+    },
+    Daemon {
+        #[arg(long, default_value_t = 1)]
+        max_concurrency: usize,
+        #[arg(long, default_value_t = 60)]
+        tick_seconds: u64,
+    },
+    Status,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ScheduleJobCommand {
+    Add {
+        #[arg(long, value_enum)]
+        kind: ScheduleJobKind,
+        #[arg(long)]
+        interval: String,
+        #[arg(long)]
+        selector: Option<String>,
+        #[arg(long)]
+        source_node_id: Option<String>,
+        #[arg(long)]
+        target_node_id: Option<String>,
+    },
+    List,
+    Enable {
+        job_id: String,
+    },
+    Disable {
+        job_id: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ScheduleJobKind {
+    #[value(name = "controller-ping")]
+    ControllerPing,
+    #[value(name = "ocserv-status")]
+    OcservStatus,
+    #[value(name = "ocserv-cert")]
+    OcservCert,
+    #[value(name = "ocserv-sessions")]
+    OcservSessions,
+    #[value(name = "path-probe")]
+    PathProbe,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RetentionCommand {
+    Show,
+    Set {
+        #[arg(value_enum)]
+        scope: RetentionScope,
+        #[arg(long)]
+        max_age: Option<String>,
+        #[arg(long)]
+        max_rows: Option<usize>,
+    },
+    Apply {
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum RetentionScope {
+    Observations,
+    #[value(name = "observability-runs")]
+    ObservabilityRuns,
+    #[value(name = "health-snapshots")]
+    HealthSnapshots,
+    #[value(name = "alert-events")]
+    AlertEvents,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum HealthCommand {
+    Summary {
+        #[arg(long)]
+        json: bool,
+    },
+    Node {
+        node_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AlertCommand {
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    Test {
+        hook: String,
+    },
+    Silence {
+        dedupe_key: String,
+        #[arg(long)]
+        for_duration: String,
+        #[arg(long)]
+        reason: String,
+    },
+    Resolve {
+        dedupe_key: String,
+        #[arg(long)]
+        reason: String,
     },
 }

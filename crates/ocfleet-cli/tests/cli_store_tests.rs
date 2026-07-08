@@ -1,6 +1,7 @@
 use ocfleet_cli::audit::AuditEvent;
 use ocfleet_cli::store::{
-    ApprovalInput, EnrollmentTokenInsert, JoinRequestInsert, NodeInsert, Store, StoreError,
+    ApprovalInput, CURRENT_SCHEMA_VERSION, EnrollmentTokenInsert, JoinRequestInsert, NodeInsert,
+    Store, StoreError,
 };
 use ocfleet_protocol::enrollment::{EndpointStatus, EnrollmentTokenStatus, JoinRequestStatus};
 use rusqlite::Connection;
@@ -42,7 +43,10 @@ fn initializes_schema_and_migration_version() {
     let dir = tempfile::tempdir().expect("temp dir");
     let db = dir.path().join("controller.sqlite");
     let store = Store::open(&db).expect("store opens");
-    assert_eq!(store.current_schema_version().expect("version"), 2);
+    assert_eq!(
+        store.current_schema_version().expect("version"),
+        CURRENT_SCHEMA_VERSION
+    );
 }
 
 #[test]
@@ -52,12 +56,18 @@ fn open_with_status_reports_database_creation() {
 
     let first = Store::open_with_status(&db).expect("create store with status");
     assert!(first.created_database);
-    assert_eq!(first.store.current_schema_version().expect("version"), 2);
+    assert_eq!(
+        first.store.current_schema_version().expect("version"),
+        CURRENT_SCHEMA_VERSION
+    );
     drop(first);
 
     let second = Store::open_with_status(&db).expect("reopen store with status");
     assert!(!second.created_database);
-    assert_eq!(second.store.current_schema_version().expect("version"), 2);
+    assert_eq!(
+        second.store.current_schema_version().expect("version"),
+        CURRENT_SCHEMA_VERSION
+    );
 }
 
 #[test]
@@ -157,6 +167,20 @@ fn open_with_status_rejects_final_path_symlink() {
 
 #[cfg(unix)]
 #[test]
+fn open_with_status_rejects_existing_database_with_hardlink() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("controller.sqlite");
+    let opened = Store::open_with_status(&db).expect("create store");
+    drop(opened);
+
+    let hardlink = dir.path().join("controller-copy.sqlite");
+    std::fs::hard_link(&db, &hardlink).expect("create hardlink");
+
+    assert!(Store::open_with_status(&db).is_err());
+}
+
+#[cfg(unix)]
+#[test]
 fn open_with_status_rejects_unsafe_existing_wal_or_shm_sidecar() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -168,6 +192,25 @@ fn open_with_status_rejects_unsafe_existing_wal_or_shm_sidecar() {
     let wal = db.with_extension("sqlite-wal");
     std::fs::write(&wal, b"unsafe wal").expect("write wal");
     std::fs::set_permissions(&wal, std::fs::Permissions::from_mode(0o644)).expect("chmod wal");
+
+    assert!(Store::open_with_status(&db).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn open_with_status_rejects_existing_sidecar_with_hardlink() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("controller.sqlite");
+    let opened = Store::open_with_status(&db).expect("create store");
+    drop(opened);
+
+    let wal = db.with_extension("sqlite-wal");
+    std::fs::write(&wal, b"private wal").expect("write wal");
+    std::fs::set_permissions(&wal, std::fs::Permissions::from_mode(0o600)).expect("chmod wal");
+    let hardlink = dir.path().join("controller-copy.sqlite-wal");
+    std::fs::hard_link(&wal, &hardlink).expect("create sidecar hardlink");
 
     assert!(Store::open_with_status(&db).is_err());
 }
@@ -480,10 +523,11 @@ fn approving_join_request_creates_active_endpoint_and_audit_before_after() {
         )
         .expect("join request created");
 
+    let endpoint_id = iroh::SecretKey::generate().public().to_string();
     let approved = store
         .approve_join_request(&ApprovalInput {
             request_id: join.request_id.clone(),
-            endpoint_id: "endpoint-approved".to_string(),
+            endpoint_id: endpoint_id.clone(),
             approved_by: "operator".to_string(),
             reason: "ticket-123".to_string(),
             approved_labels_json: serde_json::json!({"region": "hk", "role": "ocserv"}),
@@ -493,16 +537,20 @@ fn approving_join_request_creates_active_endpoint_and_audit_before_after() {
     assert_eq!(approved.status, JoinRequestStatus::Approved);
     assert_eq!(
         approved.assigned_endpoint_id.as_deref(),
-        Some("endpoint-approved")
+        Some(endpoint_id.as_str())
     );
 
     let endpoint = store
-        .get_endpoint_trust("endpoint-approved")
+        .get_endpoint_trust(&endpoint_id)
         .expect("load endpoint")
         .expect("endpoint exists");
     assert_eq!(endpoint.status, EndpointStatus::Active);
     assert_eq!(endpoint.generation, 1);
     assert_eq!(endpoint.fingerprint.as_deref(), Some("agent-fingerprint"));
+    assert_eq!(
+        endpoint.node_id, None,
+        "approval must not trust or bind agent self-reported hostname"
+    );
 
     let (event, detail) = latest_audit_event(&db);
     assert_eq!(event, "enrollment.approve");
@@ -512,13 +560,71 @@ fn approving_join_request_creates_active_endpoint_and_audit_before_after() {
 }
 
 #[test]
+fn approving_join_request_rejects_non_canonical_endpoint_id() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("controller.sqlite");
+    let store = Store::open(&db).expect("store opens");
+    let token_plaintext = "ocfleet_enroll_invalid_endpoint";
+
+    store
+        .create_enrollment_token(
+            &EnrollmentTokenInsert {
+                token_id: "tok-invalid-endpoint".to_string(),
+                token_hash: Store::hash_enrollment_token(token_plaintext),
+                created_by: "operator".to_string(),
+                expires_at: future_time(),
+                max_uses: 1,
+                description: None,
+                labels_json: serde_json::json!({}),
+                scope_json: serde_json::json!({}),
+            },
+            "operator",
+        )
+        .expect("token created");
+    let join = store
+        .submit_join_request(
+            &JoinRequestInsert {
+                token_plaintext: token_plaintext.to_string(),
+                agent_public_key: "agent-public-key".to_string(),
+                fingerprint: "agent-fingerprint".to_string(),
+                requested_endpoint_id: Some("agent-claimed-endpoint".to_string()),
+                hostname: "hk-ocserv-01".to_string(),
+                agent_version: "0.1.0".to_string(),
+                requested_labels_json: serde_json::json!({"hostname": "trusted-controller"}),
+            },
+            "agent",
+        )
+        .expect("join request created");
+
+    let err = store
+        .approve_join_request(&ApprovalInput {
+            request_id: join.request_id,
+            endpoint_id: "endpoint-approved".to_string(),
+            approved_by: "operator".to_string(),
+            reason: "ticket-123".to_string(),
+            approved_labels_json: serde_json::json!({}),
+        })
+        .expect_err("invalid endpoint id must be rejected");
+
+    assert!(matches!(err, StoreError::InvalidInput(_)));
+    assert!(
+        store
+            .get_endpoint_trust("endpoint-approved")
+            .expect("query trust")
+            .is_none()
+    );
+}
+
+#[test]
 fn endpoint_lifecycle_rotate_revoke_and_quarantine_update_status_and_generation() {
     let dir = tempfile::tempdir().expect("temp dir");
     let db = dir.path().join("controller.sqlite");
     let store = Store::open(&db).expect("store opens");
+    let endpoint_one = iroh::SecretKey::generate().public().to_string();
+    let endpoint_two = iroh::SecretKey::generate().public().to_string();
     let node = NodeInsert {
         node_id: "hk-ocserv-01".into(),
-        endpoint_id: "endpoint-one".into(),
+        endpoint_id: endpoint_one.clone(),
         name: "hk-ocserv-01".into(),
         region: "hk".into(),
         role: "ocserv".into(),
@@ -528,35 +634,65 @@ fn endpoint_lifecycle_rotate_revoke_and_quarantine_update_status_and_generation(
         .expect("insert node and endpoint trust");
 
     let rotated = store
-        .rotate_endpoint("endpoint-one", "endpoint-two", "operator", "key rotation")
+        .rotate_endpoint(&endpoint_one, &endpoint_two, "operator", "key rotation")
         .expect("rotate endpoint");
     assert_eq!(rotated.status, EndpointStatus::Active);
     assert_eq!(rotated.generation, 2);
     assert_eq!(
         rotated.previous_endpoint_id.as_deref(),
-        Some("endpoint-one")
+        Some(endpoint_one.as_str())
     );
     let old = store
-        .get_endpoint_trust("endpoint-one")
+        .get_endpoint_trust(&endpoint_one)
         .expect("load old endpoint")
         .expect("old endpoint exists");
     assert_eq!(old.status, EndpointStatus::Rotated);
-    assert_eq!(old.rotated_to.as_deref(), Some("endpoint-two"));
+    assert_eq!(old.rotated_to.as_deref(), Some(endpoint_two.as_str()));
 
     let revoked = store
-        .revoke_endpoint("endpoint-two", "operator", "lost host")
+        .revoke_endpoint(&endpoint_two, "operator", "lost host")
         .expect("revoke endpoint");
     assert_eq!(revoked.status, EndpointStatus::Revoked);
     assert_eq!(revoked.generation, 3);
 
     let quarantined = store
-        .quarantine_endpoint("endpoint-two", "operator", "suspicious traffic")
+        .quarantine_endpoint(&endpoint_two, "operator", "suspicious traffic")
         .expect("quarantine endpoint");
     assert_eq!(quarantined.status, EndpointStatus::Quarantined);
     assert_eq!(quarantined.generation, 4);
 
     let (event, detail) = latest_audit_event(&db);
     assert_eq!(event, "endpoint.quarantine");
-    assert_eq!(detail["target_id"], "endpoint-two");
+    assert_eq!(detail["target_id"], endpoint_two);
     assert_eq!(detail["reason"], "suspicious traffic");
+}
+
+#[test]
+fn endpoint_rotate_rejects_non_canonical_new_endpoint_id() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("controller.sqlite");
+    let store = Store::open(&db).expect("store opens");
+    let endpoint_one = iroh::SecretKey::generate().public().to_string();
+    let node = NodeInsert {
+        node_id: "hk-ocserv-01".into(),
+        endpoint_id: endpoint_one.clone(),
+        name: "hk-ocserv-01".into(),
+        region: "hk".into(),
+        role: "ocserv".into(),
+    };
+    store
+        .add_node(&node)
+        .expect("insert node and endpoint trust");
+
+    let err = store
+        .rotate_endpoint(&endpoint_one, "endpoint-two", "operator", "key rotation")
+        .expect_err("invalid endpoint id must be rejected");
+
+    assert!(matches!(err, StoreError::InvalidInput(_)));
+    assert!(
+        store
+            .get_endpoint_trust("endpoint-two")
+            .expect("query trust")
+            .is_none()
+    );
 }

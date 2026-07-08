@@ -43,6 +43,7 @@ fn load_or_create_secret_key_supports_single_file_relative_path() {
 
 #[test]
 fn load_or_create_secret_key_with_status_reports_actual_creation() {
+    let _guard = cwd_lock().lock().expect("process fs lock");
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("controller.secret");
 
@@ -62,6 +63,7 @@ fn controller_secret_key_rejects_existing_group_or_world_accessible_file() {
     use base64::Engine;
     use std::os::unix::fs::PermissionsExt;
 
+    let _guard = cwd_lock().lock().expect("process fs lock");
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("controller.secret");
     let key = iroh::SecretKey::generate();
@@ -77,6 +79,7 @@ fn controller_secret_key_rejects_existing_group_or_world_accessible_file() {
 #[cfg(unix)]
 #[test]
 fn controller_secret_key_rejects_final_path_symlink() {
+    let _guard = cwd_lock().lock().expect("process fs lock");
     let dir = tempfile::tempdir().expect("temp dir");
     let real_path = dir.path().join("real.secret");
     let link_path = dir.path().join("controller.secret");
@@ -103,6 +106,7 @@ fn controller_secret_key_creates_nested_parent_directories_private_under_permiss
         }
     }
 
+    let _guard = cwd_lock().lock().expect("process fs lock");
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir
         .path()

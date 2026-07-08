@@ -197,7 +197,7 @@ fn parses_probe_history_command_without_filter() {
     let cli = Cli::parse_from(["ocfleet", "probe", "history"]);
 
     let Command::Probe {
-        command: ProbeCommand::History { node_id },
+        command: ProbeCommand::History { node_id, .. },
     } = cli.command
     else {
         panic!("expected probe history command");
@@ -211,7 +211,7 @@ fn parses_probe_history_command_with_node_filter() {
     let cli = Cli::parse_from(["ocfleet", "probe", "history", "source-node"]);
 
     let Command::Probe {
-        command: ProbeCommand::History { node_id },
+        command: ProbeCommand::History { node_id, .. },
     } = cli.command
     else {
         panic!("expected probe history command");

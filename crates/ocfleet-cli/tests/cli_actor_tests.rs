@@ -61,3 +61,20 @@ fn init_audit_actor_uses_non_blank_user() {
 
     assert_eq!(latest_actor(&database), "alice");
 }
+
+#[test]
+fn init_audit_actor_rejects_control_characters_and_overlong_user() {
+    for user in [
+        "alice\nadmin".to_string(),
+        "\x1b[31madmin".to_string(),
+        "a".repeat(129),
+    ] {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let database = dir.path().join("controller.sqlite");
+        let secret_key = dir.path().join("controller.secret");
+
+        run_init_with_user(&database, &secret_key, Some(&user));
+
+        assert_eq!(latest_actor(&database), "local-cli");
+    }
+}

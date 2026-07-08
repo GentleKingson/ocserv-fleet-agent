@@ -105,8 +105,8 @@ fn map_private_file_error(err: PrivateFileError) -> IdentityError {
             io::ErrorKind::NotFound,
             "missing parent directory",
         )),
-        PrivateFileError::UnsafeParent | PrivateFileError::UnsafeFile => {
-            IdentityError::InvalidPermissions
-        }
+        PrivateFileError::UnsafeParent
+        | PrivateFileError::UnsafeFile
+        | PrivateFileError::UnsupportedPlatform => IdentityError::InvalidPermissions,
     }
 }

@@ -131,6 +131,7 @@ fn enroll_approve_activates_pending_join_request() {
         .expect("join request");
     drop(store);
 
+    let endpoint_id = iroh::SecretKey::generate().public().to_string();
     run_ocfleet(&[
         "--database",
         &database_arg,
@@ -138,7 +139,7 @@ fn enroll_approve_activates_pending_join_request() {
         "approve",
         &join.request_id,
         "--endpoint-id",
-        "endpoint-approved",
+        &endpoint_id,
         "--reason",
         "ticket-123",
     ]);
@@ -151,13 +152,127 @@ fn enroll_approve_activates_pending_join_request() {
     assert_eq!(approved.status, JoinRequestStatus::Approved);
     assert_eq!(
         approved.assigned_endpoint_id.as_deref(),
-        Some("endpoint-approved")
+        Some(endpoint_id.as_str())
     );
     let endpoint = store
-        .get_endpoint_trust("endpoint-approved")
+        .get_endpoint_trust(&endpoint_id)
         .expect("load endpoint")
         .expect("endpoint exists");
     assert_eq!(endpoint.status, EndpointStatus::Active);
+}
+
+#[test]
+fn enroll_approve_rejects_non_canonical_endpoint_id() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let database_arg = database.to_string_lossy().into_owned();
+    let token_plaintext = "approval-invalid-token";
+    let store = Store::open(&database).expect("store opens");
+    store
+        .create_enrollment_token(
+            &EnrollmentTokenInsert {
+                token_id: "tok-approve-invalid".to_string(),
+                token_hash: Store::hash_enrollment_token(token_plaintext),
+                created_by: "operator".to_string(),
+                expires_at: "2099-01-01T00:00:00Z".to_string(),
+                max_uses: 1,
+                description: None,
+                labels_json: serde_json::json!({}),
+                scope_json: serde_json::json!({}),
+            },
+            "operator",
+        )
+        .expect("token created");
+    let join = store
+        .submit_join_request(
+            &JoinRequestInsert {
+                token_plaintext: token_plaintext.to_string(),
+                agent_public_key: "agent-public-key".to_string(),
+                fingerprint: "agent-fingerprint".to_string(),
+                requested_endpoint_id: None,
+                hostname: "hk-ocserv-01".to_string(),
+                agent_version: "0.1.0".to_string(),
+                requested_labels_json: serde_json::json!({}),
+            },
+            "agent",
+        )
+        .expect("join request");
+    drop(store);
+
+    let output = run_ocfleet_failure(&[
+        "--database",
+        &database_arg,
+        "enroll",
+        "approve",
+        &join.request_id,
+        "--endpoint-id",
+        "endpoint-approved",
+        "--reason",
+        "ticket-123",
+    ]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("endpoint_id"));
+
+    let store = Store::open(&database).expect("store reopens");
+    assert!(
+        store
+            .get_endpoint_trust("endpoint-approved")
+            .expect("query endpoint")
+            .is_none()
+    );
+}
+
+#[test]
+fn enroll_request_create_rejects_control_characters_in_agent_fields() {
+    for (hostname, agent_version) in [
+        ("hk-ocserv-01\nadmin", "0.1.0"),
+        ("hk-ocserv-01", "\x1b[31m0.1.0"),
+    ] {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let database = dir.path().join("controller.sqlite");
+        let database_arg = database.to_string_lossy().into_owned();
+        let token_plaintext = "request-token";
+        let store = Store::open(&database).expect("store opens");
+        store
+            .create_enrollment_token(
+                &EnrollmentTokenInsert {
+                    token_id: "tok-request".to_string(),
+                    token_hash: Store::hash_enrollment_token(token_plaintext),
+                    created_by: "operator".to_string(),
+                    expires_at: "2099-01-01T00:00:00Z".to_string(),
+                    max_uses: 1,
+                    description: None,
+                    labels_json: serde_json::json!({}),
+                    scope_json: serde_json::json!({}),
+                },
+                "operator",
+            )
+            .expect("token created");
+        drop(store);
+
+        let output = run_ocfleet_failure(&[
+            "--database",
+            &database_arg,
+            "enroll",
+            "request",
+            "create",
+            "--token",
+            token_plaintext,
+            "--agent-public-key",
+            "agent-public-key",
+            "--fingerprint",
+            "agent-fingerprint",
+            "--hostname",
+            hostname,
+            "--agent-version",
+            agent_version,
+        ]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("hostname") || stderr.contains("agent_version"),
+            "stderr did not name rejected field: {stderr}"
+        );
+    }
 }
 
 #[test]
@@ -166,10 +281,12 @@ fn endpoint_lifecycle_commands_write_audit_and_update_registry() {
     let database = dir.path().join("controller.sqlite");
     let database_arg = database.to_string_lossy().into_owned();
     let store = Store::open(&database).expect("store opens");
+    let endpoint_one = iroh::SecretKey::generate().public().to_string();
+    let endpoint_two = iroh::SecretKey::generate().public().to_string();
     store
         .add_node(&NodeInsert {
             node_id: "hk-ocserv-01".to_string(),
-            endpoint_id: "endpoint-one".to_string(),
+            endpoint_id: endpoint_one.clone(),
             name: "hk-ocserv-01".to_string(),
             region: "hk".to_string(),
             role: "ocserv".to_string(),
@@ -182,9 +299,9 @@ fn endpoint_lifecycle_commands_write_audit_and_update_registry() {
         &database_arg,
         "endpoint",
         "rotate",
-        "endpoint-one",
+        &endpoint_one,
         "--new-endpoint-id",
-        "endpoint-two",
+        &endpoint_two,
         "--reason",
         "key rotation",
     ]);
@@ -193,7 +310,7 @@ fn endpoint_lifecycle_commands_write_audit_and_update_registry() {
         &database_arg,
         "endpoint",
         "revoke",
-        "endpoint-two",
+        &endpoint_two,
         "--reason",
         "lost host",
     ]);
@@ -202,7 +319,7 @@ fn endpoint_lifecycle_commands_write_audit_and_update_registry() {
         &database_arg,
         "endpoint",
         "quarantine",
-        "endpoint-two",
+        &endpoint_two,
         "--reason",
         "suspicious traffic",
     ]);
@@ -210,7 +327,7 @@ fn endpoint_lifecycle_commands_write_audit_and_update_registry() {
     let store = Store::open(&database).expect("store reopens");
     assert_eq!(
         store
-            .get_endpoint_trust("endpoint-one")
+            .get_endpoint_trust(&endpoint_one)
             .expect("load old")
             .expect("old exists")
             .status,
@@ -218,7 +335,7 @@ fn endpoint_lifecycle_commands_write_audit_and_update_registry() {
     );
     assert_eq!(
         store
-            .get_endpoint_trust("endpoint-two")
+            .get_endpoint_trust(&endpoint_two)
             .expect("load new")
             .expect("new exists")
             .status,
@@ -235,17 +352,18 @@ fn trust_diff_reports_registry_status_and_strict_fails_on_high_severity_diff() {
     let database = dir.path().join("controller.sqlite");
     let database_arg = database.to_string_lossy().into_owned();
     let store = Store::open(&database).expect("store opens");
+    let endpoint_id = iroh::SecretKey::generate().public().to_string();
     store
         .add_node(&NodeInsert {
             node_id: "hk-ocserv-01".to_string(),
-            endpoint_id: "endpoint-one".to_string(),
+            endpoint_id: endpoint_id.clone(),
             name: "hk-ocserv-01".to_string(),
             region: "hk".to_string(),
             role: "ocserv".to_string(),
         })
         .expect("node added");
     store
-        .revoke_endpoint("endpoint-one", "operator", "lost host")
+        .revoke_endpoint(&endpoint_id, "operator", "lost host")
         .expect("endpoint revoked");
     drop(store);
 
@@ -255,12 +373,12 @@ fn trust_diff_reports_registry_status_and_strict_fails_on_high_severity_diff() {
         "trust",
         "diff",
         "--endpoint",
-        "endpoint-one",
+        &endpoint_id,
         "--format",
         "json",
     ]);
     let value: Value = serde_json::from_slice(&output.stdout).expect("trust diff json");
-    assert_eq!(value["endpoint_filter"], "endpoint-one");
+    assert_eq!(value["endpoint_filter"], endpoint_id);
     assert_eq!(value["diffs"][0]["code"], "REVOKED_PEER_STILL_TRUSTED");
 
     let strict = run_ocfleet_failure(&[
@@ -269,7 +387,7 @@ fn trust_diff_reports_registry_status_and_strict_fails_on_high_severity_diff() {
         "trust",
         "diff",
         "--endpoint",
-        "endpoint-one",
+        &endpoint_id,
         "--strict",
     ]);
     assert!(stdout(&strict).contains("REVOKED_PEER_STILL_TRUSTED"));

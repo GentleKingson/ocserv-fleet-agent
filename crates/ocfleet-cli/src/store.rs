@@ -13,8 +13,8 @@ use uuid::Uuid;
 
 use crate::audit::AuditEvent;
 use crate::input_validation::{
-    validate_actor, validate_agent_version, validate_description, validate_hostname,
-    validate_label_json, validate_reason,
+    validate_actor, validate_agent_version, validate_description, validate_endpoint_id,
+    validate_hostname, validate_label_json, validate_reason,
 };
 use crate::private_file::{self, PrivateFileError};
 
@@ -90,6 +90,21 @@ pub struct ObservabilityJobRecord {
     pub last_run_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidObservabilityJobRecord {
+    pub job_id: String,
+    pub kind: String,
+    pub enabled: bool,
+    pub next_run_at: Option<String>,
+    pub reason_code: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ObservabilityJobLoadResult {
+    Valid(ObservabilityJobRecord),
+    Invalid(InvalidObservabilityJobRecord),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -640,6 +655,23 @@ impl Store {
         let rows = stmt.query_map([], observability_job_from_row)?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(StoreError::from)
+    }
+
+    pub fn list_observability_jobs_tolerant(
+        &self,
+    ) -> Result<Vec<ObservabilityJobLoadResult>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT job_id, kind, selector_json, pair_selector_json, interval_seconds, jitter_seconds, timeout_ms, enabled, next_run_at, last_run_at, created_at, updated_at
+             FROM observability_jobs
+             ORDER BY job_id",
+        )?;
+        let rows = stmt.query_map([], raw_observability_job_from_row)?;
+        let jobs = rows
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(observability_job_load_from_raw)
+            .collect::<Vec<_>>();
+        Ok(jobs)
     }
 
     pub fn set_observability_job_enabled(
@@ -1240,6 +1272,8 @@ impl Store {
     ) -> Result<JoinRequestRecord, StoreError> {
         validate_actor(&approval.approved_by).map_err(StoreError::InvalidInput)?;
         validate_reason(&approval.reason).map_err(StoreError::InvalidInput)?;
+        let endpoint_id =
+            validate_endpoint_id(&approval.endpoint_id).map_err(StoreError::InvalidInput)?;
         validate_label_json(&approval.approved_labels_json, "approved_labels")
             .map_err(StoreError::InvalidInput)?;
         let tx = self.conn.unchecked_transaction()?;
@@ -1251,17 +1285,15 @@ impl Store {
                 status: before.status.as_str().to_string(),
             });
         }
-        if get_endpoint_trust_tx(&tx, &approval.endpoint_id)?.is_some() {
-            return Err(StoreError::EndpointAlreadyExists(
-                approval.endpoint_id.clone(),
-            ));
+        if get_endpoint_trust_tx(&tx, &endpoint_id)?.is_some() {
+            return Err(StoreError::EndpointAlreadyExists(endpoint_id));
         }
 
-        let bundle = trust_bundle_json(&approval.endpoint_id, 1, EndpointStatus::Active);
+        let bundle = trust_bundle_json(&endpoint_id, 1, EndpointStatus::Active);
         insert_endpoint_trust_tx(
             &tx,
             &EndpointTrustRecord {
-                endpoint_id: approval.endpoint_id.clone(),
+                endpoint_id: endpoint_id.clone(),
                 node_id: None,
                 fingerprint: Some(before.fingerprint.clone()),
                 status: EndpointStatus::Active,
@@ -1283,7 +1315,7 @@ impl Store {
              WHERE request_id = ?5",
             params![
                 JoinRequestStatus::Approved.as_str(),
-                approval.endpoint_id.as_str(),
+                endpoint_id.as_str(),
                 approval.approved_labels_json.to_string(),
                 approval.approved_by.as_str(),
                 approval.request_id.as_str(),
@@ -1294,7 +1326,7 @@ impl Store {
         let mut event = AuditEvent::new(&approval.approved_by, "enrollment.approve");
         event.ok = Some(true);
         event.request_id = Some(approval.request_id.clone());
-        event.endpoint_id = Some(approval.endpoint_id.clone());
+        event.endpoint_id = Some(endpoint_id);
         event.detail_json = json_detail(
             "join_request",
             &approval.request_id,
@@ -1331,13 +1363,15 @@ impl Store {
     ) -> Result<EndpointTrustRecord, StoreError> {
         validate_actor(actor).map_err(StoreError::InvalidInput)?;
         validate_reason(reason).map_err(StoreError::InvalidInput)?;
+        let old_endpoint_id =
+            validate_endpoint_id(old_endpoint_id).map_err(StoreError::InvalidInput)?;
+        let new_endpoint_id =
+            validate_endpoint_id(new_endpoint_id).map_err(StoreError::InvalidInput)?;
         let tx = self.conn.unchecked_transaction()?;
-        let old_before = get_endpoint_trust_tx(&tx, old_endpoint_id)?
-            .ok_or_else(|| StoreError::EndpointNotFound(old_endpoint_id.to_string()))?;
-        if get_endpoint_trust_tx(&tx, new_endpoint_id)?.is_some() {
-            return Err(StoreError::EndpointAlreadyExists(
-                new_endpoint_id.to_string(),
-            ));
+        let old_before = get_endpoint_trust_tx(&tx, &old_endpoint_id)?
+            .ok_or_else(|| StoreError::EndpointNotFound(old_endpoint_id.clone()))?;
+        if get_endpoint_trust_tx(&tx, &new_endpoint_id)?.is_some() {
+            return Err(StoreError::EndpointAlreadyExists(new_endpoint_id));
         }
         let new_generation = old_before.generation + 1;
         tx.execute(
@@ -1351,24 +1385,24 @@ impl Store {
             params![
                 EndpointStatus::Rotated.as_str(),
                 new_generation as i64,
-                new_endpoint_id,
-                trust_bundle_json(old_endpoint_id, new_generation, EndpointStatus::Rotated)
+                new_endpoint_id.as_str(),
+                trust_bundle_json(&old_endpoint_id, new_generation, EndpointStatus::Rotated)
                     .to_string(),
-                old_endpoint_id,
+                old_endpoint_id.as_str(),
             ],
         )?;
         insert_endpoint_trust_tx(
             &tx,
             &EndpointTrustRecord {
-                endpoint_id: new_endpoint_id.to_string(),
+                endpoint_id: new_endpoint_id.clone(),
                 node_id: old_before.node_id.clone(),
                 fingerprint: old_before.fingerprint.clone(),
                 status: EndpointStatus::Active,
                 generation: new_generation,
-                previous_endpoint_id: Some(old_endpoint_id.to_string()),
+                previous_endpoint_id: Some(old_endpoint_id.clone()),
                 rotated_to: None,
                 trust_bundle_json: trust_bundle_json(
-                    new_endpoint_id,
+                    &new_endpoint_id,
                     new_generation,
                     EndpointStatus::Active,
                 ),
@@ -1376,13 +1410,13 @@ impl Store {
                 updated_at: String::new(),
             },
         )?;
-        let old_after = get_endpoint_trust_tx(&tx, old_endpoint_id)?.expect("old endpoint exists");
-        let new_after = get_endpoint_trust_tx(&tx, new_endpoint_id)?.expect("new endpoint exists");
+        let old_after = get_endpoint_trust_tx(&tx, &old_endpoint_id)?.expect("old endpoint exists");
+        let new_after = get_endpoint_trust_tx(&tx, &new_endpoint_id)?.expect("new endpoint exists");
         audit_endpoint_lifecycle_tx(
             &tx,
             actor,
             "endpoint.rotate",
-            new_endpoint_id,
+            &new_endpoint_id,
             Some(endpoint_audit_json(&old_before)),
             Some(serde_json::json!({
                 "old": endpoint_audit_json(&old_after),
@@ -1456,9 +1490,10 @@ impl Store {
     ) -> Result<EndpointTrustRecord, StoreError> {
         validate_actor(actor).map_err(StoreError::InvalidInput)?;
         validate_reason(reason).map_err(StoreError::InvalidInput)?;
+        let endpoint_id = validate_endpoint_id(endpoint_id).map_err(StoreError::InvalidInput)?;
         let tx = self.conn.unchecked_transaction()?;
-        let before = get_endpoint_trust_tx(&tx, endpoint_id)?
-            .ok_or_else(|| StoreError::EndpointNotFound(endpoint_id.to_string()))?;
+        let before = get_endpoint_trust_tx(&tx, &endpoint_id)?
+            .ok_or_else(|| StoreError::EndpointNotFound(endpoint_id.clone()))?;
         let generation = before.generation + 1;
         tx.execute(
             "UPDATE endpoint_trust
@@ -1470,16 +1505,16 @@ impl Store {
             params![
                 status.as_str(),
                 generation as i64,
-                trust_bundle_json(endpoint_id, generation, status).to_string(),
-                endpoint_id,
+                trust_bundle_json(&endpoint_id, generation, status).to_string(),
+                endpoint_id.as_str(),
             ],
         )?;
-        let after = get_endpoint_trust_tx(&tx, endpoint_id)?.expect("endpoint exists");
+        let after = get_endpoint_trust_tx(&tx, &endpoint_id)?.expect("endpoint exists");
         audit_endpoint_lifecycle_tx(
             &tx,
             actor,
             action,
-            endpoint_id,
+            &endpoint_id,
             Some(endpoint_audit_json(&before)),
             Some(endpoint_audit_json(&after)),
             reason,
@@ -1961,6 +1996,96 @@ fn observability_job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Obser
         last_run_at: row.get(9)?,
         created_at: row.get(10)?,
         updated_at: row.get(11)?,
+    })
+}
+
+#[derive(Debug)]
+struct RawObservabilityJobRow {
+    job_id: String,
+    kind: String,
+    selector_json: String,
+    pair_selector_json: Option<String>,
+    interval_seconds: i64,
+    jitter_seconds: i64,
+    timeout_ms: i64,
+    enabled: i64,
+    next_run_at: Option<String>,
+    last_run_at: Option<String>,
+    created_at: String,
+    updated_at: String,
+}
+
+fn raw_observability_job_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<RawObservabilityJobRow> {
+    Ok(RawObservabilityJobRow {
+        job_id: row.get(0)?,
+        kind: row.get(1)?,
+        selector_json: row.get(2)?,
+        pair_selector_json: row.get(3)?,
+        interval_seconds: row.get(4)?,
+        jitter_seconds: row.get(5)?,
+        timeout_ms: row.get(6)?,
+        enabled: row.get(7)?,
+        next_run_at: row.get(8)?,
+        last_run_at: row.get(9)?,
+        created_at: row.get(10)?,
+        updated_at: row.get(11)?,
+    })
+}
+
+fn observability_job_load_from_raw(raw: RawObservabilityJobRow) -> ObservabilityJobLoadResult {
+    let invalid = |raw: &RawObservabilityJobRow, reason_code: &str| {
+        ObservabilityJobLoadResult::Invalid(InvalidObservabilityJobRecord {
+            job_id: raw.job_id.clone(),
+            kind: raw.kind.clone(),
+            enabled: matches!(raw.enabled, 1),
+            next_run_at: raw.next_run_at.clone(),
+            reason_code: reason_code.to_string(),
+        })
+    };
+    let selector_json = match serde_json::from_str(&raw.selector_json) {
+        Ok(value) => value,
+        Err(_) => return invalid(&raw, "INVALID_SELECTOR_JSON"),
+    };
+    let pair_selector_json = match raw
+        .pair_selector_json
+        .as_deref()
+        .map(serde_json::from_str::<Value>)
+        .transpose()
+    {
+        Ok(value) => value,
+        Err(_) => return invalid(&raw, "INVALID_PAIR_SELECTOR_JSON"),
+    };
+    let interval_seconds = match i64_to_u64(raw.interval_seconds) {
+        Ok(value) => value,
+        Err(_) => return invalid(&raw, "INVALID_INTERVAL_SECONDS"),
+    };
+    let jitter_seconds = match i64_to_u64(raw.jitter_seconds) {
+        Ok(value) => value,
+        Err(_) => return invalid(&raw, "INVALID_JITTER_SECONDS"),
+    };
+    let timeout_ms = match i64_to_u64(raw.timeout_ms) {
+        Ok(value) => value,
+        Err(_) => return invalid(&raw, "INVALID_TIMEOUT_MS"),
+    };
+    let enabled = match i64_to_bool(raw.enabled, 7) {
+        Ok(value) => value,
+        Err(_) => return invalid(&raw, "INVALID_ENABLED"),
+    };
+    ObservabilityJobLoadResult::Valid(ObservabilityJobRecord {
+        job_id: raw.job_id,
+        kind: raw.kind,
+        selector_json,
+        pair_selector_json,
+        interval_seconds,
+        jitter_seconds,
+        timeout_ms,
+        enabled,
+        next_run_at: raw.next_run_at,
+        last_run_at: raw.last_run_at,
+        created_at: raw.created_at,
+        updated_at: raw.updated_at,
     })
 }
 

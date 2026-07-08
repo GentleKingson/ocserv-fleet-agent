@@ -1,4 +1,7 @@
-use ocfleet_cli::store::{AlertEventRecord, HealthSnapshotRecord, NodeInsert, Store};
+use ocfleet_cli::store::{
+    AlertEventRecord, HealthSnapshotRecord, NodeInsert, ProbeObservationInsert, Store,
+};
+use ocfleet_protocol::method::OCSERV_CERT_EXPIRY;
 use rusqlite::Connection;
 use serde_json::{Value, json};
 use std::path::Path;
@@ -294,6 +297,59 @@ fn alert_hooks_tests_rotated_endpoint_generates_inactive_alert() {
         .expect("inactive endpoint alert");
     assert_eq!(inactive["severity"], "critical");
     assert_eq!(inactive["summary"]["endpoint_status"], "rotated");
+}
+
+#[test]
+fn alert_hooks_tests_cert_expiry_summary_fields_generate_cert_alerts() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let database_arg = database.to_string_lossy().into_owned();
+    let store = Store::open(&database).expect("open store");
+    let endpoint_id = iroh::SecretKey::generate().public().to_string();
+    store
+        .add_node(&NodeInsert {
+            node_id: "hk-ocserv-01".to_string(),
+            endpoint_id: endpoint_id.clone(),
+            name: "hk-ocserv-01".to_string(),
+            region: "hk".to_string(),
+            role: "ocserv".to_string(),
+        })
+        .expect("add node");
+    store
+        .insert_probe_observation(&ProbeObservationInsert {
+            observation_id: "obs-cert-critical".to_string(),
+            run_id: None,
+            node_id: Some("hk-ocserv-01".to_string()),
+            endpoint_id: Some(endpoint_id),
+            method: OCSERV_CERT_EXPIRY.to_string(),
+            ok: Some(true),
+            error_code: None,
+            duration_ms: Some(12),
+            observed_at: "2026-07-08T00:00:00Z".to_string(),
+            expires_at: None,
+            result_class: "low_sensitive_summary".to_string(),
+            summary_json: json!({
+                "result_class": "low_sensitive_summary",
+                "cert_count": 1,
+                "days_remaining": 3,
+                "status": "expiring_soon"
+            }),
+        })
+        .expect("insert cert observation");
+    drop(store);
+
+    let output = run_ocfleet(&["--database", &database_arg, "alert", "list", "--json"]);
+    let payload: Value = serde_json::from_slice(&output.stdout).expect("valid payload");
+    let cert_alert = payload["alerts"]
+        .as_array()
+        .expect("alerts array")
+        .iter()
+        .find(|alert| alert["reason_code"] == "CERT_EXPIRING_CRITICAL")
+        .expect("cert expiry alert");
+
+    assert_eq!(cert_alert["severity"], "critical");
+    assert_eq!(cert_alert["summary"]["days_remaining"], 3);
+    assert_eq!(cert_alert["summary"]["status"], "expiring_soon");
 }
 
 #[test]

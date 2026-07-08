@@ -1,4 +1,5 @@
 use serde_json::Value;
+use std::str::FromStr;
 
 const MAX_ACTOR_LEN: usize = 128;
 const MAX_REASON_LEN: usize = 256;
@@ -61,6 +62,16 @@ pub fn validate_hostname(value: &str) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+pub fn validate_endpoint_id(value: &str) -> Result<String, String> {
+    let endpoint_id = value.trim();
+    if endpoint_id.is_empty() {
+        return Err("endpoint_id must not be empty".to_string());
+    }
+    iroh::EndpointId::from_str(endpoint_id)
+        .map(|parsed| parsed.to_string())
+        .map_err(|_| "endpoint_id must be a canonical iroh EndpointID".to_string())
 }
 
 pub fn validate_label_json(value: &Value, field: &'static str) -> Result<(), String> {

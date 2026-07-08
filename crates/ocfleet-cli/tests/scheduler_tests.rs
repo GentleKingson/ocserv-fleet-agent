@@ -512,6 +512,106 @@ fn scheduler_tests_malformed_job_does_not_block_valid_job() {
     assert!(error_codes.contains(&Some("NODE_NOT_FOUND")));
 }
 
+#[test]
+fn scheduler_tests_malformed_job_json_does_not_block_valid_job() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let database_arg = database.to_string_lossy().into_owned();
+
+    {
+        let store = Store::open(&database).expect("open store");
+        drop(store);
+        let conn = Connection::open(&database).expect("open db");
+        conn.pragma_update(None, "ignore_check_constraints", true)
+            .expect("disable check constraints for corruption fixture");
+        conn.execute(
+            "INSERT INTO observability_jobs
+             (job_id, kind, selector_json, interval_seconds, jitter_seconds, timeout_ms, enabled, next_run_at, created_at, updated_at)
+             VALUES ('bad-json-job', 'controller-ping', 'not-json', 60, 0, 5000, 1, '2026-07-08T00:00:00Z', '2026-07-08T00:00:00Z', '2026-07-08T00:00:00Z')",
+            [],
+        )
+        .expect("insert malformed json job");
+    }
+
+    run_ocfleet(&[
+        "--database",
+        &database_arg,
+        "schedule",
+        "job",
+        "add",
+        "--kind",
+        "controller-ping",
+        "--interval",
+        "60s",
+        "--selector",
+        "node_id=missing-node",
+    ]);
+
+    let output = run_ocfleet(&["--database", &database_arg, "schedule", "run", "--once"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("status=ok"));
+    assert!(stdout.contains("executed_jobs=2"));
+
+    let store = Store::open(&database).expect("open store");
+    let observations = store
+        .list_probe_observations(None, 10)
+        .expect("list observations");
+    let error_codes = observations
+        .iter()
+        .map(|observation| observation.error_code.as_deref())
+        .collect::<Vec<_>>();
+    assert!(error_codes.contains(&Some("SCHEDULER_JOB_INVALID")));
+    assert!(error_codes.contains(&Some("NODE_NOT_FOUND")));
+}
+
+#[test]
+fn scheduler_tests_failed_after_run_insert_finishes_run_as_failed() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let database_arg = database.to_string_lossy().into_owned();
+    {
+        let store = Store::open(&database).expect("open store");
+        for index in 0..51 {
+            add_node_with_generated_endpoint(&store, &format!("node-{index:02}"));
+        }
+    }
+
+    let add = run_ocfleet(&[
+        "--database",
+        &database_arg,
+        "schedule",
+        "job",
+        "add",
+        "--kind",
+        "controller-ping",
+        "--interval",
+        "60s",
+        "--selector",
+        "role=ocserv",
+    ]);
+    let job_id = parse_job_id(&add.stdout);
+
+    run_ocfleet(&["--database", &database_arg, "schedule", "run", "--once"]);
+
+    let conn = Connection::open(&database).expect("open db");
+    let (status, finished_at, summary): (String, Option<String>, String) = conn
+        .query_row(
+            "SELECT status, finished_at, summary_json FROM observability_runs WHERE job_id = ?1",
+            [&job_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("scheduler run");
+    let summary: Value = serde_json::from_str(&summary).expect("run summary");
+    assert_eq!(status, "failed");
+    assert!(finished_at.is_some());
+    assert_eq!(summary["error_code"], "SCHEDULER_JOB_INVALID");
+    assert!(
+        !summary
+            .to_string()
+            .contains("maximum scheduler targets exceeded")
+    );
+}
+
 fn add_node_with_generated_endpoint(store: &Store, node_id: &str) -> String {
     let endpoint_id = iroh::SecretKey::generate().public().to_string();
     store

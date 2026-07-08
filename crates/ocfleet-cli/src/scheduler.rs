@@ -21,7 +21,10 @@ use crate::controller_rpc::{
     write_rpc_audit,
 };
 use crate::input_validation::{local_actor, validate_selector};
-use crate::store::{ObservabilityJobRecord, ObservabilityRunInsert, ProbeObservationInsert, Store};
+use crate::store::{
+    InvalidObservabilityJobRecord, ObservabilityJobLoadResult, ObservabilityJobRecord,
+    ObservabilityRunInsert, ProbeObservationInsert, Store,
+};
 
 const DEFAULT_SELECTOR: &str = "role=ocserv";
 const EXPLICIT_PAIR_SELECTOR: &str = "explicit-pair";
@@ -365,13 +368,36 @@ async fn run_due_jobs_once(
     max_concurrency: usize,
 ) -> anyhow::Result<RunStats> {
     validate_scheduler_concurrency(max_concurrency)?;
-    let jobs = store.list_observability_jobs()?;
+    let jobs = store.list_observability_jobs_tolerant()?;
     let now = OffsetDateTime::now_utc();
     let mut stats = RunStats {
-        skipped_jobs: jobs.iter().filter(|job| !job.enabled).count(),
+        skipped_jobs: jobs
+            .iter()
+            .filter(|job| match job {
+                ObservabilityJobLoadResult::Valid(job) => !job.enabled,
+                ObservabilityJobLoadResult::Invalid(job) => !job.enabled,
+            })
+            .count(),
         ..RunStats::default()
     };
-    for job in jobs {
+    for job_load in jobs {
+        let job = match job_load {
+            ObservabilityJobLoadResult::Valid(job) => job,
+            ObservabilityJobLoadResult::Invalid(job) => {
+                if !job.enabled {
+                    continue;
+                }
+                if !invalid_job_due_at_or_before(&job, now) {
+                    continue;
+                }
+                stats.due_jobs += 1;
+                record_invalid_scheduler_job_record_observation(store, &job)?;
+                stats.executed_jobs += 1;
+                stats.observations += 1;
+                stats.failed_observations += 1;
+                continue;
+            }
+        };
         if !job.enabled {
             continue;
         }
@@ -408,6 +434,13 @@ async fn run_due_jobs_once(
         update_job_after_tick(store, &job)?;
     }
     Ok(stats)
+}
+
+fn invalid_job_due_at_or_before(job: &InvalidObservabilityJobRecord, now: OffsetDateTime) -> bool {
+    job.next_run_at
+        .as_deref()
+        .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
+        .is_none_or(|next_run_at| next_run_at <= now)
 }
 
 fn update_job_after_tick(store: &Store, job: &ObservabilityJobRecord) -> anyhow::Result<()> {
@@ -458,31 +491,14 @@ async fn run_job(
         }),
     })?;
 
-    let mut stats = RunStats::default();
-    match kind {
-        StoredJobKind::PathProbe => {
-            run_path_probe_job(store, secret_key_path, job, &run_id, &mut stats).await?
-        }
-        StoredJobKind::ControllerPing
-        | StoredJobKind::OcservStatus
-        | StoredJobKind::OcservCert
-        | StoredJobKind::OcservSessions => {
-            let targets = resolve_node_targets(
-                store,
-                selector.as_deref().context("validated selector missing")?,
-            )?;
-            if targets.is_empty() {
-                record_missing_target_observation(store, &run_id, job, "NODE_NOT_FOUND")?;
-                stats.observations += 1;
-                stats.failed_observations += 1;
-            } else {
-                for target in targets {
-                    run_node_target_job(store, secret_key_path, kind, &run_id, target, &mut stats)
-                        .await?;
-                }
+    let stats =
+        match run_job_after_start(store, secret_key_path, job, kind, selector, &run_id).await {
+            Ok(stats) => stats,
+            Err(err) => {
+                finish_failed_observability_run(store, &run_id, job, "SCHEDULER_JOB_INVALID")?;
+                return Err(err);
             }
-        }
-    }
+        };
 
     let finished_at = now_rfc3339();
     let status = if stats.observations == 0 {
@@ -506,6 +522,63 @@ async fn run_job(
         }),
     )?;
     Ok(stats)
+}
+
+async fn run_job_after_start(
+    store: &Store,
+    secret_key_path: &Path,
+    job: &ObservabilityJobRecord,
+    kind: StoredJobKind,
+    selector: Option<String>,
+    run_id: &str,
+) -> anyhow::Result<RunStats> {
+    let mut stats = RunStats::default();
+    match kind {
+        StoredJobKind::PathProbe => {
+            run_path_probe_job(store, secret_key_path, job, run_id, &mut stats).await?
+        }
+        StoredJobKind::ControllerPing
+        | StoredJobKind::OcservStatus
+        | StoredJobKind::OcservCert
+        | StoredJobKind::OcservSessions => {
+            let targets = resolve_node_targets(
+                store,
+                selector.as_deref().context("validated selector missing")?,
+            )?;
+            if targets.is_empty() {
+                record_missing_target_observation(store, run_id, job, "NODE_NOT_FOUND")?;
+                stats.observations += 1;
+                stats.failed_observations += 1;
+            } else {
+                for target in targets {
+                    run_node_target_job(store, secret_key_path, kind, run_id, target, &mut stats)
+                        .await?;
+                }
+            }
+        }
+    }
+    Ok(stats)
+}
+
+fn finish_failed_observability_run(
+    store: &Store,
+    run_id: &str,
+    job: &ObservabilityJobRecord,
+    error_code: &str,
+) -> anyhow::Result<()> {
+    store.finish_observability_run(
+        run_id,
+        &now_rfc3339(),
+        "failed",
+        &json!({
+            "job_id": job.job_id,
+            "kind": job.kind,
+            "status": "failed",
+            "error_code": error_code,
+            "result_class": SCHEDULER_RESULT_CLASS,
+        }),
+    )?;
+    Ok(())
 }
 
 async fn run_node_target_job(
@@ -904,10 +977,26 @@ fn record_invalid_scheduler_job_observation(
     job: &ObservabilityJobRecord,
     reason_code: &str,
 ) -> anyhow::Result<()> {
+    record_invalid_scheduler_job_fields_observation(store, &job.job_id, &job.kind, reason_code)
+}
+
+fn record_invalid_scheduler_job_record_observation(
+    store: &Store,
+    job: &InvalidObservabilityJobRecord,
+) -> anyhow::Result<()> {
+    record_invalid_scheduler_job_fields_observation(store, &job.job_id, &job.kind, &job.reason_code)
+}
+
+fn record_invalid_scheduler_job_fields_observation(
+    store: &Store,
+    job_id: &str,
+    kind: &str,
+    reason_code: &str,
+) -> anyhow::Result<()> {
     let summary_json = json!({
         "message": "scheduler job configuration is invalid",
-        "job_id": job.job_id,
-        "kind": job.kind,
+        "job_id": job_id,
+        "kind": kind,
         "reason_code": reason_code,
         "result_class": SCHEDULER_RESULT_CLASS,
     });
@@ -916,7 +1005,7 @@ fn record_invalid_scheduler_job_observation(
         run_id: None,
         node_id: None,
         endpoint_id: None,
-        method: first_method_for_kind(&job.kind)
+        method: first_method_for_kind(kind)
             .unwrap_or(PROBE_CONTROLLER_PING)
             .to_string(),
         ok: Some(false),

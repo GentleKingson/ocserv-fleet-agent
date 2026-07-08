@@ -21,8 +21,8 @@ use ocfleet_cli::input_validation::{
     local_actor, validate_agent_version, validate_description, validate_hostname, validate_reason,
 };
 use ocfleet_cli::ocserv_output::{
-    OcservStatusView, assert_low_sensitive_ocserv_output, format_cert_human, format_sessions_human,
-    format_status_json, format_status_view_human,
+    OcservStatusView, assert_low_sensitive_ocserv_output, format_cert_human, format_cert_json,
+    format_sessions_human, format_status_json, format_status_view_human,
 };
 use ocfleet_cli::scheduler::run_schedule_command;
 use ocfleet_cli::store::{
@@ -1899,10 +1899,7 @@ async fn run_ocserv_cert_command(
         }
     };
     let output = if json_output {
-        serde_json::to_string_pretty(&json!({
-            "node_id": node.node_id,
-            "certs": response.certs,
-        }))? + "\n"
+        format_cert_json(&node.node_id, &response)?
     } else {
         format_cert_human(&node.node_id, &response)?
     };

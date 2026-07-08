@@ -327,7 +327,13 @@ fn cert_observation_warns(record: &ProbeObservationRecord) -> bool {
     if record.method != OCSERV_CERT_EXPIRY {
         return false;
     }
-    if status_is_cert_warning(record.summary_json.get("status").and_then(Value::as_str)) {
+    if status_is_cert_warning(
+        record
+            .summary_json
+            .get("status")
+            .or_else(|| record.summary_json.get("cert_status"))
+            .and_then(Value::as_str),
+    ) {
         return true;
     }
     record

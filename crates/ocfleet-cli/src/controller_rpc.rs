@@ -976,7 +976,7 @@ pub fn low_sensitive_ocserv_observation_summary(method: &str, result: &Value) ->
                     .filter_map(|cert| cert.get("days_remaining").and_then(Value::as_i64))
                     .min()
                 {
-                    summary.insert("min_days_remaining".to_string(), json!(days_remaining));
+                    summary.insert("days_remaining".to_string(), json!(days_remaining));
                 }
                 if let Some(status) = certs
                     .iter()
@@ -988,7 +988,7 @@ pub fn low_sensitive_ocserv_observation_summary(method: &str, result: &Value) ->
                         )
                     })
                 {
-                    summary.insert("cert_status".to_string(), Value::String(status.to_string()));
+                    summary.insert("status".to_string(), Value::String(status.to_string()));
                 }
             }
         }
@@ -1258,7 +1258,7 @@ fn audit_failure_outcome(
     endpoint_id: Option<String>,
     method: String,
     duration_ms: u64,
-    message: String,
+    _message: String,
     result_class: &str,
 ) -> ControllerRpcOutcome {
     ControllerRpcOutcome {
@@ -1270,7 +1270,11 @@ fn audit_failure_outcome(
         error_code: Some(error_code_name(&ErrorCode::AuditWriteFailed)),
         duration_ms,
         result_class: result_class.to_string(),
-        summary_json: json!({ "message": message }),
+        summary_json: json!({
+            "message": "controller audit write failed",
+            "result_class": result_class,
+            "error_code": error_code_name(&ErrorCode::AuditWriteFailed),
+        }),
         message: Some("controller audit write failed".to_string()),
     }
 }
@@ -1286,4 +1290,36 @@ fn unsupported_fixed_rpc_failure(method: &str) -> RpcCommandFailure {
             "method": method,
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn audit_failure_outcome_does_not_include_raw_error() {
+        let raw_error = "unable to write /etc/ocserv/ocserv.conf via controller.sqlite-wal SELECT";
+        let outcome = audit_failure_outcome(
+            "hk-ocserv-01".to_string(),
+            Some("endpoint-1".to_string()),
+            PROBE_CONTROLLER_PING.to_string(),
+            7,
+            raw_error.to_string(),
+            CONTROLLER_RPC_RESULT_CLASS,
+        );
+
+        let summary = outcome.summary_json.to_string();
+        assert_eq!(outcome.error_code.as_deref(), Some("AUDIT_WRITE_FAILED"));
+        assert_eq!(
+            outcome.message.as_deref(),
+            Some("controller audit write failed")
+        );
+        assert_eq!(
+            outcome.summary_json["message"],
+            "controller audit write failed"
+        );
+        assert!(!summary.contains("/etc/ocserv"));
+        assert!(!summary.contains("controller.sqlite-wal"));
+        assert!(!summary.contains("SELECT"));
+    }
 }

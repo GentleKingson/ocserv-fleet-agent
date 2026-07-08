@@ -144,6 +144,9 @@ fn validate_private_file_handle(file: &File) -> Result<(), PrivateFileError> {
     if file_type != libc::S_IFREG || stat.st_uid != current_euid || stat.st_mode & 0o077 != 0 {
         return Err(PrivateFileError::UnsafeFile);
     }
+    if stat.st_nlink != 1 {
+        return Err(PrivateFileError::UnsafeFile);
+    }
     Ok(())
 }
 

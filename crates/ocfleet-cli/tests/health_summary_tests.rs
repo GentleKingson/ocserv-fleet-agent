@@ -1,7 +1,9 @@
 use ocfleet_cli::audit::AuditEvent;
 use ocfleet_cli::store::{NodeInsert, ProbeObservationInsert, Store};
 use ocfleet_protocol::enrollment::EndpointStatus;
-use ocfleet_protocol::method::{OCSERV_SERVICE_SUMMARY, OCSERV_VERSION, PROBE_CONTROLLER_PING};
+use ocfleet_protocol::method::{
+    OCSERV_CERT_EXPIRY, OCSERV_SERVICE_SUMMARY, OCSERV_VERSION, PROBE_CONTROLLER_PING,
+};
 use serde_json::{Value, json};
 use std::process::{Command, Output};
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
@@ -258,6 +260,52 @@ fn health_summary_tests_ocserv_degraded_methods_reports_degraded() {
     assert!(stdout.contains("status=degraded"));
     assert!(stdout.contains("degraded=1"));
     assert!(stdout.contains("degraded_methods=ocserv.version"));
+}
+
+#[test]
+fn health_summary_tests_cert_expiring_status_reports_degraded() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let database_arg = database.to_string_lossy().into_owned();
+    let store = Store::open(&database).expect("open store");
+    add_node(&store, "hk-ocserv-01");
+    let observed_at = now_rfc3339();
+    insert_observation(
+        &store,
+        ObservationFixture {
+            observation_id: "obs-cert-expiring",
+            node_id: "hk-ocserv-01",
+            method: OCSERV_CERT_EXPIRY,
+            ok: true,
+            error_code: None,
+            observed_at: &observed_at,
+            summary_json: json!({
+                "result_class": "low_sensitive_summary",
+                "cert_count": 1,
+                "days_remaining": 3,
+                "status": "expiring_soon"
+            }),
+        },
+    );
+    drop(store);
+
+    let output = run_ocfleet(&["--database", &database_arg, "health", "summary", "--json"]);
+    let payload: Value = serde_json::from_slice(&output.stdout).expect("valid payload");
+    let node = payload["nodes"]
+        .as_array()
+        .expect("nodes")
+        .iter()
+        .find(|node| node["node_id"] == "hk-ocserv-01")
+        .expect("node health");
+
+    assert_eq!(node["status"], "degraded");
+    assert!(
+        node["degraded_methods"]
+            .as_array()
+            .expect("degraded methods")
+            .iter()
+            .any(|method| method == OCSERV_CERT_EXPIRY)
+    );
 }
 
 #[test]

@@ -82,6 +82,16 @@ Failed RPCs store only error code, fixed method name, node IDs, endpoint IDs,
 duration, and sanitized low-sensitive error class. Raw response bodies are never
 stored in history, audit, alert payloads, or dashboard views.
 
+Low-sensitive identifiers are limited to controller-assigned `node_id`,
+`region`, `role`, fixed RPC method names, request correlation IDs, and
+EndpointIDs needed to prove endpoint binding or path-probe routing decisions.
+These values may appear in controller-local history, health, alerts, exports,
+and read-only dashboard/API responses, but they do not authorize any action and
+must not be accepted as agent-supplied trust input. Certificate and config
+fingerprints are not emitted as full hashes by default; CLI JSON, scheduled
+history, alerts, and dashboards use aggregate status plus short fingerprint
+prefixes only.
+
 ## Allowed Scheduled Methods
 
 Only these methods are allowed in scheduled jobs:
@@ -201,18 +211,19 @@ Draft columns:
 - service summary: service state and enabled state.
 - version: bounded version string and availability status.
 - sessions summary: aggregate session count only.
-- cert expiry: logical cert name, validity timestamps, days remaining, status,
-  and fingerprint status.
-- config fingerprint: algorithm, short display hash metadata, and drift status.
+- cert expiry: aggregate cert count, minimum days remaining, health status, and
+  optional short fingerprint prefix.
+- config fingerprint: algorithm, short display hash prefix, and drift status.
 - path echo: source/target endpoint IDs, root/peer request IDs, ok/error code,
   and target segment status.
 
 Rules:
 
 - `summary_json` stores typed low-sensitive summaries only.
-- config and certificate fingerprints may be stored as full DTO fields only if
-  they remain classified low-sensitive and never appear as secret material.
-  Dashboard human views should prefer short fingerprints.
+- config and certificate fingerprints must not be stored or emitted as full
+  hashes by default; use short prefixes and aggregate status. A future export
+  that needs full hashes must add an explicit classification decision and a
+  separate opt-in surface.
 - session detail, usernames, client IPs, raw target results, raw response bodies,
   and raw provider errors are forbidden.
 

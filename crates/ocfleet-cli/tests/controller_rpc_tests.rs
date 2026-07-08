@@ -4,8 +4,8 @@ use ocfleet_cli::controller_rpc::{
 };
 use ocfleet_cli::store::Store;
 use ocfleet_protocol::method::{
-    OCSERV_CONFIG_FINGERPRINT, OCSERV_SERVICE_SUMMARY, OCSERV_SESSIONS_SUMMARY, OCSERV_VERSION,
-    PROBE_CONTROLLER_PING, PROBE_PATH_ECHO,
+    OCSERV_CERT_EXPIRY, OCSERV_CONFIG_FINGERPRINT, OCSERV_SERVICE_SUMMARY, OCSERV_SESSIONS_SUMMARY,
+    OCSERV_VERSION, PROBE_CONTROLLER_PING, PROBE_PATH_ECHO,
 };
 use serde_json::json;
 
@@ -191,4 +191,40 @@ fn controller_rpc_ocserv_observation_summary_drops_raw_dto_fields() {
     ] {
         assert!(!combined.contains(marker), "raw marker leaked: {marker}");
     }
+}
+
+#[test]
+fn controller_rpc_cert_summary_uses_alert_and_health_consumable_fields() {
+    let summary = low_sensitive_ocserv_observation_summary(
+        OCSERV_CERT_EXPIRY,
+        &json!({
+            "certs": [
+                {
+                    "name": "server",
+                    "status": "valid",
+                    "days_remaining": 40,
+                    "fingerprint_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "subject": "CN=vpn.example"
+                },
+                {
+                    "name": "intermediate",
+                    "status": "expiring_soon",
+                    "days_remaining": 3,
+                    "issuer": "CN=ca"
+                }
+            ],
+            "meta": {"source": "provider", "collected_at": "2026-07-08T00:00:00Z", "freshness": "live"}
+        }),
+    )
+    .expect("cert summary");
+
+    assert_eq!(summary["result_class"], "low_sensitive_summary");
+    assert_eq!(summary["cert_count"], 2);
+    assert_eq!(summary["days_remaining"], 3);
+    assert_eq!(summary["status"], "expiring_soon");
+    assert!(summary.get("min_days_remaining").is_none());
+    assert!(summary.get("cert_status").is_none());
+    assert!(!summary.to_string().contains("bbbbbbbbbbbbbbbb"));
+    assert!(!summary.to_string().contains("subject"));
+    assert!(!summary.to_string().contains("issuer"));
 }

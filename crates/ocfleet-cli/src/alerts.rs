@@ -305,6 +305,7 @@ fn cert_expiry_candidates(observations: &[ProbeObservationRecord]) -> Vec<AlertC
             methods: vec![OCSERV_CERT_EXPIRY.to_string()],
             summary: json!({
                 "days_remaining": days_remaining,
+                "status": cert_status(&observation.summary_json),
             }),
         });
     }
@@ -528,7 +529,10 @@ fn string_array(value: &Value) -> Vec<String> {
 }
 
 fn min_days_remaining(summary: &Value) -> Option<i64> {
-    let direct = summary.get("days_remaining").and_then(Value::as_i64);
+    let direct = summary
+        .get("days_remaining")
+        .or_else(|| summary.get("min_days_remaining"))
+        .and_then(Value::as_i64);
     let nested = summary
         .get("certs")
         .and_then(Value::as_array)
@@ -541,6 +545,13 @@ fn min_days_remaining(summary: &Value) -> Option<i64> {
         (Some(value), None) | (None, Some(value)) => Some(value),
         (None, None) => None,
     }
+}
+
+fn cert_status(summary: &Value) -> Option<&str> {
+    summary
+        .get("status")
+        .or_else(|| summary.get("cert_status"))
+        .and_then(Value::as_str)
 }
 
 fn is_unreachable_error_code(code: &str) -> bool {

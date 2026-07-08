@@ -1,6 +1,6 @@
 use ocfleet_cli::ocserv_output::{
-    OcservStatusView, assert_low_sensitive_ocserv_output, format_cert_human, format_sessions_human,
-    format_status_human, format_status_json, format_status_view_human,
+    OcservStatusView, assert_low_sensitive_ocserv_output, format_cert_human, format_cert_json,
+    format_sessions_human, format_status_human, format_status_json, format_status_view_human,
     low_sensitive_ocserv_audit_message,
 };
 use ocfleet_protocol::ocserv::{
@@ -146,7 +146,7 @@ fn human_status_output_shortens_config_fingerprint() {
 }
 
 #[test]
-fn json_status_output_keeps_full_config_fingerprint() {
+fn json_status_output_shortens_config_fingerprint() {
     let hash = "d".repeat(64);
     let output = format_status_json(&OcservStatusView {
         node_id: "hk-ocserv-01".to_string(),
@@ -166,7 +166,8 @@ fn json_status_output_keeps_full_config_fingerprint() {
     })
     .expect("format json status");
 
-    assert!(output.contains(&hash));
+    assert!(output.contains("\"config_fingerprint_prefix\": \"dddddddddddd\""));
+    assert!(!output.contains(&hash));
     assert_low_sensitive_ocserv_output(&output).expect("json status is low-sensitive");
 }
 
@@ -226,7 +227,7 @@ fn formats_ocserv_cert_human_output_without_certificate_material() {
 }
 
 #[test]
-fn json_cert_output_keeps_full_cert_fingerprint() {
+fn json_cert_output_uses_low_sensitive_summary_without_full_fingerprint() {
     let response = OcservCertExpiryResponse {
         certs: vec![OcservCertExpiry {
             name: "server".to_string(),
@@ -238,14 +239,24 @@ fn json_cert_output_keeps_full_cert_fingerprint() {
         }],
         meta: meta(),
     };
-    let output = serde_json::to_string_pretty(&serde_json::json!({
-        "node_id": "hk-ocserv-01",
-        "certs": response.certs,
-    }))
-    .expect("format cert json");
+    let output = format_cert_json("hk-ocserv-01", &response).expect("format cert json");
 
-    assert!(output.contains(&"e".repeat(64)));
+    assert!(output.contains("\"cert_count\": 1"));
+    assert!(output.contains("\"days_remaining\": 117"));
+    assert!(output.contains("\"status\": \"valid\""));
+    assert!(output.contains("\"fingerprint_sha256_prefix\": \"eeeeeeeeeeee\""));
+    assert!(!output.contains(&"e".repeat(64)));
+    assert!(!output.contains("not_before"));
+    assert!(!output.contains("not_after"));
+    assert!(!output.contains("\"certs\""));
     assert_low_sensitive_ocserv_output(&output).expect("json cert is low-sensitive");
+}
+
+#[test]
+fn cli_output_rejects_full_sha256_fingerprints() {
+    let output = format!("fingerprint_sha256={}", "f".repeat(64));
+
+    assert!(assert_low_sensitive_ocserv_output(&output).is_err());
 }
 
 #[test]

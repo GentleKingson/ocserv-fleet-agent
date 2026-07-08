@@ -44,6 +44,10 @@ pub enum Command {
         #[command(subcommand)]
         command: TrustCommand,
     },
+    Ocserv {
+        #[command(subcommand)]
+        command: OcservCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -182,5 +186,32 @@ pub enum TrustCommand {
         format: TrustDiffFormat,
         #[arg(long)]
         strict: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum OcservCommand {
+    Status {
+        node: String,
+        #[arg(long)]
+        json: bool,
+    },
+    Cert {
+        node: String,
+        #[arg(long)]
+        json: bool,
+    },
+    Sessions {
+        #[command(subcommand)]
+        command: OcservSessionsCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum OcservSessionsCommand {
+    Summary {
+        node: String,
+        #[arg(long)]
+        json: bool,
     },
 }

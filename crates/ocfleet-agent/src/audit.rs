@@ -40,6 +40,8 @@ pub struct AgentAuditEvent {
     pub response_bytes: Option<usize>,
     pub stage: Option<String>,
     pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_class: Option<String>,
     pub suppressed_count: Option<u64>,
     pub limit_key: Option<String>,
     pub resource: Option<String>,
@@ -68,6 +70,7 @@ impl AgentAuditEvent {
             response_bytes: None,
             stage: None,
             reason: None,
+            result_class: None,
             suppressed_count: None,
             limit_key: None,
             resource: None,

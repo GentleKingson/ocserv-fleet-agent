@@ -13,14 +13,16 @@ use ocfleet_agent::{
     },
 };
 use ocfleet_config::agent::{
-    AgentConfig, AuditConfig, ControllerConfig, IrohConfig, NodeConfig, PathProbeConfig,
-    PeerConfig, SecurityConfig,
+    AgentConfig, AuditConfig, ControllerConfig, IrohConfig, NodeConfig, OcservReadonlyProviderKind,
+    PathProbeConfig, PeerConfig, SecurityConfig,
 };
 use ocfleet_protocol::constants::PROTOCOL_VERSION;
 use ocfleet_protocol::enrollment::{EndpointStatus, TrustBundle};
 use ocfleet_protocol::error::ErrorCode;
 use ocfleet_protocol::method::{
-    NODE_INFO, NODE_PING, PROBE_CONTROLLER_PING, PROBE_PATH_ECHO, PROBE_PEER_ECHO,
+    NODE_INFO, NODE_PING, OCSERV_CERT_EXPIRY, OCSERV_CONFIG_FINGERPRINT, OCSERV_SERVICE_SUMMARY,
+    OCSERV_SESSIONS_SUMMARY, OCSERV_VERSION, PROBE_CONTROLLER_PING, PROBE_PATH_ECHO,
+    PROBE_PEER_ECHO,
 };
 use ocfleet_protocol::rpc::RpcRequest;
 use serde_json::json;
@@ -525,6 +527,18 @@ fn authorization_enforces_caller_aware_method_matrix() {
         CallerClass::Controller,
         PROBE_PATH_ECHO
     ));
+    for method in [
+        OCSERV_SERVICE_SUMMARY,
+        OCSERV_VERSION,
+        OCSERV_SESSIONS_SUMMARY,
+        OCSERV_CERT_EXPIRY,
+        OCSERV_CONFIG_FINGERPRINT,
+    ] {
+        assert!(
+            AgentAuthorization::method_allowed(CallerClass::Controller, method),
+            "controller must be allowed to call fixed ocserv method {method}"
+        );
+    }
     assert!(!AgentAuthorization::method_allowed(
         CallerClass::Controller,
         PROBE_PEER_ECHO
@@ -534,7 +548,17 @@ fn authorization_enforces_caller_aware_method_matrix() {
         CallerClass::Peer,
         PROBE_PEER_ECHO
     ));
-    for method in [NODE_PING, NODE_INFO, PROBE_CONTROLLER_PING, PROBE_PATH_ECHO] {
+    for method in [
+        NODE_PING,
+        NODE_INFO,
+        PROBE_CONTROLLER_PING,
+        PROBE_PATH_ECHO,
+        OCSERV_SERVICE_SUMMARY,
+        OCSERV_VERSION,
+        OCSERV_SESSIONS_SUMMARY,
+        OCSERV_CERT_EXPIRY,
+        OCSERV_CONFIG_FINGERPRINT,
+    ] {
         assert!(
             !AgentAuthorization::method_allowed(CallerClass::Peer, method),
             "peer caller must not call {method}"
@@ -862,6 +886,124 @@ async fn handle_request_classifies_phase_one_methods() {
             response.error.as_ref().expect("error").code,
             ErrorCode::MethodNotFound,
             "{method} must not dispatch in phase 1"
+        );
+    }
+}
+
+#[tokio::test]
+async fn handle_request_ocserv_readonly_disabled_by_default() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let state = test_server_state(dir.path(), "agent-endpoint-1");
+    let controller = test_controller_remote(&state);
+
+    let response = handle_request(
+        &state,
+        &controller,
+        test_rpc_request(OCSERV_SERVICE_SUMMARY, valid_nonce(31)),
+    )
+    .await;
+
+    assert!(!response.ok);
+    assert_eq!(
+        response.error.as_ref().expect("error").code,
+        ErrorCode::OcservReadonlyDisabled
+    );
+}
+
+#[tokio::test]
+async fn handle_request_accepts_fixed_ocserv_readonly_methods_from_controller() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let snapshot_path = dir.path().join("ocserv-readonly.json");
+    std::fs::write(
+        &snapshot_path,
+        r#"{"service":{"state":"running","enabled":"enabled","since":"2026-07-07T12:00:00Z"},"version":"1.3.0","sessions":{"total":12}}"#,
+    )
+    .expect("write snapshot");
+    make_private(&snapshot_path);
+
+    let mut config = test_agent_config(
+        dir.path(),
+        vec![ControllerConfig {
+            endpoint_id: iroh::SecretKey::generate().public().to_string(),
+            role: "viewer".to_string(),
+        }],
+    );
+    config.ocserv_readonly.enabled = true;
+    config.ocserv_readonly.provider = OcservReadonlyProviderKind::Snapshot;
+    config.ocserv_readonly.snapshot_path = Some(snapshot_path);
+    let state = test_server_state_from_config(config, "agent-endpoint-1");
+    let controller = test_controller_remote(&state);
+
+    let service = handle_request(
+        &state,
+        &controller,
+        test_rpc_request(OCSERV_SERVICE_SUMMARY, valid_nonce(32)),
+    )
+    .await;
+    assert!(service.ok, "{service:#?}");
+    assert_eq!(
+        service.result.as_ref().expect("service result")["service"]["state"],
+        "running"
+    );
+
+    let version = handle_request(
+        &state,
+        &controller,
+        test_rpc_request(OCSERV_VERSION, valid_nonce(33)),
+    )
+    .await;
+    assert!(version.ok, "{version:#?}");
+    assert_eq!(
+        version.result.as_ref().expect("version result")["version"],
+        "1.3.0"
+    );
+
+    let sessions = handle_request(
+        &state,
+        &controller,
+        test_rpc_request(OCSERV_SESSIONS_SUMMARY, valid_nonce(34)),
+    )
+    .await;
+    assert!(sessions.ok, "{sessions:#?}");
+    assert_eq!(
+        sessions.result.as_ref().expect("sessions result")["sessions"]["total"],
+        12
+    );
+}
+
+#[tokio::test]
+async fn handle_request_rejects_ocserv_readonly_params_with_controller_supplied_sources() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let mut config = test_agent_config(
+        dir.path(),
+        vec![ControllerConfig {
+            endpoint_id: iroh::SecretKey::generate().public().to_string(),
+            role: "viewer".to_string(),
+        }],
+    );
+    config.ocserv_readonly.enabled = true;
+    config.ocserv_readonly.provider = OcservReadonlyProviderKind::Snapshot;
+    config.ocserv_readonly.snapshot_path = Some(dir.path().join("ocserv-readonly.json"));
+    let state = test_server_state_from_config(config, "agent-endpoint-1");
+    let controller = test_controller_remote(&state);
+
+    for (index, params) in [
+        json!({"path": "/etc/ocserv/ocserv.conf"}),
+        json!({"command": "systemctl status ocserv"}),
+        json!({"unit": "ssh.service"}),
+        json!({"journal": "ocserv"}),
+        json!({"service": "ocserv"}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut request =
+            test_rpc_request(OCSERV_CONFIG_FINGERPRINT, valid_nonce(40 + index as u8));
+        request.params = params;
+        let response = handle_request(&state, &controller, request).await;
+        assert_eq!(
+            response.error.as_ref().expect("error").code,
+            ErrorCode::ParamsInvalid
         );
     }
 }
@@ -1301,6 +1443,7 @@ fn test_agent_config(dir: &Path, controllers: Vec<ControllerConfig>) -> AgentCon
             rejected_peer_log_bucket_ttl_seconds: 3600,
             rejected_peer_log_aggregate_interval_seconds: 60,
         },
+        ocserv_readonly: Default::default(),
         ocserv: None,
         logs: None,
     }
@@ -1341,6 +1484,15 @@ fn test_server_state_from_config(config: AgentConfig, agent_endpoint_id: &str) -
         path_target_resolver: PathTargetResolver::endpoint_id_only(),
     }
 }
+
+#[cfg(unix)]
+fn make_private(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).expect("chmod private");
+}
+
+#[cfg(not(unix))]
+fn make_private(_path: &Path) {}
 
 fn test_rpc_request(method: &str, nonce: String) -> RpcRequest {
     RpcRequest {

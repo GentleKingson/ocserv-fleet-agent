@@ -1,4 +1,6 @@
-use ocfleet_config::agent::{AgentConfig, ConfigError, validate_agent_config};
+use ocfleet_config::agent::{
+    AgentConfig, ConfigError, OcservReadonlyProviderKind, validate_agent_config,
+};
 use ocfleet_config::cli::{CliConfig, CliConfigError, load_cli_config, validate_cli_config};
 use ocfleet_config::validation::{validate_node_id, validate_region, validate_service_name};
 use std::fs;
@@ -325,6 +327,15 @@ fn agent_config_rejects_too_small_max_response_bytes() {
 fn agent_config_defaults_include_resource_limits() {
     let config = minimal_agent_config();
 
+    assert!(!config.ocserv_readonly.enabled);
+    assert_eq!(
+        config.ocserv_readonly.provider,
+        OcservReadonlyProviderKind::Disabled
+    );
+    assert_eq!(config.ocserv_readonly.snapshot_path, None);
+    assert!(config.ocserv_readonly.certificates.is_empty());
+    assert!(config.ocserv_readonly.config_fingerprint.is_none());
+
     assert!(config.security.peers.is_empty());
     assert!(config.security.path_probes.is_empty());
     assert_eq!(config.security.max_handshake_duration_ms, 5_000);
@@ -348,6 +359,182 @@ fn agent_config_defaults_include_resource_limits() {
         config.audit.rejected_peer_log_aggregate_interval_seconds,
         60
     );
+}
+
+#[test]
+fn agent_config_accepts_ocserv_readonly_snapshot_provider() {
+    let config: AgentConfig = toml::from_str(
+        r#"
+[node]
+id = "hk-ocserv-01"
+region = "hk"
+role = "ocserv"
+
+[iroh]
+secret_key_path = "/tmp/iroh.secret"
+
+[security]
+
+[audit]
+path = "/tmp/ocfleet-audit.log"
+
+[ocserv_readonly]
+enabled = true
+provider = "snapshot"
+snapshot_path = "/var/lib/ocfleet-agent/ocserv-readonly.json"
+
+[ocserv_readonly.config_fingerprint]
+name = "main"
+config_path = "/etc/ocserv/ocserv.conf"
+
+[[ocserv_readonly.certificates]]
+name = "server"
+cert_path = "/etc/ocserv/server-cert.pem"
+"#,
+    )
+    .expect("ocserv readonly config parses");
+
+    validate_agent_config(&config).expect("ocserv readonly config validates");
+    assert!(config.ocserv_readonly.enabled);
+    assert_eq!(
+        config.ocserv_readonly.provider,
+        OcservReadonlyProviderKind::Snapshot
+    );
+    assert_eq!(config.ocserv_readonly.certificates.len(), 1);
+    assert_eq!(config.ocserv_readonly.certificates[0].name, "server");
+}
+
+#[test]
+fn agent_config_rejects_enabled_ocserv_readonly_without_explicit_provider() {
+    let err = toml::from_str::<AgentConfig>(
+        r#"
+[node]
+id = "hk-ocserv-01"
+region = "hk"
+role = "ocserv"
+
+[iroh]
+secret_key_path = "/tmp/iroh.secret"
+
+[security]
+
+[audit]
+path = "/tmp/ocfleet-audit.log"
+
+[ocserv_readonly]
+enabled = true
+snapshot_path = "/var/lib/ocfleet-agent/ocserv-readonly.json"
+"#,
+    )
+    .expect_err("enabled ocserv readonly requires explicit provider");
+
+    assert!(err.to_string().contains("provider"));
+}
+
+#[test]
+fn agent_config_rejects_unknown_ocserv_readonly_fields() {
+    let err = toml::from_str::<AgentConfig>(
+        r#"
+[node]
+id = "hk-ocserv-01"
+region = "hk"
+role = "ocserv"
+
+[iroh]
+secret_key_path = "/tmp/iroh.secret"
+
+[security]
+
+[audit]
+path = "/tmp/ocfleet-audit.log"
+
+[ocserv_readonly]
+enabled = false
+provider = "disabled"
+command = "systemctl status ocserv"
+"#,
+    )
+    .expect_err("unknown ocserv readonly fields rejected");
+
+    assert!(err.to_string().contains("unknown field"));
+}
+
+#[test]
+fn agent_config_rejects_relative_ocserv_readonly_paths() {
+    let mut config: AgentConfig = toml::from_str(
+        r#"
+[node]
+id = "hk-ocserv-01"
+region = "hk"
+role = "ocserv"
+
+[iroh]
+secret_key_path = "/tmp/iroh.secret"
+
+[security]
+
+[audit]
+path = "/tmp/ocfleet-audit.log"
+
+[ocserv_readonly]
+enabled = true
+provider = "snapshot"
+snapshot_path = "relative/snapshot.json"
+"#,
+    )
+    .expect("test config parses");
+
+    let err = validate_agent_config(&config).expect_err("relative snapshot path rejected");
+    assert!(matches!(
+        err,
+        ConfigError::Invalid(message) if message.contains("snapshot_path")
+    ));
+
+    config.ocserv_readonly.snapshot_path = Some("/var/lib/ocfleet-agent/snapshot.json".into());
+    config
+        .ocserv_readonly
+        .certificates
+        .push(ocfleet_config::agent::OcservCertificateConfig {
+            name: "server".to_string(),
+            cert_path: "server.pem".into(),
+        });
+    let err = validate_agent_config(&config).expect_err("relative cert path rejected");
+    assert!(matches!(
+        err,
+        ConfigError::Invalid(message) if message.contains("cert_path")
+    ));
+}
+
+#[test]
+fn agent_config_rejects_too_many_ocserv_certificates_and_bad_names() {
+    let mut config = minimal_agent_config();
+    config.ocserv_readonly.enabled = true;
+    config.ocserv_readonly.provider = OcservReadonlyProviderKind::Snapshot;
+    config.ocserv_readonly.snapshot_path =
+        Some("/var/lib/ocfleet-agent/ocserv-readonly.json".into());
+    for index in 0..9 {
+        config
+            .ocserv_readonly
+            .certificates
+            .push(ocfleet_config::agent::OcservCertificateConfig {
+                name: format!("server-{index}"),
+                cert_path: format!("/etc/ocserv/server-{index}.pem").into(),
+            });
+    }
+
+    let err = validate_agent_config(&config).expect_err("too many certificates rejected");
+    assert!(matches!(
+        err,
+        ConfigError::Invalid(message) if message.contains("certificates")
+    ));
+
+    config.ocserv_readonly.certificates.truncate(1);
+    config.ocserv_readonly.certificates[0].name = "../server".to_string();
+    let err = validate_agent_config(&config).expect_err("bad cert name rejected");
+    assert!(matches!(
+        err,
+        ConfigError::Invalid(message) if message.contains("name")
+    ));
 }
 
 #[test]

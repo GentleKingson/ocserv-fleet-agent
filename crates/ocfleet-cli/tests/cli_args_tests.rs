@@ -1,7 +1,7 @@
 use clap::{CommandFactory, Parser};
 use ocfleet_cli::args::{
     Cli, Command, EndpointCommand, EnrollCommand, EnrollRequestCommand, EnrollTokenCommand,
-    NodeCommand, ProbeCommand, TrustCommand, TrustDiffFormat,
+    NodeCommand, OcservCommand, OcservSessionsCommand, ProbeCommand, TrustCommand, TrustDiffFormat,
 };
 use std::path::PathBuf;
 
@@ -500,4 +500,94 @@ fn parses_node_info_command() {
     };
 
     assert_eq!(node_id, "hk-ocserv-01");
+}
+
+#[test]
+fn parses_ocserv_status_command() {
+    let cli = Cli::parse_from(["ocfleet", "ocserv", "status", "hk-ocserv-01"]);
+
+    let Command::Ocserv {
+        command: OcservCommand::Status { node, json },
+    } = cli.command
+    else {
+        panic!("expected ocserv status command");
+    };
+
+    assert_eq!(node, "hk-ocserv-01");
+    assert!(!json);
+}
+
+#[test]
+fn parses_ocserv_cert_command() {
+    let cli = Cli::parse_from(["ocfleet", "ocserv", "cert", "hk-ocserv-01", "--json"]);
+
+    let Command::Ocserv {
+        command: OcservCommand::Cert { node, json },
+    } = cli.command
+    else {
+        panic!("expected ocserv cert command");
+    };
+
+    assert_eq!(node, "hk-ocserv-01");
+    assert!(json);
+}
+
+#[test]
+fn parses_ocserv_sessions_summary_command() {
+    let cli = Cli::parse_from(["ocfleet", "ocserv", "sessions", "summary", "hk-ocserv-01"]);
+
+    let Command::Ocserv {
+        command:
+            OcservCommand::Sessions {
+                command: OcservSessionsCommand::Summary { node, json },
+            },
+    } = cli.command
+    else {
+        panic!("expected ocserv sessions summary command");
+    };
+
+    assert_eq!(node, "hk-ocserv-01");
+    assert!(!json);
+}
+
+#[test]
+fn ocserv_commands_reject_dangerous_selector_flags() {
+    for args in [
+        vec![
+            "ocfleet",
+            "ocserv",
+            "status",
+            "hk-ocserv-01",
+            "--host",
+            "127.0.0.1",
+        ],
+        vec![
+            "ocfleet",
+            "ocserv",
+            "status",
+            "hk-ocserv-01",
+            "--port",
+            "443",
+        ],
+        vec![
+            "ocfleet",
+            "ocserv",
+            "cert",
+            "hk-ocserv-01",
+            "--path",
+            "/etc/ocserv/server.pem",
+        ],
+        vec![
+            "ocfleet",
+            "ocserv",
+            "sessions",
+            "summary",
+            "hk-ocserv-01",
+            "--command",
+            "occtl show users",
+        ],
+    ] {
+        let err = Cli::try_parse_from(args).expect_err("dangerous ocserv selector rejected");
+        assert!(err.to_string().contains("unexpected argument"));
+    }
 }

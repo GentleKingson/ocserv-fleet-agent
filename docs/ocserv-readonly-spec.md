@@ -1,0 +1,248 @@
+# ocserv read-only RPC spec
+
+## Goal
+
+Phase 11 adds the first ocserv-aware observation surface for `ocserv-fleet-agent`.
+It is intentionally low-sensitive, read-only, bounded, and fixed-schema:
+
+```text
+controller -> fixed RPC -> agent -> fixed ocserv readonly provider -> typed response
+```
+
+The goal is observability, not ocserv management.
+
+## Non-goals
+
+Phase 11 does not provide service control, reload, restart, config apply,
+rollback, user management, user disconnect, session detail listing, generic file
+reads, generic command execution, or arbitrary data-source selection.
+
+## Threat Model
+
+The controller is trusted only as an RPC caller. It is not trusted to choose
+agent-local paths, service names, command lines, journal queries, regexes,
+scripts, hosts, or ports. The agent must derive all ocserv data sources from its
+local static config and must return only typed low-sensitive summaries.
+
+## Data Sensitivity Classification
+
+Allowed low-sensitive fields:
+
+- service state enum
+- service enabled enum
+- version string capped at 64 bytes
+- aggregate session count
+- certificate validity timestamps, days remaining, status enum, and SHA-256 fingerprint
+- opaque config SHA-256 fingerprint
+- bounded source/freshness metadata without paths or command names
+
+Forbidden fields:
+
+- ocserv config content
+- certificate PEM or DER content
+- private key content or paths
+- usernames
+- client IP addresses
+- session IDs
+- device details
+- logs
+- unit files
+- full command lines
+- environment variables
+- complete local filesystem paths
+
+## Allowed RPC Methods
+
+Only these fixed methods are allowed:
+
+```text
+ocserv.service.summary
+ocserv.version
+ocserv.sessions.summary
+ocserv.cert.expiry
+ocserv.config.fingerprint
+```
+
+Each request must use `null` params or `{}`. Request structs are empty and do not
+contain selectors.
+
+## Forbidden Interfaces
+
+Phase 11 must not add or expose:
+
+```text
+shell.exec
+command.run
+ocserv.exec
+ocserv.raw
+file.read
+systemctl.raw
+occtl.raw
+journalctl.raw
+```
+
+It must not return passthrough output from service managers, ocserv control
+tools, journal/log readers, or files.
+
+## Provider Contract
+
+Providers must implement a fixed `OcservReadonlyProvider` trait and return typed
+protocol structs. Unsupported data must be reported as `unknown` or
+`unavailable`, or as a low-sensitive typed error. A provider must not call a
+dangerous data source to fill a missing field.
+
+Production provider code for Phase 11 is limited to:
+
+- a disabled provider
+- a typed snapshot provider
+- certificate expiry parsing from configured certificate files
+- config fingerprint hashing from a configured config file
+
+## Agent Config
+
+Default:
+
+```toml
+[ocserv_readonly]
+enabled = false
+provider = "disabled"
+```
+
+Snapshot example:
+
+```toml
+[ocserv_readonly]
+enabled = true
+provider = "snapshot"
+snapshot_path = "/var/lib/ocfleet-agent/ocserv-readonly.json"
+
+[ocserv_readonly.config_fingerprint]
+name = "main"
+config_path = "/etc/ocserv/ocserv.conf"
+
+[[ocserv_readonly.certificates]]
+name = "server"
+cert_path = "/etc/ocserv/server-cert.pem"
+```
+
+Validation rules:
+
+- `enabled=true` requires an explicit provider.
+- provider is `disabled` or `snapshot`.
+- configured paths must be absolute.
+- certificate and fingerprint names are `[A-Za-z0-9_.-]`, max 64 bytes.
+- at most 8 certificates are configured.
+- unknown config fields are rejected.
+- controller RPC params cannot override configured paths.
+
+## RPC Schemas
+
+All responses include:
+
+```rust
+OcservReadonlyMeta {
+    source,
+    collected_at,
+    freshness,
+}
+```
+
+`source` is one of `provider`, `snapshot`, or `unavailable`. It never contains a
+path, command, unit name, or log name.
+
+`ocserv.service.summary` returns `state`, `enabled`, and optional `since`.
+
+`ocserv.version` returns optional `version` and a field status.
+
+`ocserv.sessions.summary` returns optional aggregate `total` and a field status.
+
+`ocserv.cert.expiry` returns up to 8 logical certificate entries with validity,
+days remaining, status, and SHA-256 fingerprint.
+
+`ocserv.config.fingerprint` returns algorithm `sha256`, optional 64-byte hex
+hash, and a field status.
+
+## CLI Behavior
+
+`ocfleet ocserv status <node>` calls service summary, version, sessions summary,
+and config fingerprint. Human output is key-value low-sensitive summary.
+
+`ocfleet ocserv cert <node>` calls certificate expiry and prints logical cert
+name, status, expiry, days remaining, and fingerprint.
+
+`ocfleet ocserv sessions summary <node>` calls sessions summary and prints only
+the aggregate count.
+
+The CLI does not accept ocserv-specific `--host`, `--port`, `--path`,
+`--command`, `--unit`, or similar selector flags.
+
+## Audit Rules
+
+Controller command-level audit events:
+
+```text
+ocserv.status
+ocserv.cert
+ocserv.sessions.summary
+```
+
+Controller RPC-level audit records include node ID, endpoint ID, method, request
+ID, ok/error code, duration, params hash, and `result_class =
+low_sensitive_summary`. They do not store full response bodies.
+
+Agent audit records include method, params hash, ok/error code, duration,
+response size, and `result_class = low_sensitive_summary`. They do not store
+full response bodies.
+
+## Error Model
+
+Low-sensitive ocserv error codes:
+
+```text
+OCSERV_READONLY_DISABLED
+OCSERV_PROVIDER_UNAVAILABLE
+OCSERV_PROVIDER_INVALID_DATA
+OCSERV_PROVIDER_UNSAFE_SOURCE
+OCSERV_OUTPUT_BOUND_EXCEEDED
+OCSERV_UNSUPPORTED_FIELD
+```
+
+Error messages are capped at 128 bytes and must not include local paths, file
+snippets, parser dumps, certificate material, config content, logs, or command
+output.
+
+## Bounds And Redaction
+
+Limits:
+
+- version string: 64 bytes
+- logical cert name: 64 bytes
+- cert entries: 8
+- snapshot file: 16 KiB
+- config file hashed: 1 MiB
+- certificate file parsed: 1 MiB
+- response JSON: 8 KiB
+- error message: 128 bytes
+
+All scalar fields reject control characters. Config fingerprints are opaque
+byte-level SHA-256 hashes, not semantic normalized config summaries.
+
+## Test Requirements
+
+Tests must prove:
+
+- fixed method names are the only allowed ocserv RPCs
+- request params reject controller-supplied source selectors
+- response schemas are closed typed structs
+- version, fingerprint, cert count, and file-size bounds are enforced
+- session summary returns only aggregate count
+- cert output excludes PEM, DER, subject, SAN, and paths
+- config fingerprint output excludes config content and paths
+- provider source does not introduce dangerous adapters
+- CLI output and audit details are low-sensitive
+
+## Future Extension Rules
+
+Future ocserv RPCs must update this spec before implementation. New fields must
+be classified, bounded, tested, and represented as typed protocol structs. New
+providers must keep the controller unable to choose local data sources.

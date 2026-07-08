@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -28,6 +28,8 @@ pub struct AgentConfig {
     pub iroh: IrohConfig,
     pub security: SecurityConfig,
     pub audit: AuditConfig,
+    #[serde(default)]
+    pub ocserv_readonly: OcservReadonlyConfig,
     #[serde(default)]
     pub ocserv: Option<toml::Value>,
     #[serde(default)]
@@ -136,6 +138,83 @@ pub struct AuditConfig {
     pub rejected_peer_log_aggregate_interval_seconds: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OcservReadonlyConfig {
+    pub enabled: bool,
+    pub provider: OcservReadonlyProviderKind,
+    pub snapshot_path: Option<PathBuf>,
+    pub config_fingerprint: Option<OcservConfigFingerprintConfig>,
+    pub certificates: Vec<OcservCertificateConfig>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OcservReadonlyProviderKind {
+    Disabled,
+    Snapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OcservCertificateConfig {
+    pub name: String,
+    pub cert_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OcservConfigFingerprintConfig {
+    pub name: String,
+    pub config_path: PathBuf,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OcservReadonlyConfigFields {
+    #[serde(default)]
+    enabled: bool,
+    provider: Option<OcservReadonlyProviderKind>,
+    #[serde(default)]
+    snapshot_path: Option<PathBuf>,
+    #[serde(default)]
+    config_fingerprint: Option<OcservConfigFingerprintConfig>,
+    #[serde(default)]
+    certificates: Vec<OcservCertificateConfig>,
+}
+
+impl Default for OcservReadonlyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: OcservReadonlyProviderKind::Disabled,
+            snapshot_path: None,
+            config_fingerprint: None,
+            certificates: Vec::new(),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for OcservReadonlyConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let fields = OcservReadonlyConfigFields::deserialize(deserializer)?;
+        if fields.enabled && fields.provider.is_none() {
+            return Err(serde::de::Error::missing_field("provider"));
+        }
+        Ok(Self {
+            enabled: fields.enabled,
+            provider: fields
+                .provider
+                .unwrap_or(OcservReadonlyProviderKind::Disabled),
+            snapshot_path: fields.snapshot_path,
+            config_fingerprint: fields.config_fingerprint,
+            certificates: fields.certificates,
+        })
+    }
+}
+
 pub fn load_agent_config(path: &Path) -> Result<AgentConfig, ConfigError> {
     let text = fs::read_to_string(path)?;
     let config: AgentConfig = toml::from_str(&text)?;
@@ -161,6 +240,7 @@ pub fn validate_agent_config(config: &AgentConfig) -> Result<(), ConfigError> {
             "[logs] is not part of the Phase 1 read-only MVP".to_string(),
         ));
     }
+    validate_ocserv_readonly_config(&config.ocserv_readonly)?;
     let mut controller_endpoint_ids = HashSet::new();
     for controller in &config.security.controllers {
         validate_controller_endpoint_id(&controller.endpoint_id)
@@ -344,6 +424,69 @@ pub fn validate_agent_config(config: &AgentConfig) -> Result<(), ConfigError> {
         ));
     }
     Ok(())
+}
+
+fn validate_ocserv_readonly_config(config: &OcservReadonlyConfig) -> Result<(), ConfigError> {
+    if config.enabled && config.provider == OcservReadonlyProviderKind::Disabled {
+        return Err(ConfigError::Invalid(
+            "ocserv_readonly.provider must not be disabled when enabled=true".to_string(),
+        ));
+    }
+    if config.enabled && config.provider == OcservReadonlyProviderKind::Snapshot {
+        let Some(snapshot_path) = &config.snapshot_path else {
+            return Err(ConfigError::Invalid(
+                "ocserv_readonly.snapshot_path is required for snapshot provider".to_string(),
+            ));
+        };
+        validate_absolute_path(snapshot_path, "ocserv_readonly.snapshot_path")?;
+    }
+    if let Some(snapshot_path) = &config.snapshot_path {
+        validate_absolute_path(snapshot_path, "ocserv_readonly.snapshot_path")?;
+    }
+    if config.certificates.len() > 8 {
+        return Err(ConfigError::Invalid(
+            "ocserv_readonly.certificates must contain at most 8 entries".to_string(),
+        ));
+    }
+    for certificate in &config.certificates {
+        validate_ocserv_logical_name(&certificate.name, "ocserv_readonly.certificates.name")?;
+        validate_absolute_path(
+            &certificate.cert_path,
+            "ocserv_readonly.certificates.cert_path",
+        )?;
+    }
+    if let Some(fingerprint) = &config.config_fingerprint {
+        validate_ocserv_logical_name(&fingerprint.name, "ocserv_readonly.config_fingerprint.name")?;
+        validate_absolute_path(
+            &fingerprint.config_path,
+            "ocserv_readonly.config_fingerprint.config_path",
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_absolute_path(path: &Path, field: &'static str) -> Result<(), ConfigError> {
+    validate_non_empty_path(path, field).map_err(|e| ConfigError::Invalid(e.to_string()))?;
+    if !path.is_absolute() {
+        return Err(ConfigError::Invalid(format!(
+            "{field} must be an absolute path"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_ocserv_logical_name(value: &str, field: &'static str) -> Result<(), ConfigError> {
+    let ok_len = !value.is_empty() && value.len() <= 64;
+    let ok_chars = value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
+    if ok_len && ok_chars {
+        Ok(())
+    } else {
+        Err(ConfigError::Invalid(format!(
+            "{field} must be 1-64 characters and contain only [a-zA-Z0-9._-]"
+        )))
+    }
 }
 
 fn default_alpn() -> String {

@@ -35,6 +35,12 @@ pub enum ErrorCode {
     ConfigLoadFailed,
     SecretKeyLoadFailed,
     SecretKeyPermissionInvalid,
+    OcservReadonlyDisabled,
+    OcservProviderUnavailable,
+    OcservProviderInvalidData,
+    OcservProviderUnsafeSource,
+    OcservOutputBoundExceeded,
+    OcservUnsupportedField,
     InternalError,
 }
 

@@ -1027,6 +1027,7 @@ fn test_config(
             rejected_peer_log_bucket_ttl_seconds: 3600,
             rejected_peer_log_aggregate_interval_seconds: 60,
         },
+        ocserv_readonly: Default::default(),
         ocserv: None,
         logs: None,
     }

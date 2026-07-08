@@ -44,7 +44,8 @@ use ocfleet_protocol::ocserv::{
 };
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
@@ -218,6 +219,8 @@ async fn main() -> anyhow::Result<()> {
                 EnrollCommand::Request { command } => match command {
                     EnrollRequestCommand::Create {
                         token,
+                        token_file,
+                        token_stdin,
                         agent_public_key,
                         fingerprint,
                         requested_endpoint_id,
@@ -225,12 +228,16 @@ async fn main() -> anyhow::Result<()> {
                         agent_version,
                     } => run_enroll_request_create(
                         &store,
-                        token,
-                        agent_public_key,
-                        fingerprint,
-                        requested_endpoint_id,
-                        hostname,
-                        agent_version,
+                        EnrollRequestCreateInput {
+                            token,
+                            token_file,
+                            token_stdin,
+                            agent_public_key,
+                            fingerprint,
+                            requested_endpoint_id,
+                            hostname,
+                            agent_version,
+                        },
                     )?,
                 },
                 EnrollCommand::Approve {
@@ -395,25 +402,29 @@ fn run_enroll_approve(
     Ok(())
 }
 
-fn run_enroll_request_create(
-    store: &Store,
-    token: String,
+struct EnrollRequestCreateInput {
+    token: Option<String>,
+    token_file: Option<PathBuf>,
+    token_stdin: bool,
     agent_public_key: String,
     fingerprint: String,
     requested_endpoint_id: Option<String>,
     hostname: String,
     agent_version: String,
-) -> anyhow::Result<()> {
-    validate_hostname(&hostname).map_err(anyhow::Error::msg)?;
-    validate_agent_version(&agent_version).map_err(anyhow::Error::msg)?;
+}
+
+fn run_enroll_request_create(store: &Store, input: EnrollRequestCreateInput) -> anyhow::Result<()> {
+    validate_hostname(&input.hostname).map_err(anyhow::Error::msg)?;
+    validate_agent_version(&input.agent_version).map_err(anyhow::Error::msg)?;
+    let token = resolve_enrollment_token(input.token, input.token_file, input.token_stdin)?;
     let join = store.submit_join_request(
         &JoinRequestInsert {
             token_plaintext: token,
-            agent_public_key,
-            fingerprint,
-            requested_endpoint_id,
-            hostname,
-            agent_version,
+            agent_public_key: input.agent_public_key,
+            fingerprint: input.fingerprint,
+            requested_endpoint_id: input.requested_endpoint_id,
+            hostname: input.hostname,
+            agent_version: input.agent_version,
             requested_labels_json: json!({}),
         },
         "agent",
@@ -423,6 +434,38 @@ fn run_enroll_request_create(
     println!("status={}", join.status.as_str());
     println!("hostname={}", join.hostname);
     Ok(())
+}
+
+fn resolve_enrollment_token(
+    token: Option<String>,
+    token_file: Option<PathBuf>,
+    token_stdin: bool,
+) -> anyhow::Result<String> {
+    let source_count =
+        usize::from(token.is_some()) + usize::from(token_file.is_some()) + usize::from(token_stdin);
+    if source_count != 1 {
+        bail!(
+            "provide exactly one enrollment token source: --token, --token-file, or --token-stdin"
+        );
+    }
+
+    let raw = if let Some(token) = token {
+        token
+    } else if let Some(path) = token_file {
+        std::fs::read_to_string(&path)
+            .with_context(|| format!("failed to read enrollment token file: {}", path.display()))?
+    } else {
+        let mut text = String::new();
+        std::io::stdin()
+            .read_to_string(&mut text)
+            .context("failed to read enrollment token from stdin")?;
+        text
+    };
+    let token = raw.trim_end_matches(['\r', '\n']).to_string();
+    if token.is_empty() {
+        bail!("enrollment token must not be empty");
+    }
+    Ok(token)
 }
 
 fn parse_ttl(value: &str) -> anyhow::Result<Duration> {

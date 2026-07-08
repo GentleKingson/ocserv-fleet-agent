@@ -198,6 +198,7 @@ sudo systemctl restart ocfleet-agent
 ### Common Causes
 
 - The source agent lacks a matching `[[security.path_probes]]` entry for the controller and target.
+- The source agent does not list the target as an enabled `[[security.peers]]` entry.
 - The target EndpointID in source config is stale.
 - The target agent allows the source, but the source does not authorize the controller-target pair.
 
@@ -211,9 +212,13 @@ ocfleet --database /var/lib/ocfleet-controller/controller.sqlite --secret-key /v
 
 ### Fix Steps
 
-On the source agent, add:
+On the source agent, add both entries:
 
 ```toml
+[[security.peers]]
+endpoint_id = "<target_agent_endpoint_id>"
+enabled = true
+
 [[security.path_probes]]
 controller_endpoint_id = "<controller_endpoint_id>"
 target_endpoint_id = "<target_agent_endpoint_id>"

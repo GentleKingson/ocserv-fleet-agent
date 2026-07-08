@@ -4,6 +4,7 @@ mod disabled;
 mod provider;
 mod sanitize;
 mod snapshot;
+mod trusted_file;
 
 pub use cert::CertificateExpiryProvider;
 pub use config_fingerprint::ConfigFingerprintProvider;

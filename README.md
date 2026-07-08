@@ -136,10 +136,13 @@ target/debug/ocfleet enroll token create \
   --max-uses 1 \
   --description "prod node onboarding"
 
+install -m 0600 /dev/null ./enrollment.token
+# Put the plaintext token printed above into ./enrollment.token, then run:
 target/debug/ocfleet enroll request create \
-  --token <plaintext-token> \
+  --token-file ./enrollment.token \
   --agent-public-key <agent-public-key> \
   --fingerprint <agent-fingerprint> \
+  --requested-endpoint-id <agent_endpoint_id> \
   --hostname hk-ocserv-01 \
   --agent-version 0.1.0
 
@@ -150,6 +153,9 @@ target/debug/ocfleet enroll approve <join-request-id> \
 
 Enrollment tokens only create pending join requests. Agents do not receive
 peer or path-probe authorization until approval.
+Avoid passing enrollment tokens as command-line arguments; use `--token-file` or
+`--token-stdin` so the token is less likely to leak through shell history,
+process listings, or audit collection.
 
 Call the Phase 1 RPCs:
 
@@ -159,7 +165,7 @@ target/debug/ocfleet node info hk-ocserv-01
 target/debug/ocfleet probe ping hk-ocserv-01
 ```
 
-Call a one-hop controller-orchestrated path probe only after the source agent explicitly authorizes the controller/target pair in `security.path_probes` and the target agent explicitly allowlists the source in `security.peers`:
+Call a one-hop controller-orchestrated path probe only after the source agent explicitly authorizes the controller/target pair in `security.path_probes`, the source agent lists the target as an enabled `security.peers` entry, and the target agent explicitly allowlists the source in `security.peers`:
 
 ```bash
 target/debug/ocfleet probe path source-ocserv-01 target-ocserv-01
@@ -249,6 +255,9 @@ fingerprint are collected from fixed local paths declared in the agent config.
 The controller cannot supply paths, commands, service names, unit names, or
 journal selectors. Human output shortens fingerprints; use `--json` for the full
 typed SHA-256 values.
+On Unix, snapshot files must be private to owner and all ocserv provider files
+must be regular, single-link files owned by root or the agent user and not
+group/world writable.
 
 Phase 11 uses fixed RPC methods only. It does not add shell execution, raw
 command execution, raw file read RPCs, service reload/restart, session details,

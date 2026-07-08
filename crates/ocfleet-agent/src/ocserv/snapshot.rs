@@ -1,4 +1,3 @@
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use ocfleet_protocol::error::ErrorCode;
@@ -11,7 +10,10 @@ use ocfleet_protocol::ocserv::{
 use serde::Deserialize;
 use time::OffsetDateTime;
 
-use crate::ocserv::{OcservReadonlyError, OcservReadonlyProvider, sanitize};
+use crate::ocserv::{
+    OcservReadonlyError, OcservReadonlyProvider, sanitize,
+    trusted_file::{PermissionPolicy, read_bounded_trusted_file},
+};
 
 const SNAPSHOT_MAX_BYTES: u64 = 16 * 1024;
 
@@ -132,46 +134,12 @@ fn now_rfc3339() -> String {
 }
 
 fn read_private_snapshot(path: &Path) -> Result<Vec<u8>, OcservReadonlyError> {
-    let metadata = fs::symlink_metadata(path).map_err(|_| {
-        OcservReadonlyError::new(
-            ErrorCode::OcservProviderUnavailable,
-            "ocserv readonly snapshot is unavailable",
-        )
-    })?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(OcservReadonlyError::new(
-            ErrorCode::OcservProviderUnsafeSource,
-            "ocserv readonly snapshot source is unsafe",
-        ));
-    }
-    if metadata.len() > SNAPSHOT_MAX_BYTES {
-        return Err(OcservReadonlyError::new(
-            ErrorCode::OcservOutputBoundExceeded,
-            "ocserv readonly snapshot is too large",
-        ));
-    }
-    require_private_permissions(&metadata)?;
-    fs::read(path).map_err(|_| {
-        OcservReadonlyError::new(
-            ErrorCode::OcservProviderUnavailable,
-            "ocserv readonly snapshot is unavailable",
-        )
-    })
-}
-
-#[cfg(unix)]
-fn require_private_permissions(metadata: &fs::Metadata) -> Result<(), OcservReadonlyError> {
-    use std::os::unix::fs::PermissionsExt;
-    if metadata.permissions().mode() & 0o077 != 0 {
-        return Err(OcservReadonlyError::new(
-            ErrorCode::OcservProviderUnsafeSource,
-            "ocserv readonly snapshot source is unsafe",
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn require_private_permissions(_metadata: &fs::Metadata) -> Result<(), OcservReadonlyError> {
-    Ok(())
+    read_bounded_trusted_file(
+        path,
+        SNAPSHOT_MAX_BYTES,
+        PermissionPolicy::Private,
+        "ocserv readonly snapshot is unavailable",
+        "ocserv readonly snapshot source is unsafe",
+        "ocserv readonly snapshot is too large",
+    )
 }

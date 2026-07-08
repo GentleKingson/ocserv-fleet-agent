@@ -110,6 +110,12 @@ The snapshot file is not an RPC selector. It is local static agent config.
 Controller RPC params cannot override `snapshot_path`, certificate paths,
 config paths, service names, command names, unit names, or journal sources.
 
+On Unix, provider files are opened with no-symlink fd semantics and validated
+after open. Snapshot files must be regular, single-link, owned by root or the
+agent user, and private to owner (`0600` or stricter). Certificate and config
+fingerprint files may be group/world readable, but must be regular, single-link,
+owned by root or the agent user, and not group/world writable.
+
 ## Agent Config
 
 Default:

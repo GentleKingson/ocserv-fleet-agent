@@ -17,16 +17,21 @@ approval-based onboarding flow and explicit EndpointID lifecycle controls.
 2. An agent or operator submits a join request:
 
    ```bash
+   install -m 0600 /dev/null ./enrollment.token
+   # Put the plaintext token printed above into ./enrollment.token.
    ocfleet enroll request create \
-     --token <plaintext-token> \
+     --token-file ./enrollment.token \
      --agent-public-key <agent-public-key> \
      --fingerprint <agent-fingerprint> \
+     --requested-endpoint-id <agent-endpoint-id> \
      --hostname hk-ocserv-01 \
      --agent-version 0.1.0
    ```
 
    A valid token creates a `pending` join request only. It does not grant peer
-   or path-probe trust.
+   or path-probe trust. Prefer `--token-file` or `--token-stdin`; `--token`
+   remains available for compatibility but is discouraged because command-line
+   arguments can leak through shell history, process listings, and audit tools.
 
 3. A controller operator approves the request:
 

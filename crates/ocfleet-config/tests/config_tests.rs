@@ -1,5 +1,5 @@
 use ocfleet_config::agent::{
-    AgentConfig, ConfigError, OcservReadonlyProviderKind, validate_agent_config,
+    AgentConfig, ConfigError, OcservReadonlyProviderKind, load_agent_config, validate_agent_config,
 };
 use ocfleet_config::cli::{CliConfig, CliConfigError, load_cli_config, validate_cli_config};
 use ocfleet_config::validation::{validate_node_id, validate_region, validate_service_name};
@@ -83,6 +83,48 @@ fn temp_config_path(name: &str) -> PathBuf {
         "ocfleet-config-{name}-{}-{unique}.toml",
         std::process::id()
     ))
+}
+
+fn temp_private_dir(name: &str) -> PathBuf {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after unix epoch")
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "ocfleet-config-{name}-{}-{unique}",
+        std::process::id()
+    ));
+    fs::create_dir(&path).expect("create temp config dir");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).expect("chmod temp dir");
+    }
+    path
+}
+
+fn valid_agent_config_text() -> String {
+    let endpoint_id = iroh::SecretKey::generate().public().to_string();
+    format!(
+        r#"
+[node]
+id = "hk-ocserv-01"
+region = "hk"
+role = "ocserv"
+
+[iroh]
+secret_key_path = "/tmp/iroh.secret"
+
+[security]
+
+[[security.controllers]]
+endpoint_id = "{endpoint_id}"
+role = "viewer"
+
+[audit]
+path = "/tmp/ocfleet-audit.log"
+"#,
+    )
 }
 
 #[test]
@@ -232,6 +274,62 @@ fn agent_config_rejects_malformed_controller_endpoint_id() {
     ));
 }
 
+#[cfg(unix)]
+#[test]
+fn load_agent_config_rejects_group_writable_config_file() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = temp_private_dir("agent-config-mode");
+    let path = dir.join("agent.toml");
+    fs::write(&path, valid_agent_config_text()).expect("write config");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o620)).expect("chmod unsafe config");
+
+    let err = load_agent_config(&path).expect_err("unsafe config should fail closed");
+
+    assert!(matches!(err, ConfigError::Read(_)));
+    fs::remove_dir_all(dir).expect("cleanup temp dir");
+}
+
+#[cfg(unix)]
+#[test]
+fn load_agent_config_rejects_world_writable_parent_directory() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = temp_private_dir("agent-config-parent");
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o777)).expect("chmod unsafe parent");
+    let path = dir.join("agent.toml");
+    fs::write(&path, valid_agent_config_text()).expect("write config");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("chmod config");
+
+    let err = load_agent_config(&path).expect_err("unsafe parent should fail closed");
+
+    assert!(matches!(err, ConfigError::Read(_)));
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("restore temp dir mode");
+    fs::remove_dir_all(dir).expect("cleanup temp dir");
+}
+
+#[cfg(unix)]
+#[test]
+fn load_agent_config_rejects_symlink_and_hardlink_config_file() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = temp_private_dir("agent-config-links");
+    let real_path = dir.join("agent.toml");
+    let symlink_path = dir.join("agent-link.toml");
+    let hardlink_path = dir.join("agent-hardlink.toml");
+    fs::write(&real_path, valid_agent_config_text()).expect("write config");
+    fs::set_permissions(&real_path, fs::Permissions::from_mode(0o600)).expect("chmod config");
+    std::os::unix::fs::symlink(&real_path, &symlink_path).expect("create symlink");
+    fs::hard_link(&real_path, &hardlink_path).expect("create hardlink");
+
+    let symlink_err = load_agent_config(&symlink_path).expect_err("symlink config rejected");
+    let hardlink_err = load_agent_config(&real_path).expect_err("hardlinked config rejected");
+
+    assert!(matches!(symlink_err, ConfigError::Read(_)));
+    assert!(matches!(hardlink_err, ConfigError::Read(_)));
+    fs::remove_dir_all(dir).expect("cleanup temp dir");
+}
+
 #[test]
 fn agent_config_rejects_non_viewer_controller_role() {
     let mut config = valid_agent_config();
@@ -241,6 +339,51 @@ fn agent_config_rejects_non_viewer_controller_role() {
     assert!(matches!(
         err,
         ConfigError::Invalid(message) if message.contains("controller role")
+    ));
+}
+
+#[test]
+fn agent_config_rejects_path_probe_target_not_in_enabled_peers() {
+    let controller_endpoint_id = iroh::SecretKey::generate().public().to_string();
+    let missing_target_endpoint_id = iroh::SecretKey::generate().public().to_string();
+    let disabled_target_endpoint_id = iroh::SecretKey::generate().public().to_string();
+
+    let mut missing_peer_config = minimal_agent_config();
+    missing_peer_config.security.controllers = vec![ocfleet_config::agent::ControllerConfig {
+        endpoint_id: controller_endpoint_id.clone(),
+        role: "viewer".to_string(),
+    }];
+    missing_peer_config.security.path_probes = vec![ocfleet_config::agent::PathProbeConfig {
+        controller_endpoint_id: controller_endpoint_id.clone(),
+        target_endpoint_id: missing_target_endpoint_id,
+        enabled: true,
+    }];
+    let err = validate_agent_config(&missing_peer_config)
+        .expect_err("path probe target must be an enabled peer");
+    assert!(matches!(
+        err,
+        ConfigError::Invalid(message) if message.contains("security.peers")
+    ));
+
+    let mut disabled_peer_config = minimal_agent_config();
+    disabled_peer_config.security.controllers = vec![ocfleet_config::agent::ControllerConfig {
+        endpoint_id: controller_endpoint_id.clone(),
+        role: "viewer".to_string(),
+    }];
+    disabled_peer_config.security.peers = vec![ocfleet_config::agent::PeerConfig {
+        endpoint_id: disabled_target_endpoint_id.clone(),
+        enabled: false,
+    }];
+    disabled_peer_config.security.path_probes = vec![ocfleet_config::agent::PathProbeConfig {
+        controller_endpoint_id,
+        target_endpoint_id: disabled_target_endpoint_id,
+        enabled: true,
+    }];
+    let err = validate_agent_config(&disabled_peer_config)
+        .expect_err("path probe target must not be a disabled peer");
+    assert!(matches!(
+        err,
+        ConfigError::Invalid(message) if message.contains("enabled peer")
     ));
 }
 
@@ -852,6 +995,10 @@ secret_key_path = "/tmp/iroh.secret"
 endpoint_id = "{controller_endpoint_id}"
 role = "viewer"
 
+[[security.peers]]
+endpoint_id = "{target_endpoint_id}"
+enabled = true
+
 [[security.path_probes]]
 controller_endpoint_id = "{controller_endpoint_id}"
 target_endpoint_id = "{target_endpoint_id}"
@@ -894,6 +1041,10 @@ secret_key_path = "/tmp/iroh.secret"
 [[security.controllers]]
 endpoint_id = "{controller_endpoint_id}"
 role = "viewer"
+
+[[security.peers]]
+endpoint_id = "{target_endpoint_id}"
+enabled = true
 
 [[security.path_probes]]
 controller_endpoint_id = "{controller_endpoint_id}"
@@ -958,6 +1109,13 @@ fn agent_config_rejects_duplicate_path_probe_entry() {
         });
     config
         .security
+        .peers
+        .push(ocfleet_config::agent::PeerConfig {
+            endpoint_id: target_endpoint_id.clone(),
+            enabled: true,
+        });
+    config
+        .security
         .path_probes
         .push(ocfleet_config::agent::PathProbeConfig {
             controller_endpoint_id: controller_endpoint_id.clone(),
@@ -985,6 +1143,13 @@ fn agent_config_rejects_path_probe_controller_not_in_controllers() {
     let controller_endpoint_id = iroh::SecretKey::generate().public().to_string();
     let target_endpoint_id = iroh::SecretKey::generate().public().to_string();
     let mut config = minimal_agent_config();
+    config
+        .security
+        .peers
+        .push(ocfleet_config::agent::PeerConfig {
+            endpoint_id: target_endpoint_id.clone(),
+            enabled: true,
+        });
     config
         .security
         .path_probes

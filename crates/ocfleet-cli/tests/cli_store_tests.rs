@@ -560,6 +560,127 @@ fn approving_join_request_creates_active_endpoint_and_audit_before_after() {
 }
 
 #[test]
+fn submit_join_request_validates_agent_key_fingerprint_and_requested_endpoint() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("controller.sqlite");
+    let store = Store::open(&db).expect("store opens");
+    let token_plaintext = "ocfleet_enroll_validate_fields";
+
+    store
+        .create_enrollment_token(
+            &EnrollmentTokenInsert {
+                token_id: "tok-validate-fields".to_string(),
+                token_hash: Store::hash_enrollment_token(token_plaintext),
+                created_by: "operator".to_string(),
+                expires_at: future_time(),
+                max_uses: 10,
+                description: None,
+                labels_json: serde_json::json!({}),
+                scope_json: serde_json::json!({}),
+            },
+            "operator",
+        )
+        .expect("token created");
+
+    for (agent_public_key, fingerprint, requested_endpoint_id, expected_field) in [
+        (
+            "agent-public-key\ninjected",
+            "agent-fingerprint",
+            None,
+            "agent_public_key",
+        ),
+        ("agent-public-key", "", None, "fingerprint"),
+        (
+            "agent-public-key",
+            "agent-fingerprint",
+            Some("not-an-endpoint-id"),
+            "requested_endpoint_id",
+        ),
+    ] {
+        let err = store
+            .submit_join_request(
+                &JoinRequestInsert {
+                    token_plaintext: token_plaintext.to_string(),
+                    agent_public_key: agent_public_key.to_string(),
+                    fingerprint: fingerprint.to_string(),
+                    requested_endpoint_id: requested_endpoint_id.map(ToString::to_string),
+                    hostname: "hk-ocserv-01".to_string(),
+                    agent_version: "0.1.0".to_string(),
+                    requested_labels_json: serde_json::json!({}),
+                },
+                "agent",
+            )
+            .expect_err("invalid join request field rejected");
+
+        assert!(
+            matches!(err, StoreError::InvalidInput(ref message) if message.contains(expected_field)),
+            "unexpected error for {expected_field}: {err}"
+        );
+    }
+}
+
+#[test]
+fn approving_join_request_requires_requested_endpoint_match_when_present() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("controller.sqlite");
+    let store = Store::open(&db).expect("store opens");
+    let token_plaintext = "ocfleet_enroll_endpoint_binding";
+    let requested_endpoint_id = iroh::SecretKey::generate().public().to_string();
+    let different_endpoint_id = iroh::SecretKey::generate().public().to_string();
+
+    store
+        .create_enrollment_token(
+            &EnrollmentTokenInsert {
+                token_id: "tok-endpoint-binding".to_string(),
+                token_hash: Store::hash_enrollment_token(token_plaintext),
+                created_by: "operator".to_string(),
+                expires_at: future_time(),
+                max_uses: 1,
+                description: None,
+                labels_json: serde_json::json!({}),
+                scope_json: serde_json::json!({}),
+            },
+            "operator",
+        )
+        .expect("token created");
+    let join = store
+        .submit_join_request(
+            &JoinRequestInsert {
+                token_plaintext: token_plaintext.to_string(),
+                agent_public_key: "agent-public-key".to_string(),
+                fingerprint: "agent-fingerprint".to_string(),
+                requested_endpoint_id: Some(requested_endpoint_id.clone()),
+                hostname: "hk-ocserv-01".to_string(),
+                agent_version: "0.1.0".to_string(),
+                requested_labels_json: serde_json::json!({}),
+            },
+            "agent",
+        )
+        .expect("join request created");
+
+    let err = store
+        .approve_join_request(&ApprovalInput {
+            request_id: join.request_id,
+            endpoint_id: different_endpoint_id.clone(),
+            approved_by: "operator".to_string(),
+            reason: "ticket-123".to_string(),
+            approved_labels_json: serde_json::json!({}),
+        })
+        .expect_err("different endpoint id rejected");
+
+    assert!(
+        matches!(err, StoreError::InvalidInput(ref message) if message.contains("requested_endpoint_id")),
+        "unexpected approval error: {err}"
+    );
+    assert!(
+        store
+            .get_endpoint_trust(&different_endpoint_id)
+            .expect("query trust")
+            .is_none()
+    );
+}
+
+#[test]
 fn approving_join_request_rejects_non_canonical_endpoint_id() {
     let dir = tempfile::tempdir().expect("temp dir");
     let db = dir.path().join("controller.sqlite");
@@ -587,7 +708,7 @@ fn approving_join_request_rejects_non_canonical_endpoint_id() {
                 token_plaintext: token_plaintext.to_string(),
                 agent_public_key: "agent-public-key".to_string(),
                 fingerprint: "agent-fingerprint".to_string(),
-                requested_endpoint_id: Some("agent-claimed-endpoint".to_string()),
+                requested_endpoint_id: None,
                 hostname: "hk-ocserv-01".to_string(),
                 agent_version: "0.1.0".to_string(),
                 requested_labels_json: serde_json::json!({"hostname": "trusted-controller"}),

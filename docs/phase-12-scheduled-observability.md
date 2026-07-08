@@ -107,8 +107,9 @@ Only these methods are allowed in scheduled jobs:
 `probe.path.echo` is allowed only for explicitly configured source/target pairs.
 The scheduler must not enumerate the node registry to generate mesh pairs and
 must not infer path-probe authorization from topology, region, role, naming
-conventions, or past success. Source-side authorization remains
-`security.path_probes`; target-side authorization remains `security.peers`.
+conventions, or past success. Source-side authorization requires both
+`security.path_probes` and an enabled target entry in `security.peers`;
+target-side authorization remains `security.peers`.
 
 Unknown methods and known dangerous method names must be rejected at job
 creation time and again at run time. A scheduler implementation must use an

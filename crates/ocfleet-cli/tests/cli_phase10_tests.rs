@@ -3,7 +3,7 @@ use ocfleet_protocol::enrollment::{EndpointStatus, JoinRequestStatus};
 use rusqlite::Connection;
 use serde_json::Value;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 fn run_ocfleet(args: &[&str]) -> std::process::Output {
     let output = Command::new(env!("CARGO_BIN_EXE_ocfleet"))
@@ -29,6 +29,32 @@ fn run_ocfleet_failure(args: &[&str]) -> std::process::Output {
     assert!(
         !output.status.success(),
         "ocfleet unexpectedly succeeded: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
+}
+
+fn run_ocfleet_with_stdin(args: &[&str], stdin: &str) -> std::process::Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ocfleet"))
+        .args(args)
+        .env("USER", "phase10-user")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ocfleet");
+    {
+        use std::io::Write;
+        let mut child_stdin = child.stdin.take().expect("child stdin");
+        child_stdin
+            .write_all(stdin.as_bytes())
+            .expect("write token stdin");
+    }
+    let output = child.wait_with_output().expect("wait ocfleet");
+    assert!(
+        output.status.success(),
+        "ocfleet failed: stdout={} stderr={}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
@@ -159,6 +185,144 @@ fn enroll_approve_activates_pending_join_request() {
         .expect("load endpoint")
         .expect("endpoint exists");
     assert_eq!(endpoint.status, EndpointStatus::Active);
+}
+
+#[test]
+fn enroll_request_create_reads_token_from_file_and_stdin() {
+    for source in ["file", "stdin"] {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let database = dir.path().join(format!("{source}.sqlite"));
+        let database_arg = database.to_string_lossy().into_owned();
+        let token_plaintext = format!("request-token-{source}");
+        let store = Store::open(&database).expect("store opens");
+        store
+            .create_enrollment_token(
+                &EnrollmentTokenInsert {
+                    token_id: format!("tok-request-{source}"),
+                    token_hash: Store::hash_enrollment_token(&token_plaintext),
+                    created_by: "operator".to_string(),
+                    expires_at: "2099-01-01T00:00:00Z".to_string(),
+                    max_uses: 1,
+                    description: None,
+                    labels_json: serde_json::json!({}),
+                    scope_json: serde_json::json!({}),
+                },
+                "operator",
+            )
+            .expect("token created");
+        drop(store);
+
+        let token_file = dir.path().join("token.txt");
+        let token_file_arg = token_file.to_string_lossy().into_owned();
+        let mut args = vec![
+            "--database",
+            database_arg.as_str(),
+            "enroll",
+            "request",
+            "create",
+        ];
+        let output = if source == "file" {
+            std::fs::write(&token_file, format!("{token_plaintext}\n")).expect("write token file");
+            args.extend(["--token-file", token_file_arg.as_str()]);
+            args.extend([
+                "--agent-public-key",
+                "agent-public-key",
+                "--fingerprint",
+                "agent-fingerprint",
+                "--hostname",
+                "hk-ocserv-01",
+                "--agent-version",
+                "0.1.0",
+            ]);
+            run_ocfleet(&args)
+        } else {
+            args.extend(["--token-stdin"]);
+            args.extend([
+                "--agent-public-key",
+                "agent-public-key",
+                "--fingerprint",
+                "agent-fingerprint",
+                "--hostname",
+                "hk-ocserv-01",
+                "--agent-version",
+                "0.1.0",
+            ]);
+            run_ocfleet_with_stdin(&args, &format!("{token_plaintext}\n"))
+        };
+
+        let text = stdout(&output);
+        assert_eq!(field(&text, "status"), "pending");
+
+        let store = Store::open(&database).expect("store reopens");
+        let token = store
+            .get_enrollment_token(&format!("tok-request-{source}"))
+            .expect("load token")
+            .expect("token exists");
+        assert_eq!(token.used_count, 1);
+    }
+}
+
+#[test]
+fn enroll_approve_rejects_endpoint_mismatch_when_request_named_endpoint() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let database_arg = database.to_string_lossy().into_owned();
+    let token_plaintext = "approval-bound-token";
+    let requested_endpoint_id = iroh::SecretKey::generate().public().to_string();
+    let different_endpoint_id = iroh::SecretKey::generate().public().to_string();
+    let store = Store::open(&database).expect("store opens");
+    store
+        .create_enrollment_token(
+            &EnrollmentTokenInsert {
+                token_id: "tok-approve-bound".to_string(),
+                token_hash: Store::hash_enrollment_token(token_plaintext),
+                created_by: "operator".to_string(),
+                expires_at: "2099-01-01T00:00:00Z".to_string(),
+                max_uses: 1,
+                description: None,
+                labels_json: serde_json::json!({}),
+                scope_json: serde_json::json!({}),
+            },
+            "operator",
+        )
+        .expect("token created");
+    let join = store
+        .submit_join_request(
+            &JoinRequestInsert {
+                token_plaintext: token_plaintext.to_string(),
+                agent_public_key: "agent-public-key".to_string(),
+                fingerprint: "agent-fingerprint".to_string(),
+                requested_endpoint_id: Some(requested_endpoint_id.clone()),
+                hostname: "hk-ocserv-01".to_string(),
+                agent_version: "0.1.0".to_string(),
+                requested_labels_json: serde_json::json!({}),
+            },
+            "agent",
+        )
+        .expect("join request");
+    drop(store);
+
+    let output = run_ocfleet_failure(&[
+        "--database",
+        &database_arg,
+        "enroll",
+        "approve",
+        &join.request_id,
+        "--endpoint-id",
+        &different_endpoint_id,
+        "--reason",
+        "ticket-123",
+    ]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("requested_endpoint_id"));
+
+    let store = Store::open(&database).expect("store reopens");
+    assert!(
+        store
+            .get_endpoint_trust(&different_endpoint_id)
+            .expect("query endpoint")
+            .is_none()
+    );
 }
 
 #[test]

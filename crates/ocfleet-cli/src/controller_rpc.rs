@@ -21,6 +21,7 @@ use std::time::Instant;
 
 use crate::audit::AuditEvent;
 use crate::identity::{IdentityError, load_secret_key};
+use crate::input_validation::local_actor;
 use crate::ocserv_output::low_sensitive_ocserv_audit_message;
 use crate::rpc_client::{
     RpcClientError, bind_controller_endpoint, build_request, call_endpoint_addr,
@@ -1285,11 +1286,4 @@ fn unsupported_fixed_rpc_failure(method: &str) -> RpcCommandFailure {
             "method": method,
         }),
     )
-}
-
-fn local_actor() -> String {
-    match std::env::var("USER") {
-        Ok(actor) if !actor.trim().is_empty() => actor,
-        _ => "local-cli".to_string(),
-    }
 }

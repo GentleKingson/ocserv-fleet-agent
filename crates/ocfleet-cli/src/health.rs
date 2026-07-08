@@ -10,6 +10,7 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::args::HealthCommand;
 use crate::audit::AuditEvent;
+use crate::input_validation::local_actor;
 use crate::store::{HealthSnapshotRecord, NodeRecord, ProbeObservationRecord, Store};
 
 const STALE_THRESHOLD_SECONDS: u64 = 24 * 60 * 60;
@@ -469,11 +470,4 @@ fn now_rfc3339() -> String {
     OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .expect("RFC3339 formatting succeeds")
-}
-
-fn local_actor() -> String {
-    match std::env::var("USER") {
-        Ok(actor) if !actor.trim().is_empty() => actor,
-        _ => "local-cli".to_string(),
-    }
 }

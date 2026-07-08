@@ -12,9 +12,13 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
 use crate::audit::AuditEvent;
+use crate::input_validation::{
+    validate_actor, validate_agent_version, validate_description, validate_hostname,
+    validate_label_json, validate_reason,
+};
 use crate::private_file::{self, PrivateFileError};
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 5;
+pub const CURRENT_SCHEMA_VERSION: i64 = 6;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -36,6 +40,8 @@ pub enum StoreError {
     EndpointNotFound(String),
     #[error("endpoint already exists: {0}")]
     EndpointAlreadyExists(String),
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -393,8 +399,9 @@ impl Store {
               started_at TEXT NOT NULL,
               finished_at TEXT,
               status TEXT NOT NULL CHECK (status IN ('running', 'succeeded', 'failed', 'skipped')),
-              triggered_by TEXT NOT NULL,
-              summary_json TEXT NOT NULL CHECK (json_valid(summary_json))
+              triggered_by TEXT NOT NULL CHECK (triggered_by IN ('manual', 'scheduler.run.once')),
+              summary_json TEXT NOT NULL CHECK (json_valid(summary_json)),
+              FOREIGN KEY(job_id) REFERENCES observability_jobs(job_id) ON DELETE SET NULL
             );
 
             CREATE TABLE IF NOT EXISTS probe_observations (
@@ -409,7 +416,8 @@ impl Store {
               observed_at TEXT NOT NULL,
               expires_at TEXT,
               result_class TEXT NOT NULL CHECK (result_class IN ('controller_rpc_summary', 'low_sensitive_summary', 'scheduler_summary')),
-              summary_json TEXT NOT NULL CHECK (json_valid(summary_json))
+              summary_json TEXT NOT NULL CHECK (json_valid(summary_json)),
+              FOREIGN KEY(run_id) REFERENCES observability_runs(run_id) ON DELETE SET NULL
             );
 
             CREATE TABLE IF NOT EXISTS health_snapshots (
@@ -431,7 +439,7 @@ impl Store {
               node_id TEXT,
               severity TEXT NOT NULL CHECK (severity IN ('warning', 'critical')),
               state TEXT NOT NULL CHECK (state IN ('open', 'resolved', 'silenced')),
-              reason_code TEXT NOT NULL,
+              reason_code TEXT NOT NULL CHECK (reason_code IN ('NODE_UNREACHABLE', 'NODE_STALE', 'OCSERV_DEGRADED', 'CERT_EXPIRING_CRITICAL', 'CERT_EXPIRING_WARNING', 'ENDPOINT_INACTIVE')),
               first_seen_at TEXT NOT NULL,
               last_seen_at TEXT NOT NULL,
               last_sent_at TEXT,
@@ -448,6 +456,7 @@ impl Store {
             "#,
         )?;
         rebuild_observability_v4_tables_if_needed(&tx)?;
+        tx.execute_batch(OBSERVABILITY_INDEX_SQL)?;
         tx.execute(
             "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, strftime('%Y-%m-%dT%H:%M:%SZ','now'))",
             [CURRENT_SCHEMA_VERSION],
@@ -1046,6 +1055,13 @@ impl Store {
         token: &EnrollmentTokenInsert,
         actor: &str,
     ) -> Result<(), StoreError> {
+        validate_actor(&token.created_by).map_err(StoreError::InvalidInput)?;
+        validate_actor(actor).map_err(StoreError::InvalidInput)?;
+        if let Some(description) = &token.description {
+            validate_description(description).map_err(StoreError::InvalidInput)?;
+        }
+        validate_label_json(&token.labels_json, "labels").map_err(StoreError::InvalidInput)?;
+        validate_label_json(&token.scope_json, "scope").map_err(StoreError::InvalidInput)?;
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
             "INSERT INTO enrollment_tokens
@@ -1105,6 +1121,11 @@ impl Store {
         request: &JoinRequestInsert,
         actor: &str,
     ) -> Result<JoinRequestRecord, StoreError> {
+        validate_actor(actor).map_err(StoreError::InvalidInput)?;
+        validate_hostname(&request.hostname).map_err(StoreError::InvalidInput)?;
+        validate_agent_version(&request.agent_version).map_err(StoreError::InvalidInput)?;
+        validate_label_json(&request.requested_labels_json, "requested_labels")
+            .map_err(StoreError::InvalidInput)?;
         let tx = self.conn.unchecked_transaction()?;
         let token_hash = Self::hash_enrollment_token(&request.token_plaintext);
         let token = tx
@@ -1217,6 +1238,10 @@ impl Store {
         &self,
         approval: &ApprovalInput,
     ) -> Result<JoinRequestRecord, StoreError> {
+        validate_actor(&approval.approved_by).map_err(StoreError::InvalidInput)?;
+        validate_reason(&approval.reason).map_err(StoreError::InvalidInput)?;
+        validate_label_json(&approval.approved_labels_json, "approved_labels")
+            .map_err(StoreError::InvalidInput)?;
         let tx = self.conn.unchecked_transaction()?;
         let before = get_join_request_tx(&tx, &approval.request_id)?
             .ok_or_else(|| StoreError::JoinRequestNotFound(approval.request_id.clone()))?;
@@ -1304,6 +1329,8 @@ impl Store {
         actor: &str,
         reason: &str,
     ) -> Result<EndpointTrustRecord, StoreError> {
+        validate_actor(actor).map_err(StoreError::InvalidInput)?;
+        validate_reason(reason).map_err(StoreError::InvalidInput)?;
         let tx = self.conn.unchecked_transaction()?;
         let old_before = get_endpoint_trust_tx(&tx, old_endpoint_id)?
             .ok_or_else(|| StoreError::EndpointNotFound(old_endpoint_id.to_string()))?;
@@ -1427,6 +1454,8 @@ impl Store {
         reason: &str,
         action: &str,
     ) -> Result<EndpointTrustRecord, StoreError> {
+        validate_actor(actor).map_err(StoreError::InvalidInput)?;
+        validate_reason(reason).map_err(StoreError::InvalidInput)?;
         let tx = self.conn.unchecked_transaction()?;
         let before = get_endpoint_trust_tx(&tx, endpoint_id)?
             .ok_or_else(|| StoreError::EndpointNotFound(endpoint_id.to_string()))?;
@@ -1469,14 +1498,10 @@ fn rebuild_observability_v4_tables_if_needed(tx: &Transaction<'_>) -> Result<(),
         ),
         (
             "observability_runs",
-            "status TEXT NOT NULL CHECK",
+            "triggered_by TEXT NOT NULL CHECK",
             "run status",
         ),
-        (
-            "probe_observations",
-            "result_class TEXT NOT NULL CHECK",
-            "result class",
-        ),
+        ("probe_observations", "FOREIGN KEY(run_id)", "result class"),
         (
             "health_snapshots",
             "status TEXT NOT NULL CHECK",
@@ -1484,7 +1509,7 @@ fn rebuild_observability_v4_tables_if_needed(tx: &Transaction<'_>) -> Result<(),
         ),
         (
             "alert_events",
-            "severity TEXT NOT NULL CHECK",
+            "reason_code TEXT NOT NULL CHECK",
             "alert severity",
         ),
         (
@@ -1517,6 +1542,17 @@ fn table_sql(tx: &Transaction<'_>, table: &str) -> Result<String, StoreError> {
         .optional()?
         .unwrap_or_default())
 }
+
+const OBSERVABILITY_INDEX_SQL: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_observability_jobs_enabled_next_run_at
+  ON observability_jobs(enabled, next_run_at);
+CREATE INDEX IF NOT EXISTS idx_probe_observations_node_observed_at
+  ON probe_observations(node_id, observed_at);
+CREATE INDEX IF NOT EXISTS idx_probe_observations_run_id
+  ON probe_observations(run_id);
+CREATE INDEX IF NOT EXISTS idx_alert_events_state_last_seen_at
+  ON alert_events(state, last_seen_at);
+"#;
 
 const OBSERVABILITY_V4_REBUILD_SQL: &str = r#"
 ALTER TABLE observability_jobs RENAME TO observability_jobs_legacy_v3;
@@ -1554,14 +1590,19 @@ CREATE TABLE observability_runs (
   started_at TEXT NOT NULL,
   finished_at TEXT,
   status TEXT NOT NULL CHECK (status IN ('running', 'succeeded', 'failed', 'skipped')),
-  triggered_by TEXT NOT NULL,
-  summary_json TEXT NOT NULL CHECK (json_valid(summary_json))
+  triggered_by TEXT NOT NULL CHECK (triggered_by IN ('manual', 'scheduler.run.once')),
+  summary_json TEXT NOT NULL CHECK (json_valid(summary_json)),
+  FOREIGN KEY(job_id) REFERENCES observability_jobs(job_id) ON DELETE SET NULL
 );
 INSERT INTO observability_runs
   (run_id, job_id, started_at, finished_at, status, triggered_by, summary_json)
 SELECT run_id, job_id, started_at, finished_at, status, triggered_by, summary_json
 FROM observability_runs_legacy_v3
 WHERE status IN ('running', 'succeeded', 'failed', 'skipped')
+  AND triggered_by IN ('manual', 'scheduler.run.once')
+  AND (job_id IS NULL OR EXISTS (
+    SELECT 1 FROM observability_jobs WHERE observability_jobs.job_id = observability_runs_legacy_v3.job_id
+  ))
   AND json_valid(summary_json);
 DROP TABLE observability_runs_legacy_v3;
 
@@ -1578,7 +1619,8 @@ CREATE TABLE probe_observations (
   observed_at TEXT NOT NULL,
   expires_at TEXT,
   result_class TEXT NOT NULL CHECK (result_class IN ('controller_rpc_summary', 'low_sensitive_summary', 'scheduler_summary')),
-  summary_json TEXT NOT NULL CHECK (json_valid(summary_json))
+  summary_json TEXT NOT NULL CHECK (json_valid(summary_json)),
+  FOREIGN KEY(run_id) REFERENCES observability_runs(run_id) ON DELETE SET NULL
 );
 INSERT INTO probe_observations
   (observation_id, run_id, node_id, endpoint_id, method, ok, error_code, duration_ms, observed_at, expires_at, result_class, summary_json)
@@ -1588,6 +1630,9 @@ WHERE method IN ('probe.controller.ping', 'probe.path.echo', 'ocserv.service.sum
   AND (ok IS NULL OR ok IN (0, 1))
   AND (duration_ms IS NULL OR duration_ms >= 0)
   AND result_class IN ('controller_rpc_summary', 'low_sensitive_summary', 'scheduler_summary')
+  AND (run_id IS NULL OR EXISTS (
+    SELECT 1 FROM observability_runs WHERE observability_runs.run_id = probe_observations_legacy_v3.run_id
+  ))
   AND json_valid(summary_json);
 DROP TABLE probe_observations_legacy_v3;
 
@@ -1621,7 +1666,7 @@ CREATE TABLE alert_events (
   node_id TEXT,
   severity TEXT NOT NULL CHECK (severity IN ('warning', 'critical')),
   state TEXT NOT NULL CHECK (state IN ('open', 'resolved', 'silenced')),
-  reason_code TEXT NOT NULL,
+  reason_code TEXT NOT NULL CHECK (reason_code IN ('NODE_UNREACHABLE', 'NODE_STALE', 'OCSERV_DEGRADED', 'CERT_EXPIRING_CRITICAL', 'CERT_EXPIRING_WARNING', 'ENDPOINT_INACTIVE')),
   first_seen_at TEXT NOT NULL,
   last_seen_at TEXT NOT NULL,
   last_sent_at TEXT,
@@ -1634,6 +1679,7 @@ SELECT alert_id, dedupe_key, node_id, severity, state, reason_code, first_seen_a
 FROM alert_events_legacy_v3
 WHERE severity IN ('warning', 'critical')
   AND state IN ('open', 'resolved', 'silenced')
+  AND reason_code IN ('NODE_UNREACHABLE', 'NODE_STALE', 'OCSERV_DEGRADED', 'CERT_EXPIRING_CRITICAL', 'CERT_EXPIRING_WARNING', 'ENDPOINT_INACTIVE')
   AND json_valid(detail_json);
 DROP TABLE alert_events_legacy_v3;
 
@@ -1863,7 +1909,8 @@ fn map_private_file_error(err: PrivateFileError) -> StoreError {
         PrivateFileError::Io(err) => StoreError::Io(err),
         PrivateFileError::MissingParent
         | PrivateFileError::UnsafeParent
-        | PrivateFileError::UnsafeFile => StoreError::UnsafePermissions,
+        | PrivateFileError::UnsafeFile
+        | PrivateFileError::UnsupportedPlatform => StoreError::UnsafePermissions,
     }
 }
 

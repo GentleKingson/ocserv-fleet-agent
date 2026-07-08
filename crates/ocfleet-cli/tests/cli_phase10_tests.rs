@@ -161,6 +161,59 @@ fn enroll_approve_activates_pending_join_request() {
 }
 
 #[test]
+fn enroll_request_create_rejects_control_characters_in_agent_fields() {
+    for (hostname, agent_version) in [
+        ("hk-ocserv-01\nadmin", "0.1.0"),
+        ("hk-ocserv-01", "\x1b[31m0.1.0"),
+    ] {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let database = dir.path().join("controller.sqlite");
+        let database_arg = database.to_string_lossy().into_owned();
+        let token_plaintext = "request-token";
+        let store = Store::open(&database).expect("store opens");
+        store
+            .create_enrollment_token(
+                &EnrollmentTokenInsert {
+                    token_id: "tok-request".to_string(),
+                    token_hash: Store::hash_enrollment_token(token_plaintext),
+                    created_by: "operator".to_string(),
+                    expires_at: "2099-01-01T00:00:00Z".to_string(),
+                    max_uses: 1,
+                    description: None,
+                    labels_json: serde_json::json!({}),
+                    scope_json: serde_json::json!({}),
+                },
+                "operator",
+            )
+            .expect("token created");
+        drop(store);
+
+        let output = run_ocfleet_failure(&[
+            "--database",
+            &database_arg,
+            "enroll",
+            "request",
+            "create",
+            "--token",
+            token_plaintext,
+            "--agent-public-key",
+            "agent-public-key",
+            "--fingerprint",
+            "agent-fingerprint",
+            "--hostname",
+            hostname,
+            "--agent-version",
+            agent_version,
+        ]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("hostname") || stderr.contains("agent_version"),
+            "stderr did not name rejected field: {stderr}"
+        );
+    }
+}
+
+#[test]
 fn endpoint_lifecycle_commands_write_audit_and_update_registry() {
     let dir = tempfile::tempdir().expect("temp dir");
     let database = dir.path().join("controller.sqlite");

@@ -13,14 +13,14 @@ fn open_temp_store() -> (tempfile::TempDir, Store, std::path::PathBuf) {
 }
 
 #[test]
-fn observability_store_tests_new_database_uses_schema_version_4() {
+fn observability_store_tests_new_database_uses_schema_version_6() {
     let (_dir, store, _db) = open_temp_store();
 
     assert_eq!(
         store.current_schema_version().expect("version"),
         CURRENT_SCHEMA_VERSION
     );
-    assert_eq!(CURRENT_SCHEMA_VERSION, 5);
+    assert_eq!(CURRENT_SCHEMA_VERSION, 6);
 }
 
 #[test]
@@ -89,7 +89,7 @@ fn observability_store_tests_inserts_and_lists_probe_observation() {
     let (_dir, store, _db) = open_temp_store();
     let observation = ProbeObservationInsert {
         observation_id: "obs-1".to_string(),
-        run_id: Some("run-1".to_string()),
+        run_id: None,
         node_id: Some("hk-ocserv-01".to_string()),
         endpoint_id: Some("endpoint-1".to_string()),
         method: "ocserv.sessions.summary".to_string(),
@@ -123,7 +123,7 @@ fn observability_store_tests_insert_and_finish_observability_run() {
     let (_dir, store, db) = open_temp_store();
     let run = ObservabilityRunInsert {
         run_id: "run-1".to_string(),
-        job_id: Some("job-1".to_string()),
+        job_id: None,
         started_at: "2026-07-08T07:30:00Z".to_string(),
         finished_at: None,
         status: "running".to_string(),
@@ -203,7 +203,7 @@ fn observability_store_tests_upserts_and_lists_alert_event() {
         node_id: Some("hk-ocserv-01".to_string()),
         severity: "warning".to_string(),
         state: "open".to_string(),
-        reason_code: "CERT_EXPIRING".to_string(),
+        reason_code: "CERT_EXPIRING_WARNING".to_string(),
         first_seen_at: "2026-07-08T07:00:00Z".to_string(),
         last_seen_at: "2026-07-08T07:00:00Z".to_string(),
         last_sent_at: None,
@@ -289,6 +289,92 @@ fn observability_store_tests_invalid_bool_rejected_by_db() {
         .expect_err("invalid bool must be rejected");
 
     assert!(err.to_string().contains("CHECK"));
+}
+
+#[test]
+fn observability_store_tests_rejects_invalid_triggered_by_and_reason_code() {
+    let (_dir, _store, db) = open_temp_store();
+    let conn = Connection::open(db).expect("open db");
+
+    let run_err = conn
+        .execute(
+            "INSERT INTO observability_runs
+             (run_id, job_id, started_at, status, triggered_by, summary_json)
+             VALUES ('run-bad', NULL, '2026-07-08T00:00:00Z', 'running', 'shell.exec', '{}')",
+            [],
+        )
+        .expect_err("invalid triggered_by must be rejected");
+    assert!(run_err.to_string().contains("CHECK"));
+
+    let alert_err = conn
+        .execute(
+            "INSERT INTO alert_events
+             (alert_id, dedupe_key, severity, state, reason_code, first_seen_at, last_seen_at, detail_json)
+             VALUES ('alert-bad', 'alert:bad', 'warning', 'open', 'SHELL_EXEC', '2026-07-08T00:00:00Z', '2026-07-08T00:00:00Z', '{}')",
+            [],
+        )
+        .expect_err("invalid reason_code must be rejected");
+    assert!(alert_err.to_string().contains("CHECK"));
+}
+
+#[test]
+fn observability_store_tests_enforces_observability_foreign_keys() {
+    let (_dir, store, _db) = open_temp_store();
+
+    let run = ObservabilityRunInsert {
+        run_id: "run-orphan".to_string(),
+        job_id: Some("missing-job".to_string()),
+        started_at: "2026-07-08T07:30:00Z".to_string(),
+        finished_at: None,
+        status: "running".to_string(),
+        triggered_by: "scheduler.run.once".to_string(),
+        summary_json: json!({"started": true}),
+    };
+    let err = store
+        .insert_observability_run(&run)
+        .expect_err("orphaned job_id must be rejected");
+    assert!(err.to_string().contains("FOREIGN KEY"));
+
+    let observation = ProbeObservationInsert {
+        observation_id: "obs-orphan".to_string(),
+        run_id: Some("missing-run".to_string()),
+        node_id: Some("hk-ocserv-01".to_string()),
+        endpoint_id: Some("endpoint-1".to_string()),
+        method: "probe.controller.ping".to_string(),
+        ok: Some(true),
+        error_code: None,
+        duration_ms: Some(42),
+        observed_at: "2026-07-08T07:30:00Z".to_string(),
+        expires_at: None,
+        result_class: "controller_rpc_summary".to_string(),
+        summary_json: json!({"message": "pong"}),
+    };
+    let err = store
+        .insert_probe_observation(&observation)
+        .expect_err("orphaned run_id must be rejected");
+    assert!(err.to_string().contains("FOREIGN KEY"));
+}
+
+#[test]
+fn observability_store_tests_creates_scheduler_history_and_alert_indexes() {
+    let (_dir, _store, db) = open_temp_store();
+    let conn = Connection::open(db).expect("open db");
+
+    for index in [
+        "idx_observability_jobs_enabled_next_run_at",
+        "idx_probe_observations_node_observed_at",
+        "idx_probe_observations_run_id",
+        "idx_alert_events_state_last_seen_at",
+    ] {
+        let count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                [index],
+                |row| row.get(0),
+            )
+            .expect("query index");
+        assert_eq!(count, 1, "missing index {index}");
+    }
 }
 
 #[test]

@@ -41,7 +41,7 @@ fn insert_observation(store: &Store, observation_id: &str, observed_at: &str) {
     store
         .insert_probe_observation(&ProbeObservationInsert {
             observation_id: observation_id.to_string(),
-            run_id: Some("run-1".to_string()),
+            run_id: None,
             node_id: Some("hk-ocserv-01".to_string()),
             endpoint_id: Some("endpoint-1".to_string()),
             method: "probe.controller.ping".to_string(),
@@ -78,7 +78,7 @@ fn insert_old_health_and_alert(store: &Store) {
             node_id: Some("hk-ocserv-01".to_string()),
             severity: "warning".to_string(),
             state: "open".to_string(),
-            reason_code: "STALE".to_string(),
+            reason_code: "NODE_STALE".to_string(),
             first_seen_at: "2026-01-01T00:00:00Z".to_string(),
             last_seen_at: "2026-01-01T00:00:00Z".to_string(),
             last_sent_at: None,

@@ -5,6 +5,7 @@ pub mod controller_rpc;
 pub mod doctor;
 pub mod health;
 pub mod identity;
+pub mod input_validation;
 pub mod ocserv_output;
 pub mod private_file;
 pub mod rpc_client;

@@ -20,6 +20,7 @@ use crate::controller_rpc::{
     hash_json_value, inactive_endpoint_status, low_sensitive_ocserv_observation_summary,
     write_rpc_audit,
 };
+use crate::input_validation::{local_actor, validate_selector};
 use crate::store::{ObservabilityJobRecord, ObservabilityRunInsert, ProbeObservationInsert, Store};
 
 const DEFAULT_SELECTOR: &str = "role=ocserv";
@@ -759,6 +760,7 @@ fn build_selectors(
                 bail!("--source-node-id and --target-node-id are only valid for path-probe jobs");
             }
             let selector = selector.unwrap_or_else(|| DEFAULT_SELECTOR.to_string());
+            validate_selector(&selector).map_err(anyhow::Error::msg)?;
             Ok((selector, None))
         }
     }
@@ -1044,6 +1046,7 @@ fn selector_label(job: &ObservabilityJobRecord) -> anyhow::Result<&str> {
     if selector.trim().is_empty() {
         bail!("scheduler job selector is empty");
     }
+    validate_selector(selector).map_err(anyhow::Error::msg)?;
     Ok(selector)
 }
 
@@ -1095,13 +1098,6 @@ fn offset_to_rfc3339(value: OffsetDateTime) -> String {
 
 fn observation_id() -> String {
     format!("obs-{}", Uuid::new_v4().simple())
-}
-
-fn local_actor() -> String {
-    match std::env::var("USER") {
-        Ok(actor) if !actor.trim().is_empty() => actor,
-        _ => "local-cli".to_string(),
-    }
 }
 
 async fn shutdown_signal() {

@@ -199,6 +199,41 @@ fn alert_hooks_tests_silence_writes_audit() {
 }
 
 #[test]
+fn alert_hooks_tests_reject_reason_control_characters_and_overlong_text() {
+    for (command, reason) in [
+        ("silence".to_string(), "maintenance\nopen".to_string()),
+        ("resolve".to_string(), "\x1b[31mresolved".to_string()),
+        ("silence".to_string(), "a".repeat(257)),
+    ] {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let database = dir.path().join("controller.sqlite");
+        let database_arg = database.to_string_lossy().into_owned();
+        let store = Store::open(&database).expect("open store");
+        seed_alert(&store, "node:hk-ocserv-01:node_stale");
+        drop(store);
+
+        let mut args = vec![
+            "--database",
+            &database_arg,
+            "alert",
+            command.as_str(),
+            "node:hk-ocserv-01:node_stale",
+        ];
+        if command == "silence" {
+            args.extend(["--for-duration", "1h"]);
+        }
+        args.extend(["--reason", reason.as_str()]);
+
+        let output = run_ocfleet_failure(&args);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("reason"),
+            "stderr did not name reason: {stderr}"
+        );
+    }
+}
+
+#[test]
 fn alert_hooks_tests_silenced_alert_stays_silenced_while_active_candidate_exists() {
     let dir = tempfile::tempdir().expect("temp dir");
     let database = dir.path().join("controller.sqlite");

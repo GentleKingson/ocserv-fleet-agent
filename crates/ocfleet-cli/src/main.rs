@@ -17,6 +17,9 @@ use ocfleet_cli::controller_rpc::{
 use ocfleet_cli::doctor::{DoctorOptions, format_human, run_doctor};
 use ocfleet_cli::health::run_health_command;
 use ocfleet_cli::identity::load_or_create_secret_key_with_status;
+use ocfleet_cli::input_validation::{
+    local_actor, validate_agent_version, validate_description, validate_hostname, validate_reason,
+};
 use ocfleet_cli::ocserv_output::{
     OcservStatusView, assert_low_sensitive_ocserv_output, format_cert_human, format_sessions_human,
     format_status_json, format_status_view_human,
@@ -45,13 +48,6 @@ use std::path::Path;
 use std::time::Instant;
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
-
-fn local_actor() -> String {
-    match std::env::var("USER") {
-        Ok(actor) if !actor.trim().is_empty() => actor,
-        _ => "local-cli".to_string(),
-    }
-}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -344,6 +340,9 @@ fn run_enroll_token_create(
     if max_uses == 0 {
         bail!("--max-uses must be greater than zero");
     }
+    if let Some(description) = &description {
+        validate_description(description).map_err(anyhow::Error::msg)?;
+    }
     let ttl = parse_ttl(ttl)?;
     let token_id = format!("tok-{}", Uuid::new_v4());
     let token = format!("ocfleet_enroll_{}", Uuid::new_v4().simple());
@@ -379,6 +378,7 @@ fn run_enroll_approve(
     endpoint_id: &str,
     reason: &str,
 ) -> anyhow::Result<()> {
+    validate_reason(reason).map_err(anyhow::Error::msg)?;
     let approved = store.approve_join_request(&ApprovalInput {
         request_id: join_request_id.to_string(),
         endpoint_id: endpoint_id.to_string(),
@@ -404,6 +404,8 @@ fn run_enroll_request_create(
     hostname: String,
     agent_version: String,
 ) -> anyhow::Result<()> {
+    validate_hostname(&hostname).map_err(anyhow::Error::msg)?;
+    validate_agent_version(&agent_version).map_err(anyhow::Error::msg)?;
     let join = store.submit_join_request(
         &JoinRequestInsert {
             token_plaintext: token,

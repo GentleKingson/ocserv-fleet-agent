@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 use crate::args::AlertCommand;
 use crate::audit::AuditEvent;
+use crate::input_validation::{local_actor, validate_reason};
 use crate::store::{AlertEventRecord, ProbeObservationRecord, Store};
 
 const OBSERVATION_READ_LIMIT: u64 = 1_000;
@@ -91,6 +92,7 @@ fn run_alert_silence(
     for_duration: &str,
     reason: &str,
 ) -> anyhow::Result<()> {
+    validate_reason(reason).map_err(anyhow::Error::msg)?;
     let until = (OffsetDateTime::now_utc() + parse_duration(for_duration)?)
         .format(&Rfc3339)
         .expect("RFC3339 formatting succeeds");
@@ -121,6 +123,7 @@ fn run_alert_silence(
 }
 
 fn run_alert_resolve(store: &Store, dedupe_key: &str, reason: &str) -> anyhow::Result<()> {
+    validate_reason(reason).map_err(anyhow::Error::msg)?;
     let now = now_rfc3339();
     let mut alert = find_alert(store, dedupe_key)?;
     alert.state = "resolved".to_string();
@@ -584,11 +587,4 @@ fn now_rfc3339() -> String {
     OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .expect("RFC3339 formatting succeeds")
-}
-
-fn local_actor() -> String {
-    match std::env::var("USER") {
-        Ok(actor) if !actor.trim().is_empty() => actor,
-        _ => "local-cli".to_string(),
-    }
 }

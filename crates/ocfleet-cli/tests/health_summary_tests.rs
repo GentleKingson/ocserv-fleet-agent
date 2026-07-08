@@ -64,7 +64,7 @@ fn insert_observation(store: &Store, fixture: ObservationFixture<'_>) {
     store
         .insert_probe_observation(&ProbeObservationInsert {
             observation_id: fixture.observation_id.to_string(),
-            run_id: Some("run-1".to_string()),
+            run_id: None,
             node_id: Some(fixture.node_id.to_string()),
             endpoint_id: Some(endpoint_id),
             method: fixture.method.to_string(),

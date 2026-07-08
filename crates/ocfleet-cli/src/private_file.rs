@@ -1,6 +1,10 @@
-use std::fs::{self, File};
+#[cfg(unix)]
+use std::fs;
+use std::fs::File;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PrivateFileError {
@@ -12,6 +16,8 @@ pub enum PrivateFileError {
     UnsafeParent,
     #[error("private file permissions are unsafe")]
     UnsafeFile,
+    #[error("private file protection is unsupported on this platform")]
+    UnsupportedPlatform,
 }
 
 pub fn open_private_create_new(path: &Path) -> Result<File, PrivateFileError> {
@@ -143,16 +149,12 @@ fn validate_private_file_handle(file: &File) -> Result<(), PrivateFileError> {
 
 #[cfg(not(unix))]
 fn open_private_create_new_impl(path: &Path) -> Result<File, PrivateFileError> {
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        fs::create_dir_all(parent)?;
-    }
-    Ok(fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)?)
+    let _ = path;
+    Err(PrivateFileError::UnsupportedPlatform)
 }
 
 #[cfg(not(unix))]
 fn open_existing_private_read_impl(path: &Path) -> Result<File, PrivateFileError> {
-    Ok(fs::OpenOptions::new().read(true).open(path)?)
+    let _ = path;
+    Err(PrivateFileError::UnsupportedPlatform)
 }

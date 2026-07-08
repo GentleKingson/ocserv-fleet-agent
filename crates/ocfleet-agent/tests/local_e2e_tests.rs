@@ -77,8 +77,38 @@ impl LocalAgentHarness {
     }
 }
 
+macro_rules! skip_if_local_iroh_unavailable {
+    () => {
+        if local_iroh_unavailable().await {
+            return;
+        }
+    };
+}
+
+async fn local_iroh_unavailable() -> bool {
+    match bind_controller_endpoint_local_only(SecretKey::generate()).await {
+        Ok(endpoint) => {
+            endpoint.close().await;
+            false
+        }
+        Err(err) if err.code() == ErrorCode::ConnectFailed && is_restricted_netmon_error(&err) => {
+            eprintln!("skipping local iroh e2e test: {err}");
+            true
+        }
+        Err(err) => panic!("local iroh preflight failed: {err:#?}"),
+    }
+}
+
+fn is_restricted_netmon_error(err: &ocfleet_cli::rpc_client::RpcClientError) -> bool {
+    let message = format!("{err}\n{err:#?}");
+    message.contains("Failed to create netmon monitor")
+        || (message.contains("netmon") && message.contains("Operation not permitted"))
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_controller_can_ping_and_get_node_info() {
+    skip_if_local_iroh_unavailable!();
+
     let dir = tempfile::tempdir().expect("temp dir");
     let controller_key = SecretKey::generate();
     let agent_key = SecretKey::generate();
@@ -131,6 +161,8 @@ async fn local_controller_can_ping_and_get_node_info() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_controller_can_run_controller_probe_ping() {
+    skip_if_local_iroh_unavailable!();
+
     let dir = tempfile::tempdir().expect("temp dir");
     let controller_key = SecretKey::generate();
     let agent_key = SecretKey::generate();
@@ -195,6 +227,8 @@ async fn local_controller_can_run_controller_probe_ping() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_agent_rejects_known_and_unknown_disallowed_methods() {
+    skip_if_local_iroh_unavailable!();
+
     let dir = tempfile::tempdir().expect("temp dir");
     let harness = spawn_local_agent(SecretKey::generate(), SecretKey::generate(), &dir).await;
 
@@ -215,6 +249,8 @@ async fn local_agent_rejects_known_and_unknown_disallowed_methods() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_agent_ocserv_readonly_audit_is_low_sensitive_summary_for_fixed_methods() {
+    skip_if_local_iroh_unavailable!();
+
     let dir = tempfile::tempdir().expect("temp dir");
     let harness =
         spawn_local_agent_with_ocserv_snapshot(SecretKey::generate(), SecretKey::generate(), &dir)
@@ -267,6 +303,8 @@ async fn local_agent_ocserv_readonly_audit_is_low_sensitive_summary_for_fixed_me
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_agent_rejects_replayed_nonce() {
+    skip_if_local_iroh_unavailable!();
+
     let dir = tempfile::tempdir().expect("temp dir");
     let harness = spawn_local_agent(SecretKey::generate(), SecretKey::generate(), &dir).await;
     let request = build_request(NODE_PING, json!({}), Some("local-cli".into()), 5_000);
@@ -301,6 +339,8 @@ async fn local_agent_rejects_replayed_nonce() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_agent_rejects_expired_request() {
+    skip_if_local_iroh_unavailable!();
+
     let dir = tempfile::tempdir().expect("temp dir");
     let harness = spawn_local_agent(SecretKey::generate(), SecretKey::generate(), &dir).await;
     let mut request = build_request(NODE_PING, json!({}), Some("local-cli".into()), 5_000);
@@ -336,6 +376,8 @@ async fn local_agent_rejects_expired_request() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_agent_rejects_unauthorized_controller() {
+    skip_if_local_iroh_unavailable!();
+
     let dir = tempfile::tempdir().expect("temp dir");
     let authorized_controller_key = SecretKey::generate();
     let harness = spawn_local_agent(authorized_controller_key, SecretKey::generate(), &dir).await;
@@ -369,6 +411,8 @@ async fn local_agent_rejects_unauthorized_controller() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_agent_rejects_disabled_peer_at_connection_admission() {
+    skip_if_local_iroh_unavailable!();
+
     let dir = tempfile::tempdir().expect("temp dir");
     let controller_key = SecretKey::generate();
     let disabled_peer_key = SecretKey::generate();
@@ -421,6 +465,8 @@ async fn local_agent_rejects_disabled_peer_at_connection_admission() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_peer_echo_helper_calls_authorized_target_and_writes_both_audits() {
+    skip_if_local_iroh_unavailable!();
+
     let dir = tempfile::tempdir().expect("temp dir");
     let controller_key = SecretKey::generate();
     let target_key = SecretKey::generate();
@@ -518,6 +564,8 @@ async fn local_peer_echo_helper_calls_authorized_target_and_writes_both_audits()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_peer_connection_cannot_call_controller_only_method() {
+    skip_if_local_iroh_unavailable!();
+
     let dir = tempfile::tempdir().expect("temp dir");
     let source_key = SecretKey::generate();
     let source_id = source_key.public();
@@ -567,6 +615,8 @@ async fn local_peer_connection_cannot_call_controller_only_method() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_controller_can_run_one_hop_path_probe_and_link_three_audits() {
+    skip_if_local_iroh_unavailable!();
+
     let dir = tempfile::tempdir().expect("temp dir");
     let harness = spawn_local_path_probe_agents(&dir, true, true).await;
     let request = build_request(
@@ -680,6 +730,8 @@ async fn local_controller_can_run_one_hop_path_probe_and_link_three_audits() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_path_probe_target_segment_failure_is_outer_success_with_correlated_source_audit() {
+    skip_if_local_iroh_unavailable!();
+
     let dir = tempfile::tempdir().expect("temp dir");
     let harness = spawn_local_path_probe_agents(&dir, true, false).await;
     let request = build_request(
@@ -766,6 +818,8 @@ async fn local_path_probe_target_segment_failure_is_outer_success_with_correlate
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_path_probe_rejects_missing_source_authorization() {
+    skip_if_local_iroh_unavailable!();
+
     let dir = tempfile::tempdir().expect("temp dir");
     let harness = spawn_local_path_probe_agents(&dir, false, true).await;
     let request = build_request(
@@ -807,6 +861,8 @@ async fn local_path_probe_rejects_missing_source_authorization() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_client_detects_endpoint_mismatch_before_sending_rpc() {
+    skip_if_local_iroh_unavailable!();
+
     let dir = tempfile::tempdir().expect("temp dir");
     let harness = spawn_local_agent(SecretKey::generate(), SecretKey::generate(), &dir).await;
     let wrong_endpoint_id = SecretKey::generate().public();

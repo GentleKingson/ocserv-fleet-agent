@@ -199,7 +199,7 @@ fn alert_hooks_tests_silence_writes_audit() {
 }
 
 #[test]
-fn alert_hooks_tests_jsonl_file_hook_writes_one_json_line() {
+fn alert_hooks_tests_jsonl_file_hook_is_rejected_in_phase12_mvp() {
     let dir = tempfile::tempdir().expect("temp dir");
     let database = dir.path().join("controller.sqlite");
     let database_arg = database.to_string_lossy().into_owned();
@@ -209,15 +209,50 @@ fn alert_hooks_tests_jsonl_file_hook_writes_one_json_line() {
     seed_stale_health_snapshot(&store);
     drop(store);
 
-    run_ocfleet(&["--database", &database_arg, "alert", "test", &hook]);
+    let output = run_ocfleet_failure(&["--database", &database_arg, "alert", "test", &hook]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("jsonl_file hooks are disabled"));
+    assert!(!output_path.exists());
+}
 
-    let body = std::fs::read_to_string(&output_path).expect("read jsonl");
-    let lines = body.lines().collect::<Vec<_>>();
-    assert_eq!(lines.len(), 1);
-    let payload: Value = serde_json::from_str(lines[0]).expect("valid payload");
-    assert_eq!(payload["dedupe_key"], "node:hk-ocserv-01:node_stale");
-    assert_eq!(payload["severity"], "warning");
-    assert_no_forbidden_payload_keys(&payload);
+#[test]
+fn alert_hooks_tests_webhook_hook_is_rejected_in_phase12_mvp() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let database_arg = database.to_string_lossy().into_owned();
+    let store = Store::open(&database).expect("open store");
+    seed_stale_health_snapshot(&store);
+    drop(store);
+
+    let output = run_ocfleet_failure(&[
+        "--database",
+        &database_arg,
+        "alert",
+        "test",
+        "webhook:https://example.com/alerts,hmac_secret=secret",
+    ]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("webhook hooks are disabled"));
+}
+
+#[test]
+fn alert_hooks_tests_http_webhook_is_rejected_without_network_delivery() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let database_arg = database.to_string_lossy().into_owned();
+    let store = Store::open(&database).expect("open store");
+    seed_stale_health_snapshot(&store);
+    drop(store);
+
+    let output = run_ocfleet_failure(&[
+        "--database",
+        &database_arg,
+        "alert",
+        "test",
+        "webhook:http://127.0.0.1:9/alerts",
+    ]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("webhook hooks are disabled"));
 }
 
 #[test]
@@ -238,32 +273,21 @@ fn alert_hooks_tests_payload_does_not_contain_forbidden_keys() {
     let dir = tempfile::tempdir().expect("temp dir");
     let database = dir.path().join("controller.sqlite");
     let database_arg = database.to_string_lossy().into_owned();
-    let output_path = dir.path().join("alerts.jsonl");
-    let hook = format!("jsonl_file:{}", output_path.display());
     let store = Store::open(&database).expect("open store");
     seed_stale_health_snapshot(&store);
     drop(store);
 
-    run_ocfleet(&["--database", &database_arg, "alert", "test", &hook]);
+    let output = run_ocfleet(&["--database", &database_arg, "alert", "list", "--json"]);
+    let payload: Value = serde_json::from_slice(&output.stdout).expect("valid payload");
 
-    let payload: Value = serde_json::from_str(
-        std::fs::read_to_string(&output_path)
-            .expect("read jsonl")
-            .lines()
-            .next()
-            .expect("jsonl line"),
-    )
-    .expect("valid payload");
     assert_no_forbidden_payload_keys(&payload);
 }
 
 #[test]
-fn alert_hooks_tests_payload_redacts_forbidden_summary_values() {
+fn alert_hooks_tests_payload_uses_summary_allowlist() {
     let dir = tempfile::tempdir().expect("temp dir");
     let database = dir.path().join("controller.sqlite");
     let database_arg = database.to_string_lossy().into_owned();
-    let output_path = dir.path().join("alerts.jsonl");
-    let hook = format!("jsonl_file:{}", output_path.display());
     let store = Store::open(&database).expect("open store");
     store
         .upsert_alert_event(&AlertEventRecord {
@@ -288,15 +312,8 @@ fn alert_hooks_tests_payload_redacts_forbidden_summary_values() {
         .expect("seed alert");
     drop(store);
 
-    run_ocfleet(&["--database", &database_arg, "alert", "test", &hook]);
-
-    let payload: Value = serde_json::from_str(
-        std::fs::read_to_string(&output_path)
-            .expect("read jsonl")
-            .lines()
-            .next()
-            .expect("jsonl line"),
-    )
-    .expect("valid payload");
-    assert_eq!(payload["summary"]["message"], "<redacted>");
+    let output = run_ocfleet(&["--database", &database_arg, "alert", "list", "--json"]);
+    let payload: Value = serde_json::from_slice(&output.stdout).expect("valid payload");
+    assert_eq!(payload["alerts"][0]["summary"]["status"], "stale");
+    assert!(payload["alerts"][0]["summary"].get("message").is_none());
 }

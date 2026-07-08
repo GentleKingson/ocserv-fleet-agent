@@ -155,6 +155,12 @@ fn retention_tests_set_writes_policy() {
     assert_eq!(policy.scope, "observations");
     assert_eq!(policy.max_age_days, Some(7));
     assert_eq!(policy.max_rows, Some(10));
+
+    let (event, detail) = latest_audit(&database);
+    assert_eq!(event, "retention.set");
+    assert_eq!(detail["scope"], "observations");
+    assert_eq!(detail["max_age_days"], 7);
+    assert_eq!(detail["max_rows"], 10);
 }
 
 #[test]

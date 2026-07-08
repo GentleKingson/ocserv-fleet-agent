@@ -15,15 +15,20 @@ use uuid::Uuid;
 use crate::args::{ScheduleCommand, ScheduleJobCommand, ScheduleJobKind};
 use crate::audit::AuditEvent;
 use crate::controller_rpc::{
-    CONTROLLER_RPC_RESULT_CLASS, ControllerRpcOutcome, ControllerRpcRunner, OCSERV_RESULT_CLASS,
-    OcservRpcOutcome, elapsed_ms, error_code_name, execute_node_rpc, hash_json_value,
-    inactive_endpoint_status, write_rpc_audit,
+    CONTROLLER_RPC_RESULT_CLASS, ControllerRpcOutcome, ControllerRpcRunner, FixedControllerRpc,
+    OCSERV_RESULT_CLASS, OcservRpcOutcome, elapsed_ms, error_code_name, execute_fixed_node_rpc,
+    hash_json_value, inactive_endpoint_status, write_rpc_audit,
 };
 use crate::store::{ObservabilityJobRecord, ObservabilityRunInsert, ProbeObservationInsert, Store};
 
 const DEFAULT_SELECTOR: &str = "role=ocserv";
 const EXPLICIT_PAIR_SELECTOR: &str = "explicit-pair";
 const SCHEDULER_RESULT_CLASS: &str = "scheduler_summary";
+const MIN_INTERVAL_SECONDS: u64 = 60;
+const MAX_INTERVAL_SECONDS: u64 = 24 * 60 * 60;
+const MIN_TICK_SECONDS: u64 = 10;
+const MAX_TICK_SECONDS: u64 = 60 * 60;
+const MAX_SUPPORTED_CONCURRENCY: usize = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StoredJobKind {
@@ -83,7 +88,27 @@ pub fn parse_interval_seconds(value: &str) -> anyhow::Result<u64> {
     if seconds > i64::MAX as u64 {
         bail!("interval is too large");
     }
+    if !(MIN_INTERVAL_SECONDS..=MAX_INTERVAL_SECONDS).contains(&seconds) {
+        bail!("interval must be between {MIN_INTERVAL_SECONDS} and {MAX_INTERVAL_SECONDS} seconds");
+    }
     Ok(seconds)
+}
+
+fn validate_scheduler_concurrency(max_concurrency: usize) -> anyhow::Result<()> {
+    if max_concurrency == 0 {
+        bail!("--max-concurrency must be greater than zero");
+    }
+    if max_concurrency > MAX_SUPPORTED_CONCURRENCY {
+        bail!("scheduler currently supports --max-concurrency=1");
+    }
+    Ok(())
+}
+
+fn validate_tick_seconds(tick_seconds: u64) -> anyhow::Result<()> {
+    if !(MIN_TICK_SECONDS..=MAX_TICK_SECONDS).contains(&tick_seconds) {
+        bail!("--tick-seconds must be between {MIN_TICK_SECONDS} and {MAX_TICK_SECONDS}");
+    }
+    Ok(())
 }
 
 pub async fn run_schedule_command(
@@ -188,7 +213,7 @@ fn list_jobs(store: &Store) -> anyhow::Result<()> {
             job.kind,
             job.enabled,
             job.interval_seconds,
-            selector_label(&job),
+            selector_label(&job).unwrap_or("<invalid>"),
             job.next_run_at.as_deref().unwrap_or("<none>"),
             job.last_run_at.as_deref().unwrap_or("<none>")
         );
@@ -266,12 +291,8 @@ async fn run_schedule_daemon_command(
     max_concurrency: usize,
     tick_seconds: u64,
 ) -> anyhow::Result<()> {
-    if tick_seconds == 0 {
-        bail!("--tick-seconds must be greater than zero");
-    }
-    if max_concurrency == 0 {
-        bail!("--max-concurrency must be greater than zero");
-    }
+    validate_scheduler_concurrency(max_concurrency)?;
+    validate_tick_seconds(tick_seconds)?;
     write_scheduler_audit(
         store,
         "scheduler.daemon.start",
@@ -340,9 +361,7 @@ async fn run_due_jobs_once(
     secret_key_path: &Path,
     max_concurrency: usize,
 ) -> anyhow::Result<RunStats> {
-    if max_concurrency == 0 {
-        bail!("--max-concurrency must be greater than zero");
-    }
+    validate_scheduler_concurrency(max_concurrency)?;
     let jobs = store.list_observability_jobs()?;
     let now = OffsetDateTime::now_utc();
     let mut stats = RunStats {
@@ -350,26 +369,58 @@ async fn run_due_jobs_once(
         ..RunStats::default()
     };
     for job in jobs {
-        if !job.enabled || !job_due_at_or_before(&job, now)? {
+        if !job.enabled {
+            continue;
+        }
+        let due = match job_due_at_or_before(&job, now) {
+            Ok(due) => due,
+            Err(_) => {
+                stats.due_jobs += 1;
+                record_invalid_scheduler_job_observation(store, &job, "INVALID_NEXT_RUN_AT")?;
+                stats.executed_jobs += 1;
+                stats.observations += 1;
+                stats.failed_observations += 1;
+                update_job_after_tick(store, &job)?;
+                continue;
+            }
+        };
+        if !due {
             continue;
         }
         stats.due_jobs += 1;
-        let job_stats = run_job(store, secret_key_path, &job).await?;
+        let job_stats = match run_job(store, secret_key_path, &job).await {
+            Ok(job_stats) => job_stats,
+            Err(_) => {
+                record_invalid_scheduler_job_observation(store, &job, "INVALID_JOB_CONFIGURATION")?;
+                stats.executed_jobs += 1;
+                stats.observations += 1;
+                stats.failed_observations += 1;
+                update_job_after_tick(store, &job)?;
+                continue;
+            }
+        };
         stats.executed_jobs += 1;
         stats.observations += job_stats.observations;
         stats.failed_observations += job_stats.failed_observations;
-        let finished_at = now_rfc3339();
-        let next_run_at = offset_to_rfc3339(
-            OffsetDateTime::parse(&finished_at, &Rfc3339).expect("formatted timestamp parses")
-                + Duration::seconds(job.interval_seconds as i64),
-        );
-        store.update_observability_job_run_times(
-            &job.job_id,
-            Some(&next_run_at),
-            Some(&finished_at),
-        )?;
+        update_job_after_tick(store, &job)?;
     }
     Ok(stats)
+}
+
+fn update_job_after_tick(store: &Store, job: &ObservabilityJobRecord) -> anyhow::Result<()> {
+    let finished_at = now_rfc3339();
+    let interval_seconds =
+        i64::try_from(job.interval_seconds).context("scheduler job interval is too large")?;
+    let next_run_at = offset_to_rfc3339(
+        OffsetDateTime::parse(&finished_at, &Rfc3339).expect("formatted timestamp parses")
+            + Duration::seconds(interval_seconds),
+    );
+    store.update_observability_job_run_times(
+        &job.job_id,
+        Some(&next_run_at),
+        Some(&finished_at),
+    )?;
+    Ok(())
 }
 
 async fn run_job(
@@ -378,6 +429,16 @@ async fn run_job(
     job: &ObservabilityJobRecord,
 ) -> anyhow::Result<RunStats> {
     let kind = stored_job_kind(&job.kind)?;
+    let selector = match kind {
+        StoredJobKind::PathProbe => {
+            explicit_pair(job)?;
+            None
+        }
+        StoredJobKind::ControllerPing
+        | StoredJobKind::OcservStatus
+        | StoredJobKind::OcservCert
+        | StoredJobKind::OcservSessions => Some(selector_label(job)?.to_string()),
+    };
     let started_at = now_rfc3339();
     let run_id = format!("run-{}", Uuid::new_v4().simple());
     store.insert_observability_run(&ObservabilityRunInsert {
@@ -403,7 +464,10 @@ async fn run_job(
         | StoredJobKind::OcservStatus
         | StoredJobKind::OcservCert
         | StoredJobKind::OcservSessions => {
-            let targets = resolve_node_targets(store, selector_label(job))?;
+            let targets = resolve_node_targets(
+                store,
+                selector.as_deref().context("validated selector missing")?,
+            )?;
             if targets.is_empty() {
                 record_missing_target_observation(store, &run_id, job, "NODE_NOT_FOUND")?;
                 stats.observations += 1;
@@ -557,11 +621,31 @@ async fn run_path_probe_job(
         update_observation_stats(stats, false);
         return Ok(());
     }
+    if let Some(status) = inactive_endpoint_status(store, &target.endpoint_id)? {
+        record_path_probe_target_preflight_observation(
+            store,
+            run_id,
+            &source.node_id,
+            &source.endpoint_id,
+            &target.node_id,
+            &target.endpoint_id,
+            &format!("TARGET_ENDPOINT_{}", status.as_str().to_ascii_uppercase()),
+        )?;
+        update_observation_stats(stats, false);
+        return Ok(());
+    }
 
     let started = Instant::now();
-    let params = json!({ "target_agent_endpoint_id": target.endpoint_id });
+    let params = json!({ "target_agent_endpoint_id": target.endpoint_id.clone() });
     let params_hash = hash_json_value(&params);
-    let result = execute_node_rpc(secret_key_path, &source, PROBE_PATH_ECHO, params).await;
+    let result = execute_fixed_node_rpc(
+        secret_key_path,
+        &source,
+        FixedControllerRpc::ProbePathEcho {
+            target_agent_endpoint_id: target.endpoint_id.clone(),
+        },
+    )
+    .await;
     match result {
         Ok(success) => {
             let duration_ms = elapsed_ms(started);
@@ -794,10 +878,42 @@ fn record_missing_target_observation(
         result_class: scheduler_result_class_for_job(&job.kind).to_string(),
         summary_json: json!({
             "message": "no matching node",
-            "selector": selector_label(job),
+            "selector": selector_label(job).unwrap_or("<invalid>"),
             "result_class": scheduler_result_class_for_job(&job.kind),
         }),
     })?;
+    Ok(())
+}
+
+fn record_invalid_scheduler_job_observation(
+    store: &Store,
+    job: &ObservabilityJobRecord,
+    reason_code: &str,
+) -> anyhow::Result<()> {
+    let summary_json = json!({
+        "message": "scheduler job configuration is invalid",
+        "job_id": job.job_id,
+        "kind": job.kind,
+        "reason_code": reason_code,
+        "result_class": SCHEDULER_RESULT_CLASS,
+    });
+    store.insert_probe_observation(&ProbeObservationInsert {
+        observation_id: observation_id(),
+        run_id: None,
+        node_id: None,
+        endpoint_id: None,
+        method: first_method_for_kind(&job.kind)
+            .unwrap_or(PROBE_CONTROLLER_PING)
+            .to_string(),
+        ok: Some(false),
+        error_code: Some("SCHEDULER_JOB_INVALID".to_string()),
+        duration_ms: Some(0),
+        observed_at: now_rfc3339(),
+        expires_at: None,
+        result_class: SCHEDULER_RESULT_CLASS.to_string(),
+        summary_json: summary_json.clone(),
+    })?;
+    write_scheduler_audit(store, "scheduler.job.invalid", false, summary_json)?;
     Ok(())
 }
 
@@ -822,6 +938,39 @@ fn record_path_probe_preflight_observation(
         result_class: CONTROLLER_RPC_RESULT_CLASS.to_string(),
         summary_json: json!({
             "message": "path probe preflight failed",
+            "result_class": CONTROLLER_RPC_RESULT_CLASS,
+        }),
+    })?;
+    Ok(())
+}
+
+fn record_path_probe_target_preflight_observation(
+    store: &Store,
+    run_id: &str,
+    source_node_id: &str,
+    source_endpoint_id: &str,
+    target_node_id: &str,
+    target_endpoint_id: &str,
+    error_code: &str,
+) -> anyhow::Result<()> {
+    store.insert_probe_observation(&ProbeObservationInsert {
+        observation_id: observation_id(),
+        run_id: Some(run_id.to_string()),
+        node_id: Some(source_node_id.to_string()),
+        endpoint_id: Some(source_endpoint_id.to_string()),
+        method: PROBE_PATH_ECHO.to_string(),
+        ok: Some(false),
+        error_code: Some(error_code.to_string()),
+        duration_ms: Some(0),
+        observed_at: now_rfc3339(),
+        expires_at: None,
+        result_class: CONTROLLER_RPC_RESULT_CLASS.to_string(),
+        summary_json: json!({
+            "message": "path probe target endpoint preflight failed",
+            "source_node_id": source_node_id,
+            "source_endpoint_id": source_endpoint_id,
+            "target_node_id": target_node_id,
+            "target_endpoint_id": target_endpoint_id,
             "result_class": CONTROLLER_RPC_RESULT_CLASS,
         }),
     })?;
@@ -874,11 +1023,16 @@ fn scheduler_result_class_for_job(kind: &str) -> &'static str {
     }
 }
 
-fn selector_label(job: &ObservabilityJobRecord) -> &str {
-    job.selector_json
+fn selector_label(job: &ObservabilityJobRecord) -> anyhow::Result<&str> {
+    let selector = job
+        .selector_json
         .get("selector")
         .and_then(Value::as_str)
-        .unwrap_or(DEFAULT_SELECTOR)
+        .context("scheduler job is missing selector")?;
+    if selector.trim().is_empty() {
+        bail!("scheduler job selector is empty");
+    }
+    Ok(selector)
 }
 
 fn explicit_pair(job: &ObservabilityJobRecord) -> anyhow::Result<(String, String)> {

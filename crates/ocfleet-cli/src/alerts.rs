@@ -3,11 +3,6 @@ use ocfleet_protocol::enrollment::EndpointStatus;
 use ocfleet_protocol::method::{OCSERV_CERT_EXPIRY, OCSERV_SERVICE_SUMMARY, PROBE_CONTROLLER_PING};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
-use std::fs::OpenOptions;
-use std::io::Write;
-use std::net::TcpStream;
-use std::path::PathBuf;
-use std::time::Duration as StdDuration;
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
@@ -17,7 +12,6 @@ use crate::store::{AlertEventRecord, ProbeObservationRecord, Store};
 
 const OBSERVATION_READ_LIMIT: u64 = 1_000;
 const NODE_UNREACHABLE_FAILURES: usize = 3;
-const DEFAULT_WEBHOOK_TIMEOUT_MS: u64 = 5_000;
 
 #[derive(Debug, Clone)]
 struct AlertCandidate {
@@ -27,12 +21,6 @@ struct AlertCandidate {
     reason_code: &'static str,
     methods: Vec<String>,
     summary: Value,
-}
-
-#[derive(Debug, Clone)]
-enum AlertHook {
-    JsonlFile { path: PathBuf },
-    Webhook { url: String, timeout_ms: u64 },
 }
 
 pub fn run_alert_command(store: &Store, command: AlertCommand) -> anyhow::Result<()> {
@@ -92,32 +80,9 @@ fn run_alert_list(store: &Store, json_output: bool) -> anyhow::Result<()> {
 }
 
 fn run_alert_test(store: &Store, hook: &str) -> anyhow::Result<()> {
-    let hook = parse_alert_hook(hook)?;
+    reject_disabled_alert_hook(hook)?;
     evaluate_alerts(store)?;
-    let now = now_rfc3339();
-    let mut delivered_count = 0_u64;
-    for alert in store.list_alert_events()? {
-        if alert.state != "open" || alert_is_silenced(&alert, &now) {
-            continue;
-        }
-        let payload = alert_payload(&alert);
-        deliver_alert_hook(&hook, &payload)?;
-        let mut updated = alert.clone();
-        updated.last_sent_at = Some(now.clone());
-        store.upsert_alert_event(&updated)?;
-        delivered_count += 1;
-    }
-    write_alert_audit(
-        store,
-        "alert.test",
-        json!({
-            "hook_type": hook.kind(),
-            "delivered_count": delivered_count,
-        }),
-    )?;
-    println!("hook_type={}", hook.kind());
-    println!("delivered_count={delivered_count}");
-    Ok(())
+    unreachable!("disabled alert hooks always return an error")
 }
 
 fn run_alert_silence(
@@ -397,7 +362,7 @@ fn upsert_candidate(
     Ok(record)
 }
 
-fn parse_alert_hook(value: &str) -> anyhow::Result<AlertHook> {
+fn reject_disabled_alert_hook(value: &str) -> anyhow::Result<()> {
     let (kind, rest) = value
         .split_once(':')
         .with_context(|| "alert hook must use kind:value syntax")?;
@@ -410,84 +375,18 @@ fn parse_alert_hook(value: &str) -> anyhow::Result<AlertHook> {
             if rest.trim().is_empty() {
                 bail!("jsonl_file hook requires a path");
             }
-            Ok(AlertHook::JsonlFile {
-                path: PathBuf::from(rest),
-            })
+            bail!(
+                "jsonl_file hooks are disabled until private alert directory support is implemented"
+            );
         }
-        "webhook" => parse_webhook_hook(rest),
+        "webhook" => {
+            if rest.trim().is_empty() {
+                bail!("webhook hook requires a url");
+            }
+            bail!("webhook hooks are disabled until HTTPS/HMAC/SSRF protections are implemented");
+        }
         _ => bail!("unsupported alert hook type: {kind}"),
     }
-}
-
-fn parse_webhook_hook(value: &str) -> anyhow::Result<AlertHook> {
-    let mut url = value.to_string();
-    let mut timeout_ms = DEFAULT_WEBHOOK_TIMEOUT_MS;
-    if let Some((candidate_url, options)) = value.split_once(',') {
-        url = candidate_url.to_string();
-        for option in options.split(',') {
-            if let Some(timeout) = option.strip_prefix("timeout_ms=") {
-                timeout_ms = timeout.parse().context("invalid webhook timeout_ms")?;
-            } else if option.starts_with("hmac_secret=") {
-                // Accepted as configuration syntax for Phase 12 MVP; signing can
-                // be extended without changing the fixed payload shape.
-            } else if !option.trim().is_empty() {
-                bail!("unsupported webhook option");
-            }
-        }
-    }
-    if !(url.starts_with("http://") || url.starts_with("https://")) {
-        bail!("webhook url must start with http:// or https://");
-    }
-    Ok(AlertHook::Webhook { url, timeout_ms })
-}
-
-impl AlertHook {
-    fn kind(&self) -> &'static str {
-        match self {
-            Self::JsonlFile { .. } => "jsonl_file",
-            Self::Webhook { .. } => "webhook",
-        }
-    }
-}
-
-fn deliver_alert_hook(hook: &AlertHook, payload: &Value) -> anyhow::Result<()> {
-    match hook {
-        AlertHook::JsonlFile { path } => {
-            let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-            writeln!(file, "{}", serde_json::to_string(payload)?)?;
-            Ok(())
-        }
-        AlertHook::Webhook { url, timeout_ms } => deliver_webhook(url, *timeout_ms, payload),
-    }
-}
-
-fn deliver_webhook(url: &str, timeout_ms: u64, payload: &Value) -> anyhow::Result<()> {
-    let Some(rest) = url.strip_prefix("http://") else {
-        bail!("webhook https delivery is not available in this MVP without TLS support");
-    };
-    let (host_port, path) = rest.split_once('/').unwrap_or((rest, ""));
-    let (host, port) = host_port
-        .split_once(':')
-        .map(|(host, port)| {
-            let parsed_port = port.parse::<u16>().context("invalid webhook port")?;
-            Ok::<_, anyhow::Error>((host, parsed_port))
-        })
-        .transpose()?
-        .unwrap_or((host_port, 80));
-    let mut stream = TcpStream::connect((host, port))?;
-    let timeout = StdDuration::from_millis(timeout_ms);
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
-    let body = serde_json::to_string(payload)?;
-    let request = format!(
-        "POST /{} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        path,
-        host,
-        body.len(),
-        body
-    );
-    stream.write_all(request.as_bytes())?;
-    Ok(())
 }
 
 fn find_alert(store: &Store, dedupe_key: &str) -> anyhow::Result<AlertEventRecord> {
@@ -515,22 +414,6 @@ fn alert_to_json(alert: &AlertEventRecord) -> Value {
     })
 }
 
-fn alert_payload(alert: &AlertEventRecord) -> Value {
-    json!({
-        "alert_id": alert.alert_id,
-        "dedupe_key": alert.dedupe_key,
-        "node_id": alert.node_id,
-        "severity": alert.severity,
-        "state": alert.state,
-        "reason_code": alert.reason_code,
-        "first_seen_at": alert.first_seen_at,
-        "last_seen_at": alert.last_seen_at,
-        "resolved_at": alert.resolved_at,
-        "methods": alert_methods(alert),
-        "summary": alert_summary(alert),
-    })
-}
-
 fn alert_methods(alert: &AlertEventRecord) -> Vec<String> {
     alert
         .detail_json
@@ -552,7 +435,7 @@ fn safe_summary(value: &Value) -> Value {
         Value::Object(map) => {
             let mut output = Map::new();
             for (key, value) in map {
-                if forbidden_payload_key(key) {
+                if !allowed_summary_key(key) {
                     continue;
                 }
                 output.insert(key.clone(), safe_summary(value));
@@ -567,10 +450,17 @@ fn safe_summary(value: &Value) -> Value {
     }
 }
 
-fn forbidden_payload_key(key: &str) -> bool {
+fn allowed_summary_key(key: &str) -> bool {
     matches!(
         key,
-        "path" | "command" | "log" | "username" | "client_ip" | "session_id"
+        "status"
+            | "last_error_code"
+            | "freshness_seconds"
+            | "consecutive_failures"
+            | "days_remaining"
+            | "endpoint_id"
+            | "endpoint_status"
+            | "result_class"
     )
 }
 
@@ -592,14 +482,6 @@ fn forbidden_payload_value(value: &str) -> bool {
     ]
     .iter()
     .any(|marker| value.contains(marker))
-}
-
-fn alert_is_silenced(alert: &AlertEventRecord, now: &str) -> bool {
-    alert
-        .detail_json
-        .get("silenced_until")
-        .and_then(Value::as_str)
-        .is_some_and(|until| timestamp_after(until, now).unwrap_or(false))
 }
 
 fn object_from_value(value: Value) -> Map<String, Value> {
@@ -665,12 +547,6 @@ fn parse_duration(value: &str) -> anyhow::Result<Duration> {
         'd' => Ok(Duration::days(amount)),
         _ => bail!("duration must use s, m, h, or d suffix"),
     }
-}
-
-fn timestamp_after(left: &str, right: &str) -> anyhow::Result<bool> {
-    let left = OffsetDateTime::parse(left, &Rfc3339)?;
-    let right = OffsetDateTime::parse(right, &Rfc3339)?;
-    Ok(left > right)
 }
 
 fn write_alert_audit(store: &Store, event_name: &str, detail_json: Value) -> anyhow::Result<()> {

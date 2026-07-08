@@ -14,7 +14,7 @@ use uuid::Uuid;
 use crate::audit::AuditEvent;
 use crate::private_file::{self, PrivateFileError};
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 3;
+pub const CURRENT_SCHEMA_VERSION: i64 = 4;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -304,7 +304,7 @@ impl Store {
               name TEXT NOT NULL,
               region TEXT,
               role TEXT NOT NULL DEFAULT 'ocserv',
-              enabled INTEGER NOT NULL DEFAULT 1,
+              enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
               created_at TEXT NOT NULL,
               updated_at TEXT NOT NULL
             );
@@ -374,13 +374,13 @@ impl Store {
 
             CREATE TABLE IF NOT EXISTS observability_jobs (
               job_id TEXT PRIMARY KEY,
-              kind TEXT NOT NULL,
-              selector_json TEXT NOT NULL,
-              pair_selector_json TEXT,
-              interval_seconds INTEGER NOT NULL,
-              jitter_seconds INTEGER NOT NULL DEFAULT 0,
-              timeout_ms INTEGER NOT NULL,
-              enabled INTEGER NOT NULL DEFAULT 1,
+              kind TEXT NOT NULL CHECK (kind IN ('controller-ping', 'ocserv-status', 'ocserv-cert', 'ocserv-sessions', 'path-probe')),
+              selector_json TEXT NOT NULL CHECK (json_valid(selector_json)),
+              pair_selector_json TEXT CHECK (pair_selector_json IS NULL OR json_valid(pair_selector_json)),
+              interval_seconds INTEGER NOT NULL CHECK (interval_seconds BETWEEN 60 AND 86400),
+              jitter_seconds INTEGER NOT NULL DEFAULT 0 CHECK (jitter_seconds BETWEEN 0 AND 3600),
+              timeout_ms INTEGER NOT NULL CHECK (timeout_ms BETWEEN 1000 AND 30000),
+              enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
               next_run_at TEXT,
               last_run_at TEXT,
               created_at TEXT NOT NULL,
@@ -392,9 +392,9 @@ impl Store {
               job_id TEXT,
               started_at TEXT NOT NULL,
               finished_at TEXT,
-              status TEXT NOT NULL,
+              status TEXT NOT NULL CHECK (status IN ('running', 'succeeded', 'failed', 'skipped')),
               triggered_by TEXT NOT NULL,
-              summary_json TEXT NOT NULL
+              summary_json TEXT NOT NULL CHECK (json_valid(summary_json))
             );
 
             CREATE TABLE IF NOT EXISTS probe_observations (
@@ -402,51 +402,52 @@ impl Store {
               run_id TEXT,
               node_id TEXT,
               endpoint_id TEXT,
-              method TEXT NOT NULL,
-              ok INTEGER,
+              method TEXT NOT NULL CHECK (method IN ('probe.controller.ping', 'probe.path.echo', 'ocserv.service.summary', 'ocserv.version', 'ocserv.sessions.summary', 'ocserv.cert.expiry', 'ocserv.config.fingerprint')),
+              ok INTEGER CHECK (ok IS NULL OR ok IN (0, 1)),
               error_code TEXT,
-              duration_ms INTEGER,
+              duration_ms INTEGER CHECK (duration_ms IS NULL OR duration_ms >= 0),
               observed_at TEXT NOT NULL,
               expires_at TEXT,
-              result_class TEXT NOT NULL,
-              summary_json TEXT NOT NULL
+              result_class TEXT NOT NULL CHECK (result_class IN ('controller_rpc_summary', 'low_sensitive_summary', 'scheduler_summary')),
+              summary_json TEXT NOT NULL CHECK (json_valid(summary_json))
             );
 
             CREATE TABLE IF NOT EXISTS health_snapshots (
               node_id TEXT PRIMARY KEY,
               endpoint_id TEXT,
               computed_at TEXT NOT NULL,
-              status TEXT NOT NULL,
-              freshness_seconds INTEGER,
+              status TEXT NOT NULL CHECK (status IN ('healthy', 'degraded', 'unreachable', 'stale', 'disabled', 'unknown')),
+              freshness_seconds INTEGER CHECK (freshness_seconds IS NULL OR freshness_seconds >= 0),
               last_success_at TEXT,
               last_failure_at TEXT,
               last_error_code TEXT,
-              degraded_methods_json TEXT NOT NULL,
-              summary_json TEXT NOT NULL
+              degraded_methods_json TEXT NOT NULL CHECK (json_valid(degraded_methods_json)),
+              summary_json TEXT NOT NULL CHECK (json_valid(summary_json))
             );
 
             CREATE TABLE IF NOT EXISTS alert_events (
               alert_id TEXT PRIMARY KEY,
               dedupe_key TEXT NOT NULL UNIQUE,
               node_id TEXT,
-              severity TEXT NOT NULL,
-              state TEXT NOT NULL,
+              severity TEXT NOT NULL CHECK (severity IN ('warning', 'critical')),
+              state TEXT NOT NULL CHECK (state IN ('open', 'resolved', 'silenced')),
               reason_code TEXT NOT NULL,
               first_seen_at TEXT NOT NULL,
               last_seen_at TEXT NOT NULL,
               last_sent_at TEXT,
               resolved_at TEXT,
-              detail_json TEXT NOT NULL
+              detail_json TEXT NOT NULL CHECK (json_valid(detail_json))
             );
 
             CREATE TABLE IF NOT EXISTS retention_policies (
-              scope TEXT PRIMARY KEY,
-              max_age_days INTEGER,
-              max_rows INTEGER,
+              scope TEXT PRIMARY KEY CHECK (scope IN ('observations', 'health-snapshots', 'alert-events')),
+              max_age_days INTEGER CHECK (max_age_days IS NULL OR max_age_days >= 1),
+              max_rows INTEGER CHECK (max_rows IS NULL OR max_rows >= 1),
               updated_at TEXT NOT NULL
             );
             "#,
         )?;
+        rebuild_observability_v4_tables_if_needed(&tx)?;
         tx.execute(
             "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, strftime('%Y-%m-%dT%H:%M:%SZ','now'))",
             [CURRENT_SCHEMA_VERSION],
@@ -1228,7 +1229,7 @@ impl Store {
             &tx,
             &EndpointTrustRecord {
                 endpoint_id: approval.endpoint_id.clone(),
-                node_id: Some(before.hostname.clone()),
+                node_id: None,
                 fingerprint: Some(before.fingerprint.clone()),
                 status: EndpointStatus::Active,
                 generation: 1,
@@ -1451,6 +1452,200 @@ impl Store {
     }
 }
 
+fn rebuild_observability_v4_tables_if_needed(tx: &Transaction<'_>) -> Result<(), StoreError> {
+    let checks = [
+        (
+            "observability_jobs",
+            "kind TEXT NOT NULL CHECK",
+            "kind constraint",
+        ),
+        (
+            "observability_runs",
+            "status TEXT NOT NULL CHECK",
+            "run status",
+        ),
+        (
+            "probe_observations",
+            "result_class TEXT NOT NULL CHECK",
+            "result class",
+        ),
+        (
+            "health_snapshots",
+            "status TEXT NOT NULL CHECK",
+            "health status",
+        ),
+        (
+            "alert_events",
+            "severity TEXT NOT NULL CHECK",
+            "alert severity",
+        ),
+        (
+            "retention_policies",
+            "scope TEXT PRIMARY KEY CHECK",
+            "retention scope",
+        ),
+    ];
+    let mut needs_rebuild = false;
+    for (table, marker, _label) in checks {
+        let sql = table_sql(tx, table)?;
+        if !sql.contains(marker) {
+            needs_rebuild = true;
+            break;
+        }
+    }
+    if needs_rebuild {
+        tx.execute_batch(OBSERVABILITY_V4_REBUILD_SQL)?;
+    }
+    Ok(())
+}
+
+fn table_sql(tx: &Transaction<'_>, table: &str) -> Result<String, StoreError> {
+    Ok(tx
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or_default())
+}
+
+const OBSERVABILITY_V4_REBUILD_SQL: &str = r#"
+ALTER TABLE observability_jobs RENAME TO observability_jobs_legacy_v3;
+CREATE TABLE observability_jobs (
+  job_id TEXT PRIMARY KEY,
+  kind TEXT NOT NULL CHECK (kind IN ('controller-ping', 'ocserv-status', 'ocserv-cert', 'ocserv-sessions', 'path-probe')),
+  selector_json TEXT NOT NULL CHECK (json_valid(selector_json)),
+  pair_selector_json TEXT CHECK (pair_selector_json IS NULL OR json_valid(pair_selector_json)),
+  interval_seconds INTEGER NOT NULL CHECK (interval_seconds BETWEEN 60 AND 86400),
+  jitter_seconds INTEGER NOT NULL DEFAULT 0 CHECK (jitter_seconds BETWEEN 0 AND 3600),
+  timeout_ms INTEGER NOT NULL CHECK (timeout_ms BETWEEN 1000 AND 30000),
+  enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+  next_run_at TEXT,
+  last_run_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+INSERT INTO observability_jobs
+  (job_id, kind, selector_json, pair_selector_json, interval_seconds, jitter_seconds, timeout_ms, enabled, next_run_at, last_run_at, created_at, updated_at)
+SELECT job_id, kind, selector_json, pair_selector_json, interval_seconds, jitter_seconds, timeout_ms, enabled, next_run_at, last_run_at, created_at, updated_at
+FROM observability_jobs_legacy_v3
+WHERE kind IN ('controller-ping', 'ocserv-status', 'ocserv-cert', 'ocserv-sessions', 'path-probe')
+  AND json_valid(selector_json)
+  AND (pair_selector_json IS NULL OR json_valid(pair_selector_json))
+  AND interval_seconds BETWEEN 60 AND 86400
+  AND jitter_seconds BETWEEN 0 AND 3600
+  AND timeout_ms BETWEEN 1000 AND 30000
+  AND enabled IN (0, 1);
+DROP TABLE observability_jobs_legacy_v3;
+
+ALTER TABLE observability_runs RENAME TO observability_runs_legacy_v3;
+CREATE TABLE observability_runs (
+  run_id TEXT PRIMARY KEY,
+  job_id TEXT,
+  started_at TEXT NOT NULL,
+  finished_at TEXT,
+  status TEXT NOT NULL CHECK (status IN ('running', 'succeeded', 'failed', 'skipped')),
+  triggered_by TEXT NOT NULL,
+  summary_json TEXT NOT NULL CHECK (json_valid(summary_json))
+);
+INSERT INTO observability_runs
+  (run_id, job_id, started_at, finished_at, status, triggered_by, summary_json)
+SELECT run_id, job_id, started_at, finished_at, status, triggered_by, summary_json
+FROM observability_runs_legacy_v3
+WHERE status IN ('running', 'succeeded', 'failed', 'skipped')
+  AND json_valid(summary_json);
+DROP TABLE observability_runs_legacy_v3;
+
+ALTER TABLE probe_observations RENAME TO probe_observations_legacy_v3;
+CREATE TABLE probe_observations (
+  observation_id TEXT PRIMARY KEY,
+  run_id TEXT,
+  node_id TEXT,
+  endpoint_id TEXT,
+  method TEXT NOT NULL CHECK (method IN ('probe.controller.ping', 'probe.path.echo', 'ocserv.service.summary', 'ocserv.version', 'ocserv.sessions.summary', 'ocserv.cert.expiry', 'ocserv.config.fingerprint')),
+  ok INTEGER CHECK (ok IS NULL OR ok IN (0, 1)),
+  error_code TEXT,
+  duration_ms INTEGER CHECK (duration_ms IS NULL OR duration_ms >= 0),
+  observed_at TEXT NOT NULL,
+  expires_at TEXT,
+  result_class TEXT NOT NULL CHECK (result_class IN ('controller_rpc_summary', 'low_sensitive_summary', 'scheduler_summary')),
+  summary_json TEXT NOT NULL CHECK (json_valid(summary_json))
+);
+INSERT INTO probe_observations
+  (observation_id, run_id, node_id, endpoint_id, method, ok, error_code, duration_ms, observed_at, expires_at, result_class, summary_json)
+SELECT observation_id, run_id, node_id, endpoint_id, method, ok, error_code, duration_ms, observed_at, expires_at, result_class, summary_json
+FROM probe_observations_legacy_v3
+WHERE method IN ('probe.controller.ping', 'probe.path.echo', 'ocserv.service.summary', 'ocserv.version', 'ocserv.sessions.summary', 'ocserv.cert.expiry', 'ocserv.config.fingerprint')
+  AND (ok IS NULL OR ok IN (0, 1))
+  AND (duration_ms IS NULL OR duration_ms >= 0)
+  AND result_class IN ('controller_rpc_summary', 'low_sensitive_summary', 'scheduler_summary')
+  AND json_valid(summary_json);
+DROP TABLE probe_observations_legacy_v3;
+
+ALTER TABLE health_snapshots RENAME TO health_snapshots_legacy_v3;
+CREATE TABLE health_snapshots (
+  node_id TEXT PRIMARY KEY,
+  endpoint_id TEXT,
+  computed_at TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('healthy', 'degraded', 'unreachable', 'stale', 'disabled', 'unknown')),
+  freshness_seconds INTEGER CHECK (freshness_seconds IS NULL OR freshness_seconds >= 0),
+  last_success_at TEXT,
+  last_failure_at TEXT,
+  last_error_code TEXT,
+  degraded_methods_json TEXT NOT NULL CHECK (json_valid(degraded_methods_json)),
+  summary_json TEXT NOT NULL CHECK (json_valid(summary_json))
+);
+INSERT INTO health_snapshots
+  (node_id, endpoint_id, computed_at, status, freshness_seconds, last_success_at, last_failure_at, last_error_code, degraded_methods_json, summary_json)
+SELECT node_id, endpoint_id, computed_at, status, freshness_seconds, last_success_at, last_failure_at, last_error_code, degraded_methods_json, summary_json
+FROM health_snapshots_legacy_v3
+WHERE status IN ('healthy', 'degraded', 'unreachable', 'stale', 'disabled', 'unknown')
+  AND (freshness_seconds IS NULL OR freshness_seconds >= 0)
+  AND json_valid(degraded_methods_json)
+  AND json_valid(summary_json);
+DROP TABLE health_snapshots_legacy_v3;
+
+ALTER TABLE alert_events RENAME TO alert_events_legacy_v3;
+CREATE TABLE alert_events (
+  alert_id TEXT PRIMARY KEY,
+  dedupe_key TEXT NOT NULL UNIQUE,
+  node_id TEXT,
+  severity TEXT NOT NULL CHECK (severity IN ('warning', 'critical')),
+  state TEXT NOT NULL CHECK (state IN ('open', 'resolved', 'silenced')),
+  reason_code TEXT NOT NULL,
+  first_seen_at TEXT NOT NULL,
+  last_seen_at TEXT NOT NULL,
+  last_sent_at TEXT,
+  resolved_at TEXT,
+  detail_json TEXT NOT NULL CHECK (json_valid(detail_json))
+);
+INSERT INTO alert_events
+  (alert_id, dedupe_key, node_id, severity, state, reason_code, first_seen_at, last_seen_at, last_sent_at, resolved_at, detail_json)
+SELECT alert_id, dedupe_key, node_id, severity, state, reason_code, first_seen_at, last_seen_at, last_sent_at, resolved_at, detail_json
+FROM alert_events_legacy_v3
+WHERE severity IN ('warning', 'critical')
+  AND state IN ('open', 'resolved', 'silenced')
+  AND json_valid(detail_json);
+DROP TABLE alert_events_legacy_v3;
+
+ALTER TABLE retention_policies RENAME TO retention_policies_legacy_v3;
+CREATE TABLE retention_policies (
+  scope TEXT PRIMARY KEY CHECK (scope IN ('observations', 'health-snapshots', 'alert-events')),
+  max_age_days INTEGER CHECK (max_age_days IS NULL OR max_age_days >= 1),
+  max_rows INTEGER CHECK (max_rows IS NULL OR max_rows >= 1),
+  updated_at TEXT NOT NULL
+);
+INSERT INTO retention_policies
+  (scope, max_age_days, max_rows, updated_at)
+SELECT scope, max_age_days, max_rows, updated_at
+FROM retention_policies_legacy_v3
+WHERE scope IN ('observations', 'health-snapshots', 'alert-events')
+  AND (max_age_days IS NULL OR max_age_days >= 1)
+  AND (max_rows IS NULL OR max_rows >= 1);
+DROP TABLE retention_policies_legacy_v3;
+"#;
+
 fn create_database_file_if_missing(path: &Path) -> Result<bool, StoreError> {
     match private_file::open_private_create_new(path) {
         Ok(_) => Ok(true),
@@ -1671,7 +1866,7 @@ fn node_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NodeRecord> {
         name: row.get(2)?,
         region: row.get(3)?,
         role: row.get(4)?,
-        enabled: row.get::<_, i64>(5)? == 1,
+        enabled: i64_to_bool(row.get(5)?, 5)?,
     })
 }
 
@@ -1685,7 +1880,7 @@ fn probe_history_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProbeHist
         endpoint_id: row.get(2)?,
         method: row.get(3)?,
         request_id: row.get(4)?,
-        ok: ok.map(|value| value != 0),
+        ok: ok.map(|value| i64_to_bool(value, 5)).transpose()?,
         error_code: row.get(6)?,
         duration_ms: duration_ms.and_then(|value| u64::try_from(value).ok()),
         detail_json: serde_json::from_str(&detail_json).unwrap_or(Value::Null),
@@ -1706,7 +1901,7 @@ fn observability_job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Obser
         interval_seconds: i64_to_u64(row.get(4)?)?,
         jitter_seconds: i64_to_u64(row.get(5)?)?,
         timeout_ms: i64_to_u64(row.get(6)?)?,
-        enabled: row.get::<_, i64>(7)? == 1,
+        enabled: i64_to_bool(row.get(7)?, 7)?,
         next_run_at: row.get(8)?,
         last_run_at: row.get(9)?,
         created_at: row.get(10)?,
@@ -1724,7 +1919,7 @@ fn probe_observation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Probe
         node_id: row.get(2)?,
         endpoint_id: row.get(3)?,
         method: row.get(4)?,
-        ok: ok.map(|value| value != 0),
+        ok: ok.map(|value| i64_to_bool(value, 5)).transpose()?,
         error_code: row.get(6)?,
         duration_ms: duration_ms.map(i64_to_u64).transpose()?,
         observed_at: row.get(8)?,
@@ -1968,6 +2163,21 @@ fn compact_json(value: &Value) -> String {
 
 fn bool_to_i64(value: bool) -> i64 {
     if value { 1 } else { 0 }
+}
+
+fn i64_to_bool(value: i64, column: usize) -> rusqlite::Result<bool> {
+    match value {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(rusqlite::Error::FromSqlConversionFailure(
+            column,
+            Type::Integer,
+            Box::new(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid SQLite boolean value: {value}"),
+            )),
+        )),
+    }
 }
 
 fn option_u64_to_i64(value: Option<u64>) -> Result<Option<i64>, StoreError> {

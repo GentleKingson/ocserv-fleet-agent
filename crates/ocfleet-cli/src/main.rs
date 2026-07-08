@@ -8,10 +8,11 @@ use ocfleet_cli::args::{
 };
 use ocfleet_cli::audit::AuditEvent;
 use ocfleet_cli::controller_rpc::{
-    OcservCommandAudit, RpcAuditRecord, RpcCommandFailure, elapsed_ms, error_code_from_name,
-    execute_node_rpc, execute_ocserv_rpc, execute_optional_ocserv_rpc, hash_json_value,
-    inactive_endpoint_status, known_endpoint_id, load_ocserv_rpc_node, low_sensitive_detail,
-    ocserv_failure_detail, write_ocserv_command_audit, write_rpc_audit,
+    FixedControllerRpc, OcservCommandAudit, RpcAuditRecord, RpcCommandFailure, elapsed_ms,
+    error_code_from_name, execute_fixed_node_rpc, execute_ocserv_rpc, execute_optional_ocserv_rpc,
+    hash_json_value, inactive_endpoint_status, known_endpoint_id, load_ocserv_rpc_node,
+    low_sensitive_detail, low_sensitive_fixed_rpc_summary, ocserv_failure_detail,
+    write_ocserv_command_audit, write_rpc_audit,
 };
 use ocfleet_cli::doctor::{DoctorOptions, format_human, run_doctor};
 use ocfleet_cli::health::run_health_command;
@@ -485,6 +486,14 @@ fn run_retention_set(
     }
     policy.updated_at = now_rfc3339();
     store.set_retention_policy(&policy)?;
+    let mut event = AuditEvent::new(local_actor(), "retention.set");
+    event.ok = Some(true);
+    event.detail_json = json!({
+        "scope": policy.scope.as_str(),
+        "max_age_days": policy.max_age_days,
+        "max_rows": policy.max_rows,
+    });
+    store.insert_audit(&event)?;
     println!("scope={}", policy.scope);
     println!("max_age_days={}", optional_u64(policy.max_age_days));
     println!("max_rows={}", optional_u64(policy.max_rows));
@@ -1460,30 +1469,33 @@ async fn run_path_probe_command(
         bail!(message);
     }
 
-    let params = json!({"target_agent_endpoint_id": target.endpoint_id.clone()});
+    let rpc = FixedControllerRpc::ProbePathEcho {
+        target_agent_endpoint_id: target.endpoint_id.clone(),
+    };
+    let params = rpc.params();
     let params_hash = hash_json_value(&params);
-    match execute_node_rpc(secret_key_path, &source, PROBE_PATH_ECHO, params).await {
+    match execute_fixed_node_rpc(secret_key_path, &source, rpc).await {
         Ok(success) => {
-            let peer_request_id = success
-                .result
-                .get("peer_request_id")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned);
-            let path_ok = success
-                .result
-                .get("ok")
-                .and_then(Value::as_bool)
-                .unwrap_or(true);
+            let mut summary = low_sensitive_fixed_rpc_summary(PROBE_PATH_ECHO, &success.result)?;
+            let path_ok = summary.get("ok").and_then(Value::as_bool).unwrap_or(true);
             let path_error_code = if path_ok {
                 None
             } else {
-                success
-                    .result
-                    .get("target_result")
-                    .and_then(|target_result| target_result.get("error_code"))
+                summary
+                    .get("target_error_code")
                     .and_then(Value::as_str)
                     .and_then(error_code_from_name)
             };
+            if let Some(summary) = summary.as_object_mut() {
+                summary.insert(
+                    "source_node_id".to_string(),
+                    Value::String(source.node_id.clone()),
+                );
+                summary.insert(
+                    "target_node_id".to_string(),
+                    Value::String(target.node_id.clone()),
+                );
+            }
             write_rpc_audit(
                 store,
                 RpcAuditRecord {
@@ -1496,15 +1508,7 @@ async fn run_path_probe_command(
                     ok: path_ok,
                     error_code: path_error_code,
                     duration_ms: elapsed_ms(started),
-                    detail_json: json!({
-                        "source_node_id": source.node_id,
-                        "source_endpoint_id": source.endpoint_id,
-                        "target_node_id": target.node_id,
-                        "target_endpoint_id": target.endpoint_id,
-                        "root_request_id": success.request_id,
-                        "peer_request_id": peer_request_id,
-                        "result": success.result,
-                    }),
+                    detail_json: summary,
                 },
             )?;
             print_rpc_result(PROBE_PATH_ECHO, &success.result);
@@ -1540,7 +1544,9 @@ async fn run_node_rpc_command(
     validate_node_id(node_id)?;
     let actor = local_actor();
     let started = Instant::now();
-    let params = json!({});
+    let rpc = FixedControllerRpc::from_method_without_params(method)
+        .with_context(|| format!("unsupported fixed RPC method: {method}"))?;
+    let params = rpc.params();
     let params_hash = hash_json_value(&params);
     let node = match store.get_node(node_id)? {
         Some(node) => node,
@@ -1608,8 +1614,9 @@ async fn run_node_rpc_command(
         bail!(message);
     }
 
-    match execute_node_rpc(secret_key_path, &node, method, params).await {
+    match execute_fixed_node_rpc(secret_key_path, &node, rpc).await {
         Ok(success) => {
+            let summary = low_sensitive_fixed_rpc_summary(method, &success.result)?;
             write_rpc_audit(
                 store,
                 RpcAuditRecord {
@@ -1622,7 +1629,7 @@ async fn run_node_rpc_command(
                     ok: true,
                     error_code: None,
                     duration_ms: elapsed_ms(started),
-                    detail_json: json!({ "result": success.result }),
+                    detail_json: summary,
                 },
             )?;
             print_rpc_result(method, &success.result);

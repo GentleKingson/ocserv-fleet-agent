@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, bail};
 use iroh::{EndpointAddr, EndpointId};
 use ocfleet_config::validation::validate_node_id;
 use ocfleet_protocol::DEFAULT_ALPN;
@@ -6,7 +6,7 @@ use ocfleet_protocol::RpcResponse;
 use ocfleet_protocol::enrollment::EndpointStatus;
 use ocfleet_protocol::error::ErrorCode;
 use ocfleet_protocol::method::{
-    NODE_INFO, OCSERV_CERT_EXPIRY, OCSERV_CONFIG_FINGERPRINT, OCSERV_SERVICE_SUMMARY,
+    NODE_INFO, NODE_PING, OCSERV_CERT_EXPIRY, OCSERV_CONFIG_FINGERPRINT, OCSERV_SERVICE_SUMMARY,
     OCSERV_SESSIONS_SUMMARY, OCSERV_VERSION, PROBE_CONTROLLER_PING, PROBE_PATH_ECHO,
 };
 use ocfleet_protocol::ocserv::{
@@ -30,6 +30,75 @@ use crate::store::{NodeRecord, Store};
 
 pub const CONTROLLER_RPC_RESULT_CLASS: &str = "controller_rpc_summary";
 pub const OCSERV_RESULT_CLASS: &str = "low_sensitive_summary";
+
+const FIXED_CONTROLLER_RPC_METHODS: &[&str] = &[
+    NODE_PING,
+    NODE_INFO,
+    PROBE_CONTROLLER_PING,
+    PROBE_PATH_ECHO,
+    OCSERV_SERVICE_SUMMARY,
+    OCSERV_VERSION,
+    OCSERV_SESSIONS_SUMMARY,
+    OCSERV_CERT_EXPIRY,
+    OCSERV_CONFIG_FINGERPRINT,
+];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FixedControllerRpc {
+    NodePing,
+    NodeInfo,
+    ProbeControllerPing,
+    ProbePathEcho { target_agent_endpoint_id: String },
+    OcservServiceSummary,
+    OcservVersion,
+    OcservSessionsSummary,
+    OcservCertExpiry,
+    OcservConfigFingerprint,
+}
+
+impl FixedControllerRpc {
+    pub fn from_method_without_params(method: &str) -> Option<Self> {
+        match method {
+            NODE_PING => Some(Self::NodePing),
+            NODE_INFO => Some(Self::NodeInfo),
+            PROBE_CONTROLLER_PING => Some(Self::ProbeControllerPing),
+            OCSERV_SERVICE_SUMMARY => Some(Self::OcservServiceSummary),
+            OCSERV_VERSION => Some(Self::OcservVersion),
+            OCSERV_SESSIONS_SUMMARY => Some(Self::OcservSessionsSummary),
+            OCSERV_CERT_EXPIRY => Some(Self::OcservCertExpiry),
+            OCSERV_CONFIG_FINGERPRINT => Some(Self::OcservConfigFingerprint),
+            PROBE_PATH_ECHO => None,
+            _ => None,
+        }
+    }
+
+    pub fn allowlisted_methods() -> &'static [&'static str] {
+        FIXED_CONTROLLER_RPC_METHODS
+    }
+
+    pub fn method(&self) -> &'static str {
+        match self {
+            Self::NodePing => NODE_PING,
+            Self::NodeInfo => NODE_INFO,
+            Self::ProbeControllerPing => PROBE_CONTROLLER_PING,
+            Self::ProbePathEcho { .. } => PROBE_PATH_ECHO,
+            Self::OcservServiceSummary => OCSERV_SERVICE_SUMMARY,
+            Self::OcservVersion => OCSERV_VERSION,
+            Self::OcservSessionsSummary => OCSERV_SESSIONS_SUMMARY,
+            Self::OcservCertExpiry => OCSERV_CERT_EXPIRY,
+            Self::OcservConfigFingerprint => OCSERV_CONFIG_FINGERPRINT,
+        }
+    }
+
+    pub fn params(&self) -> Value {
+        match self {
+            Self::ProbePathEcho {
+                target_agent_endpoint_id,
+            } => json!({ "target_agent_endpoint_id": target_agent_endpoint_id }),
+            _ => json!({}),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControllerRpcOutcome {
@@ -78,7 +147,35 @@ impl<'a> ControllerRpcRunner<'a> {
     pub async fn run_fixed_node_rpc(&self, node_id: &str, method: &str) -> ControllerRpcOutcome {
         let actor = local_actor();
         let started = Instant::now();
-        let params = json!({});
+        let Some(rpc) = FixedControllerRpc::from_method_without_params(method) else {
+            let duration_ms = elapsed_ms(started);
+            let failure = unsupported_fixed_rpc_failure(method);
+            let _ = write_rpc_audit(
+                self.store,
+                RpcAuditRecord {
+                    actor,
+                    node_id: node_id.to_string(),
+                    endpoint_id: known_endpoint_id(self.store, node_id),
+                    method: method.to_string(),
+                    request_id: None,
+                    params_hash: hash_json_value(&json!({})),
+                    ok: false,
+                    error_code: Some(failure.code.clone()),
+                    duration_ms,
+                    detail_json: failure.detail_json.clone(),
+                },
+            );
+            return failure_to_outcome(
+                node_id.to_string(),
+                known_endpoint_id(self.store, node_id),
+                method.to_string(),
+                failure,
+                duration_ms,
+                CONTROLLER_RPC_RESULT_CLASS,
+            );
+        };
+        let method = rpc.method();
+        let params = rpc.params();
         let params_hash = hash_json_value(&params);
         let node = match load_fixed_rpc_node(self.store, node_id) {
             Ok(node) => node,
@@ -110,10 +207,32 @@ impl<'a> ControllerRpcRunner<'a> {
             }
         };
 
-        match execute_node_rpc(self.secret_key_path, &node, method, params).await {
+        match execute_fixed_node_rpc(self.secret_key_path, &node, rpc).await {
             Ok(success) => {
                 let duration_ms = elapsed_ms(started);
-                let detail_json = json!({ "result": success.result.clone() });
+                let summary_json = match low_sensitive_fixed_rpc_summary(method, &success.result) {
+                    Ok(summary) => summary,
+                    Err(err) => {
+                        let failure = RpcCommandFailure::new(
+                            ErrorCode::InvalidResponse,
+                            err.to_string(),
+                            Some(success.request_id),
+                            json!({
+                                "message": "fixed RPC response summary is invalid",
+                                "result_class": CONTROLLER_RPC_RESULT_CLASS,
+                                "error_code": "INVALID_RESPONSE",
+                            }),
+                        );
+                        return failure_to_outcome(
+                            node.node_id,
+                            Some(node.endpoint_id),
+                            method.to_string(),
+                            failure,
+                            duration_ms,
+                            CONTROLLER_RPC_RESULT_CLASS,
+                        );
+                    }
+                };
                 match write_rpc_audit(
                     self.store,
                     RpcAuditRecord {
@@ -126,7 +245,7 @@ impl<'a> ControllerRpcRunner<'a> {
                         ok: true,
                         error_code: None,
                         duration_ms,
-                        detail_json,
+                        detail_json: summary_json.clone(),
                     },
                 ) {
                     Ok(()) => ControllerRpcOutcome {
@@ -138,7 +257,7 @@ impl<'a> ControllerRpcRunner<'a> {
                         error_code: None,
                         duration_ms,
                         result_class: CONTROLLER_RPC_RESULT_CLASS.to_string(),
-                        summary_json: success.result,
+                        summary_json,
                         message: None,
                     },
                     Err(err) => audit_failure_outcome(
@@ -456,9 +575,12 @@ where
     T: DeserializeOwned,
 {
     let started = Instant::now();
-    let params = json!({});
+    let Some(rpc) = FixedControllerRpc::from_method_without_params(method) else {
+        return Err(unsupported_fixed_rpc_failure(method));
+    };
+    let params = rpc.params();
     let params_hash = hash_json_value(&params);
-    let result = execute_node_rpc(secret_key_path, node, method, params).await;
+    let result = execute_fixed_node_rpc(secret_key_path, node, rpc).await;
     match result {
         Ok(success) => {
             let typed = match serde_json::from_value::<T>(success.result.clone()) {
@@ -666,7 +788,15 @@ impl RpcCommandFailure {
     }
 }
 
-pub async fn execute_node_rpc(
+pub async fn execute_fixed_node_rpc(
+    secret_key_path: &Path,
+    node: &NodeRecord,
+    rpc: FixedControllerRpc,
+) -> Result<RpcCommandSuccess, RpcCommandFailure> {
+    execute_node_rpc_raw(secret_key_path, node, rpc.method(), rpc.params()).await
+}
+
+async fn execute_node_rpc_raw(
     secret_key_path: &Path,
     node: &NodeRecord,
     method: &str,
@@ -730,6 +860,81 @@ pub async fn execute_node_rpc(
         request_id,
         result: response.result.unwrap_or_else(|| json!({})),
     })
+}
+
+pub fn low_sensitive_fixed_rpc_summary(method: &str, result: &Value) -> Result<Value> {
+    let mut summary = Map::new();
+    summary.insert(
+        "result_class".to_string(),
+        Value::String(CONTROLLER_RPC_RESULT_CLASS.to_string()),
+    );
+    match method {
+        NODE_PING => {
+            copy_string_field(result, &mut summary, "message");
+            copy_string_field(result, &mut summary, "node_id");
+            copy_string_field(result, &mut summary, "agent_version");
+            copy_string_field(result, &mut summary, "time_utc");
+        }
+        NODE_INFO => {
+            for field in [
+                "node_id",
+                "region",
+                "role",
+                "agent_version",
+                "current_time_utc",
+                "agent_endpoint_id",
+            ] {
+                copy_string_field(result, &mut summary, field);
+            }
+        }
+        PROBE_CONTROLLER_PING => {
+            copy_string_field(result, &mut summary, "message");
+            copy_string_field(result, &mut summary, "probe");
+            copy_string_field(result, &mut summary, "node_id");
+            copy_string_field(result, &mut summary, "agent_version");
+            copy_string_field(result, &mut summary, "agent_endpoint_id");
+            copy_string_field(result, &mut summary, "time_utc");
+        }
+        PROBE_PATH_ECHO => {
+            copy_string_field(result, &mut summary, "probe");
+            if let Some(ok) = result.get("ok").and_then(Value::as_bool) {
+                summary.insert("ok".to_string(), Value::Bool(ok));
+            }
+            copy_string_field(result, &mut summary, "source_agent_endpoint_id");
+            copy_string_field(result, &mut summary, "target_agent_endpoint_id");
+            copy_string_field(result, &mut summary, "root_request_id");
+            copy_string_field(result, &mut summary, "peer_request_id");
+            copy_string_field(result, &mut summary, "time_utc");
+            if let Some(error_code) = result
+                .get("target_result")
+                .and_then(|target| target.get("error_code"))
+                .and_then(Value::as_str)
+            {
+                summary.insert(
+                    "target_error_code".to_string(),
+                    Value::String(error_code.to_string()),
+                );
+            }
+        }
+        OCSERV_SERVICE_SUMMARY
+        | OCSERV_VERSION
+        | OCSERV_SESSIONS_SUMMARY
+        | OCSERV_CERT_EXPIRY
+        | OCSERV_CONFIG_FINGERPRINT => {
+            summary.insert(
+                "result_class".to_string(),
+                Value::String(OCSERV_RESULT_CLASS.to_string()),
+            );
+        }
+        _ => bail!("unsupported fixed RPC method for summary: {method}"),
+    }
+    Ok(Value::Object(summary))
+}
+
+fn copy_string_field(source: &Value, target: &mut Map<String, Value>, field: &str) {
+    if let Some(value) = source.get(field).and_then(Value::as_str) {
+        target.insert(field.to_string(), Value::String(value.to_string()));
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -955,6 +1160,19 @@ fn audit_failure_outcome(
         summary_json: json!({ "message": message }),
         message: Some("controller audit write failed".to_string()),
     }
+}
+
+fn unsupported_fixed_rpc_failure(method: &str) -> RpcCommandFailure {
+    RpcCommandFailure::new(
+        ErrorCode::ParamsInvalid,
+        format!("unsupported fixed RPC method: {method}"),
+        None,
+        json!({
+            "message": "unsupported fixed RPC method",
+            "result_class": CONTROLLER_RPC_RESULT_CLASS,
+            "method": method,
+        }),
+    )
 }
 
 fn local_actor() -> String {

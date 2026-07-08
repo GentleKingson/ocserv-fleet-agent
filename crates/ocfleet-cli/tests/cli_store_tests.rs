@@ -513,6 +513,10 @@ fn approving_join_request_creates_active_endpoint_and_audit_before_after() {
     assert_eq!(endpoint.status, EndpointStatus::Active);
     assert_eq!(endpoint.generation, 1);
     assert_eq!(endpoint.fingerprint.as_deref(), Some("agent-fingerprint"));
+    assert_eq!(
+        endpoint.node_id, None,
+        "approval must not trust or bind agent self-reported hostname"
+    );
 
     let (event, detail) = latest_audit_event(&db);
     assert_eq!(event, "enrollment.approve");

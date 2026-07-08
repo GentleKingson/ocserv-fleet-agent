@@ -1,6 +1,7 @@
 use ocfleet_cli::audit::AuditEvent;
 use ocfleet_cli::store::{
-    ApprovalInput, EnrollmentTokenInsert, JoinRequestInsert, NodeInsert, Store, StoreError,
+    ApprovalInput, CURRENT_SCHEMA_VERSION, EnrollmentTokenInsert, JoinRequestInsert, NodeInsert,
+    Store, StoreError,
 };
 use ocfleet_protocol::enrollment::{EndpointStatus, EnrollmentTokenStatus, JoinRequestStatus};
 use rusqlite::Connection;
@@ -42,7 +43,10 @@ fn initializes_schema_and_migration_version() {
     let dir = tempfile::tempdir().expect("temp dir");
     let db = dir.path().join("controller.sqlite");
     let store = Store::open(&db).expect("store opens");
-    assert_eq!(store.current_schema_version().expect("version"), 2);
+    assert_eq!(
+        store.current_schema_version().expect("version"),
+        CURRENT_SCHEMA_VERSION
+    );
 }
 
 #[test]
@@ -52,12 +56,18 @@ fn open_with_status_reports_database_creation() {
 
     let first = Store::open_with_status(&db).expect("create store with status");
     assert!(first.created_database);
-    assert_eq!(first.store.current_schema_version().expect("version"), 2);
+    assert_eq!(
+        first.store.current_schema_version().expect("version"),
+        CURRENT_SCHEMA_VERSION
+    );
     drop(first);
 
     let second = Store::open_with_status(&db).expect("reopen store with status");
     assert!(!second.created_database);
-    assert_eq!(second.store.current_schema_version().expect("version"), 2);
+    assert_eq!(
+        second.store.current_schema_version().expect("version"),
+        CURRENT_SCHEMA_VERSION
+    );
 }
 
 #[test]

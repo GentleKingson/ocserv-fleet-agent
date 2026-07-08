@@ -14,7 +14,7 @@ use uuid::Uuid;
 use crate::audit::AuditEvent;
 use crate::private_file::{self, PrivateFileError};
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 2;
+pub const CURRENT_SCHEMA_VERSION: i64 = 3;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -68,6 +68,102 @@ pub struct ProbeHistoryRecord {
     pub error_code: Option<String>,
     pub duration_ms: Option<u64>,
     pub detail_json: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservabilityJobRecord {
+    pub job_id: String,
+    pub kind: String,
+    pub selector_json: Value,
+    pub pair_selector_json: Option<Value>,
+    pub interval_seconds: u64,
+    pub jitter_seconds: u64,
+    pub timeout_ms: u64,
+    pub enabled: bool,
+    pub next_run_at: Option<String>,
+    pub last_run_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservabilityRunInsert {
+    pub run_id: String,
+    pub job_id: Option<String>,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+    pub status: String,
+    pub triggered_by: String,
+    pub summary_json: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeObservationInsert {
+    pub observation_id: String,
+    pub run_id: Option<String>,
+    pub node_id: Option<String>,
+    pub endpoint_id: Option<String>,
+    pub method: String,
+    pub ok: Option<bool>,
+    pub error_code: Option<String>,
+    pub duration_ms: Option<u64>,
+    pub observed_at: String,
+    pub expires_at: Option<String>,
+    pub result_class: String,
+    pub summary_json: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeObservationRecord {
+    pub observation_id: String,
+    pub run_id: Option<String>,
+    pub node_id: Option<String>,
+    pub endpoint_id: Option<String>,
+    pub method: String,
+    pub ok: Option<bool>,
+    pub error_code: Option<String>,
+    pub duration_ms: Option<u64>,
+    pub observed_at: String,
+    pub expires_at: Option<String>,
+    pub result_class: String,
+    pub summary_json: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HealthSnapshotRecord {
+    pub node_id: String,
+    pub endpoint_id: Option<String>,
+    pub computed_at: String,
+    pub status: String,
+    pub freshness_seconds: Option<u64>,
+    pub last_success_at: Option<String>,
+    pub last_failure_at: Option<String>,
+    pub last_error_code: Option<String>,
+    pub degraded_methods_json: Value,
+    pub summary_json: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlertEventRecord {
+    pub alert_id: String,
+    pub dedupe_key: String,
+    pub node_id: Option<String>,
+    pub severity: String,
+    pub state: String,
+    pub reason_code: String,
+    pub first_seen_at: String,
+    pub last_seen_at: String,
+    pub last_sent_at: Option<String>,
+    pub resolved_at: Option<String>,
+    pub detail_json: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetentionPolicyRecord {
+    pub scope: String,
+    pub max_age_days: Option<u64>,
+    pub max_rows: Option<u64>,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone)]
@@ -275,6 +371,80 @@ impl Store {
               created_at TEXT NOT NULL,
               updated_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS observability_jobs (
+              job_id TEXT PRIMARY KEY,
+              kind TEXT NOT NULL,
+              selector_json TEXT NOT NULL,
+              pair_selector_json TEXT,
+              interval_seconds INTEGER NOT NULL,
+              jitter_seconds INTEGER NOT NULL DEFAULT 0,
+              timeout_ms INTEGER NOT NULL,
+              enabled INTEGER NOT NULL DEFAULT 1,
+              next_run_at TEXT,
+              last_run_at TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS observability_runs (
+              run_id TEXT PRIMARY KEY,
+              job_id TEXT,
+              started_at TEXT NOT NULL,
+              finished_at TEXT,
+              status TEXT NOT NULL,
+              triggered_by TEXT NOT NULL,
+              summary_json TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS probe_observations (
+              observation_id TEXT PRIMARY KEY,
+              run_id TEXT,
+              node_id TEXT,
+              endpoint_id TEXT,
+              method TEXT NOT NULL,
+              ok INTEGER,
+              error_code TEXT,
+              duration_ms INTEGER,
+              observed_at TEXT NOT NULL,
+              expires_at TEXT,
+              result_class TEXT NOT NULL,
+              summary_json TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS health_snapshots (
+              node_id TEXT PRIMARY KEY,
+              endpoint_id TEXT,
+              computed_at TEXT NOT NULL,
+              status TEXT NOT NULL,
+              freshness_seconds INTEGER,
+              last_success_at TEXT,
+              last_failure_at TEXT,
+              last_error_code TEXT,
+              degraded_methods_json TEXT NOT NULL,
+              summary_json TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS alert_events (
+              alert_id TEXT PRIMARY KEY,
+              dedupe_key TEXT NOT NULL UNIQUE,
+              node_id TEXT,
+              severity TEXT NOT NULL,
+              state TEXT NOT NULL,
+              reason_code TEXT NOT NULL,
+              first_seen_at TEXT NOT NULL,
+              last_seen_at TEXT NOT NULL,
+              last_sent_at TEXT,
+              resolved_at TEXT,
+              detail_json TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS retention_policies (
+              scope TEXT PRIMARY KEY,
+              max_age_days INTEGER,
+              max_rows INTEGER,
+              updated_at TEXT NOT NULL
+            );
             "#,
         )?;
         tx.execute(
@@ -349,16 +519,62 @@ impl Store {
         &self,
         node_filter: Option<&str>,
     ) -> Result<Vec<ProbeHistoryRecord>, StoreError> {
+        self.list_probe_history_with_options(node_filter, None, 50)
+    }
+
+    pub fn list_probe_history_with_options(
+        &self,
+        node_filter: Option<&str>,
+        since: Option<&str>,
+        limit: u64,
+    ) -> Result<Vec<ProbeHistoryRecord>, StoreError> {
+        let limit = u64_to_i64(limit)?;
         if let Some(node_id) = node_filter {
+            if let Some(since) = since {
+                let mut stmt = self.conn.prepare(
+                    "SELECT ts, node_id, endpoint_id, method, request_id, ok, error_code, duration_ms, detail_json
+                     FROM controller_audit_log
+                     WHERE method IN (?1, ?2) AND node_id = ?3 AND ts >= ?4
+                     ORDER BY id DESC
+                     LIMIT ?5",
+                )?;
+                let rows = stmt.query_map(
+                    params![
+                        PROBE_CONTROLLER_PING,
+                        PROBE_PATH_ECHO,
+                        node_id,
+                        since,
+                        limit
+                    ],
+                    probe_history_from_row,
+                )?;
+                rows.collect::<Result<Vec<_>, _>>()
+                    .map_err(StoreError::from)
+            } else {
+                let mut stmt = self.conn.prepare(
+                    "SELECT ts, node_id, endpoint_id, method, request_id, ok, error_code, duration_ms, detail_json
+                     FROM controller_audit_log
+                     WHERE method IN (?1, ?2) AND node_id = ?3
+                     ORDER BY id DESC
+                     LIMIT ?4",
+                )?;
+                let rows = stmt.query_map(
+                    params![PROBE_CONTROLLER_PING, PROBE_PATH_ECHO, node_id, limit],
+                    probe_history_from_row,
+                )?;
+                rows.collect::<Result<Vec<_>, _>>()
+                    .map_err(StoreError::from)
+            }
+        } else if let Some(since) = since {
             let mut stmt = self.conn.prepare(
                 "SELECT ts, node_id, endpoint_id, method, request_id, ok, error_code, duration_ms, detail_json
                  FROM controller_audit_log
-                 WHERE method IN (?1, ?2) AND node_id = ?3
+                 WHERE method IN (?1, ?2) AND ts >= ?3
                  ORDER BY id DESC
-                 LIMIT 50",
+                 LIMIT ?4",
             )?;
             let rows = stmt.query_map(
-                params![PROBE_CONTROLLER_PING, PROBE_PATH_ECHO, node_id],
+                params![PROBE_CONTROLLER_PING, PROBE_PATH_ECHO, since, limit],
                 probe_history_from_row,
             )?;
             rows.collect::<Result<Vec<_>, _>>()
@@ -369,15 +585,396 @@ impl Store {
                  FROM controller_audit_log
                  WHERE method IN (?1, ?2)
                  ORDER BY id DESC
-                 LIMIT 50",
+                 LIMIT ?3",
             )?;
             let rows = stmt.query_map(
-                params![PROBE_CONTROLLER_PING, PROBE_PATH_ECHO],
+                params![PROBE_CONTROLLER_PING, PROBE_PATH_ECHO, limit],
                 probe_history_from_row,
             )?;
             rows.collect::<Result<Vec<_>, _>>()
                 .map_err(StoreError::from)
         }
+    }
+
+    pub fn insert_observability_job(&self, job: &ObservabilityJobRecord) -> Result<(), StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO observability_jobs
+             (job_id, kind, selector_json, pair_selector_json, interval_seconds, jitter_seconds, timeout_ms, enabled, next_run_at, last_run_at, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                job.job_id.as_str(),
+                job.kind.as_str(),
+                compact_json(&job.selector_json),
+                job.pair_selector_json.as_ref().map(compact_json),
+                u64_to_i64(job.interval_seconds)?,
+                u64_to_i64(job.jitter_seconds)?,
+                u64_to_i64(job.timeout_ms)?,
+                bool_to_i64(job.enabled),
+                job.next_run_at.as_deref(),
+                job.last_run_at.as_deref(),
+                job.created_at.as_str(),
+                job.updated_at.as_str(),
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn list_observability_jobs(&self) -> Result<Vec<ObservabilityJobRecord>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT job_id, kind, selector_json, pair_selector_json, interval_seconds, jitter_seconds, timeout_ms, enabled, next_run_at, last_run_at, created_at, updated_at
+             FROM observability_jobs
+             ORDER BY job_id",
+        )?;
+        let rows = stmt.query_map([], observability_job_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub fn set_observability_job_enabled(
+        &self,
+        job_id: &str,
+        enabled: bool,
+    ) -> Result<(), StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE observability_jobs
+             SET enabled = ?1,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+             WHERE job_id = ?2",
+            params![bool_to_i64(enabled), job_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn update_observability_job_run_times(
+        &self,
+        job_id: &str,
+        next_run_at: Option<&str>,
+        last_run_at: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE observability_jobs
+             SET next_run_at = ?1,
+                 last_run_at = ?2,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+             WHERE job_id = ?3",
+            params![next_run_at, last_run_at, job_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn insert_observability_run(&self, run: &ObservabilityRunInsert) -> Result<(), StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO observability_runs
+             (run_id, job_id, started_at, finished_at, status, triggered_by, summary_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                run.run_id.as_str(),
+                run.job_id.as_deref(),
+                run.started_at.as_str(),
+                run.finished_at.as_deref(),
+                run.status.as_str(),
+                run.triggered_by.as_str(),
+                compact_json(&run.summary_json),
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn finish_observability_run(
+        &self,
+        run_id: &str,
+        finished_at: &str,
+        status: &str,
+        summary_json: &Value,
+    ) -> Result<(), StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE observability_runs
+             SET finished_at = ?1,
+                 status = ?2,
+                 summary_json = ?3
+             WHERE run_id = ?4",
+            params![finished_at, status, compact_json(summary_json), run_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn insert_probe_observation(
+        &self,
+        observation: &ProbeObservationInsert,
+    ) -> Result<(), StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO probe_observations
+             (observation_id, run_id, node_id, endpoint_id, method, ok, error_code, duration_ms, observed_at, expires_at, result_class, summary_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                observation.observation_id.as_str(),
+                observation.run_id.as_deref(),
+                observation.node_id.as_deref(),
+                observation.endpoint_id.as_deref(),
+                observation.method.as_str(),
+                observation.ok.map(bool_to_i64),
+                observation.error_code.as_deref(),
+                option_u64_to_i64(observation.duration_ms)?,
+                observation.observed_at.as_str(),
+                observation.expires_at.as_deref(),
+                observation.result_class.as_str(),
+                compact_json(&observation.summary_json),
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn list_probe_observations(
+        &self,
+        node_filter: Option<&str>,
+        limit: u64,
+    ) -> Result<Vec<ProbeObservationRecord>, StoreError> {
+        self.list_probe_observations_since(node_filter, None, limit)
+    }
+
+    pub fn list_probe_observations_since(
+        &self,
+        node_filter: Option<&str>,
+        since: Option<&str>,
+        limit: u64,
+    ) -> Result<Vec<ProbeObservationRecord>, StoreError> {
+        let limit = u64_to_i64(limit)?;
+        if let Some(node_id) = node_filter {
+            if let Some(since) = since {
+                let mut stmt = self.conn.prepare(
+                    "SELECT observation_id, run_id, node_id, endpoint_id, method, ok, error_code, duration_ms, observed_at, expires_at, result_class, summary_json
+                     FROM probe_observations
+                     WHERE node_id = ?1 AND observed_at >= ?2
+                     ORDER BY observed_at DESC, observation_id DESC
+                     LIMIT ?3",
+                )?;
+                let rows =
+                    stmt.query_map(params![node_id, since, limit], probe_observation_from_row)?;
+                rows.collect::<Result<Vec<_>, _>>()
+                    .map_err(StoreError::from)
+            } else {
+                let mut stmt = self.conn.prepare(
+                    "SELECT observation_id, run_id, node_id, endpoint_id, method, ok, error_code, duration_ms, observed_at, expires_at, result_class, summary_json
+                     FROM probe_observations
+                     WHERE node_id = ?1
+                     ORDER BY observed_at DESC, observation_id DESC
+                     LIMIT ?2",
+                )?;
+                let rows = stmt.query_map(params![node_id, limit], probe_observation_from_row)?;
+                rows.collect::<Result<Vec<_>, _>>()
+                    .map_err(StoreError::from)
+            }
+        } else if let Some(since) = since {
+            let mut stmt = self.conn.prepare(
+                "SELECT observation_id, run_id, node_id, endpoint_id, method, ok, error_code, duration_ms, observed_at, expires_at, result_class, summary_json
+                 FROM probe_observations
+                 WHERE observed_at >= ?1
+                 ORDER BY observed_at DESC, observation_id DESC
+                 LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(params![since, limit], probe_observation_from_row)?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(StoreError::from)
+        } else {
+            let mut stmt = self.conn.prepare(
+                "SELECT observation_id, run_id, node_id, endpoint_id, method, ok, error_code, duration_ms, observed_at, expires_at, result_class, summary_json
+                 FROM probe_observations
+                 ORDER BY observed_at DESC, observation_id DESC
+                 LIMIT ?1",
+            )?;
+            let rows = stmt.query_map([limit], probe_observation_from_row)?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(StoreError::from)
+        }
+    }
+
+    pub fn upsert_health_snapshot(
+        &self,
+        snapshot: &HealthSnapshotRecord,
+    ) -> Result<(), StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO health_snapshots
+             (node_id, endpoint_id, computed_at, status, freshness_seconds, last_success_at, last_failure_at, last_error_code, degraded_methods_json, summary_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(node_id) DO UPDATE SET
+               endpoint_id = excluded.endpoint_id,
+               computed_at = excluded.computed_at,
+               status = excluded.status,
+               freshness_seconds = excluded.freshness_seconds,
+               last_success_at = excluded.last_success_at,
+               last_failure_at = excluded.last_failure_at,
+               last_error_code = excluded.last_error_code,
+               degraded_methods_json = excluded.degraded_methods_json,
+               summary_json = excluded.summary_json",
+            params![
+                snapshot.node_id.as_str(),
+                snapshot.endpoint_id.as_deref(),
+                snapshot.computed_at.as_str(),
+                snapshot.status.as_str(),
+                option_u64_to_i64(snapshot.freshness_seconds)?,
+                snapshot.last_success_at.as_deref(),
+                snapshot.last_failure_at.as_deref(),
+                snapshot.last_error_code.as_deref(),
+                compact_json(&snapshot.degraded_methods_json),
+                compact_json(&snapshot.summary_json),
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn list_health_snapshots(&self) -> Result<Vec<HealthSnapshotRecord>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT node_id, endpoint_id, computed_at, status, freshness_seconds, last_success_at, last_failure_at, last_error_code, degraded_methods_json, summary_json
+             FROM health_snapshots
+             ORDER BY node_id",
+        )?;
+        let rows = stmt.query_map([], health_snapshot_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub fn upsert_alert_event(&self, alert: &AlertEventRecord) -> Result<(), StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO alert_events
+             (alert_id, dedupe_key, node_id, severity, state, reason_code, first_seen_at, last_seen_at, last_sent_at, resolved_at, detail_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             ON CONFLICT(dedupe_key) DO UPDATE SET
+               alert_id = excluded.alert_id,
+               node_id = excluded.node_id,
+               severity = excluded.severity,
+               state = excluded.state,
+               reason_code = excluded.reason_code,
+               first_seen_at = excluded.first_seen_at,
+               last_seen_at = excluded.last_seen_at,
+               last_sent_at = excluded.last_sent_at,
+               resolved_at = excluded.resolved_at,
+               detail_json = excluded.detail_json",
+            params![
+                alert.alert_id.as_str(),
+                alert.dedupe_key.as_str(),
+                alert.node_id.as_deref(),
+                alert.severity.as_str(),
+                alert.state.as_str(),
+                alert.reason_code.as_str(),
+                alert.first_seen_at.as_str(),
+                alert.last_seen_at.as_str(),
+                alert.last_sent_at.as_deref(),
+                alert.resolved_at.as_deref(),
+                compact_json(&alert.detail_json),
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn list_alert_events(&self) -> Result<Vec<AlertEventRecord>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT alert_id, dedupe_key, node_id, severity, state, reason_code, first_seen_at, last_seen_at, last_sent_at, resolved_at, detail_json
+             FROM alert_events
+             ORDER BY last_seen_at DESC, alert_id",
+        )?;
+        let rows = stmt.query_map([], alert_event_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub fn get_retention_policy(
+        &self,
+        scope: &str,
+    ) -> Result<Option<RetentionPolicyRecord>, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT scope, max_age_days, max_rows, updated_at
+                 FROM retention_policies
+                 WHERE scope = ?1",
+                [scope],
+                retention_policy_from_row,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    pub fn set_retention_policy(&self, policy: &RetentionPolicyRecord) -> Result<(), StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO retention_policies
+             (scope, max_age_days, max_rows, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(scope) DO UPDATE SET
+               max_age_days = excluded.max_age_days,
+               max_rows = excluded.max_rows,
+               updated_at = excluded.updated_at",
+            params![
+                policy.scope.as_str(),
+                option_u64_to_i64(policy.max_age_days)?,
+                option_u64_to_i64(policy.max_rows)?,
+                policy.updated_at.as_str(),
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn count_retention_candidates(
+        &self,
+        scope: &str,
+        cutoff: Option<&str>,
+        max_rows: Option<u64>,
+    ) -> Result<u64, StoreError> {
+        let target = retention_target(scope)?;
+        count_retention_candidates_for_target(&self.conn, target, cutoff, max_rows)
+    }
+
+    pub fn prune_probe_observations(
+        &self,
+        cutoff: Option<&str>,
+        max_rows: Option<u64>,
+    ) -> Result<u64, StoreError> {
+        self.prune_retention_scope("observations", cutoff, max_rows)
+    }
+
+    pub fn prune_health_snapshots(
+        &self,
+        cutoff: Option<&str>,
+        max_rows: Option<u64>,
+    ) -> Result<u64, StoreError> {
+        self.prune_retention_scope("health-snapshots", cutoff, max_rows)
+    }
+
+    pub fn prune_alert_events(
+        &self,
+        cutoff: Option<&str>,
+        max_rows: Option<u64>,
+    ) -> Result<u64, StoreError> {
+        self.prune_retention_scope("alert-events", cutoff, max_rows)
+    }
+
+    fn prune_retention_scope(
+        &self,
+        scope: &str,
+        cutoff: Option<&str>,
+        max_rows: Option<u64>,
+    ) -> Result<u64, StoreError> {
+        let target = retention_target(scope)?;
+        let tx = self.conn.unchecked_transaction()?;
+        let deleted = prune_retention_target(&tx, target, cutoff, max_rows)?;
+        tx.commit()?;
+        Ok(deleted)
     }
 
     pub fn disable_node(&self, node_id: &str) -> Result<(), StoreError> {
@@ -1095,6 +1692,211 @@ fn probe_history_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProbeHist
     })
 }
 
+fn observability_job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ObservabilityJobRecord> {
+    let selector_json: String = row.get(2)?;
+    let pair_selector_json: Option<String> = row.get(3)?;
+    Ok(ObservabilityJobRecord {
+        job_id: row.get(0)?,
+        kind: row.get(1)?,
+        selector_json: parse_json_column(&selector_json, 2)?,
+        pair_selector_json: pair_selector_json
+            .as_deref()
+            .map(|value| parse_json_column(value, 3))
+            .transpose()?,
+        interval_seconds: i64_to_u64(row.get(4)?)?,
+        jitter_seconds: i64_to_u64(row.get(5)?)?,
+        timeout_ms: i64_to_u64(row.get(6)?)?,
+        enabled: row.get::<_, i64>(7)? == 1,
+        next_run_at: row.get(8)?,
+        last_run_at: row.get(9)?,
+        created_at: row.get(10)?,
+        updated_at: row.get(11)?,
+    })
+}
+
+fn probe_observation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProbeObservationRecord> {
+    let ok: Option<i64> = row.get(5)?;
+    let duration_ms: Option<i64> = row.get(7)?;
+    let summary_json: String = row.get(11)?;
+    Ok(ProbeObservationRecord {
+        observation_id: row.get(0)?,
+        run_id: row.get(1)?,
+        node_id: row.get(2)?,
+        endpoint_id: row.get(3)?,
+        method: row.get(4)?,
+        ok: ok.map(|value| value != 0),
+        error_code: row.get(6)?,
+        duration_ms: duration_ms.map(i64_to_u64).transpose()?,
+        observed_at: row.get(8)?,
+        expires_at: row.get(9)?,
+        result_class: row.get(10)?,
+        summary_json: parse_json_column(&summary_json, 11)?,
+    })
+}
+
+fn health_snapshot_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HealthSnapshotRecord> {
+    let freshness_seconds: Option<i64> = row.get(4)?;
+    let degraded_methods_json: String = row.get(8)?;
+    let summary_json: String = row.get(9)?;
+    Ok(HealthSnapshotRecord {
+        node_id: row.get(0)?,
+        endpoint_id: row.get(1)?,
+        computed_at: row.get(2)?,
+        status: row.get(3)?,
+        freshness_seconds: freshness_seconds.map(i64_to_u64).transpose()?,
+        last_success_at: row.get(5)?,
+        last_failure_at: row.get(6)?,
+        last_error_code: row.get(7)?,
+        degraded_methods_json: parse_json_column(&degraded_methods_json, 8)?,
+        summary_json: parse_json_column(&summary_json, 9)?,
+    })
+}
+
+fn alert_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AlertEventRecord> {
+    let detail_json: String = row.get(10)?;
+    Ok(AlertEventRecord {
+        alert_id: row.get(0)?,
+        dedupe_key: row.get(1)?,
+        node_id: row.get(2)?,
+        severity: row.get(3)?,
+        state: row.get(4)?,
+        reason_code: row.get(5)?,
+        first_seen_at: row.get(6)?,
+        last_seen_at: row.get(7)?,
+        last_sent_at: row.get(8)?,
+        resolved_at: row.get(9)?,
+        detail_json: parse_json_column(&detail_json, 10)?,
+    })
+}
+
+fn retention_policy_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RetentionPolicyRecord> {
+    let max_age_days: Option<i64> = row.get(1)?;
+    let max_rows: Option<i64> = row.get(2)?;
+    Ok(RetentionPolicyRecord {
+        scope: row.get(0)?,
+        max_age_days: max_age_days.map(i64_to_u64).transpose()?,
+        max_rows: max_rows.map(i64_to_u64).transpose()?,
+        updated_at: row.get(3)?,
+    })
+}
+
+#[derive(Clone, Copy)]
+struct RetentionTarget {
+    table: &'static str,
+    timestamp_column: &'static str,
+}
+
+fn retention_target(scope: &str) -> Result<RetentionTarget, StoreError> {
+    match scope {
+        "observations" => Ok(RetentionTarget {
+            table: "probe_observations",
+            timestamp_column: "observed_at",
+        }),
+        "health-snapshots" => Ok(RetentionTarget {
+            table: "health_snapshots",
+            timestamp_column: "computed_at",
+        }),
+        "alert-events" => Ok(RetentionTarget {
+            table: "alert_events",
+            timestamp_column: "last_seen_at",
+        }),
+        _ => Err(StoreError::Sqlite(rusqlite::Error::InvalidParameterName(
+            scope.to_string(),
+        ))),
+    }
+}
+
+fn count_retention_candidates_for_target(
+    conn: &Connection,
+    target: RetentionTarget,
+    cutoff: Option<&str>,
+    max_rows: Option<u64>,
+) -> Result<u64, StoreError> {
+    let count: i64 = match (cutoff, max_rows) {
+        (None, None) => return Ok(0),
+        (Some(cutoff), None) => conn.query_row(
+            &format!(
+                "SELECT count(*) FROM {} WHERE {} < ?1",
+                target.table, target.timestamp_column
+            ),
+            [cutoff],
+            |row| row.get(0),
+        )?,
+        (None, Some(max_rows)) => {
+            let max_rows = u64_to_i64(max_rows)?;
+            conn.query_row(
+                &format!(
+                    "SELECT count(*) FROM {} WHERE rowid IN (
+                       SELECT rowid FROM {} ORDER BY {} DESC, rowid DESC LIMIT -1 OFFSET ?1
+                     )",
+                    target.table, target.table, target.timestamp_column
+                ),
+                [max_rows],
+                |row| row.get(0),
+            )?
+        }
+        (Some(cutoff), Some(max_rows)) => {
+            let max_rows = u64_to_i64(max_rows)?;
+            conn.query_row(
+                &format!(
+                    "SELECT count(*) FROM {} WHERE {} < ?1 OR rowid IN (
+                       SELECT rowid FROM {} ORDER BY {} DESC, rowid DESC LIMIT -1 OFFSET ?2
+                     )",
+                    target.table, target.timestamp_column, target.table, target.timestamp_column
+                ),
+                params![cutoff, max_rows],
+                |row| row.get(0),
+            )?
+        }
+    };
+    u64::try_from(count)
+        .map_err(|err| StoreError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(err))))
+}
+
+fn prune_retention_target(
+    tx: &Transaction<'_>,
+    target: RetentionTarget,
+    cutoff: Option<&str>,
+    max_rows: Option<u64>,
+) -> Result<u64, StoreError> {
+    let deleted = match (cutoff, max_rows) {
+        (None, None) => 0,
+        (Some(cutoff), None) => tx.execute(
+            &format!(
+                "DELETE FROM {} WHERE {} < ?1",
+                target.table, target.timestamp_column
+            ),
+            [cutoff],
+        )?,
+        (None, Some(max_rows)) => {
+            let max_rows = u64_to_i64(max_rows)?;
+            tx.execute(
+                &format!(
+                    "DELETE FROM {} WHERE rowid IN (
+                       SELECT rowid FROM {} ORDER BY {} DESC, rowid DESC LIMIT -1 OFFSET ?1
+                     )",
+                    target.table, target.table, target.timestamp_column
+                ),
+                [max_rows],
+            )?
+        }
+        (Some(cutoff), Some(max_rows)) => {
+            let max_rows = u64_to_i64(max_rows)?;
+            tx.execute(
+                &format!(
+                    "DELETE FROM {} WHERE {} < ?1 OR rowid IN (
+                       SELECT rowid FROM {} ORDER BY {} DESC, rowid DESC LIMIT -1 OFFSET ?2
+                     )",
+                    target.table, target.timestamp_column, target.table, target.timestamp_column
+                ),
+                params![cutoff, max_rows],
+            )?
+        }
+    };
+    u64::try_from(deleted)
+        .map_err(|err| StoreError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(err))))
+}
+
 fn enrollment_token_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EnrollmentTokenRecord> {
     let status: String = row.get(7)?;
     let labels_json: String = row.get(9)?;
@@ -1158,6 +1960,23 @@ fn endpoint_trust_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Endpoint
 fn parse_json_column(value: &str, column: usize) -> rusqlite::Result<Value> {
     serde_json::from_str(value)
         .map_err(|err| rusqlite::Error::FromSqlConversionFailure(column, Type::Text, Box::new(err)))
+}
+
+fn compact_json(value: &Value) -> String {
+    value.to_string()
+}
+
+fn bool_to_i64(value: bool) -> i64 {
+    if value { 1 } else { 0 }
+}
+
+fn option_u64_to_i64(value: Option<u64>) -> Result<Option<i64>, StoreError> {
+    value.map(u64_to_i64).transpose()
+}
+
+fn u64_to_i64(value: u64) -> Result<i64, StoreError> {
+    i64::try_from(value)
+        .map_err(|err| StoreError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(err))))
 }
 
 fn parse_status<T>(value: &str, column: usize) -> rusqlite::Result<T>

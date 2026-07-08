@@ -1,26 +1,29 @@
 use anyhow::{Context, bail};
 use clap::Parser;
-use iroh::{EndpointAddr, EndpointId};
+use ocfleet_cli::alerts::run_alert_command;
 use ocfleet_cli::args::{
     Cli, Command, EndpointCommand, EnrollCommand, EnrollRequestCommand, EnrollTokenCommand,
-    NodeCommand, OcservCommand, OcservSessionsCommand, ProbeCommand, TrustCommand, TrustDiffFormat,
+    NodeCommand, OcservCommand, OcservSessionsCommand, ProbeCommand, RetentionCommand,
+    RetentionScope, TrustCommand, TrustDiffFormat,
 };
 use ocfleet_cli::audit::AuditEvent;
-use ocfleet_cli::doctor::{DoctorOptions, format_human, run_doctor};
-use ocfleet_cli::identity::{
-    IdentityError, load_or_create_secret_key_with_status, load_secret_key,
+use ocfleet_cli::controller_rpc::{
+    OcservCommandAudit, RpcAuditRecord, RpcCommandFailure, elapsed_ms, error_code_from_name,
+    execute_node_rpc, execute_ocserv_rpc, execute_optional_ocserv_rpc, hash_json_value,
+    inactive_endpoint_status, known_endpoint_id, load_ocserv_rpc_node, low_sensitive_detail,
+    ocserv_failure_detail, write_ocserv_command_audit, write_rpc_audit,
 };
+use ocfleet_cli::doctor::{DoctorOptions, format_human, run_doctor};
+use ocfleet_cli::health::run_health_command;
+use ocfleet_cli::identity::load_or_create_secret_key_with_status;
 use ocfleet_cli::ocserv_output::{
     OcservStatusView, assert_low_sensitive_ocserv_output, format_cert_human, format_sessions_human,
-    format_status_json, format_status_view_human, low_sensitive_ocserv_audit_message,
+    format_status_json, format_status_view_human,
 };
-use ocfleet_cli::rpc_client::{
-    RpcClientError, bind_controller_endpoint, build_request, call_endpoint_addr,
-    validate_path_echo_result, validate_rpc_response,
-};
+use ocfleet_cli::scheduler::run_schedule_command;
 use ocfleet_cli::store::{
     ApprovalInput, EndpointTrustRecord, EnrollmentTokenInsert, JoinRequestInsert, NodeInsert,
-    NodeRecord, ProbeHistoryRecord, Store,
+    NodeRecord, ProbeHistoryRecord, ProbeObservationRecord, RetentionPolicyRecord, Store,
 };
 use ocfleet_config::validation::{
     canonicalize_node_endpoint_id, validate_node_id, validate_region, validate_role,
@@ -35,12 +38,9 @@ use ocfleet_protocol::ocserv::{
     OcservCertExpiryResponse, OcservConfigFingerprintResponse, OcservServiceSummaryResponse,
     OcservSessionsSummaryResponse, OcservVersionResponse,
 };
-use ocfleet_protocol::{DEFAULT_ALPN, DEFAULT_DEADLINE_MS, RpcResponse};
-use serde::de::DeserializeOwned;
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::str::FromStr;
 use std::time::Instant;
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
@@ -116,9 +116,18 @@ async fn main() -> anyhow::Result<()> {
                     target_node_id,
                 } => run_probe_summary_command(&store, &source_node_id, &target_node_id)?,
                 ProbeCommand::Topology => run_probe_topology_command(&store)?,
-                ProbeCommand::History { node_id } => {
-                    run_probe_history_command(&store, node_id.as_deref())?
-                }
+                ProbeCommand::History {
+                    node_id,
+                    limit,
+                    since,
+                    json,
+                } => run_probe_history_command(
+                    &store,
+                    node_id.as_deref(),
+                    limit,
+                    since.as_deref(),
+                    json,
+                )?,
                 ProbeCommand::Observe {
                     source_node_id,
                     target_node_id,
@@ -304,6 +313,22 @@ async fn main() -> anyhow::Result<()> {
                 },
             }
         }
+        Command::Schedule { command } => {
+            let store = Store::open(&cli.database).context("failed to open controller database")?;
+            run_schedule_command(&store, &cli.secret_key, command).await?;
+        }
+        Command::Retention { command } => {
+            let store = Store::open(&cli.database).context("failed to open controller database")?;
+            run_retention_command(&store, command)?;
+        }
+        Command::Health { command } => {
+            let store = Store::open(&cli.database).context("failed to open controller database")?;
+            run_health_command(&store, command)?;
+        }
+        Command::Alert { command } => {
+            let store = Store::open(&cli.database).context("failed to open controller database")?;
+            run_alert_command(&store, command)?;
+        }
     }
 
     Ok(())
@@ -412,6 +437,201 @@ fn parse_ttl(value: &str) -> anyhow::Result<Duration> {
         "d" => Ok(Duration::days(amount)),
         _ => bail!("--ttl must use s, m, h, or d suffix"),
     }
+}
+
+fn run_retention_command(store: &Store, command: RetentionCommand) -> anyhow::Result<()> {
+    match command {
+        RetentionCommand::Show => run_retention_show(store),
+        RetentionCommand::Set {
+            scope,
+            max_age,
+            max_rows,
+        } => run_retention_set(store, scope, max_age.as_deref(), max_rows),
+        RetentionCommand::Apply { dry_run } => run_retention_apply(store, dry_run),
+    }
+}
+
+fn run_retention_show(store: &Store) -> anyhow::Result<()> {
+    for scope in RETENTION_SCOPES {
+        let policy = effective_retention_policy(store, scope)?;
+        println!(
+            "scope={} max_age_days={} max_rows={} updated_at={}",
+            policy.scope,
+            optional_u64(policy.max_age_days),
+            optional_u64(policy.max_rows),
+            policy.updated_at
+        );
+    }
+    println!("scope=controller_audit_log retention=never");
+    Ok(())
+}
+
+fn run_retention_set(
+    store: &Store,
+    scope: RetentionScope,
+    max_age: Option<&str>,
+    max_rows: Option<usize>,
+) -> anyhow::Result<()> {
+    let scope_name = retention_scope_name(scope);
+    let mut policy = effective_retention_policy(store, scope_name)?;
+    if let Some(max_age) = max_age {
+        policy.max_age_days = Some(parse_retention_max_age_days(max_age)?);
+    }
+    if let Some(max_rows) = max_rows {
+        if max_rows == 0 {
+            bail!("--max-rows must be greater than zero");
+        }
+        policy.max_rows = Some(max_rows as u64);
+    }
+    policy.updated_at = now_rfc3339();
+    store.set_retention_policy(&policy)?;
+    println!("scope={}", policy.scope);
+    println!("max_age_days={}", optional_u64(policy.max_age_days));
+    println!("max_rows={}", optional_u64(policy.max_rows));
+    Ok(())
+}
+
+fn run_retention_apply(store: &Store, dry_run: bool) -> anyhow::Result<()> {
+    for scope in RETENTION_SCOPES {
+        let policy = effective_retention_policy(store, scope)?;
+        let cutoff = retention_cutoff(&policy)?;
+        let candidate_count =
+            store.count_retention_candidates(scope, cutoff.as_deref(), policy.max_rows)?;
+        let deleted_count = if dry_run {
+            candidate_count
+        } else {
+            match *scope {
+                "observations" => {
+                    store.prune_probe_observations(cutoff.as_deref(), policy.max_rows)?
+                }
+                "health-snapshots" => {
+                    store.prune_health_snapshots(cutoff.as_deref(), policy.max_rows)?
+                }
+                "alert-events" => store.prune_alert_events(cutoff.as_deref(), policy.max_rows)?,
+                _ => unreachable!("fixed retention scope list"),
+            }
+        };
+        println!(
+            "scope={} cutoff={} deleted_count={} dry_run={}",
+            scope,
+            cutoff.as_deref().unwrap_or("<none>"),
+            deleted_count,
+            dry_run
+        );
+        let mut event = AuditEvent::new(local_actor(), "retention.apply");
+        event.ok = Some(true);
+        event.detail_json = json!({
+            "scope": scope,
+            "cutoff": cutoff,
+            "deleted_count": deleted_count,
+            "dry_run": dry_run,
+        });
+        store.insert_audit(&event)?;
+    }
+    println!("scope=controller_audit_log retention=never deleted_count=0 dry_run={dry_run}");
+    Ok(())
+}
+
+const RETENTION_SCOPES: &[&str] = &["observations", "health-snapshots", "alert-events"];
+
+fn retention_scope_name(scope: RetentionScope) -> &'static str {
+    match scope {
+        RetentionScope::Observations => "observations",
+        RetentionScope::HealthSnapshots => "health-snapshots",
+        RetentionScope::AlertEvents => "alert-events",
+    }
+}
+
+fn default_retention_policy(scope: &str) -> RetentionPolicyRecord {
+    let (max_age_days, max_rows) = match scope {
+        "observations" => (Some(30), Some(100_000)),
+        "health-snapshots" => (Some(30), None),
+        "alert-events" => (Some(180), None),
+        _ => (None, None),
+    };
+    RetentionPolicyRecord {
+        scope: scope.to_string(),
+        max_age_days,
+        max_rows,
+        updated_at: "default".to_string(),
+    }
+}
+
+fn effective_retention_policy(store: &Store, scope: &str) -> anyhow::Result<RetentionPolicyRecord> {
+    Ok(store
+        .get_retention_policy(scope)?
+        .unwrap_or_else(|| default_retention_policy(scope)))
+}
+
+fn retention_cutoff(policy: &RetentionPolicyRecord) -> anyhow::Result<Option<String>> {
+    let Some(max_age_days) = policy.max_age_days else {
+        return Ok(None);
+    };
+    let days = i64::try_from(max_age_days).context("retention max age is too large")?;
+    Ok(Some(
+        (OffsetDateTime::now_utc() - Duration::days(days))
+            .format(&Rfc3339)
+            .expect("RFC3339 formatting succeeds"),
+    ))
+}
+
+fn parse_retention_max_age_days(value: &str) -> anyhow::Result<u64> {
+    let seconds = parse_duration_seconds(value, "--max-age")?;
+    const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
+    if seconds % SECONDS_PER_DAY != 0 {
+        bail!("--max-age must resolve to whole days");
+    }
+    let days = seconds / SECONDS_PER_DAY;
+    if days == 0 {
+        bail!("--max-age must be at least one day");
+    }
+    Ok(days)
+}
+
+fn duration_cutoff_rfc3339(value: &str, label: &str) -> anyhow::Result<String> {
+    let seconds = parse_duration_seconds(value, label)?;
+    let seconds = i64::try_from(seconds).with_context(|| format!("{label} is too large"))?;
+    Ok((OffsetDateTime::now_utc() - Duration::seconds(seconds))
+        .format(&Rfc3339)
+        .expect("RFC3339 formatting succeeds"))
+}
+
+fn parse_duration_seconds(value: &str, label: &str) -> anyhow::Result<u64> {
+    let Some(unit) = value.chars().last() else {
+        bail!("{label} must use s, m, h, or d suffix");
+    };
+    let number = &value[..value.len().saturating_sub(unit.len_utf8())];
+    if number.is_empty() {
+        bail!("{label} must include a positive number");
+    }
+    let amount: u64 = number
+        .parse()
+        .with_context(|| format!("invalid {label} value: {value}"))?;
+    if amount == 0 {
+        bail!("{label} must be greater than zero");
+    }
+    let multiplier = match unit {
+        's' => 1,
+        'm' => 60,
+        'h' => 60 * 60,
+        'd' => 24 * 60 * 60,
+        _ => bail!("{label} must use s, m, h, or d suffix"),
+    };
+    amount
+        .checked_mul(multiplier)
+        .with_context(|| format!("{label} is too large"))
+}
+
+fn now_rfc3339() -> String {
+    OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .expect("RFC3339 formatting succeeds")
+}
+
+fn optional_u64(value: Option<u64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "<none>".to_string())
 }
 
 #[derive(Debug, Clone)]
@@ -583,16 +803,115 @@ fn print_trust_diff_json(
     Ok(())
 }
 
-fn run_probe_history_command(store: &Store, node_filter: Option<&str>) -> anyhow::Result<()> {
+fn run_probe_history_command(
+    store: &Store,
+    node_filter: Option<&str>,
+    limit: usize,
+    since: Option<&str>,
+    json_output: bool,
+) -> anyhow::Result<()> {
     if let Some(node_id) = node_filter {
         validate_node_id(node_id)?;
     }
+    let limit = validate_probe_history_limit(limit)?;
+    let since_cutoff = since
+        .map(|value| duration_cutoff_rfc3339(value, "--since"))
+        .transpose()?;
 
-    let records = store.list_probe_history(node_filter)?;
+    let observations =
+        store.list_probe_observations_since(node_filter, since_cutoff.as_deref(), limit)?;
+    let (source, record_count) = if observations.is_empty() {
+        let records =
+            store.list_probe_history_with_options(node_filter, since_cutoff.as_deref(), limit)?;
+        let record_count = records.len();
+        if json_output {
+            print_probe_history_audit_json(node_filter, since, limit, &records)?;
+        } else {
+            print_probe_history_audit_human(node_filter, since, limit, &records);
+        }
+        ("controller_audit", record_count)
+    } else {
+        let record_count = observations.len();
+        if json_output {
+            print_probe_observations_json(node_filter, since, limit, &observations)?;
+        } else {
+            print_probe_observations_human(node_filter, since, limit, &observations);
+        }
+        ("probe_observations", record_count)
+    };
+
+    let mut event = AuditEvent::new(local_actor(), "probe.history");
+    event.node_id = node_filter.map(ToOwned::to_owned);
+    event.ok = Some(true);
+    event.detail_json = json!({
+        "node_filter": node_filter,
+        "source": source,
+        "record_count": record_count,
+        "limit": limit,
+        "since": since,
+        "no_probe_executed": true,
+        "health_score": false,
+    });
+    store.insert_audit(&event)?;
+    Ok(())
+}
+
+fn validate_probe_history_limit(limit: usize) -> anyhow::Result<u64> {
+    if limit == 0 {
+        bail!("--limit must be greater than zero");
+    }
+    if limit > 1000 {
+        bail!("--limit must be at most 1000");
+    }
+    Ok(limit as u64)
+}
+
+fn print_probe_observations_human(
+    node_filter: Option<&str>,
+    since: Option<&str>,
+    limit: u64,
+    records: &[ProbeObservationRecord],
+) {
+    println!("probe_history=probe_observations");
+    println!("node_filter={}", node_filter.unwrap_or("<all>"));
+    println!("since={}", since.unwrap_or("<none>"));
+    println!("limit={limit}");
+    println!("record_count={}", records.len());
+    for record in records {
+        println!(
+            "record observed_at={} node_id={} method={} ok={} error_code={} duration_ms={} observation_id={} run_id={}",
+            record.observed_at,
+            record.node_id.as_deref().unwrap_or("<none>"),
+            record.method,
+            record
+                .ok
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "<none>".to_string()),
+            record.error_code.as_deref().unwrap_or("<none>"),
+            record
+                .duration_ms
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "<none>".to_string()),
+            record.observation_id,
+            record.run_id.as_deref().unwrap_or("<none>"),
+        );
+    }
+    println!("no_probe_executed=true");
+    println!("health_score=false");
+}
+
+fn print_probe_history_audit_human(
+    node_filter: Option<&str>,
+    since: Option<&str>,
+    limit: u64,
+    records: &[ProbeHistoryRecord],
+) {
     println!("probe_history=controller_audit");
     println!("node_filter={}", node_filter.unwrap_or("<all>"));
+    println!("since={}", since.unwrap_or("<none>"));
+    println!("limit={limit}");
     println!("record_count={}", records.len());
-    for record in &records {
+    for record in records {
         let peer_request_id = record
             .detail_json
             .get("peer_request_id")
@@ -617,17 +936,82 @@ fn run_probe_history_command(store: &Store, node_filter: Option<&str>) -> anyhow
     }
     println!("no_probe_executed=true");
     println!("health_score=false");
+}
 
-    let mut event = AuditEvent::new(local_actor(), "probe.history");
-    event.node_id = node_filter.map(ToOwned::to_owned);
-    event.ok = Some(true);
-    event.detail_json = json!({
-        "node_filter": node_filter,
-        "record_count": records.len(),
-        "no_probe_executed": true,
-        "health_score": false,
-    });
-    store.insert_audit(&event)?;
+fn print_probe_observations_json(
+    node_filter: Option<&str>,
+    since: Option<&str>,
+    limit: u64,
+    records: &[ProbeObservationRecord],
+) -> anyhow::Result<()> {
+    let records = records
+        .iter()
+        .map(|record| {
+            json!({
+                "observation_id": record.observation_id,
+                "run_id": record.run_id,
+                "node_id": record.node_id,
+                "endpoint_id": record.endpoint_id,
+                "method": record.method,
+                "ok": record.ok,
+                "error_code": record.error_code,
+                "duration_ms": record.duration_ms,
+                "observed_at": record.observed_at,
+                "expires_at": record.expires_at,
+                "result_class": record.result_class,
+                "summary_json": record.summary_json,
+            })
+        })
+        .collect::<Vec<_>>();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "source": "probe_observations",
+            "node_filter": node_filter,
+            "since": since,
+            "limit": limit,
+            "record_count": records.len(),
+            "records": records,
+        }))?
+    );
+    Ok(())
+}
+
+fn print_probe_history_audit_json(
+    node_filter: Option<&str>,
+    since: Option<&str>,
+    limit: u64,
+    records: &[ProbeHistoryRecord],
+) -> anyhow::Result<()> {
+    let records = records
+        .iter()
+        .map(|record| {
+            json!({
+                "ts": record.ts,
+                "node_id": record.node_id,
+                "endpoint_id": record.endpoint_id,
+                "method": record.method,
+                "request_id": record.request_id,
+                "ok": record.ok,
+                "error_code": record.error_code,
+                "duration_ms": record.duration_ms,
+                "peer_request_id": record.detail_json.get("peer_request_id").and_then(Value::as_str),
+                "target_node_id": record.detail_json.get("target_node_id").and_then(Value::as_str),
+                "target_endpoint_id": record.detail_json.get("target_endpoint_id").and_then(Value::as_str),
+            })
+        })
+        .collect::<Vec<_>>();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "source": "controller_audit",
+            "node_filter": node_filter,
+            "since": since,
+            "limit": limit,
+            "record_count": records.len(),
+            "records": records,
+        }))?
+    );
     Ok(())
 }
 
@@ -933,16 +1317,6 @@ fn print_summary_node(role: &str, node_id: &str, status: &str, endpoint_id: Opti
             );
         }
     }
-}
-
-fn inactive_endpoint_status(
-    store: &Store,
-    endpoint_id: &str,
-) -> anyhow::Result<Option<EndpointStatus>> {
-    Ok(store
-        .get_endpoint_trust(endpoint_id)?
-        .map(|endpoint| endpoint.status)
-        .filter(|status| *status != EndpointStatus::Active))
 }
 
 async fn run_path_probe_command(
@@ -1617,243 +1991,6 @@ async fn run_ocserv_sessions_summary_command(
     Ok(())
 }
 
-fn load_ocserv_rpc_node(store: &Store, node_id: &str) -> Result<NodeRecord, RpcCommandFailure> {
-    validate_node_id(node_id).map_err(|err| {
-        RpcCommandFailure::new(
-            ErrorCode::ParamsInvalid,
-            err.to_string(),
-            None,
-            low_sensitive_detail(&err.to_string()),
-        )
-    })?;
-    let node = store.get_node(node_id).map_err(|err| {
-        RpcCommandFailure::new(
-            ErrorCode::SqliteError,
-            err.to_string(),
-            None,
-            low_sensitive_detail("controller registry read failed"),
-        )
-    })?;
-    let Some(node) = node else {
-        let message = format!("node not found: {node_id}");
-        return Err(RpcCommandFailure::new(
-            ErrorCode::NodeNotFound,
-            message.clone(),
-            None,
-            low_sensitive_detail(&message),
-        ));
-    };
-    if !node.enabled {
-        let message = format!("node disabled: {node_id}");
-        return Err(RpcCommandFailure::new(
-            ErrorCode::NodeDisabled,
-            message.clone(),
-            None,
-            low_sensitive_detail(&message),
-        ));
-    }
-    if let Some(status) = inactive_endpoint_status(store, &node.endpoint_id).map_err(|err| {
-        RpcCommandFailure::new(
-            ErrorCode::SqliteError,
-            err.to_string(),
-            None,
-            low_sensitive_detail("controller endpoint trust read failed"),
-        )
-    })? {
-        let message = format!(
-            "endpoint not active: node_id={} endpoint_id={} status={}",
-            node.node_id,
-            node.endpoint_id,
-            status.as_str()
-        );
-        return Err(RpcCommandFailure::new(
-            ErrorCode::EndpointNotAllowed,
-            message.clone(),
-            None,
-            json!({
-                "message": "endpoint is not active",
-                "result_class": "low_sensitive_summary",
-                "endpoint_status": status.as_str(),
-            }),
-        ));
-    }
-    Ok(node)
-}
-
-fn known_endpoint_id(store: &Store, node_id: &str) -> Option<String> {
-    store
-        .get_node(node_id)
-        .ok()
-        .flatten()
-        .map(|node| node.endpoint_id)
-}
-
-async fn execute_ocserv_rpc<T>(
-    store: &Store,
-    secret_key_path: &Path,
-    node: &NodeRecord,
-    method: &str,
-) -> Result<T, RpcCommandFailure>
-where
-    T: DeserializeOwned,
-{
-    let started = Instant::now();
-    let params = json!({});
-    let params_hash = hash_json_value(&params);
-    let result = execute_node_rpc(secret_key_path, node, method, params).await;
-    match result {
-        Ok(success) => {
-            let typed = match serde_json::from_value::<T>(success.result.clone()) {
-                Ok(typed) => typed,
-                Err(_) => {
-                    let failure = RpcCommandFailure::new(
-                        ErrorCode::InvalidResponse,
-                        "ocserv readonly response schema is invalid",
-                        Some(success.request_id.clone()),
-                        json!({
-                            "message": "ocserv readonly response schema is invalid",
-                            "result_class": "low_sensitive_summary",
-                            "error_code": "INVALID_RESPONSE",
-                        }),
-                    );
-                    let _ = write_rpc_audit(
-                        store,
-                        RpcAuditRecord {
-                            actor: local_actor(),
-                            node_id: node.node_id.clone(),
-                            endpoint_id: Some(node.endpoint_id.clone()),
-                            method: method.to_string(),
-                            request_id: Some(success.request_id),
-                            params_hash,
-                            ok: false,
-                            error_code: Some(ErrorCode::InvalidResponse),
-                            duration_ms: elapsed_ms(started),
-                            detail_json: ocserv_failure_detail(&failure),
-                        },
-                    );
-                    return Err(failure);
-                }
-            };
-            write_rpc_audit(
-                store,
-                RpcAuditRecord {
-                    actor: local_actor(),
-                    node_id: node.node_id.clone(),
-                    endpoint_id: Some(node.endpoint_id.clone()),
-                    method: method.to_string(),
-                    request_id: Some(success.request_id),
-                    params_hash,
-                    ok: true,
-                    error_code: None,
-                    duration_ms: elapsed_ms(started),
-                    detail_json: json!({"result_class": "low_sensitive_summary"}),
-                },
-            )
-            .map_err(|err| {
-                RpcCommandFailure::new(
-                    ErrorCode::AuditWriteFailed,
-                    err.to_string(),
-                    None,
-                    low_sensitive_detail("controller audit write failed"),
-                )
-            })?;
-            Ok(typed)
-        }
-        Err(failure) => {
-            let _ = write_rpc_audit(
-                store,
-                RpcAuditRecord {
-                    actor: local_actor(),
-                    node_id: node.node_id.clone(),
-                    endpoint_id: Some(node.endpoint_id.clone()),
-                    method: method.to_string(),
-                    request_id: failure.request_id.clone(),
-                    params_hash,
-                    ok: false,
-                    error_code: Some(failure.code.clone()),
-                    duration_ms: elapsed_ms(started),
-                    detail_json: ocserv_failure_detail(&failure),
-                },
-            );
-            Err(failure)
-        }
-    }
-}
-
-enum OcservRpcOutcome<T> {
-    Available(T),
-    Unavailable {
-        method: &'static str,
-        code: ErrorCode,
-    },
-}
-
-impl<T> OcservRpcOutcome<T> {
-    fn as_available(&self) -> Option<&T> {
-        match self {
-            Self::Available(value) => Some(value),
-            Self::Unavailable { .. } => None,
-        }
-    }
-
-    fn unavailable_method(&self) -> Option<&'static str> {
-        match self {
-            Self::Available(_) => None,
-            Self::Unavailable { method, .. } => Some(*method),
-        }
-    }
-
-    fn error_code(&self) -> Option<ErrorCode> {
-        match self {
-            Self::Available(_) => None,
-            Self::Unavailable { code, .. } => Some(code.clone()),
-        }
-    }
-}
-
-async fn execute_optional_ocserv_rpc<T>(
-    store: &Store,
-    secret_key_path: &Path,
-    node: &NodeRecord,
-    method: &'static str,
-) -> OcservRpcOutcome<T>
-where
-    T: DeserializeOwned,
-{
-    match execute_ocserv_rpc(store, secret_key_path, node, method).await {
-        Ok(value) => OcservRpcOutcome::Available(value),
-        Err(failure) => OcservRpcOutcome::Unavailable {
-            method,
-            code: failure.code,
-        },
-    }
-}
-
-struct OcservCommandAudit {
-    actor: String,
-    event: &'static str,
-    node_id: String,
-    endpoint_id: Option<String>,
-    method: &'static str,
-    ok: bool,
-    error_code: Option<ErrorCode>,
-    duration_ms: u64,
-    detail_json: Value,
-}
-
-fn write_ocserv_command_audit(store: &Store, record: OcservCommandAudit) -> anyhow::Result<()> {
-    let mut event = AuditEvent::new(record.actor, record.event);
-    event.node_id = Some(record.node_id);
-    event.endpoint_id = record.endpoint_id;
-    event.method = Some(record.method.to_string());
-    event.ok = Some(record.ok);
-    event.error_code = record.error_code.as_ref().map(error_code_name);
-    event.duration_ms = Some(record.duration_ms);
-    event.detail_json = record.detail_json;
-    store.insert_audit(&event)?;
-    Ok(())
-}
-
 fn write_ocserv_command_failure(
     store: &Store,
     event: &'static str,
@@ -1878,188 +2015,6 @@ fn write_ocserv_command_failure(
         },
     )?;
     bail!(message)
-}
-
-fn low_sensitive_detail(message: &str) -> Value {
-    json!({
-        "message": low_sensitive_ocserv_audit_message(message),
-        "result_class": "low_sensitive_summary",
-    })
-}
-
-fn ocserv_failure_detail(failure: &RpcCommandFailure) -> Value {
-    json!({
-        "message": low_sensitive_ocserv_audit_message(&failure.message),
-        "result_class": "low_sensitive_summary",
-        "error_code": error_code_name(&failure.code),
-    })
-}
-
-struct RpcCommandSuccess {
-    request_id: String,
-    result: Value,
-}
-
-struct RpcCommandFailure {
-    code: ErrorCode,
-    message: String,
-    request_id: Option<String>,
-    detail_json: Value,
-}
-
-impl RpcCommandFailure {
-    fn new(
-        code: ErrorCode,
-        message: impl Into<String>,
-        request_id: Option<String>,
-        detail_json: Value,
-    ) -> Self {
-        Self {
-            code,
-            message: message.into(),
-            request_id,
-            detail_json,
-        }
-    }
-}
-
-async fn execute_node_rpc(
-    secret_key_path: &Path,
-    node: &NodeRecord,
-    method: &str,
-    params: Value,
-) -> Result<RpcCommandSuccess, RpcCommandFailure> {
-    let secret_key = load_secret_key(secret_key_path, false).map_err(|err| {
-        let code = match &err {
-            IdentityError::InvalidPermissions => ErrorCode::SecretKeyPermissionInvalid,
-            _ => ErrorCode::SecretKeyLoadFailed,
-        };
-        RpcCommandFailure::new(
-            code,
-            format!("failed to load controller SecretKey: {err}"),
-            None,
-            json!({ "error": err.to_string() }),
-        )
-    })?;
-    let endpoint = bind_controller_endpoint(secret_key).await.map_err(|err| {
-        RpcCommandFailure::new(
-            err.code(),
-            err.to_string(),
-            None,
-            rpc_client_error_detail_json(&err),
-        )
-    })?;
-    let expected_endpoint_id = EndpointId::from_str(&node.endpoint_id).map_err(|err| {
-        RpcCommandFailure::new(
-            ErrorCode::ConnectFailed,
-            format!("invalid node endpoint_id: {err}"),
-            None,
-            json!({ "endpoint_id": node.endpoint_id, "error": err.to_string() }),
-        )
-    })?;
-    let request = build_request(method, params, Some(local_actor()), DEFAULT_DEADLINE_MS);
-    let request_id = request.request_id.clone();
-    let params_for_validation = request.params.clone();
-    let response = call_endpoint_addr(
-        &endpoint,
-        EndpointAddr::new(expected_endpoint_id),
-        expected_endpoint_id,
-        DEFAULT_ALPN.as_bytes(),
-        request,
-    )
-    .await
-    .map_err(|err| {
-        RpcCommandFailure::new(
-            err.code(),
-            err.to_string(),
-            Some(request_id.clone()),
-            rpc_client_error_detail_json(&err),
-        )
-    })?;
-
-    validate_response_for_method(&response, &request_id, method, node, &params_for_validation)?;
-    Ok(RpcCommandSuccess {
-        request_id,
-        result: response.result.unwrap_or_else(|| json!({})),
-    })
-}
-
-fn validate_response_for_method(
-    response: &RpcResponse,
-    request_id: &str,
-    method: &str,
-    node: &NodeRecord,
-    params: &Value,
-) -> Result<(), RpcCommandFailure> {
-    let expected_agent_endpoint_id =
-        matches!(method, NODE_INFO | PROBE_CONTROLLER_PING).then_some(node.endpoint_id.as_str());
-    validate_rpc_response(response, request_id, expected_agent_endpoint_id).map_err(|err| {
-        RpcCommandFailure::new(
-            err.code(),
-            err.to_string(),
-            Some(request_id.to_string()),
-            rpc_client_error_detail_json(&err),
-        )
-    })?;
-    if method == PROBE_PATH_ECHO {
-        let target_endpoint_id = params
-            .get("target_agent_endpoint_id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                RpcCommandFailure::new(
-                    ErrorCode::ParamsInvalid,
-                    "probe.path.echo missing target_agent_endpoint_id",
-                    Some(request_id.to_string()),
-                    json!({}),
-                )
-            })?;
-        let result = response.result.as_ref().ok_or_else(|| {
-            RpcCommandFailure::new(
-                ErrorCode::InvalidResponse,
-                "path response missing result",
-                Some(request_id.to_string()),
-                json!({}),
-            )
-        })?;
-        validate_path_echo_result(result, &node.endpoint_id, target_endpoint_id, request_id)
-            .map_err(|err| {
-                RpcCommandFailure::new(
-                    err.code(),
-                    err.to_string(),
-                    Some(request_id.to_string()),
-                    rpc_client_error_detail_json(&err),
-                )
-            })?;
-    }
-    Ok(())
-}
-
-struct RpcAuditRecord {
-    actor: String,
-    node_id: String,
-    endpoint_id: Option<String>,
-    method: String,
-    request_id: Option<String>,
-    params_hash: String,
-    ok: bool,
-    error_code: Option<ErrorCode>,
-    duration_ms: u64,
-    detail_json: Value,
-}
-
-fn write_rpc_audit(store: &Store, record: RpcAuditRecord) -> anyhow::Result<()> {
-    let mut event = AuditEvent::new(record.actor, "rpc.completed");
-    event.node_id = Some(record.node_id);
-    event.endpoint_id = record.endpoint_id;
-    event.method = Some(record.method);
-    event.request_id = record.request_id;
-    event.params_hash = Some(record.params_hash);
-    event.ok = Some(record.ok);
-    event.error_code = record.error_code.as_ref().map(error_code_name);
-    event.duration_ms = Some(record.duration_ms);
-    event.detail_json = record.detail_json;
-    store.insert_audit(&event)?;
-    Ok(())
 }
 
 fn print_rpc_result(method: &str, result: &Value) {
@@ -2146,37 +2101,4 @@ fn print_rpc_result(method: &str, result: &Value) {
         }
         _ => {}
     }
-}
-
-fn hash_json_value(value: &Value) -> String {
-    let bytes = serde_json::to_vec(value).unwrap_or_else(|_| b"null".to_vec());
-    blake3::hash(&bytes).to_hex().to_string()
-}
-
-fn rpc_client_error_detail_json(err: &RpcClientError) -> Value {
-    let mut detail = Map::new();
-    let details = err.details().clone();
-    detail.insert("error".to_string(), Value::String(err.to_string()));
-    detail.insert("details".to_string(), details.clone());
-    if let Value::Object(details) = details {
-        for (key, value) in details {
-            detail.entry(key).or_insert(value);
-        }
-    }
-    Value::Object(detail)
-}
-
-fn error_code_name(code: &ErrorCode) -> String {
-    serde_json::to_value(code)
-        .ok()
-        .and_then(|value| value.as_str().map(ToOwned::to_owned))
-        .unwrap_or_else(|| format!("{code:?}"))
-}
-
-fn error_code_from_name(value: &str) -> Option<ErrorCode> {
-    serde_json::from_value(Value::String(value.to_string())).ok()
-}
-
-fn elapsed_ms(started: Instant) -> u64 {
-    started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
 }

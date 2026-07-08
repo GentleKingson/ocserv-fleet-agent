@@ -1,9 +1,9 @@
 use ocfleet_protocol::error::ErrorCode;
 use ocfleet_protocol::ocserv::{
     OCSERV_CERT_MAX_ENTRIES, OcservCertExpiryResponse, OcservConfigFingerprintResponse,
-    OcservServiceSummaryResponse, OcservSessionsSummaryResponse, OcservVersionResponse,
-    is_valid_ocserv_name, is_valid_ocserv_version, is_valid_sha256_hex,
-    validate_ocserv_response_json_size,
+    OcservReadonlyMeta, OcservServiceSummaryResponse, OcservSessionsSummaryResponse,
+    OcservVersionResponse, is_valid_ocserv_collected_at, is_valid_ocserv_name,
+    is_valid_ocserv_version, is_valid_sha256_hex, validate_ocserv_response_json_size,
 };
 
 use crate::ocserv::OcservReadonlyError;
@@ -11,6 +11,7 @@ use crate::ocserv::OcservReadonlyError;
 pub fn service_summary(
     response: OcservServiceSummaryResponse,
 ) -> Result<OcservServiceSummaryResponse, OcservReadonlyError> {
+    validate_meta(&response.meta)?;
     if response
         .service
         .since
@@ -25,6 +26,7 @@ pub fn service_summary(
 pub fn version(
     response: OcservVersionResponse,
 ) -> Result<OcservVersionResponse, OcservReadonlyError> {
+    validate_meta(&response.meta)?;
     if let Some(version) = response.version.as_deref()
         && !is_valid_ocserv_version(version)
     {
@@ -36,12 +38,14 @@ pub fn version(
 pub fn sessions_summary(
     response: OcservSessionsSummaryResponse,
 ) -> Result<OcservSessionsSummaryResponse, OcservReadonlyError> {
+    validate_meta(&response.meta)?;
     bounded(response)
 }
 
 pub fn cert_expiry(
     response: OcservCertExpiryResponse,
 ) -> Result<OcservCertExpiryResponse, OcservReadonlyError> {
+    validate_meta(&response.meta)?;
     if response.certs.len() > OCSERV_CERT_MAX_ENTRIES {
         return Err(OcservReadonlyError::new(
             ErrorCode::OcservOutputBoundExceeded,
@@ -74,6 +78,7 @@ pub fn cert_expiry(
 pub fn config_fingerprint(
     response: OcservConfigFingerprintResponse,
 ) -> Result<OcservConfigFingerprintResponse, OcservReadonlyError> {
+    validate_meta(&response.meta)?;
     if response.fingerprint.algorithm != "sha256" {
         return invalid_data("ocserv config fingerprint algorithm is invalid");
     }
@@ -86,6 +91,14 @@ pub fn config_fingerprint(
         return invalid_data("ocserv config fingerprint hash is invalid");
     }
     bounded(response)
+}
+
+pub fn validate_meta(meta: &OcservReadonlyMeta) -> Result<(), OcservReadonlyError> {
+    if is_valid_ocserv_collected_at(&meta.collected_at) {
+        Ok(())
+    } else {
+        invalid_data("ocserv readonly meta collected_at is invalid")
+    }
 }
 
 fn bounded<T>(response: T) -> Result<T, OcservReadonlyError>

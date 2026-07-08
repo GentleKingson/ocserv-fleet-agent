@@ -202,9 +202,53 @@ Call the Phase 11 low-sensitive ocserv read-only RPCs:
 
 ```bash
 target/debug/ocfleet ocserv status hk-ocserv-01
+target/debug/ocfleet ocserv status hk-ocserv-01 --json
 target/debug/ocfleet ocserv cert hk-ocserv-01
+target/debug/ocfleet ocserv cert hk-ocserv-01 --json
 target/debug/ocfleet ocserv sessions summary hk-ocserv-01
+target/debug/ocfleet ocserv sessions summary hk-ocserv-01 --json
 ```
+
+Agent-side deployable example:
+
+```toml
+[ocserv_readonly]
+enabled = true
+provider = "snapshot"
+snapshot_path = "/var/lib/ocfleet-agent/ocserv-readonly.json"
+
+[ocserv_readonly.config_fingerprint]
+name = "main"
+config_path = "/etc/ocserv/ocserv.conf"
+
+[[ocserv_readonly.certificates]]
+name = "server"
+cert_path = "/etc/ocserv/server-cert.pem"
+```
+
+Snapshot document example:
+
+```json
+{
+  "service": {
+    "state": "running",
+    "enabled": "enabled",
+    "since": "2026-07-07T12:00:00Z"
+  },
+  "version": "1.3.0",
+  "sessions": {
+    "total": 12
+  },
+  "collected_at": "2026-07-07T12:00:00Z"
+}
+```
+
+With `provider = "snapshot"`, service summary, version, and session summary are
+read from the fixed local snapshot document. Certificate expiry and config
+fingerprint are collected from fixed local paths declared in the agent config.
+The controller cannot supply paths, commands, service names, unit names, or
+journal selectors. Human output shortens fingerprints; use `--json` for the full
+typed SHA-256 values.
 
 Phase 11 uses fixed RPC methods only. It does not add shell execution, raw
 command execution, raw file read RPCs, service reload/restart, session details,

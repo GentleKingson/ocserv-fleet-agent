@@ -79,6 +79,73 @@ fn snapshot_provider_rejects_files_over_16_kib() {
 }
 
 #[test]
+fn snapshot_collected_at_rejects_control_chars() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let snapshot = dir.path().join("ocserv-readonly.json");
+    std::fs::write(
+        &snapshot,
+        r#"{"service":{"state":"running","enabled":"enabled"},"collected_at":"2026-07-07T12:00:00Z\n"}"#,
+    )
+    .expect("write snapshot");
+    make_private(&snapshot);
+    let provider = SnapshotOcservReadonlyProvider::new(snapshot);
+
+    let err = provider
+        .service_summary()
+        .expect_err("control chars in collected_at rejected");
+    assert_eq!(err.code(), ErrorCode::OcservProviderInvalidData);
+}
+
+#[test]
+fn snapshot_collected_at_rejects_path_like_content() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let snapshot = dir.path().join("ocserv-readonly.json");
+    std::fs::write(
+        &snapshot,
+        r#"{"service":{"state":"running","enabled":"enabled"},"collected_at":"/etc/ocserv/ocserv.conf"}"#,
+    )
+    .expect("write snapshot");
+    make_private(&snapshot);
+    let provider = SnapshotOcservReadonlyProvider::new(snapshot);
+
+    let err = provider
+        .service_summary()
+        .expect_err("path-like collected_at rejected");
+    assert_eq!(err.code(), ErrorCode::OcservProviderInvalidData);
+    assert!(!err.message().contains("/etc/ocserv"));
+}
+
+#[test]
+fn provider_error_message_drops_paths() {
+    let err = ocfleet_agent::ocserv::OcservReadonlyError::new(
+        ErrorCode::OcservProviderUnavailable,
+        "failed to read /etc/ocserv/ocserv.conf",
+    );
+
+    assert_eq!(err.message(), "ocserv readonly provider error");
+}
+
+#[test]
+fn provider_error_message_drops_command_markers() {
+    let err = ocfleet_agent::ocserv::OcservReadonlyError::new(
+        ErrorCode::OcservProviderUnavailable,
+        "systemctl status ocserv wrote stderr",
+    );
+
+    assert_eq!(err.message(), "ocserv readonly provider error");
+}
+
+#[test]
+fn provider_error_message_replaces_control_chars() {
+    let err = ocfleet_agent::ocserv::OcservReadonlyError::new(
+        ErrorCode::OcservProviderUnavailable,
+        "temporary\tcollector\nfailure",
+    );
+
+    assert_eq!(err.message(), "temporary collector failure");
+}
+
+#[test]
 fn invalid_certificate_returns_invalid_without_leaking_pem_or_path() {
     let dir = tempfile::tempdir().expect("temp dir");
     let cert_path = dir.path().join("server.pem");
@@ -196,6 +263,28 @@ fn ocserv_provider_source_does_not_use_dangerous_adapters() {
     );
 }
 
+#[test]
+fn ocserv_production_paths_do_not_use_command_execution_or_raw_passthrough() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut violations = Vec::new();
+    for path in [
+        manifest_dir.join("src").join("ocserv"),
+        manifest_dir.join("src").join("server.rs"),
+        manifest_dir
+            .join("..")
+            .join("ocfleet-cli")
+            .join("src")
+            .join("ocserv_output.rs"),
+    ] {
+        collect_forbidden_production_source(&path, &mut violations);
+    }
+
+    assert!(
+        violations.is_empty(),
+        "ocserv production source contains forbidden passthrough markers: {violations:?}"
+    );
+}
+
 fn collect_forbidden_provider_source(dir: &Path, violations: &mut Vec<String>) {
     for entry in std::fs::read_dir(dir).expect("read ocserv source dir") {
         let path = entry.expect("source entry").path();
@@ -218,6 +307,43 @@ fn collect_forbidden_provider_source(dir: &Path, violations: &mut Vec<String>) {
             if text.contains(forbidden) {
                 violations.push(format!("{} contains {forbidden}", path.display()));
             }
+        }
+    }
+}
+
+fn collect_forbidden_production_source(path: &Path, violations: &mut Vec<String>) {
+    if path.is_dir() {
+        for entry in std::fs::read_dir(path).expect("read source dir") {
+            collect_forbidden_production_source(&entry.expect("source entry").path(), violations);
+        }
+        return;
+    }
+    if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+        return;
+    }
+    let text = std::fs::read_to_string(path).expect("read production source file");
+    for forbidden in [
+        "std::process::Command",
+        "tokio::process",
+        "Command::new",
+        "duct::",
+        "xshell",
+        "systemctl",
+        "occtl",
+        "journalctl",
+        "tail -f",
+        "cat /etc",
+        "raw_stdout",
+        "raw_stderr",
+        "raw_output",
+        "raw_file",
+        "shell_exec",
+        "command_run",
+        "service_name",
+        "journal_unit",
+    ] {
+        if text.contains(forbidden) {
+            violations.push(format!("{} contains {forbidden}", path.display()));
         }
     }
 }

@@ -7,7 +7,8 @@ use ocfleet_protocol::ocserv::{
     OcservConfigFingerprintResponse, OcservFieldStatus, OcservFreshness, OcservReadonlyMeta,
     OcservReadonlySource, OcservServiceEnabledState, OcservServiceState, OcservServiceSummary,
     OcservServiceSummaryRequest, OcservServiceSummaryResponse, OcservSessionsSummary,
-    OcservSessionsSummaryResponse, OcservVersionResponse, is_valid_ocserv_name,
+    OcservSessionsSummaryRequest, OcservSessionsSummaryResponse, OcservVersionRequest,
+    OcservVersionResponse, is_valid_ocserv_collected_at, is_valid_ocserv_name,
     is_valid_ocserv_version, is_valid_sha256_hex, validate_ocserv_response_json_size,
 };
 use serde_json::json;
@@ -63,6 +64,53 @@ fn ocserv_empty_request_serializes_as_closed_object() {
 }
 
 #[test]
+fn all_ocserv_request_types_reject_unknown_fields() {
+    serde_json::from_value::<OcservServiceSummaryRequest>(json!({"path": "/etc/ocserv"}))
+        .expect_err("service summary request rejects selectors");
+    serde_json::from_value::<OcservVersionRequest>(json!({"command": "occtl show users"}))
+        .expect_err("version request rejects commands");
+    serde_json::from_value::<OcservSessionsSummaryRequest>(json!({"journal": "ocserv"}))
+        .expect_err("sessions request rejects journals");
+    serde_json::from_value::<ocfleet_protocol::ocserv::OcservCertExpiryRequest>(
+        json!({"file": "/etc/ocserv/server-cert.pem"}),
+    )
+    .expect_err("cert request rejects files");
+    serde_json::from_value::<ocfleet_protocol::ocserv::OcservConfigFingerprintRequest>(
+        json!({"path": "/etc/ocserv/ocserv.conf"}),
+    )
+    .expect_err("config request rejects paths");
+}
+
+#[test]
+fn all_ocserv_response_types_reject_unknown_fields() {
+    serde_json::from_value::<OcservServiceSummaryResponse>(json!({
+        "service": {"state": "running", "enabled": "enabled"},
+        "meta": meta(),
+        "raw": "nope"
+    }))
+    .expect_err("service response rejects raw");
+    serde_json::from_value::<OcservVersionResponse>(json!({
+        "version": "1.3.0",
+        "status": "available",
+        "meta": {"source": "snapshot", "collected_at": "2026-07-07T12:00:00Z", "freshness": "cached", "path": "/etc/ocserv"}
+    }))
+    .expect_err("meta rejects unknown path field");
+    serde_json::from_value::<OcservSessionsSummaryResponse>(json!({
+        "sessions": {"total": 12, "status": "available", "username": "alice"},
+        "meta": meta()
+    }))
+    .expect_err("sessions response rejects details");
+}
+
+#[test]
+fn ocserv_meta_collected_at_is_bounded() {
+    assert!(is_valid_ocserv_collected_at("2026-07-07T12:00:00Z"));
+    assert!(!is_valid_ocserv_collected_at(&"2".repeat(65)));
+    assert!(!is_valid_ocserv_collected_at("2026-07-07T12:00:00Z\n"));
+    assert!(!is_valid_ocserv_collected_at("/etc/ocserv/ocserv.conf"));
+}
+
+#[test]
 fn ocserv_responses_are_closed_low_sensitive_shapes() {
     let response = OcservServiceSummaryResponse {
         service: OcservServiceSummary {
@@ -93,6 +141,84 @@ fn ocserv_responses_are_closed_low_sensitive_shapes() {
         assert!(
             !text.contains(forbidden),
             "ocserv response must not contain {forbidden}: {text}"
+        );
+    }
+}
+
+#[test]
+fn ocserv_response_json_never_contains_forbidden_field_names() {
+    let responses = [
+        serde_json::to_value(OcservServiceSummaryResponse {
+            service: OcservServiceSummary {
+                state: OcservServiceState::Running,
+                enabled: OcservServiceEnabledState::Enabled,
+                since: Some("2026-07-07T12:00:00Z".to_string()),
+            },
+            meta: meta(),
+        })
+        .expect("service json"),
+        serde_json::to_value(OcservVersionResponse {
+            version: Some("1.3.0".to_string()),
+            status: OcservFieldStatus::Available,
+            meta: meta(),
+        })
+        .expect("version json"),
+        serde_json::to_value(OcservSessionsSummaryResponse {
+            sessions: OcservSessionsSummary {
+                total: Some(12),
+                status: OcservFieldStatus::Available,
+            },
+            meta: meta(),
+        })
+        .expect("sessions json"),
+    ];
+    for value in responses {
+        let text = value.to_string();
+        for forbidden in [
+            "raw",
+            "stdout",
+            "stderr",
+            "command",
+            "path",
+            "file",
+            "log",
+            "journal",
+            "unit",
+            "username",
+            "\"user\"",
+            "client_ip",
+            "vpn_ip",
+            "session_id",
+            "subject",
+            "issuer",
+            "serial",
+            "san",
+            "pem",
+            "der",
+        ] {
+            assert!(!text.contains(forbidden), "forbidden {forbidden} in {text}");
+        }
+    }
+}
+
+#[test]
+fn ocserv_known_but_forbidden_methods_remain_not_allowed() {
+    for method in [
+        "ocserv.reload",
+        "ocserv.restart",
+        "ocserv.user.list",
+        "ocserv.sessions.list",
+        "ocserv.logs.query",
+        "ocserv.command.exec",
+        "ocserv.file.read",
+        "ocserv.occtl",
+        "ocserv.systemctl",
+        "ocserv.journalctl",
+    ] {
+        assert_ne!(
+            classify_phase_one_method(method),
+            MethodStatus::Allowed,
+            "{method} must not become allowed"
         );
     }
 }

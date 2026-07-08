@@ -25,9 +25,9 @@ pub struct OcservReadonlyError {
 
 impl OcservReadonlyError {
     pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
-        let mut message = message.into();
+        let mut message = sanitize_provider_error_message(&message.into());
         if message.len() > OCSERV_ERROR_MESSAGE_MAX_BYTES {
-            message.truncate(OCSERV_ERROR_MESSAGE_MAX_BYTES);
+            truncate_to_boundary(&mut message, OCSERV_ERROR_MESSAGE_MAX_BYTES);
         }
         Self { code, message }
     }
@@ -39,6 +39,60 @@ impl OcservReadonlyError {
     pub fn message(&self) -> &str {
         &self.message
     }
+}
+
+fn sanitize_provider_error_message(message: &str) -> String {
+    let sanitized = message
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect::<String>();
+    if contains_forbidden_provider_marker(&sanitized) {
+        "ocserv readonly provider error".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn contains_forbidden_provider_marker(message: &str) -> bool {
+    let lowered = message.to_ascii_lowercase();
+    [
+        "/etc/",
+        "/var/log",
+        "ocserv.conf",
+        "server-cert",
+        "begin certificate",
+        "private key",
+        concat!("system", "ctl"),
+        concat!("journal", "ctl"),
+        concat!("occ", "tl"),
+        "execstart",
+        "stdout",
+        "stderr",
+        "username",
+        "session_id",
+        "client_ip",
+        "vpn_ip",
+        "assigned_ip",
+        "cn=",
+        "san",
+        "dns:",
+        "issuer",
+        "serial",
+        "subject",
+    ]
+    .iter()
+    .any(|marker| lowered.contains(marker))
+}
+
+fn truncate_to_boundary(value: &mut String, max_bytes: usize) {
+    if value.len() <= max_bytes {
+        return;
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value.truncate(end);
 }
 
 pub struct CompositeOcservReadonlyProvider {

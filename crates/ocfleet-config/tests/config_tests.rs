@@ -460,6 +460,44 @@ command = "systemctl status ocserv"
 }
 
 #[test]
+fn agent_config_rejects_ocserv_readonly_command_unit_journal_and_occtl_fields() {
+    for (field, value) in [
+        ("command", r#""systemctl status ocserv""#),
+        ("unit", r#""ocserv.service""#),
+        ("journal", r#""ocserv""#),
+        ("occtl", r#""show users""#),
+    ] {
+        let err = toml::from_str::<AgentConfig>(&format!(
+            r#"
+[node]
+id = "hk-ocserv-01"
+region = "hk"
+role = "ocserv"
+
+[iroh]
+secret_key_path = "/tmp/iroh.secret"
+
+[security]
+
+[audit]
+path = "/tmp/ocfleet-audit.log"
+
+[ocserv_readonly]
+enabled = false
+provider = "disabled"
+{field} = {value}
+"#,
+        ))
+        .expect_err("unknown selector fields rejected");
+
+        assert!(
+            err.to_string().contains("unknown field"),
+            "{field} should be rejected as unknown: {err}"
+        );
+    }
+}
+
+#[test]
 fn agent_config_rejects_relative_ocserv_readonly_paths() {
     let mut config: AgentConfig = toml::from_str(
         r#"
@@ -534,6 +572,54 @@ fn agent_config_rejects_too_many_ocserv_certificates_and_bad_names() {
     assert!(matches!(
         err,
         ConfigError::Invalid(message) if message.contains("name")
+    ));
+}
+
+#[test]
+fn agent_config_rejects_config_fingerprint_bad_name() {
+    let mut config = minimal_agent_config();
+    config.ocserv_readonly.config_fingerprint =
+        Some(ocfleet_config::agent::OcservConfigFingerprintConfig {
+            name: "../main".to_string(),
+            config_path: "/etc/ocserv/ocserv.conf".into(),
+        });
+
+    let err = validate_agent_config(&config).expect_err("bad fingerprint name rejected");
+    assert!(matches!(
+        err,
+        ConfigError::Invalid(message) if message.contains("config_fingerprint.name")
+    ));
+}
+
+#[test]
+fn agent_config_rejects_certificate_name_with_control_char() {
+    let mut config = minimal_agent_config();
+    config
+        .ocserv_readonly
+        .certificates
+        .push(ocfleet_config::agent::OcservCertificateConfig {
+            name: "server\n".to_string(),
+            cert_path: "/etc/ocserv/server-cert.pem".into(),
+        });
+
+    let err = validate_agent_config(&config).expect_err("control char in cert name rejected");
+    assert!(matches!(
+        err,
+        ConfigError::Invalid(message) if message.contains("certificates.name")
+    ));
+}
+
+#[test]
+fn agent_config_rejects_snapshot_provider_without_snapshot_path() {
+    let mut config = minimal_agent_config();
+    config.ocserv_readonly.enabled = true;
+    config.ocserv_readonly.provider = OcservReadonlyProviderKind::Snapshot;
+    config.ocserv_readonly.snapshot_path = None;
+
+    let err = validate_agent_config(&config).expect_err("snapshot path required");
+    assert!(matches!(
+        err,
+        ConfigError::Invalid(message) if message.contains("snapshot_path")
     ));
 }
 

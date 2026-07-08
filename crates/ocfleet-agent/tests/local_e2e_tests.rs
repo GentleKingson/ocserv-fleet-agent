@@ -18,12 +18,14 @@ use ocfleet_cli::rpc_client::{
     bind_controller_endpoint_local_only, build_request, call_endpoint_addr,
 };
 use ocfleet_config::agent::{
-    AgentConfig, AuditConfig, ControllerConfig, IrohConfig, NodeConfig, PathProbeConfig,
-    PeerConfig, SecurityConfig,
+    AgentConfig, AuditConfig, ControllerConfig, IrohConfig, NodeConfig, OcservReadonlyProviderKind,
+    PathProbeConfig, PeerConfig, SecurityConfig,
 };
 use ocfleet_protocol::error::ErrorCode;
 use ocfleet_protocol::method::{
-    NODE_INFO, NODE_PING, PROBE_CONTROLLER_PING, PROBE_PATH_ECHO, PROBE_PEER_ECHO,
+    NODE_INFO, NODE_PING, OCSERV_CERT_EXPIRY, OCSERV_CONFIG_FINGERPRINT, OCSERV_SERVICE_SUMMARY,
+    OCSERV_SESSIONS_SUMMARY, OCSERV_VERSION, PROBE_CONTROLLER_PING, PROBE_PATH_ECHO,
+    PROBE_PEER_ECHO,
 };
 use ocfleet_protocol::rpc::RpcResponse;
 use serde_json::{Value, json};
@@ -207,6 +209,58 @@ async fn local_agent_rejects_known_and_unknown_disallowed_methods() {
         unknown.error.as_ref().expect("unknown method error").code,
         ErrorCode::MethodNotFound
     );
+
+    harness.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_agent_ocserv_readonly_audit_is_low_sensitive_summary_for_fixed_methods() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let harness =
+        spawn_local_agent_with_ocserv_snapshot(SecretKey::generate(), SecretKey::generate(), &dir)
+            .await;
+
+    for method in [
+        OCSERV_SERVICE_SUMMARY,
+        OCSERV_VERSION,
+        OCSERV_SESSIONS_SUMMARY,
+        OCSERV_CERT_EXPIRY,
+        OCSERV_CONFIG_FINGERPRINT,
+    ] {
+        let request = build_request(method, json!({}), Some("local-cli".into()), 5_000);
+        let request_id = request.request_id.clone();
+        let response = call_endpoint_addr(
+            &harness.controller,
+            harness.agent_addr.clone(),
+            harness.agent_id,
+            harness.config.iroh.alpn.as_bytes(),
+            request,
+        )
+        .await
+        .expect("ocserv readonly rpc");
+
+        assert!(response.ok, "{method}: {response:#?}");
+        let event = wait_for_audit_event(&harness.audit_path, |event| {
+            event.get("stage").and_then(Value::as_str) == Some("dispatch")
+                && event.get("method").and_then(Value::as_str) == Some(method)
+                && event.get("request_id").and_then(Value::as_str) == Some(request_id.as_str())
+        })
+        .await;
+
+        assert_eq!(
+            event.get("result_class").and_then(Value::as_str),
+            Some("low_sensitive_summary")
+        );
+        assert!(event.get("result").is_none_or(Value::is_null));
+        assert!(event.get("response").is_none_or(Value::is_null));
+        assert!(event.get("response_body").is_none_or(Value::is_null));
+        assert!(
+            event
+                .get("response_bytes")
+                .and_then(Value::as_u64)
+                .is_some()
+        );
+    }
 
     harness.shutdown().await;
 }
@@ -852,6 +906,71 @@ async fn spawn_local_agent_with_peers(
     }
 }
 
+async fn spawn_local_agent_with_ocserv_snapshot(
+    controller_key: SecretKey,
+    agent_key: SecretKey,
+    dir: &TempDir,
+) -> LocalAgentHarness {
+    let controller = bind_controller_endpoint_local_only(controller_key.clone())
+        .await
+        .expect("bind local-only controller endpoint");
+    let audit_path = dir.path().join("agent-audit.jsonl");
+    let snapshot_path = dir.path().join("ocserv-readonly.json");
+    std::fs::write(
+        &snapshot_path,
+        r#"{"service":{"state":"running","enabled":"enabled","since":"2026-07-07T12:00:00Z"},"version":"1.3.0","sessions":{"total":12},"collected_at":"2026-07-07T12:00:00Z"}"#,
+    )
+    .expect("write ocserv snapshot");
+    make_private(&snapshot_path);
+
+    let mut config = test_config(
+        controller_key.public(),
+        audit_path.clone(),
+        dir.path().join("agent.secret"),
+    );
+    config.ocserv_readonly.enabled = true;
+    config.ocserv_readonly.provider = OcservReadonlyProviderKind::Snapshot;
+    config.ocserv_readonly.snapshot_path = Some(snapshot_path);
+
+    let audit = JsonlAuditWriter::new(audit_path.clone());
+    let audit_limiter = Arc::new(Mutex::new(RejectedAuditLimiter::new(&config.audit)));
+    let agent =
+        bind_agent_endpoint_local_only(&config, agent_key, audit.clone(), audit_limiter.clone())
+            .await
+            .expect("bind local-only agent endpoint");
+    let agent_addr = agent.addr();
+    let agent_id = agent.id();
+    let state = AgentServerState {
+        config: config.clone(),
+        audit,
+        nonce_cache: Arc::new(Mutex::new(NonceCache::with_limits(
+            config.security.max_live_nonces_global,
+            config.security.max_live_nonces_per_controller,
+        ))),
+        limiters: Arc::new(ServerLimiters::from_config(&config.security)),
+        audit_limiter,
+        authz: Arc::new(
+            AgentAuthorization::from_security_config(&config.security).expect("authz table builds"),
+        ),
+        agent_endpoint_id: agent_id.to_string(),
+        outbound_endpoint: Some(agent.clone()),
+        path_target_resolver: PathTargetResolver::endpoint_id_only(),
+    };
+    let server_task = tokio::spawn(serve_endpoint(agent.clone(), state));
+
+    tokio::task::yield_now().await;
+
+    LocalAgentHarness {
+        controller,
+        agent,
+        agent_addr,
+        agent_id,
+        config,
+        audit_path,
+        server_task,
+    }
+}
+
 async fn spawn_local_path_probe_agents(
     dir: &TempDir,
     source_authorizes_target: bool,
@@ -1077,3 +1196,12 @@ fn audit_is_successful_method(event: &Value, method: &str) -> bool {
         && event.get("method").and_then(Value::as_str) == Some(method)
         && event.get("ok").and_then(Value::as_bool) == Some(true)
 }
+
+#[cfg(unix)]
+fn make_private(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).expect("chmod private");
+}
+
+#[cfg(not(unix))]
+fn make_private(_path: &Path) {}

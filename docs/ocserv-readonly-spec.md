@@ -94,9 +94,21 @@ dangerous data source to fill a missing field.
 Production provider code for Phase 11 is limited to:
 
 - a disabled provider
-- a typed snapshot provider
+- a typed snapshot provider for service summary, version, and session summary
 - certificate expiry parsing from configured certificate files
 - config fingerprint hashing from a configured config file
+
+Provider composition is fixed. `provider = "snapshot"` currently means:
+
+- `ocserv.service.summary`: snapshot-backed
+- `ocserv.version`: snapshot-backed
+- `ocserv.sessions.summary`: snapshot-backed
+- `ocserv.cert.expiry`: configured certificate parser
+- `ocserv.config.fingerprint`: configured config file hasher
+
+The snapshot file is not an RPC selector. It is local static agent config.
+Controller RPC params cannot override `snapshot_path`, certificate paths,
+config paths, service names, command names, unit names, or journal sources.
 
 ## Agent Config
 
@@ -150,6 +162,10 @@ OcservReadonlyMeta {
 `source` is one of `provider`, `snapshot`, or `unavailable`. It never contains a
 path, command, unit name, or log name.
 
+`collected_at` must be bounded to 64 bytes, contain no control characters, and
+parse as RFC3339. Response metadata must not contain paths, command markers, log
+markers, or source selector text.
+
 `ocserv.service.summary` returns `state`, `enabled`, and optional `since`.
 
 `ocserv.version` returns optional `version` and a field status.
@@ -165,7 +181,11 @@ hash, and a field status.
 ## CLI Behavior
 
 `ocfleet ocserv status <node>` calls service summary, version, sessions summary,
-and config fingerprint. Human output is key-value low-sensitive summary.
+and config fingerprint. Human output is key-value low-sensitive summary. It
+returns `status=ok` when all four sub-RPCs succeed. It returns `status=degraded`
+when at least one but not all sub-RPCs fail, with unavailable fields rendered as
+`<unavailable>` and `degraded_methods` listing only fixed method names. It fails
+only when all status sub-RPCs fail or when preflight checks fail.
 
 `ocfleet ocserv cert <node>` calls certificate expiry and prints logical cert
 name, status, expiry, days remaining, and fingerprint.
@@ -175,6 +195,9 @@ the aggregate count.
 
 The CLI does not accept ocserv-specific `--host`, `--port`, `--path`,
 `--command`, `--unit`, or similar selector flags.
+
+Human CLI output shortens certificate and config fingerprints for readability.
+Use `--json` for the complete typed response with full 64-hex SHA-256 values.
 
 ## Audit Rules
 
@@ -189,6 +212,12 @@ ocserv.sessions.summary
 Controller RPC-level audit records include node ID, endpoint ID, method, request
 ID, ok/error code, duration, params hash, and `result_class =
 low_sensitive_summary`. They do not store full response bodies.
+
+Ocserv CLI command audit details are metadata-only. Decode failures use the
+fixed message `ocserv readonly response schema is invalid`; raw serde field
+paths, response bodies, provider text, local paths, command output, and log text
+must not be written to audit detail. Degraded status audit records list fixed
+method names, not raw error messages.
 
 Agent audit records include method, params hash, ok/error code, duration,
 response size, and `result_class = low_sensitive_summary`. They do not store
@@ -207,9 +236,10 @@ OCSERV_OUTPUT_BOUND_EXCEEDED
 OCSERV_UNSUPPORTED_FIELD
 ```
 
-Error messages are capped at 128 bytes and must not include local paths, file
-snippets, parser dumps, certificate material, config content, logs, or command
-output.
+Error messages are sanitized and capped at 128 bytes. They must not include
+local paths, file snippets, parser dumps, certificate material, config content,
+logs, raw stdout/stderr, session/user identifiers, client addresses, certificate
+subject/SAN/issuer/serial data, or command output.
 
 ## Bounds And Redaction
 
@@ -225,7 +255,12 @@ Limits:
 - error message: 128 bytes
 
 All scalar fields reject control characters. Config fingerprints are opaque
-byte-level SHA-256 hashes, not semantic normalized config summaries.
+byte-level SHA-256 drift fingerprints, not semantic normalized config summaries
+and not secrecy-preserving digests. Human output shows only a short prefix; JSON
+typed DTO output may include the full hash.
+
+Phase 11.1 may replace or supplement SHA-256 with HMAC-SHA-256 once a fleet-level
+fingerprint key model is designed.
 
 ## Test Requirements
 

@@ -1,9 +1,11 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use time::OffsetDateTime;
 
 pub const OCSERV_RESPONSE_MAX_JSON_BYTES: usize = 8 * 1024;
 pub const OCSERV_VERSION_MAX_BYTES: usize = 64;
 pub const OCSERV_NAME_MAX_BYTES: usize = 64;
+pub const OCSERV_COLLECTED_AT_MAX_BYTES: usize = 64;
 pub const OCSERV_CERT_MAX_ENTRIES: usize = 8;
 pub const OCSERV_ERROR_MESSAGE_MAX_BYTES: usize = 128;
 
@@ -14,6 +16,7 @@ pub enum OcservProtocolValidationError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[serde(rename_all = "snake_case")]
 pub struct OcservReadonlyMeta {
     pub source: OcservReadonlySource,
@@ -246,6 +249,45 @@ pub fn is_valid_ocserv_name(value: &str) -> bool {
 
 pub fn is_valid_sha256_hex(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+pub fn is_valid_ocserv_collected_at(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= OCSERV_COLLECTED_AT_MAX_BYTES
+        && value.bytes().all(|byte| byte >= 0x20 && byte != 0x7f)
+        && !contains_low_sensitive_forbidden_marker(value)
+        && OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339).is_ok()
+}
+
+fn contains_low_sensitive_forbidden_marker(value: &str) -> bool {
+    let lowered = value.to_ascii_lowercase();
+    [
+        "/etc/",
+        "/var/log",
+        "ocserv.conf",
+        "server-cert",
+        "begin certificate",
+        "private key",
+        "systemctl",
+        "journalctl",
+        "occtl",
+        "execstart",
+        "stdout",
+        "stderr",
+        "username",
+        "session_id",
+        "client_ip",
+        "vpn_ip",
+        "assigned_ip",
+        "cn=",
+        "san",
+        "dns:",
+        "issuer",
+        "serial",
+        "subject",
+    ]
+    .iter()
+    .any(|marker| lowered.contains(marker))
 }
 
 pub fn validate_ocserv_response_json_size<T: Serialize>(

@@ -11,8 +11,8 @@ use ocfleet_cli::identity::{
     IdentityError, load_or_create_secret_key_with_status, load_secret_key,
 };
 use ocfleet_cli::ocserv_output::{
-    assert_low_sensitive_ocserv_output, format_cert_human, format_sessions_human,
-    format_status_human,
+    OcservStatusView, assert_low_sensitive_ocserv_output, format_cert_human, format_sessions_human,
+    format_status_json, format_status_view_human, low_sensitive_ocserv_audit_message,
 };
 use ocfleet_cli::rpc_client::{
     RpcClientError, bind_controller_endpoint, build_request, call_endpoint_addr,
@@ -1304,102 +1304,126 @@ async fn run_ocserv_status_command(
         }
     };
 
-    let service = match execute_ocserv_rpc::<OcservServiceSummaryResponse>(
+    let service = execute_optional_ocserv_rpc::<OcservServiceSummaryResponse>(
         store,
         secret_key_path,
         &node,
         OCSERV_SERVICE_SUMMARY,
     )
-    .await
-    {
-        Ok(value) => value,
-        Err(failure) => {
-            write_ocserv_command_failure(
-                store,
-                "ocserv.status",
-                &node,
-                OCSERV_SERVICE_SUMMARY,
-                failure,
-                started,
-            )?;
-            return Err(anyhow::anyhow!("ocserv status failed"));
-        }
-    };
-    let version = match execute_ocserv_rpc::<OcservVersionResponse>(
+    .await;
+    let version = execute_optional_ocserv_rpc::<OcservVersionResponse>(
         store,
         secret_key_path,
         &node,
         OCSERV_VERSION,
     )
-    .await
-    {
-        Ok(value) => value,
-        Err(failure) => {
-            write_ocserv_command_failure(
-                store,
-                "ocserv.status",
-                &node,
-                OCSERV_VERSION,
-                failure,
-                started,
-            )?;
-            return Err(anyhow::anyhow!("ocserv status failed"));
-        }
-    };
-    let sessions = match execute_ocserv_rpc::<OcservSessionsSummaryResponse>(
+    .await;
+    let sessions = execute_optional_ocserv_rpc::<OcservSessionsSummaryResponse>(
         store,
         secret_key_path,
         &node,
         OCSERV_SESSIONS_SUMMARY,
     )
-    .await
-    {
-        Ok(value) => value,
-        Err(failure) => {
-            write_ocserv_command_failure(
-                store,
-                "ocserv.status",
-                &node,
-                OCSERV_SESSIONS_SUMMARY,
-                failure,
-                started,
-            )?;
-            return Err(anyhow::anyhow!("ocserv status failed"));
-        }
-    };
-    let fingerprint = match execute_ocserv_rpc::<OcservConfigFingerprintResponse>(
+    .await;
+    let fingerprint = execute_optional_ocserv_rpc::<OcservConfigFingerprintResponse>(
         store,
         secret_key_path,
         &node,
         OCSERV_CONFIG_FINGERPRINT,
     )
-    .await
-    {
-        Ok(value) => value,
-        Err(failure) => {
-            write_ocserv_command_failure(
-                store,
-                "ocserv.status",
-                &node,
-                OCSERV_CONFIG_FINGERPRINT,
-                failure,
-                started,
-            )?;
-            return Err(anyhow::anyhow!("ocserv status failed"));
-        }
+    .await;
+
+    let outcomes = [
+        service.error_code(),
+        version.error_code(),
+        sessions.error_code(),
+        fingerprint.error_code(),
+    ];
+    if outcomes.iter().all(Option::is_some) {
+        let code = outcomes
+            .iter()
+            .flatten()
+            .next()
+            .cloned()
+            .unwrap_or(ErrorCode::InternalError);
+        write_ocserv_command_audit(
+            store,
+            OcservCommandAudit {
+                actor,
+                event: "ocserv.status",
+                node_id: node.node_id.clone(),
+                endpoint_id: Some(node.endpoint_id.clone()),
+                method: OCSERV_SERVICE_SUMMARY,
+                ok: false,
+                error_code: Some(code),
+                duration_ms: elapsed_ms(started),
+                detail_json: json!({
+                    "result_class": "low_sensitive_summary",
+                    "status": "failed",
+                    "rpc_methods": [
+                        OCSERV_SERVICE_SUMMARY,
+                        OCSERV_VERSION,
+                        OCSERV_SESSIONS_SUMMARY,
+                        OCSERV_CONFIG_FINGERPRINT
+                    ],
+                    "degraded_methods": [
+                        OCSERV_SERVICE_SUMMARY,
+                        OCSERV_VERSION,
+                        OCSERV_SESSIONS_SUMMARY,
+                        OCSERV_CONFIG_FINGERPRINT
+                    ],
+                }),
+            },
+        )?;
+        return Err(anyhow::anyhow!("ocserv status failed"));
+    }
+
+    let degraded_methods = [
+        service.unavailable_method(),
+        version.unavailable_method(),
+        sessions.unavailable_method(),
+        fingerprint.unavailable_method(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+
+    let view = OcservStatusView {
+        node_id: node.node_id.clone(),
+        service: service
+            .as_available()
+            .map(|response| response.service.clone()),
+        version: version
+            .as_available()
+            .and_then(|response| response.version.clone()),
+        version_status: version
+            .as_available()
+            .map(|response| response.status)
+            .unwrap_or(ocfleet_protocol::ocserv::OcservFieldStatus::Unavailable),
+        sessions_total: sessions
+            .as_available()
+            .and_then(|response| response.sessions.total),
+        sessions_status: sessions
+            .as_available()
+            .map(|response| response.sessions.status)
+            .unwrap_or(ocfleet_protocol::ocserv::OcservFieldStatus::Unavailable),
+        config_algorithm: fingerprint
+            .as_available()
+            .map(|response| response.fingerprint.algorithm.clone()),
+        config_hash: fingerprint
+            .as_available()
+            .and_then(|response| response.fingerprint.hash.clone()),
+        config_status: fingerprint
+            .as_available()
+            .map(|response| response.fingerprint.status)
+            .unwrap_or(ocfleet_protocol::ocserv::OcservFieldStatus::Unavailable),
+        degraded_methods: degraded_methods.clone(),
     };
 
     let output = if json_output {
-        serde_json::to_string_pretty(&json!({
-            "node_id": node.node_id,
-            "service": service.service,
-            "version": version.version,
-            "version_status": version.status,
-            "sessions": sessions.sessions,
-            "config_fingerprint": fingerprint.fingerprint,
-        }))? + "\n"
+        format_status_json(&view)?
     } else {
-        format_status_human(&node.node_id, &service, &version, &sessions, &fingerprint)?
+        format_status_view_human(&view)?
     };
     assert_low_sensitive_ocserv_output(&output)?;
     print!("{output}");
@@ -1418,12 +1442,14 @@ async fn run_ocserv_status_command(
                 "node_id": node.node_id,
                 "endpoint_id": node.endpoint_id,
                 "result_class": "low_sensitive_summary",
+                "status": if degraded_methods.is_empty() { "ok" } else { "degraded" },
                 "rpc_methods": [
                     OCSERV_SERVICE_SUMMARY,
                     OCSERV_VERSION,
                     OCSERV_SESSIONS_SUMMARY,
                     OCSERV_CONFIG_FINGERPRINT
                 ],
+                "degraded_methods": degraded_methods,
             }),
         },
     )?;
@@ -1679,7 +1705,7 @@ where
         Ok(success) => {
             let typed = match serde_json::from_value::<T>(success.result.clone()) {
                 Ok(typed) => typed,
-                Err(err) => {
+                Err(_) => {
                     let failure = RpcCommandFailure::new(
                         ErrorCode::InvalidResponse,
                         "ocserv readonly response schema is invalid",
@@ -1687,7 +1713,7 @@ where
                         json!({
                             "message": "ocserv readonly response schema is invalid",
                             "result_class": "low_sensitive_summary",
-                            "error": err.to_string(),
+                            "error_code": "INVALID_RESPONSE",
                         }),
                     );
                     let _ = write_rpc_audit(
@@ -1754,6 +1780,55 @@ where
     }
 }
 
+enum OcservRpcOutcome<T> {
+    Available(T),
+    Unavailable {
+        method: &'static str,
+        code: ErrorCode,
+    },
+}
+
+impl<T> OcservRpcOutcome<T> {
+    fn as_available(&self) -> Option<&T> {
+        match self {
+            Self::Available(value) => Some(value),
+            Self::Unavailable { .. } => None,
+        }
+    }
+
+    fn unavailable_method(&self) -> Option<&'static str> {
+        match self {
+            Self::Available(_) => None,
+            Self::Unavailable { method, .. } => Some(*method),
+        }
+    }
+
+    fn error_code(&self) -> Option<ErrorCode> {
+        match self {
+            Self::Available(_) => None,
+            Self::Unavailable { code, .. } => Some(code.clone()),
+        }
+    }
+}
+
+async fn execute_optional_ocserv_rpc<T>(
+    store: &Store,
+    secret_key_path: &Path,
+    node: &NodeRecord,
+    method: &'static str,
+) -> OcservRpcOutcome<T>
+where
+    T: DeserializeOwned,
+{
+    match execute_ocserv_rpc(store, secret_key_path, node, method).await {
+        Ok(value) => OcservRpcOutcome::Available(value),
+        Err(failure) => OcservRpcOutcome::Unavailable {
+            method,
+            code: failure.code,
+        },
+    }
+}
+
 struct OcservCommandAudit {
     actor: String,
     event: &'static str,
@@ -1807,14 +1882,14 @@ fn write_ocserv_command_failure(
 
 fn low_sensitive_detail(message: &str) -> Value {
     json!({
-        "message": message,
+        "message": low_sensitive_ocserv_audit_message(message),
         "result_class": "low_sensitive_summary",
     })
 }
 
 fn ocserv_failure_detail(failure: &RpcCommandFailure) -> Value {
     json!({
-        "message": failure.message,
+        "message": low_sensitive_ocserv_audit_message(&failure.message),
         "result_class": "low_sensitive_summary",
         "error_code": error_code_name(&failure.code),
     })

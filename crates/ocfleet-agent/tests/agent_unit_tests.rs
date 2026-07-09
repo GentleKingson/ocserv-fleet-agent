@@ -20,9 +20,10 @@ use ocfleet_protocol::constants::PROTOCOL_VERSION;
 use ocfleet_protocol::enrollment::{EndpointStatus, TrustBundle};
 use ocfleet_protocol::error::ErrorCode;
 use ocfleet_protocol::method::{
-    NODE_INFO, NODE_PING, OCSERV_CERT_EXPIRY, OCSERV_CONFIG_FINGERPRINT, OCSERV_SERVICE_SUMMARY,
-    OCSERV_SESSIONS_SUMMARY, OCSERV_VERSION, PROBE_CONTROLLER_PING, PROBE_PATH_ECHO,
-    PROBE_PEER_ECHO,
+    NODE_INFO, NODE_PING, OCSERV_CERT_EXPIRY, OCSERV_CONFIG_APPLY, OCSERV_CONFIG_FINGERPRINT,
+    OCSERV_CONFIG_ROLLBACK, OCSERV_RELOAD, OCSERV_RESTART, OCSERV_SERVICE_SUMMARY,
+    OCSERV_SESSION_DISCONNECT, OCSERV_SESSIONS_SUMMARY, OCSERV_VERSION, PROBE_CONTROLLER_PING,
+    PROBE_PATH_ECHO, PROBE_PEER_ECHO,
 };
 use ocfleet_protocol::rpc::RpcRequest;
 use serde_json::json;
@@ -1448,6 +1449,36 @@ async fn handle_request_does_not_dispatch_future_direction_two_methods() {
 }
 
 #[tokio::test]
+async fn handle_request_rejects_future_controlled_write_methods_by_default() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let state = test_server_state(dir.path(), "agent-endpoint-1");
+    let controller = test_controller_remote(&state);
+
+    for (index, method) in [
+        OCSERV_RELOAD,
+        OCSERV_RESTART,
+        OCSERV_CONFIG_APPLY,
+        OCSERV_CONFIG_ROLLBACK,
+        OCSERV_SESSION_DISCONNECT,
+    ]
+    .iter()
+    .enumerate()
+    {
+        let response = handle_request(
+            &state,
+            &controller,
+            test_rpc_request(method, valid_nonce(30 + index as u8)),
+        )
+        .await;
+        assert_eq!(
+            response.error.as_ref().expect("error").code,
+            ErrorCode::MethodNotAllowed,
+            "{method} must remain rejected until controlled writes are wired and enabled"
+        );
+    }
+}
+
+#[tokio::test]
 async fn handle_request_rejects_node_info_params_that_name_local_capabilities() {
     let dir = tempfile::tempdir().expect("temp dir");
     let state = test_server_state(dir.path(), "agent-endpoint-1");
@@ -1621,6 +1652,7 @@ fn test_agent_config(dir: &Path, controllers: Vec<ControllerConfig>) -> AgentCon
             rejected_peer_log_aggregate_interval_seconds: 60,
         },
         ocserv_readonly: Default::default(),
+        controlled_writes: Default::default(),
         ocserv: None,
         logs: None,
     }

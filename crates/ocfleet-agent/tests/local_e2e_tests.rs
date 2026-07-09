@@ -1207,6 +1207,7 @@ fn test_config(
             rejected_peer_log_aggregate_interval_seconds: 60,
         },
         ocserv_readonly: Default::default(),
+        controlled_writes: Default::default(),
         ocserv: None,
         logs: None,
     }

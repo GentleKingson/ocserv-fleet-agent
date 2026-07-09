@@ -450,8 +450,8 @@ ocfleet --database /var/lib/ocfleet-controller/controller.sqlite --secret-key /v
 ### Common Causes
 
 - The hook type is forbidden, such as `exec:`, `command:`, `shell:`, or `script:`.
-- Webhook hooks are planned but currently disabled.
 - A `jsonl_file:` hook points to an unsafe path, symlink, hardlink, or group/world-writable parent.
+- A `webhook:<hook-id>` hook is missing, disabled, uses a mismatched HMAC secret, resolves to forbidden address space, returns a redirect, or times out.
 - There are no open alert events to deliver.
 
 ### Verification Commands
@@ -460,6 +460,9 @@ ocfleet --database /var/lib/ocfleet-controller/controller.sqlite --secret-key /v
 ocfleet --database /var/lib/ocfleet-controller/controller.sqlite --secret-key /var/lib/ocfleet-controller/controller.secret alert list --json
 ocfleet --database /var/lib/ocfleet-controller/controller.sqlite --secret-key /var/lib/ocfleet-controller/controller.secret alert test jsonl_file:/var/lib/ocfleet-controller/alerts.jsonl
 ocfleet --database /var/lib/ocfleet-controller/controller.sqlite --secret-key /var/lib/ocfleet-controller/controller.secret alert deliver --hook jsonl_file:/var/lib/ocfleet-controller/alerts.jsonl --dry-run
+ocfleet --database /var/lib/ocfleet-controller/controller.sqlite --secret-key /var/lib/ocfleet-controller/controller.secret alert hook list --json
+ocfleet --database /var/lib/ocfleet-controller/controller.sqlite --secret-key /var/lib/ocfleet-controller/controller.secret alert hook test <hook-id> --dry-run --hmac-secret-file /var/lib/ocfleet-controller/webhook.secret
+ocfleet --database /var/lib/ocfleet-controller/controller.sqlite --secret-key /var/lib/ocfleet-controller/controller.secret alert deliver --hook webhook:<hook-id> --limit 100 --dry-run
 ```
 
 ### Fix Steps
@@ -469,11 +472,16 @@ Use only supported read-only alert delivery hooks:
 ```bash
 sudo install -d -o "$USER" -g "$USER" -m 0700 /var/lib/ocfleet-controller
 ocfleet --database /var/lib/ocfleet-controller/controller.sqlite --secret-key /var/lib/ocfleet-controller/controller.secret alert deliver --hook jsonl_file:/var/lib/ocfleet-controller/alerts.jsonl
+ocfleet --database /var/lib/ocfleet-controller/controller.sqlite --secret-key /var/lib/ocfleet-controller/controller.secret alert hook add-webhook --name ops-alerts --url https://alerts.example.com/ocfleet --hmac-secret-file /var/lib/ocfleet-controller/webhook.secret --host-allow alerts.example.com
 ```
 
-Do not replace a rejected hook with a shell/script wrapper. Keep webhook delivery disabled until a future signed, audited design explicitly enables it.
+For webhook failures, confirm the URL is HTTPS, the host exactly matches
+`--host-allow`, DNS resolves only to public addresses, the receiver returns 2xx
+without redirecting, and the secret file matches the stored HMAC key id. Do not
+replace a rejected hook with a shell/script wrapper.
 
 ### Logs And Metrics
 
-- Controller audit: `event=alert.deliver`, `event=alert.test`, `event=alert.silence`, or `event=alert.resolve`.
+- Controller audit: `event=alert.delivery`, `event=alert.hook.add_webhook`, `event=alert.test`, `event=alert.silence`, or `event=alert.resolve`.
+- Webhook attempt state: `alert_delivery_attempts` records status, HTTP status class, low-sensitive error code, and bytes sent only.
 - Alert payloads are redacted summaries and must not include usernames, client IPs, session IDs, certificate subjects, raw logs, or raw RPC bodies.

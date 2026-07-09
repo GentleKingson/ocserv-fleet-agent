@@ -1,8 +1,9 @@
 # Alert Delivery JSONL
 
-Phase 12 alert delivery currently supports only the local `jsonl_file:<path>`
-hook. Webhook hooks are planned / not implemented and are rejected; `exec:`,
-`command:`, `shell:`, and `script:` hooks are forbidden.
+Phase 12 alert delivery supports the local `jsonl_file:<path>` hook for private
+controller-side JSONL output. HTTPS webhook delivery is documented separately in
+[`docs/alert-webhook.md`](alert-webhook.md). `exec:`, `command:`, `shell:`, and
+`script:` hooks are forbidden.
 
 ## Commands
 
@@ -23,8 +24,9 @@ Each delivered line is a low-sensitive JSON object:
 
 ```json
 {
-  "event": "alert.event",
+  "schema": "ocfleet.alert.v1",
   "hook_type": "jsonl_file",
+  "alert_id": "alert-...",
   "dedupe_key": "node:hk-ocserv-01:node_stale",
   "node_id": "hk-ocserv-01",
   "severity": "warning",

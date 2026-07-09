@@ -31,6 +31,8 @@ fn migration_tests_new_database_creates_all_current_tables_and_indexes() {
         "alert_events",
         "retention_policies",
         "health_policy",
+        "alert_hooks",
+        "alert_delivery_attempts",
     ] {
         assert_schema_object_exists(&conn, "table", table);
     }
@@ -39,6 +41,8 @@ fn migration_tests_new_database_creates_all_current_tables_and_indexes() {
         "idx_probe_observations_node_observed_at",
         "idx_probe_observations_run_id",
         "idx_alert_events_state_last_seen_at",
+        "idx_alert_delivery_attempts_alert_hook",
+        "idx_alert_hooks_enabled_type",
     ] {
         assert_schema_object_exists(&conn, "index", index);
     }
@@ -141,8 +145,11 @@ fn migration_tests_legacy_fixtures_upgrade_to_current() {
         }
         assert_schema_object_exists(&conn, "table", "retention_policies");
         assert_schema_object_exists(&conn, "table", "health_policy");
+        assert_schema_object_exists(&conn, "table", "alert_hooks");
+        assert_schema_object_exists(&conn, "table", "alert_delivery_attempts");
         assert_eq!(table_count(&conn, "health_policy"), 1);
         assert_schema_object_exists(&conn, "index", "idx_probe_observations_run_id");
+        assert_schema_object_exists(&conn, "index", "idx_alert_delivery_attempts_alert_hook");
 
         let backups = backup_files(dir.path());
         if version < CURRENT_SCHEMA_VERSION {
@@ -391,6 +398,9 @@ fn create_legacy_fixture(path: &Path, version: i64, rows: usize) {
     }
     if version >= 7 {
         conn.execute_batch(V7_HEALTH_POLICY_SQL).expect("v7 schema");
+    }
+    if version >= 8 {
+        conn.execute_batch(V8_ALERT_WEBHOOK_SQL).expect("v8 schema");
     }
     for applied in 1..=version {
         conn.execute(
@@ -896,4 +906,41 @@ INSERT INTO health_policy
   (id, stale_window_seconds, unreachable_consecutive_failures, cert_warning_days, cert_critical_days, updated_at)
 VALUES
   (1, 86400, 3, 30, 7, 'default');
+"#;
+
+const V8_ALERT_WEBHOOK_SQL: &str = r#"
+CREATE TABLE alert_hooks (
+  hook_id TEXT PRIMARY KEY,
+  name TEXT NOT NULL UNIQUE,
+  hook_type TEXT NOT NULL CHECK (hook_type IN ('webhook')),
+  endpoint_url TEXT NOT NULL,
+  endpoint_url_redacted TEXT NOT NULL,
+  endpoint_host TEXT NOT NULL,
+  host_allow_json TEXT NOT NULL CHECK (json_valid(host_allow_json)),
+  hmac_key_id TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+  max_attempts INTEGER NOT NULL CHECK (max_attempts BETWEEN 1 AND 5),
+  timeout_ms INTEGER NOT NULL CHECK (timeout_ms BETWEEN 1000 AND 5000),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE alert_delivery_attempts (
+  attempt_id TEXT PRIMARY KEY,
+  alert_id TEXT NOT NULL,
+  hook_id TEXT NOT NULL,
+  attempt_no INTEGER NOT NULL CHECK (attempt_no BETWEEN 1 AND 5),
+  attempted_at TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('succeeded', 'failed', 'dry_run')),
+  http_status_class TEXT,
+  error_code TEXT,
+  bytes_sent INTEGER NOT NULL CHECK (bytes_sent >= 0),
+  FOREIGN KEY(alert_id) REFERENCES alert_events(alert_id) ON DELETE CASCADE,
+  FOREIGN KEY(hook_id) REFERENCES alert_hooks(hook_id) ON DELETE CASCADE
+);
+
+CREATE INDEX idx_alert_delivery_attempts_alert_hook
+  ON alert_delivery_attempts(alert_id, hook_id, attempted_at);
+CREATE INDEX idx_alert_hooks_enabled_type
+  ON alert_hooks(enabled, hook_type);
 "#;

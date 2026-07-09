@@ -20,7 +20,7 @@ use crate::input_validation::{
 use crate::migrations;
 use crate::private_file::{self, PrivateFileError};
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 7;
+pub const CURRENT_SCHEMA_VERSION: i64 = 8;
 pub const DEFAULT_HEALTH_STALE_WINDOW_SECONDS: u64 = 24 * 60 * 60;
 pub const DEFAULT_HEALTH_UNREACHABLE_FAILURES: u64 = 3;
 pub const DEFAULT_HEALTH_CERT_WARNING_DAYS: u64 = 30;
@@ -204,6 +204,36 @@ pub struct AlertEventRecord {
     pub last_sent_at: Option<String>,
     pub resolved_at: Option<String>,
     pub detail_json: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlertWebhookHookRecord {
+    pub hook_id: String,
+    pub name: String,
+    pub hook_type: String,
+    pub endpoint_url: String,
+    pub endpoint_url_redacted: String,
+    pub endpoint_host: String,
+    pub host_allow: Vec<String>,
+    pub hmac_key_id: String,
+    pub enabled: bool,
+    pub max_attempts: u64,
+    pub timeout_ms: u64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlertDeliveryAttemptRecord {
+    pub attempt_id: String,
+    pub alert_id: String,
+    pub hook_id: String,
+    pub attempt_no: u64,
+    pub attempted_at: String,
+    pub status: String,
+    pub http_status_class: Option<String>,
+    pub error_code: Option<String>,
+    pub bytes_sent: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -963,6 +993,108 @@ impl Store {
              ORDER BY last_seen_at DESC, alert_id",
         )?;
         let rows = stmt.query_map(params![state, severity, node_id], alert_event_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub fn insert_alert_webhook_hook(
+        &self,
+        hook: &AlertWebhookHookRecord,
+    ) -> Result<(), StoreError> {
+        validate_alert_webhook_hook_record(hook)?;
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO alert_hooks
+             (hook_id, name, hook_type, endpoint_url, endpoint_url_redacted, endpoint_host, host_allow_json, hmac_key_id, enabled, max_attempts, timeout_ms, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                hook.hook_id.as_str(),
+                hook.name.as_str(),
+                hook.hook_type.as_str(),
+                hook.endpoint_url.as_str(),
+                hook.endpoint_url_redacted.as_str(),
+                hook.endpoint_host.as_str(),
+                compact_json(&Value::Array(
+                    hook.host_allow
+                        .iter()
+                        .map(|host| Value::String(host.clone()))
+                        .collect()
+                )),
+                hook.hmac_key_id.as_str(),
+                bool_to_i64(hook.enabled),
+                u64_to_i64(hook.max_attempts)?,
+                u64_to_i64(hook.timeout_ms)?,
+                hook.created_at.as_str(),
+                hook.updated_at.as_str(),
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn list_alert_webhook_hooks(&self) -> Result<Vec<AlertWebhookHookRecord>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT hook_id, name, hook_type, endpoint_url, endpoint_url_redacted, endpoint_host, host_allow_json, hmac_key_id, enabled, max_attempts, timeout_ms, created_at, updated_at
+             FROM alert_hooks
+             WHERE hook_type = 'webhook'
+             ORDER BY name, hook_id",
+        )?;
+        let rows = stmt.query_map([], alert_webhook_hook_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub fn get_alert_webhook_hook(
+        &self,
+        hook_id: &str,
+    ) -> Result<Option<AlertWebhookHookRecord>, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT hook_id, name, hook_type, endpoint_url, endpoint_url_redacted, endpoint_host, host_allow_json, hmac_key_id, enabled, max_attempts, timeout_ms, created_at, updated_at
+                 FROM alert_hooks
+                 WHERE hook_id = ?1 AND hook_type = 'webhook'",
+                [hook_id],
+                alert_webhook_hook_from_row,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    pub fn insert_alert_delivery_attempt(
+        &self,
+        attempt: &AlertDeliveryAttemptRecord,
+    ) -> Result<(), StoreError> {
+        validate_alert_delivery_attempt_record(attempt)?;
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO alert_delivery_attempts
+             (attempt_id, alert_id, hook_id, attempt_no, attempted_at, status, http_status_class, error_code, bytes_sent)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                attempt.attempt_id.as_str(),
+                attempt.alert_id.as_str(),
+                attempt.hook_id.as_str(),
+                u64_to_i64(attempt.attempt_no)?,
+                attempt.attempted_at.as_str(),
+                attempt.status.as_str(),
+                attempt.http_status_class.as_deref(),
+                attempt.error_code.as_deref(),
+                u64_to_i64(attempt.bytes_sent)?,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn list_alert_delivery_attempts(
+        &self,
+    ) -> Result<Vec<AlertDeliveryAttemptRecord>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT attempt_id, alert_id, hook_id, attempt_no, attempted_at, status, http_status_class, error_code, bytes_sent
+             FROM alert_delivery_attempts
+             ORDER BY attempted_at DESC, attempt_id",
+        )?;
+        let rows = stmt.query_map([], alert_delivery_attempt_from_row)?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(StoreError::from)
     }
@@ -2138,6 +2270,44 @@ fn alert_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AlertEventR
     })
 }
 
+fn alert_webhook_hook_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<AlertWebhookHookRecord> {
+    let host_allow_json: String = row.get(6)?;
+    let host_allow = parse_string_array_column(&host_allow_json, 6)?;
+    Ok(AlertWebhookHookRecord {
+        hook_id: row.get(0)?,
+        name: row.get(1)?,
+        hook_type: row.get(2)?,
+        endpoint_url: row.get(3)?,
+        endpoint_url_redacted: row.get(4)?,
+        endpoint_host: row.get(5)?,
+        host_allow,
+        hmac_key_id: row.get(7)?,
+        enabled: i64_to_bool(row.get(8)?, 8)?,
+        max_attempts: i64_to_u64(row.get(9)?)?,
+        timeout_ms: i64_to_u64(row.get(10)?)?,
+        created_at: row.get(11)?,
+        updated_at: row.get(12)?,
+    })
+}
+
+fn alert_delivery_attempt_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<AlertDeliveryAttemptRecord> {
+    Ok(AlertDeliveryAttemptRecord {
+        attempt_id: row.get(0)?,
+        alert_id: row.get(1)?,
+        hook_id: row.get(2)?,
+        attempt_no: i64_to_u64(row.get(3)?)?,
+        attempted_at: row.get(4)?,
+        status: row.get(5)?,
+        http_status_class: row.get(6)?,
+        error_code: row.get(7)?,
+        bytes_sent: i64_to_u64(row.get(8)?)?,
+    })
+}
+
 fn retention_policy_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RetentionPolicyRecord> {
     let max_age_days: Option<i64> = row.get(1)?;
     let max_rows: Option<i64> = row.get(2)?;
@@ -2157,6 +2327,65 @@ fn health_policy_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HealthPol
         cert_critical_days: i64_to_u64(row.get(3)?)?,
         updated_at: row.get(4)?,
     })
+}
+
+fn validate_alert_webhook_hook_record(hook: &AlertWebhookHookRecord) -> Result<(), StoreError> {
+    validate_description(&hook.name).map_err(StoreError::InvalidInput)?;
+    validate_safe_id("hook_id", &hook.hook_id, 128)?;
+    validate_safe_id("endpoint_host", &hook.endpoint_host, 253)?;
+    validate_safe_id("hmac_key_id", &hook.hmac_key_id, 128)?;
+    if hook.hook_type != "webhook" {
+        return Err(StoreError::InvalidInput(
+            "alert hook type must be webhook".to_string(),
+        ));
+    }
+    if hook.host_allow.is_empty() || hook.host_allow.len() > 16 {
+        return Err(StoreError::InvalidInput(
+            "alert webhook host allowlist must contain 1-16 hosts".to_string(),
+        ));
+    }
+    for host in &hook.host_allow {
+        validate_safe_id("host_allow", host, 253)?;
+    }
+    validate_u64_range("max_attempts", hook.max_attempts, 1, 5)?;
+    validate_u64_range("timeout_ms", hook.timeout_ms, 1_000, 5_000)?;
+    Ok(())
+}
+
+fn validate_alert_delivery_attempt_record(
+    attempt: &AlertDeliveryAttemptRecord,
+) -> Result<(), StoreError> {
+    validate_safe_id("attempt_id", &attempt.attempt_id, 128)?;
+    validate_safe_id("alert_id", &attempt.alert_id, 128)?;
+    validate_safe_id("hook_id", &attempt.hook_id, 128)?;
+    validate_u64_range("attempt_no", attempt.attempt_no, 1, 5)?;
+    validate_u64_range("bytes_sent", attempt.bytes_sent, 0, 1_048_576)?;
+    if !matches!(attempt.status.as_str(), "succeeded" | "failed" | "dry_run") {
+        return Err(StoreError::InvalidInput(
+            "alert delivery attempt status is invalid".to_string(),
+        ));
+    }
+    if let Some(class) = &attempt.http_status_class {
+        validate_safe_id("http_status_class", class, 16)?;
+    }
+    if let Some(error_code) = &attempt.error_code {
+        validate_safe_id("error_code", error_code, 64)?;
+    }
+    Ok(())
+}
+
+fn validate_safe_id(field: &'static str, value: &str, max_len: usize) -> Result<(), StoreError> {
+    let ok_len = !value.is_empty() && value.len() <= max_len;
+    let ok_chars = value
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b':'));
+    if ok_len && ok_chars {
+        Ok(())
+    } else {
+        Err(StoreError::InvalidInput(format!(
+            "{field} must be 1-{max_len} chars and contain only [a-zA-Z0-9._:-]"
+        )))
+    }
 }
 
 fn validate_health_policy(policy: &HealthPolicyRecord) -> Result<(), StoreError> {
@@ -2451,6 +2680,35 @@ fn endpoint_trust_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Endpoint
 fn parse_json_column(value: &str, column: usize) -> rusqlite::Result<Value> {
     serde_json::from_str(value)
         .map_err(|err| rusqlite::Error::FromSqlConversionFailure(column, Type::Text, Box::new(err)))
+}
+
+fn parse_string_array_column(value: &str, column: usize) -> rusqlite::Result<Vec<String>> {
+    let value = parse_json_column(value, column)?;
+    let Some(values) = value.as_array() else {
+        return Err(rusqlite::Error::FromSqlConversionFailure(
+            column,
+            Type::Text,
+            Box::new(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "expected JSON array",
+            )),
+        ));
+    };
+    let mut output = Vec::with_capacity(values.len());
+    for value in values {
+        let Some(text) = value.as_str() else {
+            return Err(rusqlite::Error::FromSqlConversionFailure(
+                column,
+                Type::Text,
+                Box::new(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "expected JSON string array",
+                )),
+            ));
+        };
+        output.push(text.to_string());
+    }
+    Ok(output)
 }
 
 fn compact_json(value: &Value) -> String {

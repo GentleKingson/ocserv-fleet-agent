@@ -20,11 +20,11 @@ RPC boundary.
 | Scheduler | partially implemented / active implementation | `ocfleet schedule job add/list/show/validate/enable/disable`, `ocfleet schedule run --once [--job-id <job-id>]`, `ocfleet schedule run list/show`, `ocfleet schedule daemon`, `ocfleet schedule status --json` |
 | Observations | partially implemented / active implementation | `ocfleet observation list --node <node-id> --method <method> --limit <n> --json`, `ocfleet observation show <observation-id> --json` |
 | Health | partially implemented / active implementation | `ocfleet health summary`, `ocfleet health node`, `ocfleet health snapshot list`, `ocfleet health policy show/set` |
-| Alerts | partially implemented / active implementation | `ocfleet alert list --state ... --severity ... --node ... --json`, `ocfleet alert test/deliver/silence/resolve`; only `jsonl_file:<path>` delivery is enabled |
+| Alerts | partially implemented / active implementation | `ocfleet alert list --state ... --severity ... --node ... --json`, `ocfleet alert hook add-webhook/list/test`, `ocfleet alert test/deliver/silence/resolve`; `jsonl_file:<path>` and explicitly configured HTTPS `webhook:<hook-id>` delivery are enabled |
 | Retention | partially implemented / active implementation | `ocfleet retention show/set/explain/apply` for observability history scopes |
 | Audit export | partially implemented / active implementation | `ocfleet audit export --from ... --to ... --format jsonl --output ...` |
 | `ocfleet-api` / Web dashboard | partially implemented / active implementation | `ocfleet-api --database controller.sqlite --read-only --listen 127.0.0.1:8080`; read-only `GET` routes and a minimal static dashboard are present |
-| Webhook hooks | planned / not implemented | `webhook:` hooks are rejected until HTTPS/HMAC/SSRF protections are designed and implemented |
+| Webhook hooks | partially implemented / active implementation | HTTPS-only webhook delivery with host allowlists, public resolved IP checks, HMAC signing, bounded attempts/timeouts, disabled redirects, and low-sensitive attempt/audit rows |
 
 ## Goals
 
@@ -278,9 +278,9 @@ Rules:
 - alert hooks receive alert metadata and summary fields only.
 - local script execution, shell hooks, command hooks, and unbounded templates are
   forbidden.
-- current SQLite delivery tracking uses `last_sent_at`; first-phase JSONL
-  delivery failures are recorded in `alert.delivery` audit rows rather than a
-  delivery retry state machine.
+- current SQLite delivery tracking uses `last_sent_at` for successful delivery
+  and `alert_delivery_attempts` for low-sensitive webhook attempt outcomes.
+  JSONL delivery failures are recorded in `alert.delivery` audit rows.
 
 ### `retention_policies`
 
@@ -353,7 +353,8 @@ After `schedule run --once` and after each daemon tick, the controller evaluates
 local alert candidates from existing observations, health snapshots, and endpoint
 trust state. This phase only upserts local `alert_events`; it does not deliver
 JSONL files, call webhooks, execute shell, execute scripts, or perform
-remediation. `schedule run --once` prints `alert_evaluation=ok|failed` and
+remediation. Alert delivery remains an explicit local CLI operation.
+`schedule run --once` prints `alert_evaluation=ok|failed` and
 `alert_events=<count>`, and the scheduler audit detail records the same bounded
 summary.
 
@@ -419,6 +420,11 @@ ocfleet alert list --state open --severity critical --node hk-ocserv-01 --json
 ocfleet alert test jsonl_file:./private-alerts/test.jsonl
 ocfleet alert deliver --hook jsonl_file:./private-alerts/alerts.jsonl --limit 100
 ocfleet alert deliver --hook jsonl_file:./private-alerts/alerts.jsonl --limit 100 --dry-run
+ocfleet alert hook add-webhook --name ops-alerts --url https://alerts.example.com/ocfleet --hmac-secret-file ./webhook.secret --host-allow alerts.example.com
+ocfleet alert hook list --json
+ocfleet alert hook test <hook-id> --dry-run --hmac-secret-file ./webhook.secret
+ocfleet alert deliver --hook webhook:<hook-id> --limit 100 --dry-run
+ocfleet alert deliver --hook webhook:<hook-id> --limit 100 --hmac-secret-file ./webhook.secret
 ocfleet alert silence <dedupe-key> --for-duration 24h --reason "maintenance"
 ocfleet alert resolve <dedupe-key> --reason "certificate renewed"
 ```
@@ -427,10 +433,13 @@ ocfleet alert resolve <dedupe-key> --reason "certificate renewed"
 validating that the destination is in a private directory and is not a symlink,
 hardlink, world-readable file, or non-regular file. `alert deliver` evaluates
 local alert state, selects bounded open alerts, writes compact JSONL payloads,
-and updates `last_sent_at` after successful non-dry-run delivery. These commands
-must not call agents, expand shell syntax, read secrets, or execute local
-scripts. See `docs/alert-delivery-jsonl.md` for the JSONL payload schema and
-low-sensitive field allowlist.
+or sends fixed-schema HTTPS webhook payloads, and updates `last_sent_at` after
+successful non-dry-run delivery. Webhook delivery requires an explicit hook id,
+HTTPS URL, host allowlist, private HMAC secret file, bounded timeout, bounded
+attempts, public resolved IPs, and disabled redirects. These commands must not
+call agents, expand shell syntax, execute local scripts, or perform remediation.
+See `docs/alert-delivery-jsonl.md` for the JSONL payload schema and
+`docs/alert-webhook.md` for webhook signing and SSRF boundaries.
 
 ### Audit Export
 
@@ -482,11 +491,15 @@ explicitly designs authenticated, audited, non-RPC-triggering API mutations.
 
 ## Alert Hook Model
 
-Alert hooks are outbound notification integrations only. The first supported
-hook type is `jsonl_file:<path>`, which appends compact fixed-schema JSONL to a
-private local file. HTTPS webhook delivery is a later phase behind explicit
-configuration and must remain disabled until SSRF, HMAC, timeout, redirect, and
-retry boundaries are implemented.
+Alert hooks are outbound notification integrations only. Supported hook types
+are `jsonl_file:<path>`, which appends compact fixed-schema JSONL to a private
+local file, and `webhook:<hook-id>`, which sends compact fixed-schema HTTPS
+payloads to an explicitly configured controller-local webhook hook.
+
+Webhook hooks require HTTPS, exact host allowlists, public resolved IPs, private
+HMAC secret files, bounded attempts, bounded timeouts, disabled redirects, and
+low-sensitive attempt rows. They do not store secrets or full URL path/query in
+controller audit. See `docs/alert-webhook.md`.
 
 Allowed alert payload fields:
 
@@ -510,10 +523,12 @@ Forbidden hook behavior:
 - raw audit row delivery
 - automatic remediation
 
-The current JSONL delivery phase writes `alert.delivery` audit rows with bounded
+The current delivery phase writes `alert.delivery` audit rows with bounded
 metadata: hook type, alert count, bytes written, dry-run flag, and fixed
-low-sensitive error code on failure. It does not store the output path in audit,
-does not retry, and does not add a delivery retry state machine.
+low-sensitive error code on failure. It does not store the JSONL output path,
+webhook secret, full webhook URL path/query, request body, or response body in
+audit. Webhook attempts are bounded and recorded in `alert_delivery_attempts`
+with status, HTTP status class, low-sensitive error code, and bytes sent.
 
 ## Security Rules
 
@@ -604,6 +619,8 @@ ocfleet alert list --json
 ocfleet alert list --state open --severity critical --node hk-ocserv-01 --json
 ocfleet alert test jsonl_file:./private-alerts/test.jsonl
 ocfleet alert deliver --hook jsonl_file:./private-alerts/alerts.jsonl --limit 100 --dry-run
+ocfleet alert hook list --json
+ocfleet alert deliver --hook webhook:<hook-id> --limit 100 --dry-run
 ocfleet alert silence <dedupe-key> --for-duration 24h --reason "smoke silence"
 ocfleet alert resolve <dedupe-key> --reason "smoke resolved"
 

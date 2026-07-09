@@ -45,8 +45,9 @@ production-complete.
   - `ocfleet health` summaries, node health views, and local health policy
     thresholds derived from stored observations; `health snapshot list` reports
     the latest stored snapshot per node
-  - `ocfleet alert` filtered list, silence, resolve, test, and private
-    `jsonl_file` delivery for bounded low-sensitive alert events
+  - `ocfleet alert` filtered list, silence, resolve, test, private
+    `jsonl_file` delivery, and explicitly configured HTTPS webhook delivery for
+    bounded low-sensitive alert events
   - `ocfleet retention` policy, dry-run explanation, and pruning for
     observability history tables
   - `ocfleet audit export` for bounded redacted JSONL controller audit windows
@@ -363,6 +364,13 @@ target/debug/ocfleet health summary
 target/debug/ocfleet health snapshot list --limit 50 --json
 target/debug/ocfleet alert list
 target/debug/ocfleet alert list --state open --severity critical --json
+target/debug/ocfleet alert hook add-webhook \
+  --name ops-alerts \
+  --url https://alerts.example.com/ocfleet \
+  --hmac-secret-file ./webhook.secret \
+  --host-allow alerts.example.com
+target/debug/ocfleet alert hook list --json
+target/debug/ocfleet alert deliver --hook webhook:<hook-id> --limit 100 --dry-run
 target/debug/ocfleet retention show
 target/debug/ocfleet retention explain --scope observations --json
 target/debug/ocfleet audit export \
@@ -376,7 +384,9 @@ These commands operate inside the controller boundary. Scheduler jobs use only
 fixed job kinds; non-path jobs target `role=<role>` or `node_id=<node-id>`
 selectors, and path jobs require an explicit source/target node pair. Health,
 alerts, retention, and audit export use controller SQLite state and bounded
-low-sensitive summaries. Webhook alert hooks are disabled in the current source.
+low-sensitive summaries. Webhook alert hooks require explicit HTTPS endpoints,
+host allowlists, private HMAC secret files, bounded retries, and no redirect
+following.
 
 The historical Phase 7 ocserv-aware read-only document remains as the
 conservative pre-Phase-11 boundary record. The implemented ocserv-aware surface is
@@ -397,6 +407,7 @@ Networking must allow the controller to reach the agent through iroh using the r
 - `docs/release-notes/v0.1.0.md`: v0.1.0 release notes and known limitations.
 - `docs/status.md`: implementation status by feature and CLI surface.
 - `docs/roadmap.md`: forward roadmap from the current documentation baseline.
+- `docs/alert-webhook.md`: HTTPS webhook alert delivery security model and HMAC contract.
 - `docs/phase-10-enrollment-trust.md`: Phase 10 onboarding and trust lifecycle guide.
 - `docs/ocserv-readonly-spec.md`: Phase 11 ocserv read-only RPC contract.
 - `docs/phase-12-scheduled-observability.md`: Phase 12 CLI observability and read-only API/dashboard status.

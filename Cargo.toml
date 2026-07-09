@@ -23,6 +23,7 @@ clap = { version = "4", features = ["derive", "env"] }
 iroh = "1.0.1"
 libc = "0.2"
 rusqlite = { version = "0.34", features = ["backup", "bundled"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

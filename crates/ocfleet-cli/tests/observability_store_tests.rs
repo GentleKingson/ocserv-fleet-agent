@@ -1,6 +1,7 @@
 use ocfleet_cli::store::{
-    AlertEventRecord, CURRENT_SCHEMA_VERSION, HealthSnapshotRecord, ObservabilityJobRecord,
-    ObservabilityRunInsert, ProbeObservationInsert, RetentionPolicyRecord, Store,
+    AlertDeliveryAttemptRecord, AlertEventRecord, AlertWebhookHookRecord, CURRENT_SCHEMA_VERSION,
+    HealthSnapshotRecord, ObservabilityJobRecord, ObservabilityRunInsert, ProbeObservationInsert,
+    RetentionPolicyRecord, Store,
 };
 use rusqlite::Connection;
 use serde_json::json;
@@ -35,6 +36,8 @@ fn observability_store_tests_new_observability_tables_exist() {
         "alert_events",
         "retention_policies",
         "health_policy",
+        "alert_hooks",
+        "alert_delivery_attempts",
     ] {
         let exists: i64 = conn
             .query_row(
@@ -45,6 +48,73 @@ fn observability_store_tests_new_observability_tables_exist() {
             .expect("table query");
         assert_eq!(exists, 1, "missing table {table}");
     }
+}
+
+#[test]
+fn observability_store_tests_inserts_webhook_hook_and_delivery_attempt() {
+    let (_dir, store, _db) = open_temp_store();
+    let hook = AlertWebhookHookRecord {
+        hook_id: "webhook-1".to_string(),
+        name: "ops".to_string(),
+        hook_type: "webhook".to_string(),
+        endpoint_url: "https://93.184.216.34/alerts?token=redacted-in-output".to_string(),
+        endpoint_url_redacted: "https://93.184.216.34/<redacted>".to_string(),
+        endpoint_host: "93.184.216.34".to_string(),
+        host_allow: vec!["93.184.216.34".to_string()],
+        hmac_key_id: "abcd1234abcd1234".to_string(),
+        enabled: true,
+        max_attempts: 2,
+        timeout_ms: 1_500,
+        created_at: "2026-07-08T07:00:00Z".to_string(),
+        updated_at: "2026-07-08T07:00:00Z".to_string(),
+    };
+    store
+        .insert_alert_webhook_hook(&hook)
+        .expect("insert webhook hook");
+    store
+        .upsert_alert_event(&AlertEventRecord {
+            alert_id: "alert-1".to_string(),
+            dedupe_key: "node:hk-ocserv-01:node_stale".to_string(),
+            node_id: Some("hk-ocserv-01".to_string()),
+            severity: "warning".to_string(),
+            state: "open".to_string(),
+            reason_code: "NODE_STALE".to_string(),
+            first_seen_at: "2026-07-08T07:00:00Z".to_string(),
+            last_seen_at: "2026-07-08T07:00:00Z".to_string(),
+            last_sent_at: None,
+            resolved_at: None,
+            detail_json: json!({"summary": {"status": "stale"}}),
+        })
+        .expect("insert alert");
+    let attempt = AlertDeliveryAttemptRecord {
+        attempt_id: "attempt-1".to_string(),
+        alert_id: "alert-1".to_string(),
+        hook_id: "webhook-1".to_string(),
+        attempt_no: 1,
+        attempted_at: "2026-07-08T07:01:00Z".to_string(),
+        status: "failed".to_string(),
+        http_status_class: Some("5xx".to_string()),
+        error_code: Some("WEBHOOK_HTTP_5XX".to_string()),
+        bytes_sent: 512,
+    };
+    store
+        .insert_alert_delivery_attempt(&attempt)
+        .expect("insert delivery attempt");
+
+    let hooks = store
+        .list_alert_webhook_hooks()
+        .expect("list webhook hooks");
+    assert_eq!(hooks, vec![hook.clone()]);
+    assert_eq!(
+        store
+            .get_alert_webhook_hook("webhook-1")
+            .expect("get webhook hook"),
+        Some(hook)
+    );
+    let attempts = store
+        .list_alert_delivery_attempts()
+        .expect("list delivery attempts");
+    assert_eq!(attempts, vec![attempt]);
 }
 
 #[test]

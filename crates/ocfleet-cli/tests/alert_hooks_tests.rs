@@ -1,15 +1,52 @@
 use ocfleet_cli::alert_delivery::MAX_DELIVERY_LIMIT;
+use ocfleet_cli::alert_webhook::{
+    WebhookHttpRequest, WebhookHttpResponse, WebhookHttpResult, WebhookSender, hmac_key_id,
+    validate_webhook_endpoint, webhook_signature,
+};
+use ocfleet_cli::alerts::deliver_webhook_alerts_with_sender;
 use ocfleet_cli::store::{
-    AlertEventRecord, HealthSnapshotRecord, NodeInsert, ProbeObservationInsert, Store,
+    AlertEventRecord, AlertWebhookHookRecord, HealthSnapshotRecord, NodeInsert,
+    ProbeObservationInsert, Store,
 };
 use ocfleet_protocol::method::OCSERV_CERT_EXPIRY;
 use rusqlite::Connection;
 use serde_json::{Value, json};
+use std::cell::RefCell;
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Output};
+
+#[derive(Debug)]
+struct FakeWebhookSender {
+    requests: RefCell<Vec<WebhookHttpRequest>>,
+    result: WebhookHttpResult,
+}
+
+impl FakeWebhookSender {
+    fn new(result: WebhookHttpResult) -> Self {
+        Self {
+            requests: RefCell::new(Vec::new()),
+            result,
+        }
+    }
+
+    fn request_count(&self) -> usize {
+        self.requests.borrow().len()
+    }
+
+    fn requests(&self) -> Vec<WebhookHttpRequest> {
+        self.requests.borrow().clone()
+    }
+}
+
+impl WebhookSender for FakeWebhookSender {
+    fn send(&self, request: &WebhookHttpRequest) -> WebhookHttpResult {
+        self.requests.borrow_mut().push(request.clone());
+        self.result.clone()
+    }
+}
 
 fn run_ocfleet(args: &[&str]) -> Output {
     let output = Command::new(env!("CARGO_BIN_EXE_ocfleet"))
@@ -60,6 +97,35 @@ fn seed_alert(store: &Store, dedupe_key: &str) {
             }),
         })
         .expect("seed alert");
+}
+
+fn seed_webhook_hook(
+    store: &Store,
+    hook_id: &str,
+    endpoint_url: &str,
+    secret: &[u8],
+) -> AlertWebhookHookRecord {
+    let host = validate_webhook_endpoint(endpoint_url, &["93.184.216.34".to_string()])
+        .expect("valid endpoint");
+    let hook = AlertWebhookHookRecord {
+        hook_id: hook_id.to_string(),
+        name: "ops".to_string(),
+        hook_type: "webhook".to_string(),
+        endpoint_url: host.url,
+        endpoint_url_redacted: host.redacted_url,
+        endpoint_host: host.host,
+        host_allow: host.host_allow,
+        hmac_key_id: hmac_key_id(secret),
+        enabled: true,
+        max_attempts: 2,
+        timeout_ms: 1_500,
+        created_at: "2026-07-08T00:00:00Z".to_string(),
+        updated_at: "2026-07-08T00:00:00Z".to_string(),
+    };
+    store
+        .insert_alert_webhook_hook(&hook)
+        .expect("insert webhook hook");
+    hook
 }
 
 fn upsert_alert(
@@ -154,6 +220,12 @@ fn assert_no_forbidden_payload_keys(value: &Value) {
 fn assert_mode(path: &Path, expected: u32) {
     let mode = fs::metadata(path).expect("metadata").permissions().mode() & 0o777;
     assert_eq!(mode, expected, "unexpected mode for {}", path.display());
+}
+
+#[cfg(unix)]
+fn write_private_secret(path: &Path, secret: &[u8]) {
+    fs::write(path, secret).expect("write secret");
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("chmod secret");
 }
 
 #[test]
@@ -900,71 +972,376 @@ fn alert_hooks_tests_jsonl_file_limit_above_max_is_rejected_and_audited() {
 }
 
 #[test]
-fn alert_hooks_tests_webhook_hook_is_rejected_in_phase12_mvp() {
+#[cfg(unix)]
+fn alert_hooks_tests_webhook_add_rejects_http_url() {
     let dir = tempfile::tempdir().expect("temp dir");
     let database = dir.path().join("controller.sqlite");
     let database_arg = database.to_string_lossy().into_owned();
-    let store = Store::open(&database).expect("open store");
-    seed_stale_health_snapshot(&store);
-    drop(store);
+    let secret = dir.path().join("webhook.secret");
+    write_private_secret(&secret, b"0123456789abcdef0123456789abcdef");
+    let secret_arg = secret.to_string_lossy().into_owned();
 
     let output = run_ocfleet_failure(&[
         "--database",
         &database_arg,
         "alert",
-        "test",
-        "webhook:https://example.com/alerts,hmac_secret=secret",
+        "hook",
+        "add-webhook",
+        "--name",
+        "ops",
+        "--url",
+        "http://93.184.216.34/alerts",
+        "--hmac-secret-file",
+        &secret_arg,
+        "--host-allow",
+        "93.184.216.34",
     ]);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("webhook hooks are disabled"));
+    assert!(stderr.contains("webhook URL must use https"));
+}
 
+#[test]
+#[cfg(unix)]
+fn alert_hooks_tests_webhook_add_rejects_private_and_metadata_hosts() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let database_arg = database.to_string_lossy().into_owned();
+    let secret = dir.path().join("webhook.secret");
+    write_private_secret(&secret, b"0123456789abcdef0123456789abcdef");
+    let secret_arg = secret.to_string_lossy().into_owned();
+
+    for host in [
+        "127.0.0.1",
+        "10.0.0.1",
+        "169.254.169.254",
+        "metadata.google.internal",
+    ] {
+        let url = format!("https://{host}/alerts");
+        let output = run_ocfleet_failure(&[
+            "--database",
+            &database_arg,
+            "alert",
+            "hook",
+            "add-webhook",
+            "--name",
+            "ops",
+            "--url",
+            &url,
+            "--hmac-secret-file",
+            &secret_arg,
+            "--host-allow",
+            host,
+        ]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("forbidden"),
+            "expected forbidden host/IP error for {host}: {stderr}"
+        );
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn alert_hooks_tests_webhook_add_list_and_audit_redact_secret_and_url_path() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let database_arg = database.to_string_lossy().into_owned();
+    let secret = dir.path().join("webhook.secret");
+    write_private_secret(&secret, b"0123456789abcdef0123456789abcdef");
+    let secret_arg = secret.to_string_lossy().into_owned();
+
+    let output = run_ocfleet(&[
+        "--database",
+        &database_arg,
+        "alert",
+        "hook",
+        "add-webhook",
+        "--name",
+        "ops",
+        "--url",
+        "https://93.184.216.34/alerts/path?token=supersecret",
+        "--hmac-secret-file",
+        &secret_arg,
+        "--host-allow",
+        "93.184.216.34",
+        "--max-attempts",
+        "2",
+        "--timeout-ms",
+        "1500",
+    ]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("hook_type=webhook"));
+    assert!(stdout.contains("endpoint_url=https://93.184.216.34/<redacted>"));
+    assert!(!stdout.contains("supersecret"));
+    let hook_id = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("hook_id="))
+        .expect("hook id")
+        .to_string();
+
+    let output = run_ocfleet(&[
+        "--database",
+        &database_arg,
+        "alert",
+        "hook",
+        "list",
+        "--json",
+    ]);
+    let list = String::from_utf8_lossy(&output.stdout);
+    assert!(list.contains("https://93.184.216.34/<redacted>"));
+    assert!(!list.contains("supersecret"));
+    assert!(!list.contains("/alerts/path"));
+    assert!(!list.contains("0123456789abcdef"));
+
+    let (event, detail) = latest_audit(&database);
+    assert_eq!(event, "alert.hook.add_webhook");
+    assert_eq!(detail["endpoint_url"], "https://93.184.216.34/<redacted>");
+    assert!(!detail.to_string().contains("supersecret"));
+    assert!(!detail.to_string().contains("0123456789abcdef"));
+
+    let store = Store::open(&database).expect("open store");
+    seed_alert(&store, "node:hk-ocserv-01:node_stale");
+    drop(store);
+    let hook_arg = format!("webhook:{hook_id}");
     let output = run_ocfleet_failure(&[
         "--database",
         &database_arg,
         "alert",
         "deliver",
         "--hook",
-        "webhook:https://example.com/alerts,hmac_secret=secret",
+        &hook_arg,
     ]);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("webhook hooks are disabled"));
+    assert!(stderr.contains("--hmac-secret-file"));
+    let (event, ok, detail) = latest_audit_with_ok(&database);
+    assert_eq!(event, "alert.delivery");
+    assert_eq!(ok, 0);
+    assert_eq!(detail["hook_type"], "webhook");
+    assert!(!detail.to_string().contains("supersecret"));
+    assert!(!detail.to_string().contains("0123456789abcdef"));
+    assert!(!detail.to_string().contains("/alerts/path"));
 }
 
 #[test]
-fn alert_hooks_tests_http_webhook_is_rejected_without_network_delivery() {
+fn alert_hooks_tests_webhook_signature_is_deterministic() {
+    let signature = webhook_signature(
+        b"0123456789abcdef",
+        "2026-07-09T00:00:00Z",
+        "delivery-fixed",
+        br#"{"schema":"ocfleet.alert.v1"}"#,
+    );
+    assert_eq!(
+        signature,
+        "2680331a9d05793856ee7c9700574921c103b94ce286f0539dc0b979d3c9bac9"
+    );
+    assert_eq!(
+        signature,
+        webhook_signature(
+            b"0123456789abcdef",
+            "2026-07-09T00:00:00Z",
+            "delivery-fixed",
+            br#"{"schema":"ocfleet.alert.v1"}"#,
+        )
+    );
+}
+
+#[test]
+fn alert_hooks_tests_webhook_dry_run_writes_attempt_without_network_request() {
     let dir = tempfile::tempdir().expect("temp dir");
     let database = dir.path().join("controller.sqlite");
-    let database_arg = database.to_string_lossy().into_owned();
     let store = Store::open(&database).expect("open store");
-    seed_stale_health_snapshot(&store);
-    drop(store);
+    seed_alert(&store, "node:hk-ocserv-01:node_stale");
+    let hook = seed_webhook_hook(
+        &store,
+        "webhook-dry-run",
+        "https://93.184.216.34/alerts",
+        b"0123456789abcdef",
+    );
+    let alerts = store.list_alert_events().expect("list alerts");
+    let sender = FakeWebhookSender::new(WebhookHttpResult::Completed(WebhookHttpResponse {
+        status_code: 200,
+        status_class: "2xx".to_string(),
+        response_bytes: 0,
+    }));
 
-    let output = run_ocfleet_failure(&[
-        "--database",
-        &database_arg,
-        "alert",
-        "test",
-        "webhook:http://127.0.0.1:9/alerts",
-    ]);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("webhook hooks are disabled"));
+    let summary =
+        deliver_webhook_alerts_with_sender(&store, &hook.hook_id, &alerts, true, None, &sender)
+            .expect("dry-run delivery");
 
-    for hook in [
-        "webhook:http://127.0.0.1:9/alerts",
-        "webhook:https://127.0.0.1/alerts",
-        "webhook:https://10.0.0.1/alerts",
-    ] {
-        let output = run_ocfleet_failure(&[
-            "--database",
-            &database_arg,
-            "alert",
-            "deliver",
-            "--hook",
-            hook,
-        ]);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stderr.contains("webhook hooks are disabled"));
-    }
+    assert_eq!(summary.record_count, 1);
+    assert!(summary.bytes_written > 0);
+    assert_eq!(sender.request_count(), 0);
+    let attempts = store
+        .list_alert_delivery_attempts()
+        .expect("list delivery attempts");
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].status, "dry_run");
+    assert!(attempts[0].http_status_class.is_none());
+}
+
+#[test]
+fn alert_hooks_tests_webhook_payload_size_limit_rejects_without_network_request() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let store = Store::open(&database).expect("open store");
+    store
+        .upsert_alert_event(&AlertEventRecord {
+            alert_id: "alert-large".to_string(),
+            dedupe_key: "node:hk-ocserv-01:node_stale".to_string(),
+            node_id: Some("hk-ocserv-01".to_string()),
+            severity: "warning".to_string(),
+            state: "open".to_string(),
+            reason_code: "NODE_STALE".to_string(),
+            first_seen_at: "2026-07-08T00:00:00Z".to_string(),
+            last_seen_at: "2026-07-08T00:00:00Z".to_string(),
+            last_sent_at: None,
+            resolved_at: None,
+            detail_json: json!({
+                "methods": ["probe.controller.ping"],
+                "summary": {"status": "x".repeat(20 * 1024)}
+            }),
+        })
+        .expect("seed large alert");
+    let hook = seed_webhook_hook(
+        &store,
+        "webhook-large",
+        "https://93.184.216.34/alerts",
+        b"0123456789abcdef",
+    );
+    let alerts = store.list_alert_events().expect("list alerts");
+    let sender = FakeWebhookSender::new(WebhookHttpResult::Completed(WebhookHttpResponse {
+        status_code: 200,
+        status_class: "2xx".to_string(),
+        response_bytes: 0,
+    }));
+
+    let err =
+        deliver_webhook_alerts_with_sender(&store, &hook.hook_id, &alerts, true, None, &sender)
+            .expect_err("large payload rejected");
+
+    assert!(
+        err.to_string()
+            .contains("alert delivery payload exceeds limit")
+    );
+    assert_eq!(sender.request_count(), 0);
+    assert!(
+        store
+            .list_alert_delivery_attempts()
+            .expect("list delivery attempts")
+            .is_empty()
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn alert_hooks_tests_webhook_delivery_writes_attempt_and_hmac_headers() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let secret_path = dir.path().join("webhook.secret");
+    let secret = b"0123456789abcdef0123456789abcdef";
+    write_private_secret(&secret_path, secret);
+    let store = Store::open(&database).expect("open store");
+    seed_alert(&store, "node:hk-ocserv-01:node_stale");
+    let hook = seed_webhook_hook(
+        &store,
+        "webhook-success",
+        "https://93.184.216.34/alerts",
+        secret,
+    );
+    let alerts = store.list_alert_events().expect("list alerts");
+    let sender = FakeWebhookSender::new(WebhookHttpResult::Completed(WebhookHttpResponse {
+        status_code: 200,
+        status_class: "2xx".to_string(),
+        response_bytes: 0,
+    }));
+
+    let summary = deliver_webhook_alerts_with_sender(
+        &store,
+        &hook.hook_id,
+        &alerts,
+        false,
+        Some(&secret_path),
+        &sender,
+    )
+    .expect("webhook delivery");
+
+    assert_eq!(summary.record_count, 1);
+    assert!(summary.bytes_written > 0);
+    let requests = sender.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].url, "https://93.184.216.34/alerts");
+    assert!(
+        requests[0]
+            .headers
+            .iter()
+            .any(|(name, value)| name == "X-Ocfleet-Signature" && value.starts_with("sha256="))
+    );
+    assert!(
+        requests[0]
+            .headers
+            .iter()
+            .any(|(name, _)| name == "X-Ocfleet-Timestamp")
+    );
+    assert!(
+        requests[0]
+            .headers
+            .iter()
+            .any(|(name, _)| name == "X-Ocfleet-Delivery-Id")
+    );
+    let attempts = store
+        .list_alert_delivery_attempts()
+        .expect("list delivery attempts");
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].status, "succeeded");
+    assert_eq!(attempts[0].http_status_class.as_deref(), Some("2xx"));
+    assert!(attempts[0].error_code.is_none());
+}
+
+#[test]
+#[cfg(unix)]
+fn alert_hooks_tests_webhook_redirect_is_rejected_and_attempt_is_recorded() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let secret_path = dir.path().join("webhook.secret");
+    let secret = b"0123456789abcdef0123456789abcdef";
+    write_private_secret(&secret_path, secret);
+    let store = Store::open(&database).expect("open store");
+    seed_alert(&store, "node:hk-ocserv-01:node_stale");
+    let hook = seed_webhook_hook(
+        &store,
+        "webhook-redirect",
+        "https://93.184.216.34/alerts",
+        secret,
+    );
+    let alerts = store.list_alert_events().expect("list alerts");
+    let sender = FakeWebhookSender::new(WebhookHttpResult::Completed(WebhookHttpResponse {
+        status_code: 302,
+        status_class: "3xx".to_string(),
+        response_bytes: 0,
+    }));
+
+    let err = deliver_webhook_alerts_with_sender(
+        &store,
+        &hook.hook_id,
+        &alerts,
+        false,
+        Some(&secret_path),
+        &sender,
+    )
+    .expect_err("redirect is rejected");
+
+    assert!(err.to_string().contains("WEBHOOK_REDIRECT_FORBIDDEN"));
+    assert_eq!(sender.request_count(), 1);
+    let attempts = store
+        .list_alert_delivery_attempts()
+        .expect("list delivery attempts");
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].status, "failed");
+    assert_eq!(attempts[0].http_status_class.as_deref(), Some("3xx"));
+    assert_eq!(
+        attempts[0].error_code.as_deref(),
+        Some("WEBHOOK_REDIRECT_FORBIDDEN")
+    );
 }
 
 #[test]

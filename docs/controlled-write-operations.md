@@ -52,7 +52,7 @@ allowed in the default build.
 | `ocserv.restart` | Emergency restart of one locally configured ocserv service identity. | Disabled by default even when controlled writes are enabled. Requires explicit emergency policy, higher approval role, reason, change ticket, dry-run, and outage acknowledgement. |
 | `ocserv.config.apply` | Apply a reviewed ocserv config bundle. | Accepts only signed bundle metadata and a bundle ID known to the agent. No raw config body or raw command in RPC. Dry-run validates signature, schema, expected previous bundle, and local policy. |
 | `ocserv.config.rollback` | Roll back to a known previous signed bundle. | Target must be an agent-known signed previous bundle. Rollback cannot accept arbitrary file paths or config content. |
-| `ocserv.session.disconnect` | Disconnect one server-side selected session. | Uses an opaque agent-issued session token selected from a low-sensitive workflow. The token must not expose username, client IP, session ID, certificate subject, or raw occtl output. |
+| `ocserv.session.disconnect` | Future design placeholder only. | The scaffold carries no token or selector and always rejects validation because no selector design currently satisfies the low-sensitive boundary. |
 
 ## Forbidden Forever Operations
 
@@ -122,7 +122,12 @@ Non-reversible operations require a stronger approval record and an explicit
 ## Protocol Draft
 
 Draft DTOs live behind the `controlled-writes` feature in
-`ocfleet-protocol::controlled_write`. They are not wired into dispatch.
+`ocfleet-protocol::controlled_write`. They are not wired into dispatch. Their
+validation accepts dry-run only, bounds every string/hash/signature, requires
+operation/params agreement, requires restart outage acknowledgement, redacts
+actor/reason/signed material/params from request `Debug`, and uses a closed
+typed response summary instead of arbitrary JSON. Response validation rejects
+inconsistent policy decisions and missing rollback or irreversibility metadata.
 
 Request fields:
 
@@ -161,8 +166,8 @@ Responses contain only low-sensitive summaries:
   "dry_run": true,
   "summary": {
     "operation_kind": "ocserv_config_apply",
-    "policy": "allowed_by_local_policy",
-    "bundle_known": true
+    "policy_decision": "would_allow",
+    "validation_code": "POLICY_ALLOWED"
   },
   "rollback_available": true,
   "rollback_plan_id": "rollback_...",
@@ -254,9 +259,12 @@ local_identity = "ocserv-primary"
 ```
 
 The current default build rejects `enabled = true` because the
-`controlled-writes` feature is off. A future feature-enabled build must still
-require local policy for each operation. The controller must never supply local
-service units, paths, commands, selectors, scripts, or package names.
+`controlled-writes` feature is off. A feature-enabled build validates local
+policy and dry-run DTOs, but the agent still rejects every controlled-write RPC
+as not allowed because no dispatch exists. The controller must never supply
+local service units, paths, commands, selectors, scripts, or package names.
+Feature-enabled config also requires `ocserv_restart.emergency_only = true` and
+rejects enabling session disconnect because no safe opaque selector exists.
 
 ## Safety Gates
 

@@ -183,6 +183,7 @@ service_name = "ocserv.service"
 }
 
 #[test]
+#[cfg(not(feature = "controlled-writes"))]
 fn agent_config_controlled_writes_feature_is_default_disabled() {
     let config: AgentConfig = toml::from_str(
         r#"
@@ -264,6 +265,49 @@ local_identity = "ocserv-primary"
 }
 
 #[test]
+#[cfg(feature = "controlled-writes")]
+fn feature_enabled_config_requires_emergency_restart_and_rejects_session_disconnect() {
+    let base = r#"
+[node]
+id = "hk-ocserv-01"
+region = "hk"
+role = "ocserv"
+
+[iroh]
+secret_key_path = "/tmp/iroh.secret"
+
+[security]
+
+[audit]
+path = "/tmp/ocfleet-audit.log"
+
+[controlled_writes]
+enabled = true
+"#;
+
+    let restart: AgentConfig = toml::from_str(&format!(
+        "{base}\n[controlled_writes.ocserv_restart]\nenabled = true\n"
+    ))
+    .expect("restart config parses");
+    let err = validate_agent_config(&restart).expect_err("restart acknowledgement is mandatory");
+    assert!(matches!(
+        err,
+        ConfigError::Invalid(message) if message.contains("emergency_only=true")
+    ));
+
+    let disconnect: AgentConfig = toml::from_str(&format!(
+        "{base}\n[controlled_writes.ocserv_session_disconnect]\nenabled = true\n"
+    ))
+    .expect("disconnect config parses");
+    let err =
+        validate_agent_config(&disconnect).expect_err("disconnect policy remains unavailable");
+    assert!(matches!(
+        err,
+        ConfigError::Invalid(message) if message.contains("without a safe selector")
+    ));
+}
+
+#[test]
 fn agent_config_rejects_controlled_write_operation_without_global_enable() {
     let config: AgentConfig = toml::from_str(
         r#"
@@ -293,6 +337,38 @@ emergency_only = true
         err,
         ConfigError::Invalid(message)
             if message.contains("controlled_writes.enabled must be true")
+    ));
+}
+
+#[test]
+fn agent_config_rejects_unsafe_dormant_controlled_write_identity() {
+    let config: AgentConfig = toml::from_str(
+        r#"
+[node]
+id = "hk-ocserv-01"
+region = "hk"
+role = "ocserv"
+
+[iroh]
+secret_key_path = "/tmp/iroh.secret"
+
+[security]
+
+[audit]
+path = "/tmp/ocfleet-audit.log"
+
+[controlled_writes.ocserv_reload]
+enabled = false
+local_identity = "/usr/bin/systemctl restart ocserv"
+"#,
+    )
+    .expect("dormant controlled writes config should parse");
+
+    let err = validate_agent_config(&config)
+        .expect_err("unsafe dormant local identities must fail closed");
+    assert!(matches!(
+        err,
+        ConfigError::Invalid(message) if message.contains("local_identity")
     ));
 }
 

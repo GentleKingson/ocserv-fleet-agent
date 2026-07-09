@@ -538,6 +538,15 @@ pub fn validate_agent_config(config: &AgentConfig) -> Result<(), ConfigError> {
 }
 
 fn validate_controlled_writes_config(config: &ControlledWritesConfig) -> Result<(), ConfigError> {
+    validate_controlled_write_policy("ocserv_reload", &config.ocserv_reload)?;
+    validate_controlled_write_policy("ocserv_restart", &config.ocserv_restart)?;
+    validate_controlled_write_policy("ocserv_config_apply", &config.ocserv_config_apply)?;
+    validate_controlled_write_policy("ocserv_config_rollback", &config.ocserv_config_rollback)?;
+    validate_controlled_write_policy(
+        "ocserv_session_disconnect",
+        &config.ocserv_session_disconnect,
+    )?;
+
     let has_operation_enabled = config.ocserv_reload.enabled
         || config.ocserv_restart.enabled
         || config.ocserv_config_apply.enabled
@@ -557,19 +566,21 @@ fn validate_controlled_writes_config(config: &ControlledWritesConfig) -> Result<
     }
     #[cfg(feature = "controlled-writes")]
     {
-        validate_controlled_write_policy("ocserv_reload", &config.ocserv_reload)?;
-        validate_controlled_write_policy("ocserv_restart", &config.ocserv_restart)?;
-        validate_controlled_write_policy("ocserv_config_apply", &config.ocserv_config_apply)?;
-        validate_controlled_write_policy("ocserv_config_rollback", &config.ocserv_config_rollback)?;
-        validate_controlled_write_policy(
-            "ocserv_session_disconnect",
-            &config.ocserv_session_disconnect,
-        )?;
+        if config.ocserv_restart.enabled && !config.ocserv_restart.emergency_only {
+            return Err(ConfigError::Invalid(
+                "controlled_writes.ocserv_restart requires emergency_only=true".to_string(),
+            ));
+        }
+        if config.ocserv_session_disconnect.enabled {
+            return Err(ConfigError::Invalid(
+                "controlled_writes.ocserv_session_disconnect is unavailable without a safe selector"
+                    .to_string(),
+            ));
+        }
     }
     Ok(())
 }
 
-#[cfg(feature = "controlled-writes")]
 fn validate_controlled_write_policy(
     field: &'static str,
     policy: &ControlledWriteOperationPolicy,
@@ -580,10 +591,9 @@ fn validate_controlled_write_policy(
     Ok(())
 }
 
-#[cfg(feature = "controlled-writes")]
 fn validate_safe_local_identity(value: &str, field: &'static str) -> Result<(), ConfigError> {
     let trimmed = value.trim();
-    if trimmed.is_empty() || trimmed.len() > 128 {
+    if trimmed.is_empty() || trimmed.len() > 128 || trimmed != value {
         return Err(ConfigError::Invalid(format!(
             "controlled_writes.{field}.local_identity must be 1-128 bytes"
         )));

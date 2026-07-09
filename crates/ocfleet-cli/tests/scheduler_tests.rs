@@ -55,6 +55,35 @@ fn parse_job_id(stdout: &[u8]) -> String {
         .expect("job id in stdout")
 }
 
+fn json_stdout(output: &Output) -> Value {
+    serde_json::from_slice(&output.stdout).expect("valid JSON stdout")
+}
+
+fn assert_no_raw_scheduler_fields(value: &Value) {
+    match value {
+        Value::Object(map) => {
+            for key in map.keys() {
+                assert!(
+                    !matches!(
+                        key.as_str(),
+                        "raw" | "raw_body" | "stdout" | "stderr" | "response_body"
+                    ),
+                    "forbidden raw scheduler field present: {key}"
+                );
+            }
+            for value in map.values() {
+                assert_no_raw_scheduler_fields(value);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                assert_no_raw_scheduler_fields(value);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn latest_audit(database: &Path) -> (String, i64, Value) {
     let conn = Connection::open(database).expect("open db");
     let (event, ok, detail): (String, i64, String) = conn
@@ -129,6 +158,81 @@ fn scheduler_tests_schedule_job_add_and_list() {
     assert!(stdout.contains("selector=role=ocserv"));
     assert!(stdout.contains("next_run_at="));
     assert!(stdout.contains("last_run_at="));
+}
+
+#[test]
+fn scheduler_tests_job_name_show_validate_status_and_json_outputs() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let database_arg = database.to_string_lossy().into_owned();
+    {
+        let store = Store::open(&database).expect("open store");
+        add_node_with_generated_endpoint(&store, "hk-ocserv-01");
+    }
+
+    let add = run_ocfleet(&[
+        "--database",
+        &database_arg,
+        "schedule",
+        "job",
+        "add",
+        "--name",
+        "HK ping",
+        "--kind",
+        "controller-ping",
+        "--interval",
+        "60s",
+        "--selector",
+        "node_id=hk-ocserv-01",
+    ]);
+    let job_id = parse_job_id(&add.stdout);
+
+    let list = run_ocfleet(&[
+        "--database",
+        &database_arg,
+        "schedule",
+        "job",
+        "list",
+        "--json",
+    ]);
+    let payload = json_stdout(&list);
+    assert_eq!(payload["job_count"], 1);
+    assert_eq!(payload["jobs"][0]["job_id"], job_id);
+    assert_eq!(payload["jobs"][0]["name"], "HK ping");
+    assert_eq!(payload["jobs"][0]["selector"], "node_id=hk-ocserv-01");
+    assert_no_raw_scheduler_fields(&payload);
+
+    let show = run_ocfleet(&[
+        "--database",
+        &database_arg,
+        "schedule",
+        "job",
+        "show",
+        &job_id,
+        "--json",
+    ]);
+    let payload = json_stdout(&show);
+    assert_eq!(payload["job"]["job_id"], job_id);
+    assert_eq!(payload["job"]["name"], "HK ping");
+    assert_no_raw_scheduler_fields(&payload);
+
+    let validate = run_ocfleet(&[
+        "--database",
+        &database_arg,
+        "schedule",
+        "job",
+        "validate",
+        &job_id,
+        "--json",
+    ]);
+    let payload = json_stdout(&validate);
+    assert_eq!(payload["valid"], true);
+    assert_eq!(payload["target_count"], 1);
+
+    let status = run_ocfleet(&["--database", &database_arg, "schedule", "status", "--json"]);
+    let payload = json_stdout(&status);
+    assert!(payload.get("enabled_jobs").is_some());
+    assert!(payload.get("due_jobs").is_some());
 }
 
 #[test]
@@ -299,6 +403,57 @@ fn scheduler_tests_path_probe_rejects_user_selector() {
     ]);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("--selector is not valid for path-probe"));
+}
+
+#[test]
+fn scheduler_tests_path_probe_validate_requires_explicit_pair_without_mesh_enumeration() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let database_arg = database.to_string_lossy().into_owned();
+    {
+        let store = Store::open(&database).expect("open store");
+        add_node_with_generated_endpoint(&store, "source-node");
+        add_node_with_generated_endpoint(&store, "target-node");
+        drop(store);
+        let conn = Connection::open(&database).expect("open db");
+        conn.execute(
+            "INSERT INTO observability_jobs
+             (job_id, kind, selector_json, pair_selector_json, interval_seconds, jitter_seconds, timeout_ms, enabled, next_run_at, created_at, updated_at)
+             VALUES ('bad-path-job', 'path-probe', '{\"selector\":\"explicit_pair\"}', NULL, 60, 0, 5000, 1, '2026-07-08T00:00:00Z', '2026-07-08T00:00:00Z', '2026-07-08T00:00:00Z')",
+            [],
+        )
+        .expect("insert path-probe job without pair");
+    }
+
+    let output = run_ocfleet_failure(&[
+        "--database",
+        &database_arg,
+        "schedule",
+        "job",
+        "validate",
+        "bad-path-job",
+        "--json",
+    ]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let payload: Value = serde_json::from_str(&stdout).expect("valid validation JSON");
+    assert_eq!(payload["valid"], false);
+    assert_eq!(payload["reason_code"], "INVALID_PATH_PAIR");
+    assert_eq!(payload["target_count"], 0);
+    assert!(!stdout.contains("mesh"));
+
+    let store = Store::open(&database).expect("open store");
+    assert!(
+        store
+            .list_probe_observations(None, 10)
+            .expect("list observations")
+            .is_empty()
+    );
+    assert!(
+        store
+            .list_observability_runs(10)
+            .expect("list runs")
+            .is_empty()
+    );
 }
 
 #[test]
@@ -665,6 +820,208 @@ fn scheduler_tests_run_once_disabled_job_skipped() {
         .list_probe_observations(None, 10)
         .expect("list observations");
     assert!(observations.is_empty());
+}
+
+#[test]
+fn scheduler_tests_targeted_run_executes_only_selected_job_and_queries_run() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let database_arg = database.to_string_lossy().into_owned();
+    {
+        let store = Store::open(&database).expect("open store");
+        let first_endpoint = add_node_with_generated_endpoint(&store, "hk-ocserv-01");
+        let second_endpoint = add_node_with_generated_endpoint(&store, "sg-ocserv-01");
+        store
+            .revoke_endpoint(&first_endpoint, "scheduler-user", "test preflight")
+            .expect("revoke first endpoint");
+        store
+            .revoke_endpoint(&second_endpoint, "scheduler-user", "test preflight")
+            .expect("revoke second endpoint");
+    }
+
+    let first = run_ocfleet(&[
+        "--database",
+        &database_arg,
+        "schedule",
+        "job",
+        "add",
+        "--kind",
+        "controller-ping",
+        "--interval",
+        "60s",
+        "--selector",
+        "node_id=hk-ocserv-01",
+    ]);
+    let first_job_id = parse_job_id(&first.stdout);
+    let second = run_ocfleet(&[
+        "--database",
+        &database_arg,
+        "schedule",
+        "job",
+        "add",
+        "--kind",
+        "controller-ping",
+        "--interval",
+        "60s",
+        "--selector",
+        "node_id=sg-ocserv-01",
+    ]);
+    let second_job_id = parse_job_id(&second.stdout);
+
+    let output = run_ocfleet(&[
+        "--database",
+        &database_arg,
+        "schedule",
+        "run",
+        "--once",
+        "--job-id",
+        &first_job_id,
+        "--json",
+    ]);
+    let payload = json_stdout(&output);
+    assert_eq!(payload["status"], "ok");
+    assert_eq!(payload["job_id"], first_job_id);
+    assert_eq!(payload["due_jobs"], 1);
+    assert_eq!(payload["executed_jobs"], 1);
+    let json_run_id = payload["run_ids"][0]
+        .as_str()
+        .expect("run id in run once JSON")
+        .to_string();
+    assert_no_raw_scheduler_fields(&payload);
+
+    let store = Store::open(&database).expect("open store");
+    let runs = store.list_observability_runs(10).expect("list runs");
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].run_id, json_run_id);
+    assert_eq!(runs[0].job_id.as_deref(), Some(first_job_id.as_str()));
+    assert_eq!(runs[0].observation_count, 1);
+    let observations = store
+        .list_probe_observations(None, 10)
+        .expect("list observations");
+    assert_eq!(observations.len(), 1);
+    assert_eq!(observations[0].node_id.as_deref(), Some("hk-ocserv-01"));
+    assert_ne!(runs[0].job_id.as_deref(), Some(second_job_id.as_str()));
+    let run_id = runs[0].run_id.clone();
+    drop(store);
+
+    let list = run_ocfleet(&[
+        "--database",
+        &database_arg,
+        "schedule",
+        "run",
+        "list",
+        "--limit",
+        "10",
+        "--json",
+    ]);
+    let payload = json_stdout(&list);
+    assert_eq!(payload["run_count"], 1);
+    assert_eq!(payload["runs"][0]["run_id"], run_id);
+    assert_eq!(payload["runs"][0]["job_id"], first_job_id);
+    assert_eq!(payload["runs"][0]["observation_count"], 1);
+    assert_no_raw_scheduler_fields(&payload);
+
+    let show = run_ocfleet(&[
+        "--database",
+        &database_arg,
+        "schedule",
+        "run",
+        "show",
+        &run_id,
+        "--json",
+    ]);
+    let payload = json_stdout(&show);
+    assert_eq!(payload["run"]["run_id"], run_id);
+    assert_eq!(payload["run"]["job_id"], first_job_id);
+    assert_eq!(payload["run"]["failed_observation_count"], 1);
+    assert_no_raw_scheduler_fields(&payload);
+
+    let (event, ok, detail) = latest_audit(&database);
+    assert_eq!(event, "scheduler.run.once");
+    assert_eq!(ok, 1);
+    assert_eq!(detail["job_id"], first_job_id);
+}
+
+#[test]
+fn scheduler_tests_run_all_due_jobs_still_executes_every_due_job() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let database_arg = database.to_string_lossy().into_owned();
+
+    run_ocfleet(&[
+        "--database",
+        &database_arg,
+        "schedule",
+        "job",
+        "add",
+        "--kind",
+        "controller-ping",
+        "--interval",
+        "60s",
+        "--selector",
+        "node_id=missing-a",
+    ]);
+    run_ocfleet(&[
+        "--database",
+        &database_arg,
+        "schedule",
+        "job",
+        "add",
+        "--kind",
+        "controller-ping",
+        "--interval",
+        "60s",
+        "--selector",
+        "node_id=missing-b",
+    ]);
+
+    let output = run_ocfleet(&["--database", &database_arg, "schedule", "run", "--once"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("due_jobs=2"));
+    assert!(stdout.contains("executed_jobs=2"));
+    assert!(stdout.contains("failed_observations=2"));
+}
+
+#[test]
+fn scheduler_tests_invalid_job_and_run_ids_return_clear_errors() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let database_arg = database.to_string_lossy().into_owned();
+
+    for args in [
+        vec![
+            "--database",
+            &database_arg,
+            "schedule",
+            "job",
+            "show",
+            "missing-job",
+        ],
+        vec![
+            "--database",
+            &database_arg,
+            "schedule",
+            "run",
+            "--once",
+            "--job-id",
+            "missing-job",
+        ],
+        vec![
+            "--database",
+            &database_arg,
+            "schedule",
+            "run",
+            "show",
+            "missing-run",
+        ],
+    ] {
+        let output = run_ocfleet_failure(&args);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("not found"),
+            "expected not found error, got: {stderr}"
+        );
+    }
 }
 
 #[test]

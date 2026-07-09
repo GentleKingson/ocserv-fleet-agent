@@ -16,10 +16,11 @@ RPC boundary.
 
 | Surface | Current status | Current CLI or source state |
 | --- | --- | --- |
-| Scheduler | partially implemented / active implementation | `ocfleet schedule job add/list/enable/disable`, `ocfleet schedule run --once`, `ocfleet schedule daemon`, `ocfleet schedule status` |
-| Health | partially implemented / active implementation | `ocfleet health summary`, `ocfleet health node`, `ocfleet health policy show/set` |
-| Alerts | partially implemented / active implementation | `ocfleet alert list/test/deliver/silence/resolve`; only `jsonl_file:<path>` delivery is enabled |
-| Retention | partially implemented / active implementation | `ocfleet retention show/set/apply` for observability history scopes |
+| Scheduler | partially implemented / active implementation | `ocfleet schedule job add/list/show/validate/enable/disable`, `ocfleet schedule run --once [--job-id <job-id>]`, `ocfleet schedule run list/show`, `ocfleet schedule daemon`, `ocfleet schedule status --json` |
+| Observations | partially implemented / active implementation | `ocfleet observation list --node <node-id> --method <method> --limit <n> --json`, `ocfleet observation show <observation-id> --json` |
+| Health | partially implemented / active implementation | `ocfleet health summary`, `ocfleet health node`, `ocfleet health snapshot list`, `ocfleet health policy show/set` |
+| Alerts | partially implemented / active implementation | `ocfleet alert list --state ... --severity ... --node ... --json`, `ocfleet alert test/deliver/silence/resolve`; only `jsonl_file:<path>` delivery is enabled |
+| Retention | partially implemented / active implementation | `ocfleet retention show/set/explain/apply` for observability history scopes |
 | Audit export | partially implemented / active implementation | `ocfleet audit export --from ... --to ... --format jsonl --output ...` |
 | `ocfleet-api` / Web dashboard | planned / not implemented | No API binary, routes, or Web UI are present |
 | Webhook hooks | planned / not implemented | `webhook:` hooks are rejected until HTTPS/HMAC/SSRF protections are designed and implemented |
@@ -309,6 +310,7 @@ boundary. Examples below match the current `ocfleet` argument parser.
 
 ```bash
 ocfleet schedule job add \
+  --name "HK ocserv status" \
   --kind ocserv-status \
   --selector node_id=hk-ocserv-01 \
   --interval 60s
@@ -325,12 +327,21 @@ ocfleet schedule job add \
   --interval 300s
 
 ocfleet schedule job list
+ocfleet schedule job list --json
+ocfleet schedule job show <job-id>
+ocfleet schedule job show <job-id> --json
+ocfleet schedule job validate <job-id>
+ocfleet schedule job validate <job-id> --json
 ocfleet schedule job enable <job-id>
 ocfleet schedule job disable <job-id>
 ocfleet schedule run --once
+ocfleet schedule run --once --job-id <job-id> --json
 ocfleet schedule run --once --max-concurrency 4
+ocfleet schedule run list --limit 50 --json
+ocfleet schedule run show <run-id> --json
 ocfleet schedule daemon --tick-seconds 60 --max-concurrency 4
 ocfleet schedule status
+ocfleet schedule status --json
 ```
 
 `schedule daemon` runs scheduler loops only from local controller config and
@@ -345,6 +356,18 @@ remediation. `schedule run --once` prints `alert_evaluation=ok|failed` and
 `alert_events=<count>`, and the scheduler audit detail records the same bounded
 summary.
 
+### Observations
+
+```bash
+ocfleet observation list --node hk-ocserv-01 --method probe.controller.ping --limit 50 --json
+ocfleet observation show <observation-id>
+ocfleet observation show <observation-id> --json
+```
+
+Observation queries read bounded stored rows from controller SQLite. They do not
+call agents, run probes, or expose raw RPC response bodies. JSON output includes
+a sanitized low-sensitive `summary` projection only.
+
 ### Health
 
 ```bash
@@ -352,11 +375,17 @@ ocfleet health summary
 ocfleet health summary --json
 ocfleet health node hk-ocserv-01
 ocfleet health node hk-ocserv-01 --json
+ocfleet health snapshot list --limit 50
+ocfleet health snapshot list --limit 50 --json
 ocfleet health policy show
 ocfleet health policy set --stale-window 24h --unreachable-failures 3 --cert-warning-days 30 --cert-critical-days 7
 ```
 
-Health commands read SQLite snapshots and observations. They do not run probes.
+`health summary` and `health node` read SQLite observations, compute the current
+derived health view, and upsert the latest per-node snapshot. They do not run
+probes. `health snapshot list` shows the current latest snapshot per node
+because the current schema stores one health snapshot row per node, not a full
+snapshot history.
 Health policy commands update only controller-local SQLite thresholds for stale
 health windows, consecutive unreachable failures, and certificate warning or
 critical alert windows. Each policy update writes a controller audit record with
@@ -367,14 +396,17 @@ the old and new bounded threshold values.
 ```bash
 ocfleet retention show
 ocfleet retention set observations --max-age 30d --max-rows 100000
+ocfleet retention explain --scope observations --json
 ocfleet retention apply --dry-run --scope observations --before 2026-07-01T00:00:00Z --json
 ocfleet retention apply --scope observations --batch-size 1000 --limit 10000
 ```
 
 Retention commands modify retention policy and prune local SQLite history only.
-They do not call agents. `retention apply` reports `matched_count`, cutoff,
-policy row cap, oldest/newest candidate timestamps, deleted rows, batch count,
-and a SHA-256 report checksum. Actual deletes are split into bounded batches;
+They do not call agents. `retention explain` reports the effective policy,
+cutoff, matched count, and oldest/newest candidate timestamps without deleting
+rows or writing audit. `retention apply` reports `matched_count`, cutoff, policy
+row cap, oldest/newest candidate timestamps, deleted rows, batch count, and a
+SHA-256 report checksum. Actual deletes are split into bounded batches;
 controller audit rows are never deleted by retention.
 
 ### Alerts
@@ -382,6 +414,7 @@ controller audit rows are never deleted by retention.
 ```bash
 ocfleet alert list
 ocfleet alert list --json
+ocfleet alert list --state open --severity critical --node hk-ocserv-01 --json
 ocfleet alert test jsonl_file:./private-alerts/test.jsonl
 ocfleet alert deliver --hook jsonl_file:./private-alerts/alerts.jsonl --limit 100
 ocfleet alert deliver --hook jsonl_file:./private-alerts/alerts.jsonl --limit 100 --dry-run
@@ -395,7 +428,8 @@ hardlink, world-readable file, or non-regular file. `alert deliver` evaluates
 local alert state, selects bounded open alerts, writes compact JSONL payloads,
 and updates `last_sent_at` after successful non-dry-run delivery. These commands
 must not call agents, expand shell syntax, read secrets, or execute local
-scripts.
+scripts. See `docs/alert-delivery-jsonl.md` for the JSONL payload schema and
+low-sensitive field allowlist.
 
 ### Audit Export
 
@@ -410,7 +444,8 @@ is bounded by `--max-rows`, output uses private `0600` create-new files under a
 private `0700` parent, and `--include-checksum` writes a SHA-256 sidecar. Default
 redaction hides secret-like fields; strict redaction hashes actor, node,
 endpoint, and request identifiers. The `audit.export` audit row is written after
-the file is produced, so it is not included in that export window snapshot.
+the file is produced, so it is not included in that export window snapshot. See
+`docs/audit-export.md` for redaction mode and private output path details.
 
 ### Planned Read-only Web/API Dashboard
 
@@ -526,24 +561,37 @@ Smoke commands for current CLI surfaces:
 ocfleet schedule job add --kind controller-ping --selector node_id=hk-ocserv-01 --interval 60s
 ocfleet schedule job add --kind path-probe --source-node-id hk-ocserv-01 --target-node-id sg-ocserv-01 --interval 300s
 ocfleet schedule job list
+ocfleet schedule job list --json
+ocfleet schedule job show <job-id> --json
+ocfleet schedule job validate <job-id> --json
 ocfleet schedule job disable <job-id>
 ocfleet schedule job enable <job-id>
 ocfleet schedule run --once
+ocfleet schedule run --once --job-id <job-id> --json
+ocfleet schedule run list --limit 50 --json
+ocfleet schedule run show <run-id> --json
 ocfleet schedule status
+ocfleet schedule status --json
+
+ocfleet observation list --node hk-ocserv-01 --method probe.controller.ping --limit 50 --json
+ocfleet observation show <observation-id> --json
 
 ocfleet health summary
 ocfleet health summary --json
 ocfleet health node hk-ocserv-01
 ocfleet health node hk-ocserv-01 --json
+ocfleet health snapshot list --limit 50 --json
 ocfleet health policy show
 
 ocfleet retention show
 ocfleet retention set observations --max-age 30d --max-rows 100000
+ocfleet retention explain --scope observations --json
 ocfleet retention apply --dry-run --scope observations --json
 ocfleet retention apply --scope observations --batch-size 1000 --limit 10000
 
 ocfleet alert list
 ocfleet alert list --json
+ocfleet alert list --state open --severity critical --node hk-ocserv-01 --json
 ocfleet alert test jsonl_file:./private-alerts/test.jsonl
 ocfleet alert deliver --hook jsonl_file:./private-alerts/alerts.jsonl --limit 100 --dry-run
 ocfleet alert silence <dedupe-key> --for-duration 24h --reason "smoke silence"

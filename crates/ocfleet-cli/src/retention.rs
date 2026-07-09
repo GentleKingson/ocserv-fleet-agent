@@ -26,6 +26,25 @@ struct RetentionApplyReport {
     scopes: Vec<RetentionScopeReport>,
 }
 
+#[derive(Debug, Serialize)]
+struct RetentionExplainReport {
+    generated_at: String,
+    scope: String,
+    effective_policy: RetentionPolicyJson,
+    cutoff: Option<String>,
+    matched_count: u64,
+    oldest_candidate: Option<String>,
+    newest_candidate: Option<String>,
+    dry_run: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct RetentionPolicyJson {
+    max_age_days: Option<u64>,
+    max_rows: Option<u64>,
+    updated_at: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct RetentionScopeReport {
     scope: String,
@@ -67,6 +86,7 @@ pub fn run_retention_command(store: &Store, command: RetentionCommand) -> anyhow
             json,
             batch_size,
         ),
+        RetentionCommand::Explain { scope, json } => run_retention_explain(store, scope, json),
     }
 }
 
@@ -177,6 +197,54 @@ fn run_retention_apply(
         println!(
             "scope=controller_audit_log retention=never matched_count=0 deleted_count=0 rows_deleted=0 dry_run={dry_run}"
         );
+    }
+    Ok(())
+}
+
+fn run_retention_explain(
+    store: &Store,
+    scope: RetentionScope,
+    json_output: bool,
+) -> anyhow::Result<()> {
+    let scope_name = retention_scope_name(scope);
+    let policy = effective_retention_policy(store, scope_name)?;
+    let cutoff = retention_cutoff(&policy)?;
+    let candidate_report =
+        store.retention_candidate_report(scope_name, cutoff.as_deref(), policy.max_rows)?;
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&RetentionExplainReport {
+                generated_at: now_rfc3339(),
+                scope: scope_name.to_string(),
+                effective_policy: RetentionPolicyJson {
+                    max_age_days: policy.max_age_days,
+                    max_rows: policy.max_rows,
+                    updated_at: policy.updated_at,
+                },
+                cutoff,
+                matched_count: candidate_report.matched_count,
+                oldest_candidate: candidate_report.oldest_timestamp,
+                newest_candidate: candidate_report.newest_timestamp,
+                dry_run: true,
+            })?
+        );
+    } else {
+        println!("scope={scope_name}");
+        println!("max_age_days={}", optional_u64(policy.max_age_days));
+        println!("max_rows={}", optional_u64(policy.max_rows));
+        println!("updated_at={}", policy.updated_at);
+        println!("cutoff={}", optional_str(cutoff.as_deref()));
+        println!("matched_count={}", candidate_report.matched_count);
+        println!(
+            "oldest_candidate={}",
+            optional_str(candidate_report.oldest_timestamp.as_deref())
+        );
+        println!(
+            "newest_candidate={}",
+            optional_str(candidate_report.newest_timestamp.as_deref())
+        );
+        println!("dry_run=true");
     }
     Ok(())
 }

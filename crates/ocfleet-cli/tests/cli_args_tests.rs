@@ -1,9 +1,11 @@
 use clap::{CommandFactory, Parser};
 use ocfleet_cli::args::{
-    AlertCommand, AuditCommand, AuditExportFormat, Cli, Command, EndpointCommand, EnrollCommand,
-    EnrollRequestCommand, EnrollTokenCommand, HealthCommand, HealthPolicyCommand, NodeCommand,
-    OcservCommand, OcservSessionsCommand, ProbeCommand, RedactionMode, RetentionCommand,
-    RetentionScope, TrustCommand, TrustDiffFormat,
+    AlertCommand, AlertSeverity, AlertState, AuditCommand, AuditExportFormat, Cli, Command,
+    EndpointCommand, EnrollCommand, EnrollRequestCommand, EnrollTokenCommand, HealthCommand,
+    HealthPolicyCommand, HealthSnapshotCommand, NodeCommand, ObservationCommand, OcservCommand,
+    OcservSessionsCommand, ProbeCommand, RedactionMode, RetentionCommand, RetentionScope,
+    ScheduleCommand, ScheduleJobCommand, ScheduleJobKind, ScheduleRunCommand, TrustCommand,
+    TrustDiffFormat,
 };
 use std::path::PathBuf;
 
@@ -185,6 +187,40 @@ fn parses_alert_deliver_command() {
 }
 
 #[test]
+fn parses_alert_list_filters() {
+    let cli = Cli::parse_from([
+        "ocfleet",
+        "alert",
+        "list",
+        "--state",
+        "open",
+        "--severity",
+        "critical",
+        "--node",
+        "hk-ocserv-01",
+        "--json",
+    ]);
+
+    let Command::Alert {
+        command:
+            AlertCommand::List {
+                state,
+                severity,
+                node,
+                json,
+            },
+    } = cli.command
+    else {
+        panic!("expected alert list command");
+    };
+
+    assert_eq!(state, Some(AlertState::Open));
+    assert_eq!(severity, Some(AlertSeverity::Critical));
+    assert_eq!(node.as_deref(), Some("hk-ocserv-01"));
+    assert!(json);
+}
+
+#[test]
 fn parses_retention_apply_report_options() {
     let cli = Cli::parse_from([
         "ocfleet",
@@ -223,6 +259,226 @@ fn parses_retention_apply_report_options() {
     assert_eq!(limit, Some(25));
     assert_eq!(batch_size, 10);
     assert!(json);
+}
+
+#[test]
+fn parses_retention_explain_command() {
+    let cli = Cli::parse_from([
+        "ocfleet",
+        "retention",
+        "explain",
+        "--scope",
+        "alert-events",
+        "--json",
+    ]);
+
+    let Command::Retention {
+        command: RetentionCommand::Explain { scope, json },
+    } = cli.command
+    else {
+        panic!("expected retention explain command");
+    };
+
+    assert_eq!(scope, RetentionScope::AlertEvents);
+    assert!(json);
+}
+
+#[test]
+fn parses_scheduler_operability_commands() {
+    let cli = Cli::parse_from([
+        "ocfleet",
+        "schedule",
+        "job",
+        "add",
+        "--name",
+        "HK ping",
+        "--kind",
+        "controller-ping",
+        "--interval",
+        "5m",
+        "--selector",
+        "node_id=hk-ocserv-01",
+    ]);
+    let Command::Schedule {
+        command:
+            ScheduleCommand::Job {
+                command:
+                    ScheduleJobCommand::Add {
+                        name,
+                        kind,
+                        interval,
+                        selector,
+                        source_node_id,
+                        target_node_id,
+                    },
+            },
+    } = cli.command
+    else {
+        panic!("expected schedule job add command");
+    };
+    assert_eq!(name.as_deref(), Some("HK ping"));
+    assert_eq!(kind, ScheduleJobKind::ControllerPing);
+    assert_eq!(interval, "5m");
+    assert_eq!(selector.as_deref(), Some("node_id=hk-ocserv-01"));
+    assert_eq!(source_node_id, None);
+    assert_eq!(target_node_id, None);
+
+    let cli = Cli::parse_from(["ocfleet", "schedule", "job", "list", "--json"]);
+    assert!(matches!(
+        cli.command,
+        Command::Schedule {
+            command: ScheduleCommand::Job {
+                command: ScheduleJobCommand::List { json: true }
+            }
+        }
+    ));
+
+    let cli = Cli::parse_from(["ocfleet", "schedule", "job", "show", "job-1", "--json"]);
+    assert!(matches!(
+        cli.command,
+        Command::Schedule {
+            command: ScheduleCommand::Job {
+                command: ScheduleJobCommand::Show {
+                    job_id,
+                    json: true
+                }
+            }
+        } if job_id == "job-1"
+    ));
+
+    let cli = Cli::parse_from(["ocfleet", "schedule", "job", "validate", "job-1", "--json"]);
+    assert!(matches!(
+        cli.command,
+        Command::Schedule {
+            command: ScheduleCommand::Job {
+                command: ScheduleJobCommand::Validate {
+                    job_id,
+                    json: true
+                }
+            }
+        } if job_id == "job-1"
+    ));
+}
+
+#[test]
+fn parses_schedule_run_query_and_targeted_once_commands() {
+    let cli = Cli::parse_from([
+        "ocfleet",
+        "schedule",
+        "run",
+        "--once",
+        "--job-id",
+        "job-1",
+        "--max-concurrency",
+        "4",
+        "--json",
+    ]);
+    let Command::Schedule {
+        command:
+            ScheduleCommand::Run {
+                command,
+                once,
+                job_id,
+                max_concurrency,
+                json,
+            },
+    } = cli.command
+    else {
+        panic!("expected schedule run command");
+    };
+    assert!(command.is_none());
+    assert!(once);
+    assert_eq!(job_id.as_deref(), Some("job-1"));
+    assert_eq!(max_concurrency, 4);
+    assert!(json);
+
+    let cli = Cli::parse_from([
+        "ocfleet", "schedule", "run", "list", "--limit", "25", "--json",
+    ]);
+    assert!(matches!(
+        cli.command,
+        Command::Schedule {
+            command: ScheduleCommand::Run {
+                command: Some(ScheduleRunCommand::List {
+                    limit: 25,
+                    json: true
+                }),
+                ..
+            }
+        }
+    ));
+
+    let cli = Cli::parse_from(["ocfleet", "schedule", "run", "show", "run-1", "--json"]);
+    assert!(matches!(
+        cli.command,
+        Command::Schedule {
+            command: ScheduleCommand::Run {
+                command: Some(ScheduleRunCommand::Show {
+                    run_id,
+                    json: true
+                }),
+                ..
+            }
+        } if run_id == "run-1"
+    ));
+}
+
+#[test]
+fn parses_observation_and_health_snapshot_queries() {
+    let cli = Cli::parse_from([
+        "ocfleet",
+        "observation",
+        "list",
+        "--node",
+        "hk-ocserv-01",
+        "--method",
+        "probe.controller.ping",
+        "--limit",
+        "25",
+        "--json",
+    ]);
+    let Command::Observation {
+        command:
+            ObservationCommand::List {
+                node,
+                method,
+                limit,
+                json,
+            },
+    } = cli.command
+    else {
+        panic!("expected observation list command");
+    };
+    assert_eq!(node.as_deref(), Some("hk-ocserv-01"));
+    assert_eq!(method.as_deref(), Some("probe.controller.ping"));
+    assert_eq!(limit, 25);
+    assert!(json);
+
+    let cli = Cli::parse_from(["ocfleet", "observation", "show", "obs-1", "--json"]);
+    assert!(matches!(
+        cli.command,
+        Command::Observation {
+            command: ObservationCommand::Show {
+                observation_id,
+                json: true
+            }
+        } if observation_id == "obs-1"
+    ));
+
+    let cli = Cli::parse_from([
+        "ocfleet", "health", "snapshot", "list", "--limit", "25", "--json",
+    ]);
+    assert!(matches!(
+        cli.command,
+        Command::Health {
+            command: HealthCommand::Snapshot {
+                command: HealthSnapshotCommand::List {
+                    limit: 25,
+                    json: true
+                }
+            }
+        }
+    ));
 }
 
 #[test]

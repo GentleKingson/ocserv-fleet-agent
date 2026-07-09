@@ -21,6 +21,7 @@ use ocfleet_cli::identity::load_or_create_secret_key_with_status;
 use ocfleet_cli::input_validation::{
     local_actor, validate_agent_version, validate_description, validate_hostname, validate_reason,
 };
+use ocfleet_cli::observation::run_observation_command;
 use ocfleet_cli::ocserv_output::{
     OcservStatusView, assert_low_sensitive_ocserv_output, format_cert_human, format_cert_json,
     format_sessions_human, format_status_json, format_status_view_human,
@@ -322,6 +323,10 @@ async fn main() -> anyhow::Result<()> {
         Command::Schedule { command } => {
             let store = Store::open(&cli.database).context("failed to open controller database")?;
             run_schedule_command(&store, &cli.secret_key, command).await?;
+        }
+        Command::Observation { command } => {
+            let store = Store::open(&cli.database).context("failed to open controller database")?;
+            run_observation_command(&store, command)?;
         }
         Command::Retention { command } => {
             let store = Store::open(&cli.database).context("failed to open controller database")?;

@@ -10,6 +10,7 @@ pub mod health;
 pub mod identity;
 pub mod input_validation;
 pub(crate) mod migrations;
+pub mod observation;
 pub mod ocserv_output;
 pub mod private_file;
 pub mod retention;

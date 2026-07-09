@@ -37,12 +37,18 @@ production-complete.
 - Supports Phase 12 CLI observability partially:
   - `ocfleet schedule` for controller-local observation jobs using fixed job
     kinds: `controller-ping`, `ocserv-status`, `ocserv-cert`,
-    `ocserv-sessions`, and `path-probe`
+    `ocserv-sessions`, and `path-probe`; current query surfaces include job
+    show/validate, targeted `run --once --job-id <job-id>`, run list/show, and
+    JSON status output
+  - `ocfleet observation` list/show queries for bounded low-sensitive stored
+    observations
   - `ocfleet health` summaries, node health views, and local health policy
-    thresholds derived from stored observations
-  - `ocfleet alert` list, silence, resolve, test, and private `jsonl_file`
-    delivery for bounded low-sensitive alert events
-  - `ocfleet retention` policy and pruning for observability history tables
+    thresholds derived from stored observations; `health snapshot list` reports
+    the latest stored snapshot per node
+  - `ocfleet alert` filtered list, silence, resolve, test, and private
+    `jsonl_file` delivery for bounded low-sensitive alert events
+  - `ocfleet retention` policy, dry-run explanation, and pruning for
+    observability history tables
   - `ocfleet audit export` for bounded redacted JSONL controller audit windows
 - Supports fixed RPC methods:
   - `node.ping`
@@ -322,11 +328,24 @@ target/debug/ocfleet schedule job add \
   --interval 300s
 
 target/debug/ocfleet schedule job list
+target/debug/ocfleet schedule job show <job-id> --json
+target/debug/ocfleet schedule job validate <job-id> --json
 target/debug/ocfleet schedule run --once
+target/debug/ocfleet schedule run --once --job-id <job-id> --json
+target/debug/ocfleet schedule run list --limit 50 --json
 target/debug/ocfleet schedule status
+target/debug/ocfleet schedule status --json
+target/debug/ocfleet observation list \
+  --node hk-ocserv-01 \
+  --method probe.controller.ping \
+  --limit 50 \
+  --json
 target/debug/ocfleet health summary
+target/debug/ocfleet health snapshot list --limit 50 --json
 target/debug/ocfleet alert list
+target/debug/ocfleet alert list --state open --severity critical --json
 target/debug/ocfleet retention show
+target/debug/ocfleet retention explain --scope observations --json
 target/debug/ocfleet audit export \
   --from 2026-07-01T00:00:00Z \
   --to 2026-07-08T00:00:00Z \

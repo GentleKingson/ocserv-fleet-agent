@@ -411,11 +411,70 @@ fn health_summary_tests_json_output_is_valid_fixed_schema() {
     let output = run_ocfleet(&["--database", &database_arg, "health", "summary", "--json"]);
     let value: Value = serde_json::from_slice(&output.stdout).expect("valid json");
 
+    assert_eq!(value["schema"], "ocfleet.health.v1");
     assert!(value.get("generated_at").is_some());
     assert_eq!(value["summary"]["total"], 1);
+    assert!(value["summary"].get("degraded").is_some());
+    assert!(value["summary"].get("unreachable").is_some());
+    assert!(value["summary"].get("stale").is_some());
+    assert!(value["summary"].get("disabled").is_some());
+    assert!(value["summary"].get("unknown").is_some());
     assert_eq!(value["summary"]["healthy"], 1);
     assert_eq!(value["nodes"][0]["node_id"], "hk-ocserv-01");
     assert_eq!(value["nodes"][0]["status"], "healthy");
+}
+
+#[test]
+fn health_summary_tests_snapshot_list_json_reports_latest_per_node_limitation() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let database_arg = database.to_string_lossy().into_owned();
+    let store = Store::open(&database).expect("open store");
+    add_node(&store, "hk-ocserv-01");
+    let observed_at = now_rfc3339();
+    insert_observation(
+        &store,
+        ObservationFixture {
+            observation_id: "obs-ping-ok",
+            node_id: "hk-ocserv-01",
+            method: PROBE_CONTROLLER_PING,
+            ok: true,
+            error_code: None,
+            observed_at: &observed_at,
+            summary_json: json!({"message": "pong"}),
+        },
+    );
+    drop(store);
+
+    let summary = run_ocfleet(&[
+        "--database",
+        &database_arg,
+        "health",
+        "node",
+        "hk-ocserv-01",
+        "--json",
+    ]);
+    let summary: Value = serde_json::from_slice(&summary.stdout).expect("valid health JSON");
+    assert_eq!(summary["schema"], "ocfleet.health.v1");
+    assert_eq!(summary["nodes"][0]["status"], "healthy");
+
+    let output = run_ocfleet(&[
+        "--database",
+        &database_arg,
+        "health",
+        "snapshot",
+        "list",
+        "--limit",
+        "10",
+        "--json",
+    ]);
+    let value: Value = serde_json::from_slice(&output.stdout).expect("valid snapshot JSON");
+    assert_eq!(value["schema"], "ocfleet.health_snapshots.v1");
+    assert_eq!(value["limit"], 10);
+    assert_eq!(value["limitation"], "latest_per_node");
+    assert_eq!(value["snapshot_count"], 1);
+    assert_eq!(value["snapshots"][0]["node_id"], "hk-ocserv-01");
+    assert_eq!(value["snapshots"][0]["status"], "healthy");
 }
 
 #[test]

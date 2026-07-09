@@ -24,7 +24,7 @@ use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 use crate::alerts::{AlertEvaluationSummary, evaluate_alerts_with_summary};
-use crate::args::{ScheduleCommand, ScheduleJobCommand, ScheduleJobKind};
+use crate::args::{ScheduleCommand, ScheduleJobCommand, ScheduleJobKind, ScheduleRunCommand};
 use crate::audit::AuditEvent;
 use crate::controller_rpc::{
     CONTROLLER_RPC_RESULT_CLASS, FixedControllerRpc, OCSERV_RESULT_CLASS, OcservRpcOutcome,
@@ -32,10 +32,10 @@ use crate::controller_rpc::{
     hash_json_value, inactive_endpoint_status, low_sensitive_fixed_rpc_summary,
     low_sensitive_ocserv_observation_summary, ocserv_failure_detail, write_rpc_audit,
 };
-use crate::input_validation::{local_actor, validate_selector};
+use crate::input_validation::{local_actor, validate_description, validate_selector};
 use crate::store::{
     InvalidObservabilityJobRecord, NodeRecord, ObservabilityJobLoadResult, ObservabilityJobRecord,
-    ObservabilityRunInsert, ProbeObservationInsert, Store,
+    ObservabilityRunInsert, ObservabilityRunRecord, ProbeObservationInsert, Store,
 };
 
 const DEFAULT_SELECTOR: &str = "role=ocserv";
@@ -49,6 +49,7 @@ pub const MAX_ALLOWED_CONCURRENCY: usize = 32;
 const DEFAULT_PER_NODE_CONCURRENCY: usize = 1;
 const DEFAULT_RPC_BUDGET_PER_TICK: usize = MAX_ALLOWED_CONCURRENCY * MAX_TARGETS_PER_JOB;
 const MAX_TARGETS_PER_JOB: usize = 50;
+const MAX_QUERY_LIMIT: u64 = 1_000;
 const ALERT_EVALUATION_ERROR_CODE: &str = "ALERT_EVALUATION_FAILED";
 const ALERT_EVALUATION_ERROR_MESSAGE: &str = "local alert evaluation failed";
 
@@ -68,6 +69,7 @@ struct RunStats {
     skipped_jobs: usize,
     observations: usize,
     failed_observations: usize,
+    run_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -294,22 +296,44 @@ pub async fn run_schedule_command(
     match command {
         ScheduleCommand::Job { command } => run_schedule_job_command(store, command),
         ScheduleCommand::Run {
+            command,
             once,
+            job_id,
             max_concurrency,
-        } => run_schedule_run_once_command(store, secret_key_path, once, max_concurrency).await,
+            json,
+        } => match command {
+            Some(ScheduleRunCommand::List { limit, json }) => {
+                run_schedule_run_list(store, limit, json)
+            }
+            Some(ScheduleRunCommand::Show { run_id, json }) => {
+                run_schedule_run_show(store, &run_id, json)
+            }
+            None => {
+                run_schedule_run_once_command(
+                    store,
+                    secret_key_path,
+                    once,
+                    job_id.as_deref(),
+                    max_concurrency,
+                    json,
+                )
+                .await
+            }
+        },
         ScheduleCommand::Daemon {
             max_concurrency,
             tick_seconds,
         } => {
             run_schedule_daemon_command(store, secret_key_path, max_concurrency, tick_seconds).await
         }
-        ScheduleCommand::Status => run_schedule_status_command(store),
+        ScheduleCommand::Status { json } => run_schedule_status_command(store, json),
     }
 }
 
 fn run_schedule_job_command(store: &Store, command: ScheduleJobCommand) -> anyhow::Result<()> {
     match command {
         ScheduleJobCommand::Add {
+            name,
             kind,
             interval,
             selector,
@@ -317,13 +341,16 @@ fn run_schedule_job_command(store: &Store, command: ScheduleJobCommand) -> anyho
             target_node_id,
         } => add_job(
             store,
+            name,
             kind,
             &interval,
             selector,
             source_node_id,
             target_node_id,
         ),
-        ScheduleJobCommand::List => list_jobs(store),
+        ScheduleJobCommand::List { json } => list_jobs(store, json),
+        ScheduleJobCommand::Show { job_id, json } => show_job(store, &job_id, json),
+        ScheduleJobCommand::Validate { job_id, json } => validate_job(store, &job_id, json),
         ScheduleJobCommand::Enable { job_id } => set_job_enabled(store, &job_id, true),
         ScheduleJobCommand::Disable { job_id } => set_job_enabled(store, &job_id, false),
     }
@@ -331,12 +358,16 @@ fn run_schedule_job_command(store: &Store, command: ScheduleJobCommand) -> anyho
 
 fn add_job(
     store: &Store,
+    name: Option<String>,
     kind: ScheduleJobKind,
     interval: &str,
     selector: Option<String>,
     source_node_id: Option<String>,
     target_node_id: Option<String>,
 ) -> anyhow::Result<()> {
+    if let Some(name) = &name {
+        validate_description(name).map_err(anyhow::Error::msg)?;
+    }
     let interval_seconds = parse_interval_seconds(interval)?;
     let (selector_value, pair_selector_json) =
         build_selectors(kind, selector, source_node_id, target_node_id)?;
@@ -344,7 +375,10 @@ fn add_job(
     let job = ObservabilityJobRecord {
         job_id: format!("job-{}", Uuid::new_v4().simple()),
         kind: schedule_kind_name(kind).to_string(),
-        selector_json: json!({ "selector": selector_value }),
+        selector_json: json!({
+            "selector": selector_value,
+            "name": name,
+        }),
         pair_selector_json,
         interval_seconds,
         jitter_seconds: 0,
@@ -362,6 +396,7 @@ fn add_job(
         true,
         json!({
             "job_id": job.job_id.as_str(),
+            "name": job_name(&job),
             "kind": job.kind.as_str(),
             "interval_seconds": job.interval_seconds,
             "selector": selector_value.as_str(),
@@ -369,6 +404,7 @@ fn add_job(
         }),
     )?;
     println!("job_id={}", job.job_id);
+    println!("name={}", job_name(&job).unwrap_or("<none>"));
     println!("kind={}", job.kind);
     println!("enabled={}", job.enabled);
     println!("interval_seconds={}", job.interval_seconds);
@@ -380,11 +416,23 @@ fn add_job(
     Ok(())
 }
 
-fn list_jobs(store: &Store) -> anyhow::Result<()> {
-    for job in store.list_observability_jobs()? {
+fn list_jobs(store: &Store, json_output: bool) -> anyhow::Result<()> {
+    let jobs = store.list_observability_jobs()?;
+    if json_output {
         println!(
-            "job_id={} kind={} enabled={} interval_seconds={} selector={} next_run_at={} last_run_at={}",
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "job_count": jobs.len(),
+                "jobs": jobs.iter().map(job_to_json).collect::<Vec<_>>(),
+            }))?
+        );
+        return Ok(());
+    }
+    for job in jobs {
+        println!(
+            "job_id={} name={} kind={} enabled={} interval_seconds={} selector={} next_run_at={} last_run_at={}",
             job.job_id,
+            job_name(&job).unwrap_or("<none>"),
             job.kind,
             job.enabled,
             job.interval_seconds,
@@ -392,6 +440,178 @@ fn list_jobs(store: &Store) -> anyhow::Result<()> {
             job.next_run_at.as_deref().unwrap_or("<none>"),
             job.last_run_at.as_deref().unwrap_or("<none>")
         );
+    }
+    Ok(())
+}
+
+fn show_job(store: &Store, job_id: &str, json_output: bool) -> anyhow::Result<()> {
+    let job = store
+        .get_observability_job(job_id)?
+        .with_context(|| format!("observability job not found: {job_id}"))?;
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "job": job_to_json(&job),
+            }))?
+        );
+    } else {
+        let pair = explicit_pair(&job).ok();
+        println!("job_id={}", job.job_id);
+        println!("name={}", job_name(&job).unwrap_or("<none>"));
+        println!("kind={}", job.kind);
+        println!("enabled={}", job.enabled);
+        println!("interval_seconds={}", job.interval_seconds);
+        println!("jitter_seconds={}", job.jitter_seconds);
+        println!("timeout_ms={}", job.timeout_ms);
+        println!("selector={}", selector_label(&job).unwrap_or("<invalid>"));
+        println!(
+            "source_node_id={}",
+            pair.as_ref()
+                .map(|(source, _)| source.as_str())
+                .unwrap_or("<none>")
+        );
+        println!(
+            "target_node_id={}",
+            pair.as_ref()
+                .map(|(_, target)| target.as_str())
+                .unwrap_or("<none>")
+        );
+        println!(
+            "next_run_at={}",
+            job.next_run_at.as_deref().unwrap_or("<none>")
+        );
+        println!(
+            "last_run_at={}",
+            job.last_run_at.as_deref().unwrap_or("<none>")
+        );
+        println!("created_at={}", job.created_at);
+        println!("updated_at={}", job.updated_at);
+    }
+    Ok(())
+}
+
+fn validate_job(store: &Store, job_id: &str, json_output: bool) -> anyhow::Result<()> {
+    let result = store
+        .get_observability_job_tolerant(job_id)?
+        .with_context(|| format!("observability job not found: {job_id}"))?;
+    let validation = match result {
+        ObservabilityJobLoadResult::Valid(job) => validate_job_config(store, &job),
+        ObservabilityJobLoadResult::Invalid(job) => JobValidation {
+            job_id: job.job_id,
+            valid: false,
+            reason_code: Some(job.reason_code),
+            message: "stored scheduler job row is invalid".to_string(),
+            target_count: 0,
+        },
+    };
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "job_id": validation.job_id,
+                "valid": validation.valid,
+                "reason_code": validation.reason_code,
+                "message": validation.message,
+                "target_count": validation.target_count,
+            }))?
+        );
+    } else {
+        println!("job_id={}", validation.job_id);
+        println!("valid={}", validation.valid);
+        println!(
+            "reason_code={}",
+            validation.reason_code.as_deref().unwrap_or("<none>")
+        );
+        println!("message={}", validation.message);
+        println!("target_count={}", validation.target_count);
+    }
+    if !validation.valid {
+        bail!("scheduler job validation failed: {}", validation.message);
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct JobValidation {
+    job_id: String,
+    valid: bool,
+    reason_code: Option<String>,
+    message: String,
+    target_count: usize,
+}
+
+fn validate_job_config(store: &Store, job: &ObservabilityJobRecord) -> JobValidation {
+    match validate_job_config_inner(store, job) {
+        Ok(target_count) => JobValidation {
+            job_id: job.job_id.clone(),
+            valid: true,
+            reason_code: None,
+            message: "ok".to_string(),
+            target_count,
+        },
+        Err((reason_code, message)) => JobValidation {
+            job_id: job.job_id.clone(),
+            valid: false,
+            reason_code: Some(reason_code),
+            message,
+            target_count: 0,
+        },
+    }
+}
+
+fn validate_job_config_inner(
+    store: &Store,
+    job: &ObservabilityJobRecord,
+) -> Result<usize, (String, String)> {
+    let kind =
+        stored_job_kind(&job.kind).map_err(|err| ("INVALID_KIND".to_string(), err.to_string()))?;
+    match kind {
+        StoredJobKind::PathProbe => {
+            let (source, target) = explicit_pair(job)
+                .map_err(|err| ("INVALID_PATH_PAIR".to_string(), err.to_string()))?;
+            validate_registry_node(store, &source)?;
+            validate_registry_node(store, &target)?;
+            Ok(2)
+        }
+        StoredJobKind::ControllerPing
+        | StoredJobKind::OcservStatus
+        | StoredJobKind::OcservCert
+        | StoredJobKind::OcservSessions => {
+            let selector = selector_label(job)
+                .map_err(|err| ("INVALID_SELECTOR".to_string(), err.to_string()))?;
+            let targets = resolve_node_targets(store, selector)
+                .map_err(|err| ("INVALID_SELECTOR".to_string(), err.to_string()))?;
+            if targets.is_empty() {
+                return Err((
+                    "NO_MATCHING_NODES".to_string(),
+                    "selector matched no nodes".to_string(),
+                ));
+            }
+            for target in &targets {
+                validate_registry_node(store, &target.node_id)?;
+            }
+            Ok(targets.len())
+        }
+    }
+}
+
+fn validate_registry_node(store: &Store, node_id: &str) -> Result<(), (String, String)> {
+    validate_node_id(node_id).map_err(|err| ("INVALID_NODE_ID".to_string(), err.to_string()))?;
+    let node = store
+        .get_node(node_id)
+        .map_err(|err| ("STORE_ERROR".to_string(), err.to_string()))?
+        .ok_or_else(|| {
+            (
+                "NODE_NOT_FOUND".to_string(),
+                format!("node not found: {node_id}"),
+            )
+        })?;
+    if !node.enabled {
+        return Err((
+            "NODE_DISABLED".to_string(),
+            format!("node disabled: {node_id}"),
+        ));
     }
     Ok(())
 }
@@ -429,27 +649,92 @@ async fn run_schedule_run_once_command(
     store: &Store,
     secret_key_path: &Path,
     once: bool,
+    job_id: Option<&str>,
     max_concurrency: usize,
+    json_output: bool,
 ) -> anyhow::Result<()> {
     if !once {
         bail!("schedule run currently requires --once");
     }
-    let stats = run_due_jobs_once(store, secret_key_path, max_concurrency).await?;
+    let stats = if let Some(job_id) = job_id {
+        run_target_job_once(store, secret_key_path, job_id, max_concurrency).await?
+    } else {
+        run_due_jobs_once(store, secret_key_path, max_concurrency).await?
+    };
     let alert_evaluation = evaluate_scheduler_alerts(store);
     write_scheduler_audit(
         store,
         "scheduler.run.once",
         true,
-        scheduler_run_once_detail_json(&stats, max_concurrency, &alert_evaluation),
+        scheduler_run_once_detail_json(&stats, job_id, max_concurrency, &alert_evaluation),
     )?;
-    println!("status=ok");
-    println!("due_jobs={}", stats.due_jobs);
-    println!("executed_jobs={}", stats.executed_jobs);
-    println!("skipped_jobs={}", stats.skipped_jobs);
-    println!("observations={}", stats.observations);
-    println!("failed_observations={}", stats.failed_observations);
-    println!("alert_evaluation={}", alert_evaluation.status_label());
-    println!("alert_events={}", alert_evaluation.alert_events_upserted);
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "status": "ok",
+                "job_id": job_id,
+                "due_jobs": stats.due_jobs,
+                "executed_jobs": stats.executed_jobs,
+                "skipped_jobs": stats.skipped_jobs,
+                "observations": stats.observations,
+                "failed_observations": stats.failed_observations,
+                "run_ids": stats.run_ids,
+                "alert_evaluation": alert_evaluation.status_label(),
+                "alert_events": alert_evaluation.alert_events_upserted,
+            }))?
+        );
+    } else {
+        println!("status=ok");
+        println!("job_id={}", job_id.unwrap_or("<all-due>"));
+        println!("due_jobs={}", stats.due_jobs);
+        println!("executed_jobs={}", stats.executed_jobs);
+        println!("skipped_jobs={}", stats.skipped_jobs);
+        println!("observations={}", stats.observations);
+        println!("failed_observations={}", stats.failed_observations);
+        println!("run_ids={}", comma_list_or_none(&stats.run_ids));
+        println!("alert_evaluation={}", alert_evaluation.status_label());
+        println!("alert_events={}", alert_evaluation.alert_events_upserted);
+    }
+    Ok(())
+}
+
+fn run_schedule_run_list(store: &Store, limit: u64, json_output: bool) -> anyhow::Result<()> {
+    let limit = validate_query_limit(limit)?;
+    let runs = store.list_observability_runs(limit)?;
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "limit": limit,
+                "run_count": runs.len(),
+                "runs": runs.iter().map(run_to_json).collect::<Vec<_>>(),
+            }))?
+        );
+    } else {
+        println!("limit={limit}");
+        println!("run_count={}", runs.len());
+        for run in &runs {
+            print_run_human(run);
+        }
+    }
+    Ok(())
+}
+
+fn run_schedule_run_show(store: &Store, run_id: &str, json_output: bool) -> anyhow::Result<()> {
+    let run = store
+        .get_observability_run(run_id)?
+        .with_context(|| format!("observability run not found: {run_id}"))?;
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "run": run_to_json(&run),
+            }))?
+        );
+    } else {
+        print_run_human(&run);
+    }
     Ok(())
 }
 
@@ -503,7 +788,7 @@ async fn run_schedule_daemon_command(
     Ok(())
 }
 
-fn run_schedule_status_command(store: &Store) -> anyhow::Result<()> {
+fn run_schedule_status_command(store: &Store, json_output: bool) -> anyhow::Result<()> {
     let jobs = store.list_observability_jobs()?;
     let now = OffsetDateTime::now_utc();
     let enabled_job_count = jobs.iter().filter(|job| job.enabled).count();
@@ -517,14 +802,28 @@ fn run_schedule_status_command(store: &Store) -> anyhow::Result<()> {
         .filter_map(|job| job.last_run_at.as_ref().map(|last| (last, job)))
         .max_by(|(left, _), (right, _)| left.cmp(right));
 
-    println!("enabled_jobs={enabled_job_count}");
-    println!("due_jobs={due_job_count}");
-    if let Some((last_run_at, job)) = last_run {
-        println!("last_run_job_id={}", job.job_id);
-        println!("last_run_at={last_run_at}");
+    if json_output {
+        let last_run_job_id = last_run.map(|(_, job)| job.job_id.as_str());
+        let last_run_at = last_run.map(|(last_run_at, _)| last_run_at.as_str());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "enabled_jobs": enabled_job_count,
+                "due_jobs": due_job_count,
+                "last_run_job_id": last_run_job_id,
+                "last_run_at": last_run_at,
+            }))?
+        );
     } else {
-        println!("last_run_job_id=<none>");
-        println!("last_run_at=<none>");
+        println!("enabled_jobs={enabled_job_count}");
+        println!("due_jobs={due_job_count}");
+        if let Some((last_run_at, job)) = last_run {
+            println!("last_run_job_id={}", job.job_id);
+            println!("last_run_at={last_run_at}");
+        } else {
+            println!("last_run_job_id=<none>");
+            println!("last_run_at=<none>");
+        }
     }
     Ok(())
 }
@@ -605,9 +904,57 @@ async fn run_due_jobs_once(
         stats.executed_jobs += 1;
         stats.observations += job_stats.observations;
         stats.failed_observations += job_stats.failed_observations;
+        stats.run_ids.extend(job_stats.run_ids);
         update_job_after_tick(store, &job)?;
     }
     Ok(stats)
+}
+
+async fn run_target_job_once(
+    store: &Store,
+    secret_key_path: &Path,
+    job_id: &str,
+    max_concurrency: usize,
+) -> anyhow::Result<RunStats> {
+    let job = match store
+        .get_observability_job_tolerant(job_id)?
+        .with_context(|| format!("observability job not found: {job_id}"))?
+    {
+        ObservabilityJobLoadResult::Valid(job) => job,
+        ObservabilityJobLoadResult::Invalid(job) => {
+            bail!(
+                "observability job {} is invalid: {}",
+                job.job_id,
+                job.reason_code
+            );
+        }
+    };
+    if !job.enabled {
+        bail!("observability job is disabled: {job_id}");
+    }
+    let validation = validate_job_config(store, &job);
+    if !validation.valid {
+        bail!("scheduler job validation failed: {}", validation.message);
+    }
+
+    let limits = SchedulerLimits::from_max_concurrency(max_concurrency)?;
+    let mut rpc_budget_remaining = limits.rpc_budget_per_tick;
+    let mut tick_context = SchedulerTickContext {
+        store,
+        secret_key_path,
+        limits,
+        rpc_budget_remaining: &mut rpc_budget_remaining,
+    };
+    let job_stats = run_job(&mut tick_context, &job).await?;
+    update_job_after_tick(store, &job)?;
+    Ok(RunStats {
+        due_jobs: 1,
+        executed_jobs: 1,
+        skipped_jobs: 0,
+        observations: job_stats.observations,
+        failed_observations: job_stats.failed_observations,
+        run_ids: job_stats.run_ids,
+    })
 }
 
 fn invalid_job_due_at_or_before(job: &InvalidObservabilityJobRecord, now: OffsetDateTime) -> bool {
@@ -626,10 +973,14 @@ fn evaluate_scheduler_alerts(store: &Store) -> SchedulerAlertEvaluation {
 
 fn scheduler_run_once_detail_json(
     stats: &RunStats,
+    job_id: Option<&str>,
     max_concurrency: usize,
     alert_evaluation: &SchedulerAlertEvaluation,
 ) -> Value {
     let mut detail = Map::new();
+    if let Some(job_id) = job_id {
+        detail.insert("job_id".to_string(), json!(job_id));
+    }
     detail.insert("due_jobs".to_string(), json!(stats.due_jobs));
     detail.insert("executed_jobs".to_string(), json!(stats.executed_jobs));
     detail.insert("skipped_jobs".to_string(), json!(stats.skipped_jobs));
@@ -638,6 +989,7 @@ fn scheduler_run_once_detail_json(
         "failed_observations".to_string(),
         json!(stats.failed_observations),
     );
+    detail.insert("run_ids".to_string(), json!(&stats.run_ids));
     detail.insert("max_concurrency".to_string(), json!(max_concurrency));
     append_alert_evaluation_detail(&mut detail, alert_evaluation);
     detail.insert("result_class".to_string(), json!(SCHEDULER_RESULT_CLASS));
@@ -736,7 +1088,7 @@ async fn run_job(
             }),
         })?;
 
-    let stats = match run_job_after_start(tick_context, job, kind, selector, &run_id).await {
+    let mut stats = match run_job_after_start(tick_context, job, kind, selector, &run_id).await {
         Ok(stats) => stats,
         Err(err) => {
             finish_failed_observability_run(
@@ -748,6 +1100,7 @@ async fn run_job(
             return Err(err);
         }
     };
+    stats.run_ids.push(run_id.clone());
 
     let finished_at = now_rfc3339();
     let status = if stats.observations == 0 {
@@ -2132,6 +2485,71 @@ fn first_method_for_kind(kind: &str) -> Option<&'static str> {
         "path-probe" => Some(PROBE_PATH_ECHO),
         _ => None,
     }
+}
+
+fn job_to_json(job: &ObservabilityJobRecord) -> Value {
+    let pair = explicit_pair(job).ok();
+    json!({
+        "job_id": job.job_id,
+        "name": job_name(job),
+        "kind": job.kind,
+        "enabled": job.enabled,
+        "interval_seconds": job.interval_seconds,
+        "jitter_seconds": job.jitter_seconds,
+        "timeout_ms": job.timeout_ms,
+        "selector": selector_label(job).unwrap_or("<invalid>"),
+        "source_node_id": pair.as_ref().map(|(source, _)| source.as_str()),
+        "target_node_id": pair.as_ref().map(|(_, target)| target.as_str()),
+        "next_run_at": job.next_run_at,
+        "last_run_at": job.last_run_at,
+        "created_at": job.created_at,
+        "updated_at": job.updated_at,
+    })
+}
+
+fn job_name(job: &ObservabilityJobRecord) -> Option<&str> {
+    job.selector_json.get("name").and_then(Value::as_str)
+}
+
+fn run_to_json(run: &ObservabilityRunRecord) -> Value {
+    json!({
+        "run_id": run.run_id,
+        "job_id": run.job_id,
+        "started_at": run.started_at,
+        "finished_at": run.finished_at,
+        "status": run.status,
+        "triggered_by": run.triggered_by,
+        "observation_count": run.observation_count,
+        "failed_observation_count": run.failed_observation_count,
+    })
+}
+
+fn print_run_human(run: &ObservabilityRunRecord) {
+    println!(
+        "run_id={} job_id={} status={} started_at={} finished_at={} observation_count={} failed_observation_count={}",
+        run.run_id,
+        run.job_id.as_deref().unwrap_or("<none>"),
+        run.status,
+        run.started_at,
+        run.finished_at.as_deref().unwrap_or("<none>"),
+        run.observation_count,
+        run.failed_observation_count,
+    );
+}
+
+fn comma_list_or_none(values: &[String]) -> String {
+    if values.is_empty() {
+        "<none>".to_string()
+    } else {
+        values.join(",")
+    }
+}
+
+fn validate_query_limit(limit: u64) -> anyhow::Result<u64> {
+    if limit == 0 || limit > MAX_QUERY_LIMIT {
+        bail!("--limit must be between 1 and {MAX_QUERY_LIMIT}");
+    }
+    Ok(limit)
 }
 
 fn scheduler_result_class_for_job(kind: &str) -> &'static str {

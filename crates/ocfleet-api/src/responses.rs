@@ -1,5 +1,5 @@
 use axum::Json;
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 use serde_json::Value;
@@ -41,6 +41,14 @@ impl ApiError {
         Self::new(StatusCode::NOT_FOUND, "NOT_FOUND", message)
     }
 
+    pub fn method_not_allowed() -> Self {
+        Self::new(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "METHOD_NOT_ALLOWED",
+            "method not allowed; this API exposes read-only GET routes only",
+        )
+    }
+
     pub fn internal() -> Self {
         Self::new(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -61,13 +69,25 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        let status = self.status;
         let body = ApiErrorBody {
             generated_at: now_rfc3339(),
             error_code: self.error_code,
             message: self.message,
             request_id: self.request_id,
         };
-        (self.status, Json(body)).into_response()
+        let mut response = (status, Json(body)).into_response();
+        if status == StatusCode::UNAUTHORIZED {
+            response.headers_mut().insert(
+                header::WWW_AUTHENTICATE,
+                HeaderValue::from_static("Bearer realm=\"ocfleet-api\""),
+            );
+        } else if status == StatusCode::METHOD_NOT_ALLOWED {
+            response
+                .headers_mut()
+                .insert(header::ALLOW, HeaderValue::from_static("GET, HEAD"));
+        }
+        response
     }
 }
 

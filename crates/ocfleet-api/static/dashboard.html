@@ -52,14 +52,19 @@
       display: grid;
       gap: 18px;
     }
-    .toolbar {
+    .toolbar, .audit-controls {
       display: flex;
-      align-items: center;
+      align-items: end;
       gap: 8px;
       flex-wrap: wrap;
     }
-    input {
-      min-width: 260px;
+    .field {
+      display: grid;
+      gap: 4px;
+    }
+    label { color: var(--muted); font-size: 12px; font-weight: 650; }
+    input, select {
+      min-width: 160px;
       height: 34px;
       padding: 0 10px;
       border: 1px solid var(--line);
@@ -67,6 +72,7 @@
       background: var(--bg);
       color: var(--ink);
     }
+    #token { min-width: 260px; }
     button {
       height: 34px;
       padding: 0 12px;
@@ -86,13 +92,13 @@
     }
     .grid {
       display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
+      grid-template-columns: repeat(2, minmax(0, 1fr));
       gap: 18px;
     }
     @media (max-width: 880px) {
       .grid { grid-template-columns: 1fr; }
       header { align-items: flex-start; flex-direction: column; }
-      input { min-width: min(100%, 260px); }
+      #token { min-width: min(100%, 260px); }
     }
     .stats {
       display: grid;
@@ -107,6 +113,7 @@
     }
     .stat strong { display: block; font-size: 22px; line-height: 1.1; }
     .stat span { color: var(--muted); }
+    .table-wrap { overflow-x: auto; }
     table {
       width: 100%;
       border-collapse: collapse;
@@ -131,9 +138,10 @@
   <header>
     <h1>ocfleet</h1>
     <div class="toolbar">
-      <input id="token" type="password" autocomplete="off" placeholder="Bearer token">
+      <label for="token">Bearer token</label>
+      <input id="token" type="password" autocomplete="off">
       <button id="refresh" type="button">Refresh</button>
-      <span id="status" class="muted"></span>
+      <span id="status" class="muted" role="status" aria-live="polite"></span>
     </div>
   </header>
   <main>
@@ -143,86 +151,190 @@
     </section>
     <section>
       <h2>Node Health</h2>
-      <div id="nodes"></div>
+      <div id="nodes" class="table-wrap"></div>
     </section>
     <div class="grid">
       <section>
+        <h2>Jobs</h2>
+        <div id="jobs" class="table-wrap"></div>
+      </section>
+      <section>
         <h2>Open Alerts</h2>
-        <div id="alerts"></div>
+        <div id="alerts" class="table-wrap"></div>
       </section>
       <section>
         <h2>Recent Runs</h2>
-        <div id="runs"></div>
+        <div id="runs" class="table-wrap"></div>
       </section>
       <section>
         <h2>Recent Observations</h2>
-        <div id="observations"></div>
+        <div id="observations" class="table-wrap"></div>
       </section>
     </div>
+    <section>
+      <h2>Audit Export Preview</h2>
+      <form id="audit-form" class="audit-controls" method="get" action="/audit/export">
+        <div class="field">
+          <label for="audit-from">From</label>
+          <input id="audit-from" name="from" type="datetime-local" required>
+        </div>
+        <div class="field">
+          <label for="audit-to">To</label>
+          <input id="audit-to" name="to" type="datetime-local" required>
+        </div>
+        <div class="field">
+          <label for="audit-rows">Rows</label>
+          <input id="audit-rows" name="max_rows" type="number" min="1" max="1000" value="25" required>
+        </div>
+        <div class="field">
+          <label for="audit-redact">Redaction</label>
+          <select id="audit-redact" name="redact">
+            <option value="default">Default</option>
+            <option value="strict">Strict</option>
+          </select>
+        </div>
+        <button type="submit">Preview</button>
+      </form>
+      <div id="audit" class="table-wrap"></div>
+    </section>
   </main>
   <script>
     const tokenInput = document.querySelector("#token");
     const statusEl = document.querySelector("#status");
+    const text = value => value === null || value === undefined || value === "" ? "none" : String(value);
+    const cls = value => String(value || "").replace(/[^a-z0-9_-]/gi, "-").toLowerCase();
     const headers = () => {
       const token = tokenInput.value.trim();
       return token ? { "Authorization": `Bearer ${token}` } : {};
     };
-    const text = value => value === null || value === undefined || value === "" ? "none" : String(value);
-    const cls = value => String(value || "").replace(/[^a-z0-9_-]/gi, "-").toLowerCase();
     async function loadJson(path) {
-      const response = await fetch(path, { headers: headers() });
+      const response = await fetch(path, { method: "GET", headers: headers(), cache: "no-store", credentials: "same-origin" });
       if (!response.ok) {
         const body = await response.json().catch(() => ({}));
         throw new Error(body.message || `${response.status}`);
       }
       return response.json();
     }
-    function table(columns, rows) {
-      if (!rows.length) return '<p class="muted">No rows</p>';
-      const head = columns.map(column => `<th>${column.label}</th>`).join("");
-      const body = rows.map(row => `<tr>${columns.map(column => `<td>${column.render(row)}</td>`).join("")}</tr>`).join("");
-      return `<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
+    function renderTable(target, columns, rows) {
+      const container = document.querySelector(target);
+      if (!rows.length) {
+        const empty = document.createElement("p");
+        empty.className = "muted";
+        empty.textContent = "No rows";
+        container.replaceChildren(empty);
+        return;
+      }
+      const table = document.createElement("table");
+      const headRow = document.createElement("tr");
+      for (const column of columns) {
+        const cell = document.createElement("th");
+        cell.scope = "col";
+        cell.textContent = column.label;
+        headRow.append(cell);
+      }
+      const head = document.createElement("thead");
+      head.append(headRow);
+      const body = document.createElement("tbody");
+      for (const row of rows) {
+        const tableRow = document.createElement("tr");
+        for (const column of columns) {
+          const cell = document.createElement("td");
+          const value = column.value(row);
+          cell.textContent = text(value);
+          if (column.className) cell.className = column.className(value);
+          tableRow.append(cell);
+        }
+        body.append(tableRow);
+      }
+      table.append(head, body);
+      container.replaceChildren(table);
+    }
+    function renderSummary(summary) {
+      const container = document.querySelector("#summary");
+      const stats = Object.entries(summary).map(([key, value]) => {
+        const item = document.createElement("div");
+        item.className = "stat";
+        const number = document.createElement("strong");
+        number.textContent = text(value);
+        const label = document.createElement("span");
+        label.textContent = key;
+        item.append(number, label);
+        return item;
+      });
+      container.replaceChildren(...stats);
     }
     async function refresh() {
       statusEl.textContent = "Loading";
-      const [summary, nodes, alerts, runs, observations] = await Promise.all([
+      const [summary, nodes, jobs, alerts, runs, observations] = await Promise.all([
         loadJson("/health/summary"),
         loadJson("/health/nodes"),
+        loadJson("/jobs"),
         loadJson("/alerts?state=open&limit=25"),
         loadJson("/runs?limit=10"),
         loadJson("/observations?limit=10")
       ]);
-      document.querySelector("#summary").innerHTML = Object.entries(summary.summary)
-        .map(([key, value]) => `<div class="stat"><strong>${value}</strong><span>${key}</span></div>`)
-        .join("");
-      document.querySelector("#nodes").innerHTML = table([
-        { label: "node", render: row => text(row.node_id) },
-        { label: "role", render: row => text(row.role) },
-        { label: "region", render: row => text(row.region) },
-        { label: "status", render: row => `<span class="status-${cls(row.status)}">${text(row.status)}</span>` },
-        { label: "computed", render: row => text(row.computed_at) }
+      renderSummary(summary.summary || {});
+      renderTable("#nodes", [
+        { label: "node", value: row => row.node_id },
+        { label: "role", value: row => row.role },
+        { label: "region", value: row => row.region },
+        { label: "status", value: row => row.status, className: value => `status-${cls(value)}` },
+        { label: "computed", value: row => row.computed_at }
       ], nodes.items || []);
-      document.querySelector("#alerts").innerHTML = table([
-        { label: "dedupe", render: row => text(row.dedupe_key) },
-        { label: "severity", render: row => `<span class="severity-${cls(row.severity)}">${text(row.severity)}</span>` },
-        { label: "reason", render: row => text(row.reason_code) }
+      renderTable("#jobs", [
+        { label: "job", value: row => row.job_id },
+        { label: "kind", value: row => row.kind },
+        { label: "enabled", value: row => row.enabled },
+        { label: "next", value: row => row.next_run_at }
+      ], jobs.items || []);
+      renderTable("#alerts", [
+        { label: "dedupe", value: row => row.dedupe_key },
+        { label: "severity", value: row => row.severity, className: value => `severity-${cls(value)}` },
+        { label: "reason", value: row => row.reason_code }
       ], alerts.items || []);
-      document.querySelector("#runs").innerHTML = table([
-        { label: "run", render: row => text(row.run_id) },
-        { label: "status", render: row => text(row.status) },
-        { label: "observations", render: row => text(row.observation_count) }
+      renderTable("#runs", [
+        { label: "run", value: row => row.run_id },
+        { label: "status", value: row => row.status },
+        { label: "observations", value: row => row.observation_count }
       ], runs.items || []);
-      document.querySelector("#observations").innerHTML = table([
-        { label: "observation", render: row => text(row.observation_id) },
-        { label: "node", render: row => text(row.node_id) },
-        { label: "method", render: row => text(row.method) },
-        { label: "ok", render: row => text(row.ok) }
+      renderTable("#observations", [
+        { label: "observation", value: row => row.observation_id },
+        { label: "node", value: row => row.node_id },
+        { label: "method", value: row => row.method },
+        { label: "ok", value: row => row.ok }
       ], observations.items || []);
       statusEl.textContent = `Updated ${new Date().toLocaleTimeString()}`;
     }
+    const localDateTime = date => {
+      const local = new Date(date.getTime() - date.getTimezoneOffset() * 60000);
+      return local.toISOString().slice(0, 16);
+    };
+    const now = new Date();
+    document.querySelector("#audit-to").value = localDateTime(now);
+    document.querySelector("#audit-from").value = localDateTime(new Date(now.getTime() - 86400000));
     document.querySelector("#refresh").addEventListener("click", () => refresh().catch(error => {
       statusEl.textContent = error.message;
     }));
+    document.querySelector("#audit-form").addEventListener("submit", event => {
+      event.preventDefault();
+      const from = new Date(document.querySelector("#audit-from").value);
+      const to = new Date(document.querySelector("#audit-to").value);
+      const params = new URLSearchParams({
+        from: from.toISOString(),
+        to: to.toISOString(),
+        max_rows: document.querySelector("#audit-rows").value,
+        redact: document.querySelector("#audit-redact").value
+      });
+      loadJson(`/audit/export?${params}`).then(result => {
+        renderTable("#audit", [
+          { label: "time", value: row => row.ts },
+          { label: "actor", value: row => row.actor },
+          { label: "event", value: row => row.event },
+          { label: "ok", value: row => row.ok },
+          { label: "error", value: row => row.error_code }
+        ], result.items || []);
+      }).catch(error => { statusEl.textContent = error.message; });
+    });
     refresh().catch(error => { statusEl.textContent = error.message; });
   </script>
 </body>

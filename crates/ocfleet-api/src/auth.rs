@@ -28,6 +28,44 @@ impl Role {
             Self::SecurityAdmin => 2,
         }
     }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Viewer => "viewer",
+            Self::Operator => "operator",
+            Self::SecurityAdmin => "security-admin",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Principal {
+    role: Role,
+    authenticated: bool,
+}
+
+impl Principal {
+    pub fn local_viewer() -> Self {
+        Self {
+            role: Role::Viewer,
+            authenticated: false,
+        }
+    }
+
+    fn authenticated_viewer() -> Self {
+        Self {
+            role: Role::Viewer,
+            authenticated: true,
+        }
+    }
+
+    pub fn role(self) -> Role {
+        self.role
+    }
+
+    pub fn is_authenticated(self) -> bool {
+        self.authenticated
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -55,17 +93,12 @@ impl AuthToken {
         })
     }
 
-    pub fn verify_headers(&self, headers: &HeaderMap) -> bool {
-        let Some(value) = headers.get(axum::http::header::AUTHORIZATION) else {
-            return false;
-        };
-        let Ok(value) = value.to_str() else {
-            return false;
-        };
-        let Some(token) = value.strip_prefix("Bearer ") else {
-            return false;
-        };
+    pub fn authenticate_headers(&self, headers: &HeaderMap) -> Option<Principal> {
+        let value = headers.get(axum::http::header::AUTHORIZATION)?;
+        let value = value.to_str().ok()?;
+        let token = value.strip_prefix("Bearer ")?;
         constant_time_eq(&self.digest, &digest(token.as_bytes()))
+            .then_some(Principal::authenticated_viewer())
     }
 }
 
@@ -118,7 +151,9 @@ mod tests {
                 .parse()
                 .expect("header"),
         );
-        assert!(token.verify_headers(&headers));
+        let principal = token.authenticate_headers(&headers).expect("principal");
+        assert_eq!(principal.role(), Role::Viewer);
+        assert!(principal.is_authenticated());
     }
 
     #[test]
@@ -128,5 +163,8 @@ mod tests {
         assert!(Role::Operator.permits(Role::Viewer));
         assert!(!Role::Operator.permits(Role::SecurityAdmin));
         assert!(Role::SecurityAdmin.permits(Role::Operator));
+        assert_eq!(Role::Viewer.as_str(), "viewer");
+        assert_eq!(Principal::local_viewer().role(), Role::Viewer);
+        assert!(!Principal::local_viewer().is_authenticated());
     }
 }

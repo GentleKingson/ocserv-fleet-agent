@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::path::Path;
 
@@ -7,8 +8,8 @@ use axum::http::{Method, Request, StatusCode, header};
 use ocfleet_api::{ApiCli, ApiConfig, AppState, RedactionMode, build_router};
 use ocfleet_cli::audit::AuditEvent;
 use ocfleet_cli::store::{
-    AlertEventRecord, HealthSnapshotRecord, NodeInsert, ObservabilityJobRecord,
-    ObservabilityRunInsert, ProbeObservationInsert, Store,
+    AlertEventRecord, CURRENT_SCHEMA_VERSION, HealthSnapshotRecord, NodeInsert,
+    ObservabilityJobRecord, ObservabilityRunInsert, ProbeObservationInsert, Store,
 };
 use rusqlite::Connection;
 use serde_json::{Value, json};
@@ -16,11 +17,160 @@ use tempfile::TempDir;
 use tower::ServiceExt;
 
 const TOKEN: &str = "abcdefghijklmnopqrstuvwxyz123456";
+const OPENAPI: &str = include_str!("../../../docs/api/openapi.yaml");
+const ROUTES_SOURCE: &str = include_str!("../src/routes.rs");
+
+#[test]
+fn openapi_contract_is_get_only_and_matches_router_paths() {
+    let spec: Value = serde_json::from_str(OPENAPI)
+        .expect("OpenAPI file is valid JSON, which is also valid YAML 1.2");
+    assert_eq!(spec["openapi"], "3.1.1");
+    assert_eq!(
+        spec["components"]["securitySchemes"]["BearerAuth"]["type"],
+        "http"
+    );
+    assert_eq!(
+        spec["components"]["securitySchemes"]["BearerAuth"]["scheme"],
+        "bearer"
+    );
+    assert_eq!(
+        spec["x-ocfleet-listener-auth"]["non_loopback"],
+        "bearer-required-viewer-only"
+    );
+    assert_eq!(
+        spec["components"]["schemas"]["ObservationMethods"]["maxItems"],
+        16
+    );
+    for schema in [
+        "HealthSummaryResponse",
+        "HealthNodeListResponse",
+        "HealthNodeResponse",
+        "JobListResponse",
+        "JobResponse",
+        "RunListResponse",
+        "RunResponse",
+        "ObservationListResponse",
+        "ObservationResponse",
+        "AlertListResponse",
+        "AlertResponse",
+        "AuditListResponse",
+        "ErrorResponse",
+    ] {
+        assert!(
+            spec["components"]["schemas"].get(schema).is_some(),
+            "missing explicit response schema: {schema}"
+        );
+    }
+
+    assert_local_refs_resolve(&spec, &spec);
+
+    let paths = spec["paths"].as_object().expect("paths object");
+    let declared = paths.keys().map(String::as_str).collect::<BTreeSet<_>>();
+    let expected = [
+        "/",
+        "/healthz",
+        "/health/summary",
+        "/health/nodes",
+        "/health/nodes/{node_id}",
+        "/jobs",
+        "/jobs/{job_id}",
+        "/runs",
+        "/runs/{run_id}",
+        "/observations",
+        "/observations/{observation_id}",
+        "/alerts",
+        "/alerts/{dedupe_key_or_alert_id}",
+        "/audit/export",
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    assert_eq!(declared, expected);
+
+    let router_paths = [
+        "/",
+        "/healthz",
+        "/health/summary",
+        "/health/nodes",
+        "/health/nodes/{node_id}",
+        "/jobs",
+        "/jobs/{job_id}",
+        "/runs",
+        "/runs/{run_id}",
+        "/observations",
+        "/observations/{observation_id}",
+        "/alerts",
+        "/alerts/{lookup}",
+        "/audit/export",
+    ];
+    assert_eq!(ROUTES_SOURCE.matches(".route(").count(), router_paths.len());
+    for path in router_paths {
+        assert!(
+            ROUTES_SOURCE.contains(&format!(".route(\"{path}\", get(")),
+            "router route missing from contract audit: {path}"
+        );
+    }
+
+    for (path, item) in paths {
+        let operations = item.as_object().expect("path item object");
+        assert_eq!(
+            operations.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["get"],
+            "{path} must declare only GET"
+        );
+    }
+
+    for forbidden in [
+        "\"post\"",
+        "\"put\"",
+        "\"patch\"",
+        "\"delete\"",
+        "/rpc",
+        "/jobs/{id}/run",
+        "/alerts/{id}/resolve",
+        "/alerts/{id}/silence",
+    ] {
+        assert!(
+            !OPENAPI.contains(forbidden),
+            "OpenAPI must not declare forbidden surface: {forbidden}"
+        );
+    }
+}
+
+fn assert_local_refs_resolve(value: &Value, root: &Value) {
+    match value {
+        Value::Object(object) => {
+            if let Some(reference) = object.get("$ref").and_then(Value::as_str) {
+                assert!(reference.starts_with("#/"), "only local refs are allowed");
+                assert!(
+                    root.pointer(&reference[1..]).is_some(),
+                    "unresolved OpenAPI ref: {reference}"
+                );
+            }
+            for child in object.values() {
+                assert_local_refs_resolve(child, root);
+            }
+        }
+        Value::Array(values) => {
+            for child in values {
+                assert_local_refs_resolve(child, root);
+            }
+        }
+        _ => {}
+    }
+}
 
 #[tokio::test]
 async fn get_routes_return_fixed_shapes() {
     let fixture = Fixture::new();
     let router = fixture.router(None);
+
+    let (status, headers, _) = raw_request(router.clone(), Method::GET, "/healthz", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers.get(header::CACHE_CONTROL).unwrap(), "no-store");
+    assert_eq!(
+        headers.get(header::X_CONTENT_TYPE_OPTIONS).unwrap(),
+        "nosniff"
+    );
 
     let (_, healthz) = json_request(router.clone(), Method::GET, "/healthz", None).await;
     assert_eq!(healthz["status"], "ok");
@@ -99,12 +249,21 @@ async fn forbidden_methods_do_not_write() {
         (Method::PATCH, "/alerts/alert-a"),
         (Method::DELETE, "/alerts/alert-a"),
     ] {
-        let (status, _) = text_request(router.clone(), method, uri, None).await;
+        let (status, body) = json_request(router.clone(), method, uri, None).await;
         assert!(matches!(
             status,
             StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
         ));
+        assert!(matches!(
+            body["error_code"].as_str(),
+            Some("NOT_FOUND" | "METHOD_NOT_ALLOWED")
+        ));
+        assert_error_shape(&body);
     }
+
+    let (status, headers, _) = raw_request(router, Method::POST, "/jobs", None).await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(headers.get(header::ALLOW).unwrap(), "GET, HEAD");
 
     assert_eq!(table_counts(&fixture.database), before);
 }
@@ -124,11 +283,12 @@ async fn authenticated_viewer_token_has_no_mutating_routes() {
         (Method::PATCH, "/alerts/alert-a"),
         (Method::DELETE, "/alerts/alert-a"),
     ] {
-        let (status, _) = text_request(router.clone(), method, uri, Some(TOKEN)).await;
+        let (status, body) = json_request(router.clone(), method, uri, Some(TOKEN)).await;
         assert!(matches!(
             status,
             StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
         ));
+        assert_error_shape(&body);
     }
 
     assert_eq!(table_counts(&fixture.database), before);
@@ -172,6 +332,191 @@ fn non_loopback_without_auth_token_file_fails_closed() {
 }
 
 #[test]
+fn max_limit_is_bounded_at_startup() {
+    let fixture = Fixture::new();
+    for max_limit in [0, 10_001] {
+        let cli = ApiCli {
+            database: fixture.database.clone(),
+            read_only: true,
+            listen: "127.0.0.1:8080".parse::<SocketAddr>().expect("addr"),
+            max_limit,
+            redact: RedactionMode::Default,
+            auth_token_file: None,
+        };
+        let err = ApiConfig::from_cli(cli).expect_err("must reject unsafe max limit");
+        assert!(err.to_string().contains("between 1 and 10000"));
+    }
+}
+
+#[test]
+fn startup_validation_requires_the_current_complete_schema() {
+    let fixture = Fixture::new();
+    fixture
+        .state(None)
+        .validate_startup()
+        .expect("current schema");
+
+    let conn = Connection::open(&fixture.database).expect("open db");
+    conn.execute(
+        "DELETE FROM schema_migrations WHERE version = ?1",
+        [CURRENT_SCHEMA_VERSION],
+    )
+    .expect("downgrade migration marker");
+    drop(conn);
+
+    let err = fixture
+        .state(None)
+        .validate_startup()
+        .expect_err("old schema must fail closed");
+    assert!(err.to_string().contains("schema version"));
+    assert!(
+        err.to_string()
+            .contains(&CURRENT_SCHEMA_VERSION.to_string())
+    );
+}
+
+#[test]
+fn startup_validation_rejects_missing_api_tables() {
+    let fixture = Fixture::new();
+    let conn = Connection::open(&fixture.database).expect("open db");
+    conn.execute("DROP TABLE alert_events", [])
+        .expect("drop required table");
+    drop(conn);
+
+    let err = fixture
+        .state(None)
+        .validate_startup()
+        .expect_err("missing table must fail closed");
+    assert!(err.to_string().contains("alert_events"));
+}
+
+#[cfg(unix)]
+#[test]
+fn startup_validation_rejects_symlink_and_world_readable_databases() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let fixture = Fixture::new();
+    let link = fixture._dir.path().join("controller-link.sqlite");
+    symlink(&fixture.database, &link).expect("symlink database");
+    let err = state_for_database(link)
+        .validate_startup()
+        .expect_err("symlink database must fail closed");
+    assert!(err.to_string().contains("private-file validation"));
+
+    std::fs::set_permissions(&fixture.database, std::fs::Permissions::from_mode(0o644))
+        .expect("chmod database");
+    let err = fixture
+        .state(None)
+        .validate_startup()
+        .expect_err("world-readable database must fail closed");
+    assert!(err.to_string().contains("private-file validation"));
+}
+
+#[cfg(unix)]
+#[test]
+fn startup_validation_rejects_unsafe_sqlite_sidecars() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = Fixture::new();
+    let wal = sqlite_sidecar_path(&fixture.database, "-wal");
+    std::fs::write(&wal, b"unsafe sidecar").expect("write sidecar");
+    std::fs::set_permissions(&wal, std::fs::Permissions::from_mode(0o644)).expect("chmod sidecar");
+    let err = fixture
+        .state(None)
+        .validate_startup()
+        .expect_err("unsafe sidecar must fail closed");
+    assert!(err.to_string().contains("private-file validation"));
+}
+
+#[cfg(unix)]
+#[test]
+fn startup_validation_prepares_private_fixed_sqlite_sidecars() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let fixture = Fixture::new();
+    for suffix in ["-wal", "-shm"] {
+        let sidecar = sqlite_sidecar_path(&fixture.database, suffix);
+        match std::fs::remove_file(&sidecar) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => panic!("remove stale sidecar: {err}"),
+        }
+    }
+
+    fixture
+        .state(None)
+        .validate_startup()
+        .expect("prepare private sidecars");
+    for suffix in ["-wal", "-shm"] {
+        let metadata = std::fs::metadata(sqlite_sidecar_path(&fixture.database, suffix))
+            .expect("sidecar metadata");
+        assert!(metadata.is_file());
+        assert_eq!(metadata.permissions().mode() & 0o077, 0);
+        assert_eq!(metadata.nlink(), 1);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn startup_validation_rejects_symlinked_sqlite_sidecars() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let fixture = Fixture::new();
+    let origin = fixture._dir.path().join("sidecar-target");
+    std::fs::write(&origin, b"symlinked sidecar").expect("write target");
+    std::fs::set_permissions(&origin, std::fs::Permissions::from_mode(0o600))
+        .expect("chmod target");
+    let wal = sqlite_sidecar_path(&fixture.database, "-wal");
+    symlink(&origin, &wal).expect("symlink sidecar");
+    let err = fixture
+        .state(None)
+        .validate_startup()
+        .expect_err("symlinked sidecar must fail closed");
+    assert!(err.to_string().contains("private-file validation"));
+}
+
+#[cfg(unix)]
+#[test]
+fn startup_validation_rejects_hardlinked_sqlite_sidecars() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = Fixture::new();
+    let origin = fixture._dir.path().join("sidecar-origin");
+    std::fs::write(&origin, b"hardlinked sidecar").expect("write origin");
+    std::fs::set_permissions(&origin, std::fs::Permissions::from_mode(0o600))
+        .expect("chmod origin");
+    let shm = sqlite_sidecar_path(&fixture.database, "-shm");
+    std::fs::hard_link(&origin, &shm).expect("hardlink sidecar");
+    let err = fixture
+        .state(None)
+        .validate_startup()
+        .expect_err("hardlinked sidecar must fail closed");
+    assert!(err.to_string().contains("private-file validation"));
+}
+
+#[cfg(unix)]
+#[test]
+fn bearer_token_file_must_be_private() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = Fixture::new();
+    let token_file = fixture._dir.path().join("public-api-token");
+    std::fs::write(&token_file, TOKEN).expect("write token");
+    std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o644))
+        .expect("permissions");
+    let cli = ApiCli {
+        database: fixture.database.clone(),
+        read_only: true,
+        listen: "127.0.0.1:8080".parse::<SocketAddr>().expect("addr"),
+        max_limit: 1_000,
+        redact: RedactionMode::Default,
+        auth_token_file: Some(token_file),
+    };
+    let err = ApiConfig::from_cli(cli).expect_err("must reject public token file");
+    assert!(err.to_string().contains("failed to load --auth-token-file"));
+}
+
+#[test]
 fn read_only_flag_is_required() {
     let fixture = Fixture::new();
     let cli = ApiCli {
@@ -192,8 +537,13 @@ async fn bearer_auth_accepts_configured_token_and_rejects_others() {
     let token_file = fixture.write_token_file(TOKEN);
     let router = fixture.router(Some(token_file));
 
-    let (status, _) = json_request(router.clone(), Method::GET, "/healthz", None).await;
+    let (status, headers, body) = raw_request(router.clone(), Method::GET, "/healthz", None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        headers.get(header::WWW_AUTHENTICATE).unwrap(),
+        "Bearer realm=\"ocfleet-api\""
+    );
+    assert_error_shape(&serde_json::from_str(&body).expect("JSON error"));
 
     let (status, _) = json_request(router.clone(), Method::GET, "/healthz", Some("wrong")).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -228,6 +578,24 @@ async fn limit_bounds_are_enforced() {
 }
 
 #[tokio::test]
+async fn malformed_and_unknown_query_parameters_return_json_errors() {
+    let fixture = Fixture::new();
+    let router = fixture.router(None);
+
+    for uri in [
+        "/runs?limit=not-a-number",
+        "/observations?unknown=value",
+        "/alerts?limit=1&limit=2",
+        "/audit/export?from=2026-07-09T00:00:00Z&to=2026-07-10T00:00:00Z&extra=value",
+    ] {
+        let (status, body) = json_request(router.clone(), Method::GET, uri, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+        assert_eq!(body["error_code"], "BAD_REQUEST");
+        assert_error_shape(&body);
+    }
+}
+
+#[tokio::test]
 async fn redaction_removes_forbidden_observation_and_audit_fields() {
     let fixture = Fixture::new();
     let router = fixture.router(None);
@@ -249,6 +617,9 @@ async fn redaction_removes_forbidden_observation_and_audit_fields() {
     let audit_text = serde_json::to_string(&audit).expect("json");
     assert!(!audit_text.contains("super-secret"));
     assert!(!audit_text.contains("Bearer abc"));
+    assert!(!audit_text.contains("BEGIN CERTIFICATE"));
+    assert!(!audit_text.contains("raw_config"));
+    assert!(!audit_text.contains(&"x".repeat(300)));
     assert!(audit_text.contains("sha256:"));
     assert_eq!(audit["items"][0]["detail"]["token"], "<redacted>");
 }
@@ -293,10 +664,92 @@ async fn audit_export_rejects_oversized_windows_and_rows() {
 async fn dashboard_contains_no_mutating_route_wiring() {
     let fixture = Fixture::new();
     let router = fixture.router(None);
-    let (status, body) = text_request(router, Method::GET, "/", None).await;
+    let (status, headers, body) = raw_request(router, Method::GET, "/", None).await;
     assert_eq!(status, StatusCode::OK);
-    for forbidden in ["POST", "PUT", "PATCH", "DELETE", "/rpc", "/jobs/{id}/run"] {
-        assert!(!body.contains(forbidden), "dashboard contains {forbidden}");
+    let csp = headers
+        .get(header::CONTENT_SECURITY_POLICY)
+        .expect("dashboard CSP header")
+        .to_str()
+        .expect("valid CSP header");
+    assert!(csp.contains("default-src 'none'"));
+    assert!(csp.contains("connect-src 'self'"));
+    assert!(csp.contains("frame-ancestors 'none'"));
+    assert!(csp.contains("script-src 'sha256-"));
+    assert!(csp.contains("style-src 'sha256-"));
+    assert!(!csp.contains("unsafe-inline"));
+    assert!(!csp.contains("unsafe-eval"));
+    assert_eq!(
+        headers.get(header::X_CONTENT_TYPE_OPTIONS).unwrap(),
+        "nosniff"
+    );
+    assert_eq!(headers.get(header::CACHE_CONTROL).unwrap(), "no-store");
+    assert_eq!(headers.get(header::X_FRAME_OPTIONS).unwrap(), "DENY");
+
+    for required in [
+        "id=\"summary\"",
+        "id=\"nodes\"",
+        "id=\"jobs\"",
+        "id=\"runs\"",
+        "id=\"observations\"",
+        "id=\"alerts\"",
+        "id=\"audit-form\"",
+        "method=\"get\"",
+        "action=\"/audit/export\"",
+        "fetch(path, { method: \"GET\"",
+    ] {
+        assert!(body.contains(required), "dashboard is missing {required}");
+    }
+
+    let lower = body.to_ascii_lowercase();
+    for forbidden in [
+        "run job",
+        "resolve alert",
+        "silence alert",
+        "mutate retention",
+        "mutate trust",
+        "add node",
+        "remove node",
+        "reload ocserv",
+        "restart ocserv",
+        "apply config",
+        "rollback config",
+        "disconnect session",
+        "/rpc",
+        "/jobs/{id}/run",
+        "/alerts/{id}/resolve",
+        "/alerts/{id}/silence",
+        "method: \"post\"",
+        "method: \"put\"",
+        "method: \"patch\"",
+        "method: \"delete\"",
+        "xmlhttprequest",
+        "sendbeacon",
+        "innerhtml",
+        "outerhtml",
+        "insertadjacenthtml",
+    ] {
+        assert!(!lower.contains(forbidden), "dashboard contains {forbidden}");
+    }
+}
+
+#[tokio::test]
+async fn invalid_identifiers_are_rejected() {
+    let fixture = Fixture::new();
+    let router = fixture.router(None);
+
+    for uri in [
+        "/health/nodes/bad%20node",
+        "/jobs/bad%20job",
+        "/runs/bad%20run",
+        "/observations/bad%20observation",
+        "/alerts/bad%20alert",
+        "/observations?method=../../etc/passwd",
+        "/runs?job_id=bad%20job",
+        "/alerts?node_id=node/a",
+    ] {
+        let (status, body) = json_request(router.clone(), Method::GET, uri, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+        assert_eq!(body["error_code"], "BAD_REQUEST");
     }
 }
 
@@ -305,6 +758,13 @@ fn assert_list_shape(value: &Value, count: usize) {
     assert!(value.get("limit").is_some());
     assert_eq!(value["count"], count);
     assert!(value["items"].is_array());
+}
+
+fn assert_error_shape(value: &Value) {
+    assert!(value["generated_at"].is_string());
+    assert!(value["error_code"].is_string());
+    assert!(value["message"].is_string());
+    assert!(value["request_id"].is_string());
 }
 
 async fn json_request(
@@ -326,6 +786,16 @@ async fn text_request(
     uri: &str,
     token: Option<&str>,
 ) -> (StatusCode, String) {
+    let (status, _, body) = raw_request(router, method, uri, token).await;
+    (status, body)
+}
+
+async fn raw_request(
+    router: Router,
+    method: Method,
+    uri: &str,
+    token: Option<&str>,
+) -> (StatusCode, axum::http::HeaderMap, String) {
     let mut builder = Request::builder().method(method).uri(uri);
     if let Some(token) = token {
         builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
@@ -335,11 +805,13 @@ async fn text_request(
         .await
         .expect("response");
     let status = response.status();
+    let headers = response.headers().clone();
     let bytes = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("body");
     (
         status,
+        headers,
         String::from_utf8(bytes.to_vec()).expect("utf8 body"),
     )
 }
@@ -382,6 +854,10 @@ impl Fixture {
     }
 
     fn router(&self, auth_token_file: Option<std::path::PathBuf>) -> Router {
+        build_router(self.state(auth_token_file))
+    }
+
+    fn state(&self, auth_token_file: Option<std::path::PathBuf>) -> AppState {
         let cli = ApiCli {
             database: self.database.clone(),
             read_only: true,
@@ -391,7 +867,7 @@ impl Fixture {
             auth_token_file,
         };
         let config = ApiConfig::from_cli(cli).expect("config");
-        build_router(AppState::from_config(config))
+        AppState::from_config(config)
     }
 
     fn write_token_file(&self, token: &str) -> std::path::PathBuf {
@@ -405,6 +881,24 @@ impl Fixture {
         }
         path
     }
+}
+
+fn state_for_database(database: std::path::PathBuf) -> AppState {
+    let cli = ApiCli {
+        database,
+        read_only: true,
+        listen: "127.0.0.1:0".parse::<SocketAddr>().expect("addr"),
+        max_limit: 1_000,
+        redact: RedactionMode::Default,
+        auth_token_file: None,
+    };
+    AppState::from_config(ApiConfig::from_cli(cli).expect("config"))
+}
+
+fn sqlite_sidecar_path(database: &Path, suffix: &str) -> std::path::PathBuf {
+    let mut path = database.as_os_str().to_os_string();
+    path.push(suffix);
+    path.into()
 }
 
 fn seed_database(path: &Path) {
@@ -458,11 +952,7 @@ fn seed_database(path: &Path) {
             observed_at: "2026-07-09T00:01:02Z".to_string(),
             expires_at: None,
             result_class: "controller_rpc_summary".to_string(),
-            summary_json: json!({
-                "status": "failed",
-                "username": "alice",
-                "raw_body": "raw-secret"
-            }),
+            summary_json: json!({"status": "failed"}),
         })
         .expect("insert observation");
     store
@@ -476,7 +966,7 @@ fn seed_database(path: &Path) {
             last_failure_at: Some("2026-07-09T00:01:02Z".to_string()),
             last_error_code: Some("ENDPOINT_NOT_ALLOWED".to_string()),
             degraded_methods_json: json!(["probe.controller.ping"]),
-            summary_json: json!({"status": "unreachable", "raw_body": "hidden"}),
+            summary_json: json!({"status": "unreachable"}),
         })
         .expect("insert health");
     store
@@ -495,7 +985,6 @@ fn seed_database(path: &Path) {
                 "methods": ["probe.controller.ping"],
                 "summary": {
                     "status": "unreachable",
-                    "username": "alice",
                     "last_error_code": "ENDPOINT_NOT_ALLOWED"
                 }
             }),
@@ -510,10 +999,55 @@ fn seed_database(path: &Path) {
     event.request_id = Some("request-a".to_string());
     event.ok = Some(true);
     event.detail_json = json!({
-        "token": "super-secret",
-        "authorization": "Bearer abc",
         "node_id": "node-a",
         "result_class": "controller_rpc_summary"
     });
     store.insert_audit(&event).expect("insert audit");
+    drop(store);
+
+    // Model an externally polluted database so API fail-closed projection is
+    // tested independently from the controller's write-time validation.
+    let conn = Connection::open(path).expect("open db for pollution fixture");
+    conn.execute(
+        "UPDATE probe_observations SET summary_json = ?1 WHERE observation_id = 'obs-a'",
+        [json!({
+            "status": "failed",
+            "username": "alice",
+            "raw_body": "raw-secret"
+        })
+        .to_string()],
+    )
+    .expect("pollute observation summary");
+    conn.execute(
+        "UPDATE health_snapshots SET summary_json = ?1 WHERE node_id = 'node-a'",
+        [json!({"status": "unreachable", "raw_body": "hidden"}).to_string()],
+    )
+    .expect("pollute health summary");
+    conn.execute(
+        "UPDATE alert_events SET detail_json = ?1 WHERE alert_id = 'alert-a'",
+        [json!({
+            "methods": ["probe.controller.ping"],
+            "summary": {
+                "status": "unreachable",
+                "username": "alice",
+                "last_error_code": "ENDPOINT_NOT_ALLOWED"
+            }
+        })
+        .to_string()],
+    )
+    .expect("pollute alert detail");
+    conn.execute(
+        "UPDATE controller_audit_log SET detail_json = ?1 WHERE event = 'test.event'",
+        [json!({
+            "token": "super-secret",
+            "authorization": "Bearer abc",
+            "node_id": "node-a",
+            "result_class": "controller_rpc_summary",
+            "raw_config": "listen-host = 0.0.0.0",
+            "note": "-----BEGIN CERTIFICATE----- data",
+            "oversized": "x".repeat(300)
+        })
+        .to_string()],
+    )
+    .expect("pollute audit detail");
 }

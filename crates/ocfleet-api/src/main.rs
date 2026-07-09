@@ -13,7 +13,7 @@ async fn main() -> anyhow::Result<()> {
     let config = ApiConfig::from_cli(ApiCli::parse())?;
     let listen = config.listen;
     let state = AppState::from_config(config);
-    state.check_readable()?;
+    state.validate_startup()?;
 
     let listener = tokio::net::TcpListener::bind(listen).await?;
     tracing::info!(%listen, "starting read-only ocfleet API");

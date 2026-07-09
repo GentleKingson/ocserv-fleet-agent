@@ -1,0 +1,1149 @@
+{
+  "openapi": "3.1.1",
+  "info": {
+    "title": "ocfleet read-only observation API",
+    "version": "0.2.0",
+    "description": "Read-only, low-sensitive observation API over an existing controller SQLite database. It does not call agents, run scheduler jobs, change trust, mutate retention, or expose raw logs/config/cert/session/user/client data."
+  },
+  "servers": [
+    {
+      "url": "http://127.0.0.1:8080",
+      "description": "Default loopback listener for local operator workflows"
+    }
+  ],
+  "security": [
+    {
+      "BearerAuth": []
+    },
+    {}
+  ],
+  "x-ocfleet-listener-auth": {
+    "loopback": "bearer-optional-local-viewer",
+    "non_loopback": "bearer-required-viewer-only",
+    "transport": "plain-http-upstream-requires-tls-reverse-proxy"
+  },
+  "paths": {
+    "/": {
+      "get": {
+        "operationId": "getDashboard",
+        "summary": "Static read-only dashboard",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Dashboard HTML"
+          }
+        }
+      }
+    },
+    "/healthz": {
+      "get": {
+        "operationId": "getHealthz",
+        "summary": "Read-only API health check",
+        "responses": {
+          "200": {
+            "description": "API and database are readable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthzResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/health/summary": {
+      "get": {
+        "operationId": "getHealthSummary",
+        "summary": "Fleet health summary from stored snapshots",
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/HealthSummary"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/health/nodes": {
+      "get": {
+        "operationId": "listHealthNodes",
+        "summary": "Node health rows",
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/HealthNodeList"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/health/nodes/{node_id}": {
+      "get": {
+        "operationId": "getHealthNode",
+        "summary": "Single node health row",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/NodeId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/HealthNode"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/jobs": {
+      "get": {
+        "operationId": "listJobs",
+        "summary": "Stored observability jobs",
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/JobList"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/jobs/{job_id}": {
+      "get": {
+        "operationId": "getJob",
+        "summary": "Single stored observability job",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/JobId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Job"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/runs": {
+      "get": {
+        "operationId": "listRuns",
+        "summary": "Stored scheduler run summaries",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Limit"
+          },
+          {
+            "$ref": "#/components/parameters/JobIdQuery"
+          },
+          {
+            "$ref": "#/components/parameters/RunStatus"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/RunList"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/runs/{run_id}": {
+      "get": {
+        "operationId": "getRun",
+        "summary": "Single stored scheduler run summary",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/RunId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Run"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/observations": {
+      "get": {
+        "operationId": "listObservations",
+        "summary": "Low-sensitive stored observation summaries",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Limit"
+          },
+          {
+            "$ref": "#/components/parameters/NodeIdQuery"
+          },
+          {
+            "$ref": "#/components/parameters/MethodQuery"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/ObservationList"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/observations/{observation_id}": {
+      "get": {
+        "operationId": "getObservation",
+        "summary": "Single low-sensitive stored observation summary",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ObservationId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Observation"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/alerts": {
+      "get": {
+        "operationId": "listAlerts",
+        "summary": "Stored alert event summaries",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/AlertState"
+          },
+          {
+            "$ref": "#/components/parameters/AlertSeverity"
+          },
+          {
+            "$ref": "#/components/parameters/NodeIdQuery"
+          },
+          {
+            "$ref": "#/components/parameters/Limit"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/AlertList"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/alerts/{dedupe_key_or_alert_id}": {
+      "get": {
+        "operationId": "getAlert",
+        "summary": "Single stored alert event summary",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/AlertLookup"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Alert"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/audit/export": {
+      "get": {
+        "operationId": "getAuditExport",
+        "summary": "Bounded low-sensitive audit export rows",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/From"
+          },
+          {
+            "$ref": "#/components/parameters/To"
+          },
+          {
+            "$ref": "#/components/parameters/Redact"
+          },
+          {
+            "$ref": "#/components/parameters/MaxRows"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/AuditList"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "BearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "Required for non-loopback listeners via a private --auth-token-file and resolves only to the viewer role. The API is plain HTTP: non-loopback deployments must use a TLS-terminating reverse proxy plus firewall/private-network controls, and must not expose port 8080 directly to the public Internet. Loopback local-operator listeners may run unauthenticated."
+      }
+    },
+    "parameters": {
+      "Limit": {
+        "name": "limit",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10000,
+          "default": 50
+        }
+      },
+      "MaxRows": {
+        "name": "max_rows",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10000,
+          "default": 50
+        }
+      },
+      "NodeId": {
+        "name": "node_id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "$ref": "#/components/schemas/SafeIdentifier"
+        }
+      },
+      "NodeIdQuery": {
+        "name": "node_id",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "$ref": "#/components/schemas/SafeIdentifier"
+        }
+      },
+      "JobId": {
+        "name": "job_id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "$ref": "#/components/schemas/SafeIdentifier"
+        }
+      },
+      "JobIdQuery": {
+        "name": "job_id",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "$ref": "#/components/schemas/SafeIdentifier"
+        }
+      },
+      "RunId": {
+        "name": "run_id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "$ref": "#/components/schemas/SafeIdentifier"
+        }
+      },
+      "ObservationId": {
+        "name": "observation_id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "$ref": "#/components/schemas/SafeIdentifier"
+        }
+      },
+      "AlertLookup": {
+        "name": "dedupe_key_or_alert_id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "$ref": "#/components/schemas/SafeIdentifier"
+        }
+      },
+      "MethodQuery": {
+        "name": "method",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "$ref": "#/components/schemas/SafeIdentifier"
+        }
+      },
+      "RunStatus": {
+        "name": "status",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "string",
+          "enum": [
+            "running",
+            "succeeded",
+            "failed",
+            "skipped"
+          ]
+        }
+      },
+      "AlertState": {
+        "name": "state",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "string",
+          "enum": [
+            "open",
+            "silenced",
+            "resolved"
+          ]
+        }
+      },
+      "AlertSeverity": {
+        "name": "severity",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "string",
+          "enum": [
+            "warning",
+            "critical"
+          ]
+        }
+      },
+      "From": {
+        "name": "from",
+        "in": "query",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "To": {
+        "name": "to",
+        "in": "query",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "Redact": {
+        "name": "redact",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "string",
+          "enum": [
+            "none",
+            "default",
+            "strict"
+          ],
+          "default": "default"
+        }
+      }
+    },
+    "responses": {
+      "HealthSummary": {
+        "description": "Fleet health counts computed from stored snapshots",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/HealthSummaryResponse"
+            }
+          }
+        }
+      },
+      "HealthNodeList": {
+        "description": "Bounded node health list",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/HealthNodeListResponse"
+            }
+          }
+        }
+      },
+      "HealthNode": {
+        "description": "Single node health projection",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/HealthNodeResponse"
+            }
+          }
+        }
+      },
+      "JobList": {
+        "description": "Bounded observability job list",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/JobListResponse"
+            }
+          }
+        }
+      },
+      "Job": {
+        "description": "Single observability job projection",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/JobResponse"
+            }
+          }
+        }
+      },
+      "RunList": {
+        "description": "Bounded scheduler run list",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/RunListResponse"
+            }
+          }
+        }
+      },
+      "Run": {
+        "description": "Single scheduler run projection",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/RunResponse"
+            }
+          }
+        }
+      },
+      "ObservationList": {
+        "description": "Bounded low-sensitive observation list",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ObservationListResponse"
+            }
+          }
+        }
+      },
+      "Observation": {
+        "description": "Single low-sensitive observation projection",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ObservationResponse"
+            }
+          }
+        }
+      },
+      "AlertList": {
+        "description": "Bounded low-sensitive alert list",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/AlertListResponse"
+            }
+          }
+        }
+      },
+      "Alert": {
+        "description": "Single low-sensitive alert projection",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/AlertResponse"
+            }
+          }
+        }
+      },
+      "AuditList": {
+        "description": "Bounded audit export window",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/AuditListResponse"
+            }
+          }
+        }
+      },
+      "BadRequest": {
+        "description": "Invalid bounded query or identifier",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      },
+      "Unauthorized": {
+        "description": "Missing or invalid bearer token",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      },
+      "NotFound": {
+        "description": "Item not found",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "SafeIdentifier": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 256,
+        "pattern": "^[A-Za-z0-9_.:-]+$"
+      },
+      "GeneratedAt": {
+        "type": "string",
+        "format": "date-time"
+      },
+      "LowSensitiveValue": {
+        "description": "Bounded JSON value after low-sensitive projection and redaction.",
+        "anyOf": [
+          { "type": "null" },
+          { "type": "boolean" },
+          { "type": "number" },
+          { "type": "string", "maxLength": 256 },
+          {
+            "type": "array",
+            "maxItems": 32,
+            "items": { "$ref": "#/components/schemas/LowSensitiveValue" }
+          },
+          {
+            "type": "object",
+            "maxProperties": 32,
+            "propertyNames": { "maxLength": 256 },
+            "additionalProperties": { "$ref": "#/components/schemas/LowSensitiveValue" }
+          }
+        ]
+      },
+      "LowSensitiveObject": {
+        "type": "object",
+        "maxProperties": 32,
+        "propertyNames": { "maxLength": 256 },
+        "additionalProperties": { "$ref": "#/components/schemas/LowSensitiveValue" },
+        "description": "Low-sensitive summary fields only, with at most four runtime nesting levels. Raw logs, raw config, raw cert data, stdout/stderr, username, client IP, session ID, cert subject/SAN/issuer/serial, secrets, tokens, paths, selectors, and command text are not part of this contract."
+      },
+      "HealthzResponse": {
+        "type": "object",
+        "required": [
+          "generated_at",
+          "status",
+          "read_only",
+          "auth_enabled"
+        ],
+        "properties": {
+          "generated_at": {
+            "$ref": "#/components/schemas/GeneratedAt"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "ok"
+            ]
+          },
+          "read_only": {
+            "type": "boolean",
+            "const": true
+          },
+          "auth_enabled": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ListResponse": {
+        "type": "object",
+        "required": [
+          "generated_at",
+          "limit",
+          "count",
+          "items"
+        ],
+        "properties": {
+          "generated_at": {
+            "$ref": "#/components/schemas/GeneratedAt"
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 10000
+          },
+          "count": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 10000
+          },
+          "items": {
+            "type": "array",
+            "maxItems": 10000,
+            "items": {
+              "$ref": "#/components/schemas/LowSensitiveObject"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
+      "SingleResponse": {
+        "type": "object",
+        "required": [
+          "generated_at",
+          "item"
+        ],
+        "properties": {
+          "generated_at": {
+            "$ref": "#/components/schemas/GeneratedAt"
+          },
+          "item": {
+            "$ref": "#/components/schemas/LowSensitiveObject"
+          }
+        },
+        "additionalProperties": false
+      },
+      "SummaryResponse": {
+        "type": "object",
+        "required": [
+          "generated_at",
+          "summary"
+        ],
+        "properties": {
+          "generated_at": {
+            "$ref": "#/components/schemas/GeneratedAt"
+          },
+          "summary": {
+            "$ref": "#/components/schemas/LowSensitiveObject"
+          }
+        },
+        "additionalProperties": false
+      },
+      "HealthSummary": {
+        "type": "object",
+        "required": [
+          "total",
+          "healthy",
+          "degraded",
+          "unreachable",
+          "stale",
+          "disabled",
+          "unknown"
+        ],
+        "properties": {
+          "total": { "type": "integer", "minimum": 0, "maximum": 10000 },
+          "healthy": { "type": "integer", "minimum": 0, "maximum": 10000 },
+          "degraded": { "type": "integer", "minimum": 0, "maximum": 10000 },
+          "unreachable": { "type": "integer", "minimum": 0, "maximum": 10000 },
+          "stale": { "type": "integer", "minimum": 0, "maximum": 10000 },
+          "disabled": { "type": "integer", "minimum": 0, "maximum": 10000 },
+          "unknown": { "type": "integer", "minimum": 0, "maximum": 10000 }
+        },
+        "additionalProperties": false
+      },
+      "ObservationMethod": {
+        "type": "string",
+        "maxLength": 64,
+        "enum": [
+          "node.ping",
+          "node.info",
+          "probe.controller.ping",
+          "probe.path.echo",
+          "ocserv.service.summary",
+          "ocserv.version",
+          "ocserv.sessions.summary",
+          "ocserv.cert.expiry",
+          "ocserv.config.fingerprint"
+        ]
+      },
+      "ObservationMethods": {
+        "type": "array",
+        "maxItems": 16,
+        "uniqueItems": true,
+        "items": {
+          "$ref": "#/components/schemas/ObservationMethod"
+        }
+      },
+      "ProjectedObservationMethod": {
+        "description": "A fixed observation method, or a fail-closed marker for a polluted stored row.",
+        "anyOf": [
+          { "$ref": "#/components/schemas/ObservationMethod" },
+          { "type": "string", "const": "<redacted>" }
+        ]
+      },
+      "HealthNode": {
+        "type": "object",
+        "required": [
+          "node_id",
+          "endpoint_id",
+          "name",
+          "region",
+          "role",
+          "enabled",
+          "status",
+          "computed_at",
+          "freshness_seconds",
+          "last_success_at",
+          "last_failure_at",
+          "last_error_code",
+          "degraded_methods",
+          "summary"
+        ],
+        "properties": {
+          "node_id": { "$ref": "#/components/schemas/SafeIdentifier" },
+          "endpoint_id": { "$ref": "#/components/schemas/SafeIdentifier" },
+          "name": { "type": "string", "maxLength": 256 },
+          "region": { "type": "string", "maxLength": 128 },
+          "role": { "type": "string", "maxLength": 128 },
+          "enabled": { "type": "boolean" },
+          "status": {
+            "type": "string",
+            "enum": ["healthy", "degraded", "unreachable", "stale", "disabled", "unknown"]
+          },
+          "computed_at": { "type": ["string", "null"], "format": "date-time" },
+          "freshness_seconds": { "type": ["integer", "null"], "minimum": 0 },
+          "last_success_at": { "type": ["string", "null"], "format": "date-time" },
+          "last_failure_at": { "type": ["string", "null"], "format": "date-time" },
+          "last_error_code": { "type": ["string", "null"], "maxLength": 128 },
+          "degraded_methods": { "$ref": "#/components/schemas/ObservationMethods" },
+          "summary": { "$ref": "#/components/schemas/LowSensitiveObject" }
+        },
+        "additionalProperties": false
+      },
+      "Job": {
+        "type": "object",
+        "required": [
+          "job_id",
+          "name",
+          "kind",
+          "enabled",
+          "interval_seconds",
+          "jitter_seconds",
+          "timeout_ms",
+          "selector",
+          "source_node_id",
+          "target_node_id",
+          "next_run_at",
+          "last_run_at",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "job_id": { "$ref": "#/components/schemas/SafeIdentifier" },
+          "name": { "type": ["string", "null"], "maxLength": 256 },
+          "kind": { "type": "string", "maxLength": 64 },
+          "enabled": { "type": "boolean" },
+          "interval_seconds": { "type": "integer", "minimum": 1 },
+          "jitter_seconds": { "type": "integer", "minimum": 0 },
+          "timeout_ms": { "type": "integer", "minimum": 1 },
+          "selector": { "type": "string", "maxLength": 256 },
+          "source_node_id": { "type": ["string", "null"], "maxLength": 256, "pattern": "^[A-Za-z0-9_.:-]+$" },
+          "target_node_id": { "type": ["string", "null"], "maxLength": 256, "pattern": "^[A-Za-z0-9_.:-]+$" },
+          "next_run_at": { "type": ["string", "null"], "format": "date-time" },
+          "last_run_at": { "type": ["string", "null"], "format": "date-time" },
+          "created_at": { "$ref": "#/components/schemas/GeneratedAt" },
+          "updated_at": { "$ref": "#/components/schemas/GeneratedAt" }
+        },
+        "additionalProperties": false
+      },
+      "Run": {
+        "type": "object",
+        "required": [
+          "run_id",
+          "job_id",
+          "started_at",
+          "finished_at",
+          "status",
+          "triggered_by",
+          "observation_count",
+          "failed_observation_count"
+        ],
+        "properties": {
+          "run_id": { "$ref": "#/components/schemas/SafeIdentifier" },
+          "job_id": { "type": ["string", "null"], "maxLength": 256, "pattern": "^[A-Za-z0-9_.:-]+$" },
+          "started_at": { "$ref": "#/components/schemas/GeneratedAt" },
+          "finished_at": { "type": ["string", "null"], "format": "date-time" },
+          "status": { "type": "string", "enum": ["running", "succeeded", "failed", "skipped"] },
+          "triggered_by": { "type": "string", "maxLength": 128 },
+          "observation_count": { "type": "integer", "minimum": 0, "maximum": 10000 },
+          "failed_observation_count": { "type": "integer", "minimum": 0, "maximum": 10000 }
+        },
+        "additionalProperties": false
+      },
+      "Observation": {
+        "type": "object",
+        "required": [
+          "observation_id",
+          "run_id",
+          "node_id",
+          "endpoint_id",
+          "method",
+          "ok",
+          "error_code",
+          "duration_ms",
+          "observed_at",
+          "expires_at",
+          "result_class",
+          "summary"
+        ],
+        "properties": {
+          "observation_id": { "$ref": "#/components/schemas/SafeIdentifier" },
+          "run_id": { "type": ["string", "null"], "maxLength": 256, "pattern": "^[A-Za-z0-9_.:-]+$" },
+          "node_id": { "type": ["string", "null"], "maxLength": 256, "pattern": "^[A-Za-z0-9_.:-]+$" },
+          "endpoint_id": { "type": ["string", "null"], "maxLength": 256, "pattern": "^[A-Za-z0-9_.:-]+$" },
+          "method": { "$ref": "#/components/schemas/ProjectedObservationMethod" },
+          "ok": { "type": ["boolean", "null"] },
+          "error_code": { "type": ["string", "null"], "maxLength": 128 },
+          "duration_ms": { "type": ["integer", "null"], "minimum": 0 },
+          "observed_at": { "$ref": "#/components/schemas/GeneratedAt" },
+          "expires_at": { "type": ["string", "null"], "format": "date-time" },
+          "result_class": { "type": "string", "maxLength": 128 },
+          "summary": { "$ref": "#/components/schemas/LowSensitiveObject" }
+        },
+        "additionalProperties": false
+      },
+      "Alert": {
+        "type": "object",
+        "required": [
+          "alert_id",
+          "dedupe_key",
+          "node_id",
+          "severity",
+          "state",
+          "reason_code",
+          "first_seen_at",
+          "last_seen_at",
+          "last_sent_at",
+          "resolved_at",
+          "methods",
+          "summary"
+        ],
+        "properties": {
+          "alert_id": { "$ref": "#/components/schemas/SafeIdentifier" },
+          "dedupe_key": { "$ref": "#/components/schemas/SafeIdentifier" },
+          "node_id": { "type": ["string", "null"], "maxLength": 256, "pattern": "^[A-Za-z0-9_.:-]+$" },
+          "severity": { "type": "string", "enum": ["warning", "critical"] },
+          "state": { "type": "string", "enum": ["open", "silenced", "resolved"] },
+          "reason_code": { "type": "string", "maxLength": 128 },
+          "first_seen_at": { "$ref": "#/components/schemas/GeneratedAt" },
+          "last_seen_at": { "$ref": "#/components/schemas/GeneratedAt" },
+          "last_sent_at": { "type": ["string", "null"], "format": "date-time" },
+          "resolved_at": { "type": ["string", "null"], "format": "date-time" },
+          "methods": { "$ref": "#/components/schemas/ObservationMethods" },
+          "summary": { "$ref": "#/components/schemas/LowSensitiveObject" }
+        },
+        "additionalProperties": false
+      },
+      "AuditRecord": {
+        "type": "object",
+        "required": [
+          "id",
+          "ts",
+          "actor",
+          "event",
+          "node_id",
+          "endpoint_id",
+          "method",
+          "request_id",
+          "params_hash",
+          "ok",
+          "error_code",
+          "duration_ms",
+          "detail"
+        ],
+        "properties": {
+          "id": { "type": "integer", "minimum": 1 },
+          "ts": { "$ref": "#/components/schemas/GeneratedAt" },
+          "actor": { "type": "string", "maxLength": 256 },
+          "event": { "type": "string", "maxLength": 128 },
+          "node_id": { "type": ["string", "null"], "maxLength": 256 },
+          "endpoint_id": { "type": ["string", "null"], "maxLength": 256 },
+          "method": { "type": ["string", "null"], "maxLength": 128 },
+          "request_id": { "type": ["string", "null"], "maxLength": 256 },
+          "params_hash": { "type": ["string", "null"], "maxLength": 256 },
+          "ok": { "type": ["boolean", "null"] },
+          "error_code": { "type": ["string", "null"], "maxLength": 128 },
+          "duration_ms": { "type": ["integer", "null"], "minimum": 0 },
+          "detail": { "$ref": "#/components/schemas/LowSensitiveObject" }
+        },
+        "additionalProperties": false
+      },
+      "HealthSummaryResponse": {
+        "allOf": [
+          { "$ref": "#/components/schemas/SummaryResponse" },
+          { "type": "object", "properties": { "summary": { "$ref": "#/components/schemas/HealthSummary" } } }
+        ]
+      },
+      "HealthNodeListResponse": {
+        "allOf": [
+          { "$ref": "#/components/schemas/ListResponse" },
+          { "type": "object", "properties": { "items": { "type": "array", "maxItems": 10000, "items": { "$ref": "#/components/schemas/HealthNode" } } } }
+        ]
+      },
+      "HealthNodeResponse": {
+        "allOf": [
+          { "$ref": "#/components/schemas/SingleResponse" },
+          { "type": "object", "properties": { "item": { "$ref": "#/components/schemas/HealthNode" } } }
+        ]
+      },
+      "JobListResponse": {
+        "allOf": [
+          { "$ref": "#/components/schemas/ListResponse" },
+          { "type": "object", "properties": { "items": { "type": "array", "maxItems": 10000, "items": { "$ref": "#/components/schemas/Job" } } } }
+        ]
+      },
+      "JobResponse": {
+        "allOf": [
+          { "$ref": "#/components/schemas/SingleResponse" },
+          { "type": "object", "properties": { "item": { "$ref": "#/components/schemas/Job" } } }
+        ]
+      },
+      "RunListResponse": {
+        "allOf": [
+          { "$ref": "#/components/schemas/ListResponse" },
+          { "type": "object", "properties": { "items": { "type": "array", "maxItems": 10000, "items": { "$ref": "#/components/schemas/Run" } } } }
+        ]
+      },
+      "RunResponse": {
+        "allOf": [
+          { "$ref": "#/components/schemas/SingleResponse" },
+          { "type": "object", "properties": { "item": { "$ref": "#/components/schemas/Run" } } }
+        ]
+      },
+      "ObservationListResponse": {
+        "allOf": [
+          { "$ref": "#/components/schemas/ListResponse" },
+          { "type": "object", "properties": { "items": { "type": "array", "maxItems": 10000, "items": { "$ref": "#/components/schemas/Observation" } } } }
+        ]
+      },
+      "ObservationResponse": {
+        "allOf": [
+          { "$ref": "#/components/schemas/SingleResponse" },
+          { "type": "object", "properties": { "item": { "$ref": "#/components/schemas/Observation" } } }
+        ]
+      },
+      "AlertListResponse": {
+        "allOf": [
+          { "$ref": "#/components/schemas/ListResponse" },
+          { "type": "object", "properties": { "items": { "type": "array", "maxItems": 10000, "items": { "$ref": "#/components/schemas/Alert" } } } }
+        ]
+      },
+      "AlertResponse": {
+        "allOf": [
+          { "$ref": "#/components/schemas/SingleResponse" },
+          { "type": "object", "properties": { "item": { "$ref": "#/components/schemas/Alert" } } }
+        ]
+      },
+      "AuditListResponse": {
+        "allOf": [
+          { "$ref": "#/components/schemas/ListResponse" },
+          { "type": "object", "properties": { "items": { "type": "array", "maxItems": 10000, "items": { "$ref": "#/components/schemas/AuditRecord" } } } }
+        ]
+      },
+      "ErrorResponse": {
+        "type": "object",
+        "required": [
+          "generated_at",
+          "error_code",
+          "message",
+          "request_id"
+        ],
+        "properties": {
+          "generated_at": {
+            "$ref": "#/components/schemas/GeneratedAt"
+          },
+          "error_code": {
+            "type": "string",
+            "enum": [
+              "BAD_REQUEST",
+              "UNAUTHORIZED",
+              "NOT_FOUND",
+              "METHOD_NOT_ALLOWED",
+              "INTERNAL_ERROR"
+            ]
+          },
+          "message": {
+            "type": "string",
+            "maxLength": 512
+          },
+          "request_id": {
+            "$ref": "#/components/schemas/SafeIdentifier"
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  }
+}

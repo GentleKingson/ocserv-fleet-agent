@@ -19,13 +19,31 @@ local storage.
 
 - fleet health summary
 - node health table from latest stored health snapshots
+- scheduler jobs
 - open alerts
 - recent observability runs
 - recent low-sensitive observations
+- bounded audit export preview
 
 The dashboard calls only read-only `GET` endpoints. It has no controls for
 running jobs, calling agent RPCs, resolving or silencing alerts, changing
 retention policy, editing trust, or modifying the node registry.
+
+The audit preview submits a same-origin `GET /audit/export` request with a
+bounded time window and row count. It presents only the API projection and
+offers `default` or `strict` redaction; it does not create a server-side file or
+write an audit row.
+
+`GET /` is served with a Content-Security-Policy header that denies default
+loads, allows same-origin API fetches, and permits the static inline dashboard
+style/script only by SHA-256 hash. The route also sends `X-Content-Type-Options:
+nosniff`, `Referrer-Policy: no-referrer`, `X-Frame-Options: DENY`, and
+`Cache-Control: no-store`.
+
+The dashboard builds table cells with DOM text nodes rather than HTML string
+insertion. Stored values cannot create markup. Its single fetch helper sets
+`method: GET` explicitly, and the page contains no non-GET fetch or form and no
+beacon or XHR path.
 
 ## Limits
 

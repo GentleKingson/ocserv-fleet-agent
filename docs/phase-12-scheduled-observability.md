@@ -336,6 +336,13 @@ ocfleet schedule daemon
 SQLite job rows. It must not expose an unauthenticated socket and must not allow
 dashboard/API callers to trigger RPCs.
 
+After `schedule run --once` and after each daemon tick, the controller evaluates
+local alert candidates from existing observations, health snapshots, and endpoint
+trust state. This phase only upserts local `alert_events`; it does not run
+jsonl, webhook, shell, exec, script, or other delivery hooks. `schedule run
+--once` prints `alert_evaluation=ok|failed` and `alert_events=<count>`, and the
+scheduler audit detail records the same bounded summary.
+
 ### Health
 
 ```bash
@@ -438,6 +445,9 @@ Forbidden hook behavior:
 Failed hook delivery must create or update `alert_events.delivery_state` and
 write controller audit metadata. It must not retry without a configured bounded
 backoff policy.
+
+The current scheduler integration stops before this delivery phase: alert
+evaluation only writes controller-local `alert_events`.
 
 ## Security Rules
 

@@ -12,7 +12,7 @@ use ocfleet_protocol::ocserv::{
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -23,6 +23,7 @@ use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
+use crate::alerts::{AlertEvaluationSummary, evaluate_alerts_with_summary};
 use crate::args::{ScheduleCommand, ScheduleJobCommand, ScheduleJobKind};
 use crate::audit::AuditEvent;
 use crate::controller_rpc::{
@@ -48,6 +49,8 @@ pub const MAX_ALLOWED_CONCURRENCY: usize = 32;
 const DEFAULT_PER_NODE_CONCURRENCY: usize = 1;
 const DEFAULT_RPC_BUDGET_PER_TICK: usize = MAX_ALLOWED_CONCURRENCY * MAX_TARGETS_PER_JOB;
 const MAX_TARGETS_PER_JOB: usize = 50;
+const ALERT_EVALUATION_ERROR_CODE: &str = "ALERT_EVALUATION_FAILED";
+const ALERT_EVALUATION_ERROR_MESSAGE: &str = "local alert evaluation failed";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StoredJobKind {
@@ -65,6 +68,50 @@ struct RunStats {
     skipped_jobs: usize,
     observations: usize,
     failed_observations: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SchedulerAlertEvaluation {
+    ok: bool,
+    evaluated_candidates: usize,
+    alert_events_upserted: usize,
+    open_alerts: usize,
+    silenced_alerts: usize,
+    created_or_updated_count: usize,
+    error_code: Option<&'static str>,
+    error_message: Option<&'static str>,
+}
+
+impl SchedulerAlertEvaluation {
+    fn success(summary: AlertEvaluationSummary) -> Self {
+        Self {
+            ok: true,
+            evaluated_candidates: summary.evaluated_candidates,
+            alert_events_upserted: summary.upserted_alerts,
+            open_alerts: summary.open_alerts,
+            silenced_alerts: summary.silenced_alerts,
+            created_or_updated_count: summary.created_or_updated_count,
+            error_code: None,
+            error_message: None,
+        }
+    }
+
+    fn failure() -> Self {
+        Self {
+            ok: false,
+            evaluated_candidates: 0,
+            alert_events_upserted: 0,
+            open_alerts: 0,
+            silenced_alerts: 0,
+            created_or_updated_count: 0,
+            error_code: Some(ALERT_EVALUATION_ERROR_CODE),
+            error_message: Some(ALERT_EVALUATION_ERROR_MESSAGE),
+        }
+    }
+
+    fn status_label(self) -> &'static str {
+        if self.ok { "ok" } else { "failed" }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -388,21 +435,12 @@ async fn run_schedule_run_once_command(
         bail!("schedule run currently requires --once");
     }
     let stats = run_due_jobs_once(store, secret_key_path, max_concurrency).await?;
-    // TODO(Phase 12): call alert evaluation after scheduler runs once the
-    // alert policy surface is finalized for scheduled delivery.
+    let alert_evaluation = evaluate_scheduler_alerts(store);
     write_scheduler_audit(
         store,
         "scheduler.run.once",
         true,
-        json!({
-            "due_jobs": stats.due_jobs,
-            "executed_jobs": stats.executed_jobs,
-            "skipped_jobs": stats.skipped_jobs,
-            "observations": stats.observations,
-            "failed_observations": stats.failed_observations,
-            "max_concurrency": max_concurrency,
-            "result_class": SCHEDULER_RESULT_CLASS,
-        }),
+        scheduler_run_once_detail_json(&stats, max_concurrency, &alert_evaluation),
     )?;
     println!("status=ok");
     println!("due_jobs={}", stats.due_jobs);
@@ -410,6 +448,8 @@ async fn run_schedule_run_once_command(
     println!("skipped_jobs={}", stats.skipped_jobs);
     println!("observations={}", stats.observations);
     println!("failed_observations={}", stats.failed_observations);
+    println!("alert_evaluation={}", alert_evaluation.status_label());
+    println!("alert_events={}", alert_evaluation.alert_events_upserted);
     Ok(())
 }
 
@@ -434,8 +474,13 @@ async fn run_schedule_daemon_command(
 
     loop {
         run_due_jobs_once(store, secret_key_path, max_concurrency).await?;
-        // TODO(Phase 12): call alert evaluation after scheduler ticks once the
-        // alert policy surface is finalized for scheduled delivery.
+        let alert_evaluation = evaluate_scheduler_alerts(store);
+        write_scheduler_audit(
+            store,
+            "scheduler.alert.evaluate",
+            alert_evaluation.ok,
+            scheduler_alert_evaluation_detail_json(&alert_evaluation),
+        )?;
         tokio::select! {
             _ = tokio::time::sleep(std::time::Duration::from_secs(tick_seconds)) => {}
             _ = shutdown_signal() => {
@@ -570,6 +615,76 @@ fn invalid_job_due_at_or_before(job: &InvalidObservabilityJobRecord, now: Offset
         .as_deref()
         .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
         .is_none_or(|next_run_at| next_run_at <= now)
+}
+
+fn evaluate_scheduler_alerts(store: &Store) -> SchedulerAlertEvaluation {
+    match evaluate_alerts_with_summary(store) {
+        Ok(summary) => SchedulerAlertEvaluation::success(summary),
+        Err(_err) => SchedulerAlertEvaluation::failure(),
+    }
+}
+
+fn scheduler_run_once_detail_json(
+    stats: &RunStats,
+    max_concurrency: usize,
+    alert_evaluation: &SchedulerAlertEvaluation,
+) -> Value {
+    let mut detail = Map::new();
+    detail.insert("due_jobs".to_string(), json!(stats.due_jobs));
+    detail.insert("executed_jobs".to_string(), json!(stats.executed_jobs));
+    detail.insert("skipped_jobs".to_string(), json!(stats.skipped_jobs));
+    detail.insert("observations".to_string(), json!(stats.observations));
+    detail.insert(
+        "failed_observations".to_string(),
+        json!(stats.failed_observations),
+    );
+    detail.insert("max_concurrency".to_string(), json!(max_concurrency));
+    append_alert_evaluation_detail(&mut detail, alert_evaluation);
+    detail.insert("result_class".to_string(), json!(SCHEDULER_RESULT_CLASS));
+    Value::Object(detail)
+}
+
+fn scheduler_alert_evaluation_detail_json(alert_evaluation: &SchedulerAlertEvaluation) -> Value {
+    let mut detail = Map::new();
+    append_alert_evaluation_detail(&mut detail, alert_evaluation);
+    detail.insert("result_class".to_string(), json!(SCHEDULER_RESULT_CLASS));
+    Value::Object(detail)
+}
+
+fn append_alert_evaluation_detail(
+    detail: &mut Map<String, Value>,
+    alert_evaluation: &SchedulerAlertEvaluation,
+) {
+    detail.insert(
+        "alert_evaluation_ok".to_string(),
+        json!(alert_evaluation.ok),
+    );
+    detail.insert(
+        "alert_evaluated_candidates".to_string(),
+        json!(alert_evaluation.evaluated_candidates),
+    );
+    detail.insert(
+        "alert_events_upserted".to_string(),
+        json!(alert_evaluation.alert_events_upserted),
+    );
+    detail.insert(
+        "alert_open_alerts".to_string(),
+        json!(alert_evaluation.open_alerts),
+    );
+    detail.insert(
+        "alert_silenced_alerts".to_string(),
+        json!(alert_evaluation.silenced_alerts),
+    );
+    detail.insert(
+        "alert_created_or_updated_count".to_string(),
+        json!(alert_evaluation.created_or_updated_count),
+    );
+    if let Some(code) = alert_evaluation.error_code {
+        detail.insert("alert_evaluation_error_code".to_string(), json!(code));
+    }
+    if let Some(message) = alert_evaluation.error_message {
+        detail.insert("alert_evaluation_error_message".to_string(), json!(message));
+    }
 }
 
 fn update_job_after_tick(store: &Store, job: &ObservabilityJobRecord) -> anyhow::Result<()> {

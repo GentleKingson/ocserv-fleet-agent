@@ -24,6 +24,15 @@ struct AlertCandidate {
     summary: Value,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AlertEvaluationSummary {
+    pub evaluated_candidates: usize,
+    pub upserted_alerts: usize,
+    pub open_alerts: usize,
+    pub silenced_alerts: usize,
+    pub created_or_updated_count: usize,
+}
+
 pub fn run_alert_command(store: &Store, command: AlertCommand) -> anyhow::Result<()> {
     match command {
         AlertCommand::List { json } => run_alert_list(store, json),
@@ -40,15 +49,38 @@ pub fn run_alert_command(store: &Store, command: AlertCommand) -> anyhow::Result
 }
 
 pub fn evaluate_alerts(store: &Store) -> anyhow::Result<Vec<AlertEventRecord>> {
+    let (updated, _) = evaluate_alert_records(store)?;
+    Ok(updated)
+}
+
+pub fn evaluate_alerts_with_summary(store: &Store) -> anyhow::Result<AlertEvaluationSummary> {
+    let (_, summary) = evaluate_alert_records(store)?;
+    Ok(summary)
+}
+
+fn evaluate_alert_records(
+    store: &Store,
+) -> anyhow::Result<(Vec<AlertEventRecord>, AlertEvaluationSummary)> {
     let now = now_rfc3339();
     let existing = store.list_alert_events()?;
     let policy = store.get_health_policy()?;
+    let candidates = alert_candidates(store, &policy)?;
     let mut updated = Vec::new();
-    for candidate in alert_candidates(store, &policy)? {
+    for candidate in candidates {
         let record = upsert_candidate(store, &existing, candidate, &now)?;
         updated.push(record);
     }
-    Ok(updated)
+    let summary = AlertEvaluationSummary {
+        evaluated_candidates: updated.len(),
+        upserted_alerts: updated.len(),
+        open_alerts: updated.iter().filter(|alert| alert.state == "open").count(),
+        silenced_alerts: updated
+            .iter()
+            .filter(|alert| alert.state == "silenced")
+            .count(),
+        created_or_updated_count: updated.len(),
+    };
+    Ok((updated, summary))
 }
 
 fn run_alert_list(store: &Store, json_output: bool) -> anyhow::Result<()> {

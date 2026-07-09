@@ -1,9 +1,12 @@
-use ocfleet_cli::store::{NodeInsert, Store};
+use ocfleet_cli::store::{NodeInsert, ProbeObservationInsert, Store};
 use ocfleet_protocol::enrollment::EndpointStatus;
-use rusqlite::Connection;
+use ocfleet_protocol::method::PROBE_CONTROLLER_PING;
+use rusqlite::{Connection, OptionalExtension};
 use serde_json::Value;
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 fn run_ocfleet(args: &[&str]) -> Output {
     let output = Command::new(env!("CARGO_BIN_EXE_ocfleet"))
@@ -35,6 +38,16 @@ fn run_ocfleet_failure(args: &[&str]) -> Output {
     output
 }
 
+fn spawn_ocfleet(args: &[&str]) -> Child {
+    Command::new(env!("CARGO_BIN_EXE_ocfleet"))
+        .args(args)
+        .env("USER", "scheduler-user")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ocfleet")
+}
+
 fn parse_job_id(stdout: &[u8]) -> String {
     String::from_utf8_lossy(stdout)
         .lines()
@@ -56,6 +69,36 @@ fn latest_audit(database: &Path) -> (String, i64, Value) {
         ok,
         serde_json::from_str(&detail).expect("parse detail json"),
     )
+}
+
+fn wait_for_audit_event(
+    database: &Path,
+    event_name: &str,
+    timeout: Duration,
+) -> Option<(i64, Value)> {
+    let started = Instant::now();
+    while started.elapsed() < timeout {
+        let result = Connection::open(database)
+            .expect("open db")
+            .query_row(
+                "SELECT ok, detail_json FROM controller_audit_log
+                 WHERE event = ?1
+                 ORDER BY id DESC
+                 LIMIT 1",
+                [event_name],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .expect("query audit event");
+        if let Some((ok, detail)) = result {
+            return Some((
+                ok,
+                serde_json::from_str(&detail).expect("parse detail json"),
+            ));
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    None
 }
 
 #[test]
@@ -391,6 +434,197 @@ fn scheduler_tests_run_once_with_no_due_jobs_succeeds() {
     assert_eq!(event, "scheduler.run.once");
     assert_eq!(ok, 1);
     assert_eq!(detail["due_jobs"], 0);
+}
+
+#[test]
+fn scheduler_tests_run_once_evaluates_alerts_from_probe_observations() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let database_arg = database.to_string_lossy().into_owned();
+
+    {
+        let store = Store::open(&database).expect("open store");
+        let endpoint_id = add_node_with_generated_endpoint(&store, "hk-ocserv-01");
+        let mut policy = Store::default_health_policy();
+        policy.unreachable_consecutive_failures = 1;
+        store
+            .set_health_policy(&policy, "scheduler-test")
+            .expect("set health policy");
+        store
+            .insert_probe_observation(&ProbeObservationInsert {
+                observation_id: "obs-timeout-1".to_string(),
+                run_id: None,
+                node_id: Some("hk-ocserv-01".to_string()),
+                endpoint_id: Some(endpoint_id),
+                method: PROBE_CONTROLLER_PING.to_string(),
+                ok: Some(false),
+                error_code: Some("RPC_TIMEOUT".to_string()),
+                duration_ms: Some(100),
+                observed_at: "2026-07-08T00:00:00Z".to_string(),
+                expires_at: None,
+                result_class: "controller_rpc_summary".to_string(),
+                summary_json: serde_json::json!({
+                    "result_class": "controller_rpc_summary"
+                }),
+            })
+            .expect("insert observation");
+    }
+
+    let output = run_ocfleet(&["--database", &database_arg, "schedule", "run", "--once"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("status=ok"));
+    assert!(stdout.contains("alert_evaluation=ok"));
+    assert!(stdout.contains("alert_events=1"));
+
+    let store = Store::open(&database).expect("reopen store");
+    let alerts = store.list_alert_events().expect("list alerts");
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].dedupe_key, "node:hk-ocserv-01:node_unreachable");
+    assert_eq!(alerts[0].reason_code, "NODE_UNREACHABLE");
+
+    let (event, ok, detail) = latest_audit(&database);
+    assert_eq!(event, "scheduler.run.once");
+    assert_eq!(ok, 1);
+    assert_eq!(detail["alert_evaluation_ok"], true);
+    assert_eq!(detail["alert_events_upserted"], 1);
+    assert_eq!(detail["alert_open_alerts"], 1);
+}
+
+#[test]
+fn scheduler_tests_repeated_run_once_dedupes_alert_events() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let database_arg = database.to_string_lossy().into_owned();
+
+    {
+        let store = Store::open(&database).expect("open store");
+        let endpoint_id = add_node_with_generated_endpoint(&store, "hk-ocserv-01");
+        let mut policy = Store::default_health_policy();
+        policy.unreachable_consecutive_failures = 1;
+        store
+            .set_health_policy(&policy, "scheduler-test")
+            .expect("set health policy");
+        store
+            .insert_probe_observation(&ProbeObservationInsert {
+                observation_id: "obs-timeout-1".to_string(),
+                run_id: None,
+                node_id: Some("hk-ocserv-01".to_string()),
+                endpoint_id: Some(endpoint_id),
+                method: PROBE_CONTROLLER_PING.to_string(),
+                ok: Some(false),
+                error_code: Some("RPC_TIMEOUT".to_string()),
+                duration_ms: Some(100),
+                observed_at: "2026-07-08T00:00:00Z".to_string(),
+                expires_at: None,
+                result_class: "controller_rpc_summary".to_string(),
+                summary_json: serde_json::json!({
+                    "result_class": "controller_rpc_summary"
+                }),
+            })
+            .expect("insert observation");
+    }
+
+    run_ocfleet(&["--database", &database_arg, "schedule", "run", "--once"]);
+    run_ocfleet(&["--database", &database_arg, "schedule", "run", "--once"]);
+
+    let store = Store::open(&database).expect("reopen store");
+    let alerts = store.list_alert_events().expect("list alerts");
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].dedupe_key, "node:hk-ocserv-01:node_unreachable");
+}
+
+#[test]
+fn scheduler_tests_alert_evaluation_failure_keeps_run_once_successful() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let database_arg = database.to_string_lossy().into_owned();
+
+    {
+        let store = Store::open(&database).expect("open store");
+        drop(store);
+        let conn = Connection::open(&database).expect("open db");
+        conn.pragma_update(None, "ignore_check_constraints", true)
+            .expect("ignore check constraints");
+        conn.execute(
+            "UPDATE health_policy SET unreachable_consecutive_failures = -1 WHERE id = 1",
+            [],
+        )
+        .expect("corrupt health policy");
+    }
+
+    let output = run_ocfleet(&["--database", &database_arg, "schedule", "run", "--once"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("status=ok"));
+    assert!(stdout.contains("alert_evaluation=failed"));
+    assert!(stdout.contains("alert_events=0"));
+
+    let (event, ok, detail) = latest_audit(&database);
+    assert_eq!(event, "scheduler.run.once");
+    assert_eq!(ok, 1);
+    assert_eq!(detail["alert_evaluation_ok"], false);
+    assert_eq!(
+        detail["alert_evaluation_error_code"],
+        "ALERT_EVALUATION_FAILED"
+    );
+    assert_eq!(
+        detail["alert_evaluation_error_message"],
+        "local alert evaluation failed"
+    );
+}
+
+#[test]
+fn scheduler_tests_daemon_alert_evaluation_failure_writes_warning_and_continues() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let database_arg = database.to_string_lossy().into_owned();
+
+    {
+        let store = Store::open(&database).expect("open store");
+        drop(store);
+        let conn = Connection::open(&database).expect("open db");
+        conn.pragma_update(None, "ignore_check_constraints", true)
+            .expect("ignore check constraints");
+        conn.execute(
+            "UPDATE health_policy SET unreachable_consecutive_failures = -1 WHERE id = 1",
+            [],
+        )
+        .expect("corrupt health policy");
+    }
+
+    let mut child = spawn_ocfleet(&[
+        "--database",
+        &database_arg,
+        "schedule",
+        "daemon",
+        "--tick-seconds",
+        "10",
+    ]);
+    let audit = wait_for_audit_event(
+        &database,
+        "scheduler.alert.evaluate",
+        Duration::from_secs(5),
+    );
+    let still_running = child.try_wait().expect("try wait").is_none();
+    let _ = child.kill();
+    let output = child.wait_with_output().expect("wait for daemon");
+
+    let (ok, detail) = audit.unwrap_or_else(|| {
+        panic!(
+            "missing scheduler.alert.evaluate audit: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
+    assert_eq!(ok, 0);
+    assert_eq!(detail["alert_evaluation_ok"], false);
+    assert_eq!(
+        detail["alert_evaluation_error_code"],
+        "ALERT_EVALUATION_FAILED"
+    );
+    assert!(
+        still_running,
+        "daemon exited after alert evaluation failure"
+    );
 }
 
 #[test]

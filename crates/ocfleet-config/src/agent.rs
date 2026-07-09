@@ -153,6 +153,7 @@ pub struct OcservReadonlyConfig {
 pub enum OcservReadonlyProviderKind {
     Disabled,
     Snapshot,
+    CollectorSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -511,10 +512,15 @@ fn validate_ocserv_readonly_config(config: &OcservReadonlyConfig) -> Result<(), 
             "ocserv_readonly.provider must not be disabled when enabled=true".to_string(),
         ));
     }
-    if config.enabled && config.provider == OcservReadonlyProviderKind::Snapshot {
+    if config.enabled
+        && matches!(
+            config.provider,
+            OcservReadonlyProviderKind::Snapshot | OcservReadonlyProviderKind::CollectorSnapshot
+        )
+    {
         let Some(snapshot_path) = &config.snapshot_path else {
             return Err(ConfigError::Invalid(
-                "ocserv_readonly.snapshot_path is required for snapshot provider".to_string(),
+                "ocserv_readonly.snapshot_path is required for snapshot-based provider".to_string(),
             ));
         };
         validate_absolute_path(snapshot_path, "ocserv_readonly.snapshot_path")?;

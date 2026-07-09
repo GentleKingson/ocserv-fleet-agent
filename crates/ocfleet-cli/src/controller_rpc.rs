@@ -949,6 +949,41 @@ pub fn low_sensitive_ocserv_observation_summary(method: &str, result: &Value) ->
                 &["service", "enabled"],
                 "service_enabled",
             );
+            copy_nested_string_field(
+                result,
+                &mut summary,
+                &["live", "collector_status"],
+                "collector_status",
+            );
+            copy_nested_string_field(
+                result,
+                &mut summary,
+                &["live", "last_snapshot_at"],
+                "last_snapshot_at",
+            );
+            copy_nested_u64_field(
+                result,
+                &mut summary,
+                &["live", "auth_failure_count_rolling"],
+                "auth_failure_count_rolling",
+            );
+            copy_nested_u64_field(
+                result,
+                &mut summary,
+                &["live", "connection_failure_count_rolling"],
+                "connection_failure_count_rolling",
+            );
+            if let Some(days_remaining) =
+                nested_value(result, &["live", "cert_min_days_remaining"]).and_then(Value::as_i64)
+            {
+                summary.insert("cert_min_days_remaining".to_string(), json!(days_remaining));
+            }
+            copy_nested_string_field(
+                result,
+                &mut summary,
+                &["live", "config_fingerprint_short"],
+                "config_fingerprint_short",
+            );
         }
         OCSERV_VERSION => {
             copy_string_field(result, &mut summary, "version");

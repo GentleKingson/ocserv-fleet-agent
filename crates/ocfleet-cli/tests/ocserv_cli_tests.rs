@@ -4,9 +4,10 @@ use ocfleet_cli::ocserv_output::{
     low_sensitive_ocserv_audit_message,
 };
 use ocfleet_protocol::ocserv::{
-    OcservCertExpiry, OcservCertExpiryResponse, OcservCertStatus, OcservConfigFingerprint,
-    OcservConfigFingerprintResponse, OcservFieldStatus, OcservFreshness, OcservReadonlyMeta,
-    OcservReadonlySource, OcservServiceEnabledState, OcservServiceState, OcservServiceSummary,
+    OcservCertExpiry, OcservCertExpiryResponse, OcservCertStatus, OcservCollectorStatus,
+    OcservConfigFingerprint, OcservConfigFingerprintResponse, OcservFieldStatus, OcservFreshness,
+    OcservLiveReadonlyMetadata, OcservReadonlyMeta, OcservReadonlySource,
+    OcservServiceEnabledState, OcservServiceState, OcservServiceSummary,
     OcservServiceSummaryResponse, OcservSessionsSummary, OcservSessionsSummaryResponse,
     OcservVersionResponse,
 };
@@ -30,6 +31,7 @@ fn formats_ocserv_status_human_output_as_low_sensitive_summary() {
                 since: Some("2026-07-07T12:00:00Z".to_string()),
             },
             meta: meta(),
+            live: None,
         },
         &OcservVersionResponse {
             version: Some("1.3.0".to_string()),
@@ -76,6 +78,7 @@ fn formats_unavailable_ocserv_status_fields_without_paths_or_raw_output() {
                 since: None,
             },
             meta: meta(),
+            live: None,
         },
         &OcservVersionResponse {
             version: None,
@@ -117,6 +120,7 @@ fn human_status_output_shortens_config_fingerprint() {
                 since: None,
             },
             meta: meta(),
+            live: None,
         },
         &OcservVersionResponse {
             version: Some("1.3.0".to_string()),
@@ -162,6 +166,7 @@ fn json_status_output_shortens_config_fingerprint() {
         config_algorithm: Some("sha256".to_string()),
         config_hash: Some(hash.clone()),
         config_status: OcservFieldStatus::Available,
+        live: None,
         degraded_methods: Vec::new(),
     })
     .expect("format json status");
@@ -169,6 +174,42 @@ fn json_status_output_shortens_config_fingerprint() {
     assert!(output.contains("\"config_fingerprint_prefix\": \"dddddddddddd\""));
     assert!(!output.contains(&hash));
     assert_low_sensitive_ocserv_output(&output).expect("json status is low-sensitive");
+}
+
+#[test]
+fn json_status_output_includes_live_readonly_metadata() {
+    let output = format_status_json(&OcservStatusView {
+        node_id: "hk-ocserv-01".to_string(),
+        service: Some(OcservServiceSummary {
+            state: OcservServiceState::Running,
+            enabled: OcservServiceEnabledState::Enabled,
+            since: None,
+        }),
+        version: Some("1.3.0".to_string()),
+        version_status: OcservFieldStatus::Available,
+        sessions_total: Some(12),
+        sessions_status: OcservFieldStatus::Available,
+        config_algorithm: Some("sha256".to_string()),
+        config_hash: None,
+        config_status: OcservFieldStatus::Unavailable,
+        live: Some(OcservLiveReadonlyMetadata {
+            collector_status: OcservCollectorStatus::Ok,
+            last_snapshot_at: "2026-07-07T12:00:00Z".to_string(),
+            auth_failure_count_rolling: Some(2),
+            connection_failure_count_rolling: Some(1),
+            cert_min_days_remaining: Some(42),
+            config_fingerprint_short: Some("abcdef123456".to_string()),
+        }),
+        degraded_methods: Vec::new(),
+    })
+    .expect("format live status");
+
+    assert!(output.contains("\"collector_status\": \"ok\""));
+    assert!(output.contains("\"auth_failure_count_rolling\": 2"));
+    assert!(output.contains("\"connection_failure_count_rolling\": 1"));
+    assert!(output.contains("\"cert_min_days_remaining\": 42"));
+    assert!(output.contains("\"config_fingerprint_short\": \"abcdef123456\""));
+    assert_low_sensitive_ocserv_output(&output).expect("live status is low-sensitive");
 }
 
 #[test]
@@ -187,6 +228,7 @@ fn formats_status_degraded_without_raw_errors() {
         config_algorithm: Some("sha256".to_string()),
         config_hash: None,
         config_status: OcservFieldStatus::Unavailable,
+        live: None,
         degraded_methods: vec!["ocserv.version", "ocserv.config.fingerprint"],
     })
     .expect("format degraded status");

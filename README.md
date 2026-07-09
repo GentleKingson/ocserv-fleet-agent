@@ -292,6 +292,9 @@ Snapshot document example:
 With `provider = "snapshot"`, service summary, version, and session summary are
 read from the fixed local snapshot document. Certificate expiry and config
 fingerprint are collected from fixed local paths declared in the agent config.
+For richer low-sensitive live metadata, agents can use
+`provider = "collector_snapshot"` with a fixed v2 JSON snapshot file; see
+[`docs/ocserv-live-readonly-provider.md`](docs/ocserv-live-readonly-provider.md).
 The controller cannot supply paths, commands, service names, unit names, or
 journal selectors. Human output shortens fingerprints; use `--json` for the full
 typed SHA-256 values.

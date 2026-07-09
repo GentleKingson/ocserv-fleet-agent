@@ -548,6 +548,44 @@ cert_path = "/etc/ocserv/server-cert.pem"
 }
 
 #[test]
+fn agent_config_accepts_ocserv_readonly_collector_snapshot_provider() {
+    let config: AgentConfig = toml::from_str(
+        r#"
+[node]
+id = "hk-ocserv-01"
+region = "hk"
+role = "ocserv"
+
+[iroh]
+secret_key_path = "/tmp/iroh.secret"
+
+[security]
+
+[audit]
+path = "/tmp/ocfleet-audit.log"
+
+[ocserv_readonly]
+enabled = true
+provider = "collector_snapshot"
+snapshot_path = "/var/lib/ocfleet-agent/ocserv-live-snapshot.json"
+"#,
+    )
+    .expect("collector snapshot config parses");
+
+    validate_agent_config(&config).expect("collector snapshot config validates");
+    assert_eq!(
+        config.ocserv_readonly.provider,
+        OcservReadonlyProviderKind::CollectorSnapshot
+    );
+    assert_eq!(
+        config.ocserv_readonly.snapshot_path.as_deref(),
+        Some(std::path::Path::new(
+            "/var/lib/ocfleet-agent/ocserv-live-snapshot.json"
+        ))
+    );
+}
+
+#[test]
 fn agent_config_rejects_enabled_ocserv_readonly_without_explicit_provider() {
     let err = toml::from_str::<AgentConfig>(
         r#"
@@ -760,6 +798,20 @@ fn agent_config_rejects_snapshot_provider_without_snapshot_path() {
     config.ocserv_readonly.snapshot_path = None;
 
     let err = validate_agent_config(&config).expect_err("snapshot path required");
+    assert!(matches!(
+        err,
+        ConfigError::Invalid(message) if message.contains("snapshot_path")
+    ));
+}
+
+#[test]
+fn agent_config_rejects_collector_snapshot_provider_without_snapshot_path() {
+    let mut config = minimal_agent_config();
+    config.ocserv_readonly.enabled = true;
+    config.ocserv_readonly.provider = OcservReadonlyProviderKind::CollectorSnapshot;
+    config.ocserv_readonly.snapshot_path = None;
+
+    let err = validate_agent_config(&config).expect_err("collector snapshot path required");
     assert!(matches!(
         err,
         ConfigError::Invalid(message) if message.contains("snapshot_path")

@@ -1,8 +1,9 @@
 use anyhow::{Result, bail};
 use ocfleet_protocol::ocserv::{
-    OcservCertExpiryResponse, OcservConfigFingerprintResponse, OcservFieldStatus,
-    OcservServiceSummary, OcservServiceSummaryResponse, OcservSessionsSummaryResponse,
-    OcservVersionResponse, is_valid_sha256_hex, validate_ocserv_response_json_size,
+    OcservCertExpiryResponse, OcservCollectorStatus, OcservConfigFingerprintResponse,
+    OcservFieldStatus, OcservLiveReadonlyMetadata, OcservServiceSummary,
+    OcservServiceSummaryResponse, OcservSessionsSummaryResponse, OcservVersionResponse,
+    is_valid_sha256_hex, validate_ocserv_response_json_size,
 };
 use serde_json::json;
 
@@ -20,6 +21,7 @@ pub struct OcservStatusView {
     pub config_algorithm: Option<String>,
     pub config_hash: Option<String>,
     pub config_status: OcservFieldStatus,
+    pub live: Option<OcservLiveReadonlyMetadata>,
     pub degraded_methods: Vec<&'static str>,
 }
 
@@ -55,6 +57,7 @@ pub fn format_status_human(
         config_algorithm: Some(fingerprint.fingerprint.algorithm.clone()),
         config_hash: fingerprint.fingerprint.hash.clone(),
         config_status: fingerprint.fingerprint.status,
+        live: service.live.clone(),
         degraded_methods: Vec::new(),
     };
     format_status_view_human(&view)
@@ -123,10 +126,35 @@ pub fn format_status_json(view: &OcservStatusView) -> Result<String> {
             "status": view.config_status,
         },
         "config_fingerprint_prefix": fingerprint_prefix(view.config_hash.as_deref(), view.config_status)?,
+        "live": live_json(view.live.as_ref()),
         "degraded_methods": &view.degraded_methods,
     }))? + "\n";
     assert_low_sensitive_ocserv_output(&output)?;
     Ok(output)
+}
+
+fn live_json(live: Option<&OcservLiveReadonlyMetadata>) -> serde_json::Value {
+    let Some(live) = live else {
+        return serde_json::Value::Null;
+    };
+    json!({
+        "collector_status": collector_status_name(live.collector_status),
+        "last_snapshot_at": &live.last_snapshot_at,
+        "auth_failure_count_rolling": live.auth_failure_count_rolling,
+        "connection_failure_count_rolling": live.connection_failure_count_rolling,
+        "cert_min_days_remaining": live.cert_min_days_remaining,
+        "config_fingerprint_short": live.config_fingerprint_short.as_deref(),
+    })
+}
+
+fn collector_status_name(status: OcservCollectorStatus) -> &'static str {
+    match status {
+        OcservCollectorStatus::Ok => "ok",
+        OcservCollectorStatus::Partial => "partial",
+        OcservCollectorStatus::Stale => "stale",
+        OcservCollectorStatus::Unavailable => "unavailable",
+        OcservCollectorStatus::Unknown => "unknown",
+    }
 }
 
 pub fn format_cert_human(node_id: &str, response: &OcservCertExpiryResponse) -> Result<String> {

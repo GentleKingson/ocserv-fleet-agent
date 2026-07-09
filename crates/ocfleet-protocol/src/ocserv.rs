@@ -8,6 +8,11 @@ pub const OCSERV_NAME_MAX_BYTES: usize = 64;
 pub const OCSERV_COLLECTED_AT_MAX_BYTES: usize = 64;
 pub const OCSERV_CERT_MAX_ENTRIES: usize = 8;
 pub const OCSERV_ERROR_MESSAGE_MAX_BYTES: usize = 128;
+pub const OCSERV_CONFIG_FINGERPRINT_SHORT_MIN_BYTES: usize = 6;
+pub const OCSERV_CONFIG_FINGERPRINT_SHORT_MAX_BYTES: usize = 16;
+pub const OCSERV_ROLLING_COUNT_MAX: u64 = 1_000_000;
+pub const OCSERV_CERT_DAYS_REMAINING_MIN: i64 = -3650;
+pub const OCSERV_CERT_DAYS_REMAINING_MAX: i64 = 36500;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum OcservProtocolValidationError {
@@ -58,6 +63,8 @@ pub struct OcservServiceSummaryRequest {}
 pub struct OcservServiceSummaryResponse {
     pub service: OcservServiceSummary,
     pub meta: OcservReadonlyMeta,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live: Option<OcservLiveReadonlyMetadata>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -121,6 +128,31 @@ pub struct OcservSessionsSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total: Option<u32>,
     pub status: OcservFieldStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OcservLiveReadonlyMetadata {
+    pub collector_status: OcservCollectorStatus,
+    pub last_snapshot_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_failure_count_rolling: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_failure_count_rolling: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cert_min_days_remaining: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_fingerprint_short: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OcservCollectorStatus {
+    Ok,
+    Partial,
+    Stale,
+    Unavailable,
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -230,6 +262,18 @@ impl std::fmt::Display for OcservFieldStatus {
     }
 }
 
+impl std::fmt::Display for OcservCollectorStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Ok => "ok",
+            Self::Partial => "partial",
+            Self::Stale => "stale",
+            Self::Unavailable => "unavailable",
+            Self::Unknown => "unknown",
+        })
+    }
+}
+
 pub fn is_valid_ocserv_version(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= OCSERV_VERSION_MAX_BYTES
@@ -249,6 +293,12 @@ pub fn is_valid_ocserv_name(value: &str) -> bool {
 
 pub fn is_valid_sha256_hex(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+pub fn is_valid_sha256_short_hex(value: &str) -> bool {
+    (OCSERV_CONFIG_FINGERPRINT_SHORT_MIN_BYTES..=OCSERV_CONFIG_FINGERPRINT_SHORT_MAX_BYTES)
+        .contains(&value.len())
+        && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 pub fn is_valid_ocserv_collected_at(value: &str) -> bool {

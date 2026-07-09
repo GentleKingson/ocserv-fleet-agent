@@ -1659,6 +1659,9 @@ async fn run_ocserv_status_command(
             .as_available()
             .map(|response| response.fingerprint.status)
             .unwrap_or(ocfleet_protocol::ocserv::OcservFieldStatus::Unavailable),
+        live: service
+            .as_available()
+            .and_then(|response| response.live.clone()),
         degraded_methods: degraded_methods.clone(),
     };
 

@@ -95,6 +95,7 @@ Production provider code for Phase 11 is limited to:
 
 - a disabled provider
 - a typed snapshot provider for service summary, version, and session summary
+- a typed `collector_snapshot` provider for fixed v2 low-sensitive live metadata
 - certificate expiry parsing from configured certificate files
 - config fingerprint hashing from a configured config file
 
@@ -103,6 +104,15 @@ Provider composition is fixed. `provider = "snapshot"` currently means:
 - `ocserv.service.summary`: snapshot-backed
 - `ocserv.version`: snapshot-backed
 - `ocserv.sessions.summary`: snapshot-backed
+- `ocserv.cert.expiry`: configured certificate parser
+- `ocserv.config.fingerprint`: configured config file hasher
+
+`provider = "collector_snapshot"` currently means:
+
+- `ocserv.service.summary`: v2 snapshot-backed service state plus optional
+  aggregate live metadata
+- `ocserv.version`: v2 snapshot-backed optional version
+- `ocserv.sessions.summary`: v2 snapshot-backed optional aggregate session count
 - `ocserv.cert.expiry`: configured certificate parser
 - `ocserv.config.fingerprint`: configured config file hasher
 
@@ -146,12 +156,24 @@ cert_path = "/etc/ocserv/server-cert.pem"
 Validation rules:
 
 - `enabled=true` requires an explicit provider.
-- provider is `disabled` or `snapshot`.
+- provider is `disabled`, `snapshot`, or `collector_snapshot`.
 - configured paths must be absolute.
 - certificate and fingerprint names are `[A-Za-z0-9_.-]`, max 64 bytes.
 - at most 8 certificates are configured.
 - unknown config fields are rejected.
 - controller RPC params cannot override configured paths.
+
+Collector snapshot example:
+
+```toml
+[ocserv_readonly]
+enabled = true
+provider = "collector_snapshot"
+snapshot_path = "/var/lib/ocfleet-agent/ocserv-live-snapshot.json"
+```
+
+See [`ocserv-live-readonly-provider.md`](ocserv-live-readonly-provider.md) for
+the v2 schema, freshness rules, local collector model, and migration notes.
 
 ## RPC Schemas
 

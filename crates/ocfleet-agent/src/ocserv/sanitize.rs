@@ -1,9 +1,11 @@
 use ocfleet_protocol::error::ErrorCode;
 use ocfleet_protocol::ocserv::{
-    OCSERV_CERT_MAX_ENTRIES, OcservCertExpiryResponse, OcservConfigFingerprintResponse,
-    OcservReadonlyMeta, OcservServiceSummaryResponse, OcservSessionsSummaryResponse,
-    OcservVersionResponse, is_valid_ocserv_collected_at, is_valid_ocserv_name,
-    is_valid_ocserv_version, is_valid_sha256_hex, validate_ocserv_response_json_size,
+    OCSERV_CERT_DAYS_REMAINING_MAX, OCSERV_CERT_DAYS_REMAINING_MIN, OCSERV_CERT_MAX_ENTRIES,
+    OCSERV_ROLLING_COUNT_MAX, OcservCertExpiryResponse, OcservConfigFingerprintResponse,
+    OcservLiveReadonlyMetadata, OcservReadonlyMeta, OcservServiceSummaryResponse,
+    OcservSessionsSummaryResponse, OcservVersionResponse, is_valid_ocserv_collected_at,
+    is_valid_ocserv_name, is_valid_ocserv_version, is_valid_sha256_hex, is_valid_sha256_short_hex,
+    validate_ocserv_response_json_size,
 };
 
 use crate::ocserv::OcservReadonlyError;
@@ -19,6 +21,9 @@ pub fn service_summary(
         .is_some_and(has_scalar_control_or_too_long)
     {
         return invalid_data("ocserv service summary contains invalid timestamp");
+    }
+    if let Some(live) = &response.live {
+        validate_live_metadata(live)?;
     }
     bounded(response)
 }
@@ -99,6 +104,39 @@ pub fn validate_meta(meta: &OcservReadonlyMeta) -> Result<(), OcservReadonlyErro
     } else {
         invalid_data("ocserv readonly meta collected_at is invalid")
     }
+}
+
+pub fn validate_live_metadata(
+    live: &OcservLiveReadonlyMetadata,
+) -> Result<(), OcservReadonlyError> {
+    if !is_valid_ocserv_collected_at(&live.last_snapshot_at) {
+        return invalid_data("ocserv live snapshot timestamp is invalid");
+    }
+    for count in [
+        live.auth_failure_count_rolling,
+        live.connection_failure_count_rolling,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if count > OCSERV_ROLLING_COUNT_MAX {
+            return invalid_data("ocserv live rolling count is invalid");
+        }
+    }
+    if let Some(days_remaining) = live.cert_min_days_remaining
+        && !(OCSERV_CERT_DAYS_REMAINING_MIN..=OCSERV_CERT_DAYS_REMAINING_MAX)
+            .contains(&days_remaining)
+    {
+        return invalid_data("ocserv live certificate days remaining is invalid");
+    }
+    if live
+        .config_fingerprint_short
+        .as_deref()
+        .is_some_and(|value| !is_valid_sha256_short_hex(value))
+    {
+        return invalid_data("ocserv live config fingerprint prefix is invalid");
+    }
+    Ok(())
 }
 
 fn bounded<T>(response: T) -> Result<T, OcservReadonlyError>

@@ -78,6 +78,28 @@ fn snapshot_provider_rejects_files_over_16_kib() {
     assert_eq!(err.code(), ErrorCode::OcservOutputBoundExceeded);
 }
 
+#[cfg(unix)]
+#[test]
+fn snapshot_provider_rejects_hardlinked_snapshot_file() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let snapshot = dir.path().join("ocserv-readonly.json");
+    let hardlink = dir.path().join("ocserv-readonly-hardlink.json");
+    std::fs::write(
+        &snapshot,
+        r#"{"service":{"state":"running","enabled":"enabled"},"version":"1.3.0"}"#,
+    )
+    .expect("write snapshot");
+    make_private(&snapshot);
+    std::fs::hard_link(&snapshot, &hardlink).expect("create hardlink");
+    let provider = SnapshotOcservReadonlyProvider::new(snapshot);
+
+    let err = provider
+        .service_summary()
+        .expect_err("hardlinked snapshot source rejected");
+
+    assert_eq!(err.code(), ErrorCode::OcservProviderUnsafeSource);
+}
+
 #[test]
 fn snapshot_collected_at_rejects_control_chars() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -214,6 +236,28 @@ fn certificate_provider_rejects_files_over_1_mib() {
     assert_eq!(err.code(), ErrorCode::OcservOutputBoundExceeded);
 }
 
+#[cfg(unix)]
+#[test]
+fn certificate_provider_rejects_group_writable_certificate_file() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let cert_path = dir.path().join("server.pem");
+    std::fs::write(&cert_path, "not a cert").expect("write cert");
+    std::fs::set_permissions(&cert_path, std::fs::Permissions::from_mode(0o620))
+        .expect("chmod cert");
+    let provider = CertificateExpiryProvider::new(vec![OcservCertificateConfig {
+        name: "server".to_string(),
+        cert_path,
+    }]);
+
+    let err = provider
+        .cert_expiry()
+        .expect_err("group-writable cert source rejected");
+
+    assert_eq!(err.code(), ErrorCode::OcservProviderUnsafeSource);
+}
+
 #[test]
 fn config_fingerprint_provider_returns_only_sha256_hash() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -248,6 +292,28 @@ fn config_fingerprint_provider_rejects_files_over_1_mib() {
         .config_fingerprint()
         .expect_err("oversized config rejected");
     assert_eq!(err.code(), ErrorCode::OcservOutputBoundExceeded);
+}
+
+#[cfg(unix)]
+#[test]
+fn config_fingerprint_provider_rejects_group_writable_config_file() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let config_path = dir.path().join("ocserv.conf");
+    std::fs::write(&config_path, "auth = plain[/etc/ocserv/passwd]\n").expect("write config");
+    std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o620))
+        .expect("chmod config");
+    let provider = ConfigFingerprintProvider::new(Some(OcservConfigFingerprintConfig {
+        name: "main".to_string(),
+        config_path,
+    }));
+
+    let err = provider
+        .config_fingerprint()
+        .expect_err("group-writable config source rejected");
+
+    assert_eq!(err.code(), ErrorCode::OcservProviderUnsafeSource);
 }
 
 #[test]

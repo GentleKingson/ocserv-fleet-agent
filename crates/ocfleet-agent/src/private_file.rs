@@ -210,7 +210,11 @@ fn validate_private_file_handle(file: &File) -> io::Result<()> {
     let stat = unsafe { stat.assume_init() };
     let current_euid = unsafe { libc::geteuid() };
     let file_type = stat.st_mode & libc::S_IFMT;
-    if file_type != libc::S_IFREG || stat.st_uid != current_euid || stat.st_mode & 0o077 != 0 {
+    if file_type != libc::S_IFREG
+        || stat.st_uid != current_euid
+        || stat.st_nlink != 1
+        || stat.st_mode & 0o077 != 0
+    {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "unsafe private file permissions",
@@ -220,42 +224,33 @@ fn validate_private_file_handle(file: &File) -> io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn open_private_append_impl(path: &Path) -> io::Result<File> {
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        fs::create_dir_all(parent)?;
-    }
-    fs::OpenOptions::new().create(true).append(true).open(path)
+fn open_private_append_impl(_path: &Path) -> io::Result<File> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "private file operations are only supported on Unix",
+    ))
 }
 
 #[cfg(not(unix))]
-fn open_private_create_new_impl(path: &Path) -> io::Result<File> {
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        fs::create_dir_all(parent)?;
-    }
-    fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
+fn open_private_create_new_impl(_path: &Path) -> io::Result<File> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "private file operations are only supported on Unix",
+    ))
 }
 
 #[cfg(not(unix))]
-fn open_existing_private_read_impl(path: &Path) -> io::Result<File> {
-    fs::OpenOptions::new().read(true).open(path)
+fn open_existing_private_read_impl(_path: &Path) -> io::Result<File> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "private file operations are only supported on Unix",
+    ))
 }
 
 #[cfg(not(unix))]
-fn write_private_replace_impl(path: &Path, payload: &[u8]) -> io::Result<()> {
-    use std::io::Write;
-
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        fs::create_dir_all(parent)?;
-    }
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(path)?;
-    file.write_all(payload)?;
-    file.sync_all()?;
-    Ok(())
+fn write_private_replace_impl(_path: &Path, _payload: &[u8]) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "private file operations are only supported on Unix",
+    ))
 }

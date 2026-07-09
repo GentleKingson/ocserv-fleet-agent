@@ -2355,6 +2355,7 @@ name = "ocfleet-config"
 version = "0.1.0"
 dependencies = [
  "iroh",
+ "libc",
  "serde",
  "thiserror 2.0.18",
  "toml",

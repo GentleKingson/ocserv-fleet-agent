@@ -1,6 +1,7 @@
 use serde::{Deserialize, Deserializer};
 use std::collections::HashSet;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -216,10 +217,79 @@ impl<'de> Deserialize<'de> for OcservReadonlyConfig {
 }
 
 pub fn load_agent_config(path: &Path) -> Result<AgentConfig, ConfigError> {
-    let text = fs::read_to_string(path)?;
+    let text = read_agent_config_file(path)?;
     let config: AgentConfig = toml::from_str(&text)?;
     validate_agent_config(&config)?;
     Ok(config)
+}
+
+#[cfg(unix)]
+fn read_agent_config_file(path: &Path) -> std::io::Result<String> {
+    use std::mem::MaybeUninit;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    validate_trusted_parent(path)?;
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+
+    let mut stat = MaybeUninit::<libc::stat>::uninit();
+    let result = unsafe { libc::fstat(file.as_raw_fd(), stat.as_mut_ptr()) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let stat = unsafe { stat.assume_init() };
+    let current_euid = unsafe { libc::geteuid() };
+    let file_type = stat.st_mode & libc::S_IFMT;
+    if file_type != libc::S_IFREG
+        || (stat.st_uid != 0 && stat.st_uid != current_euid)
+        || stat.st_nlink != 1
+        || stat.st_mode & 0o022 != 0
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "unsafe agent config file permissions",
+        ));
+    }
+
+    let mut text = String::new();
+    file.read_to_string(&mut text)?;
+    Ok(text)
+}
+
+#[cfg(unix)]
+fn validate_trusted_parent(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    else {
+        return Ok(());
+    };
+    let metadata = fs::symlink_metadata(parent)?;
+    let current_euid = unsafe { libc::geteuid() };
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || (metadata.uid() != 0 && metadata.uid() != current_euid)
+        || metadata.mode() & 0o022 != 0
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "unsafe agent config parent permissions",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn read_agent_config_file(_path: &Path) -> std::io::Result<String> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "secure agent config loading is only supported on Unix",
+    ))
 }
 
 pub fn validate_agent_config(config: &AgentConfig) -> Result<(), ConfigError> {
@@ -253,6 +323,7 @@ pub fn validate_agent_config(config: &AgentConfig) -> Result<(), ConfigError> {
         );
     }
     let mut peer_endpoint_ids = HashSet::new();
+    let mut enabled_peer_endpoint_ids = HashSet::new();
     for peer in &config.security.peers {
         validate_peer_endpoint_id(&peer.endpoint_id)
             .map_err(|e| ConfigError::Invalid(e.to_string()))?;
@@ -267,6 +338,9 @@ pub fn validate_agent_config(config: &AgentConfig) -> Result<(), ConfigError> {
             return Err(ConfigError::Invalid(format!(
                 "endpoint_id cannot be both controller and peer: {endpoint_id}"
             )));
+        }
+        if peer.enabled {
+            enabled_peer_endpoint_ids.insert(endpoint_id);
         }
     }
     let mut path_probe_pairs = HashSet::new();
@@ -289,6 +363,11 @@ pub fn validate_agent_config(config: &AgentConfig) -> Result<(), ConfigError> {
         if controller_endpoint_ids.contains(&target_endpoint_id) {
             return Err(ConfigError::Invalid(format!(
                 "path probe target_endpoint_id must not exist in security.controllers: {target_endpoint_id}"
+            )));
+        }
+        if !enabled_peer_endpoint_ids.contains(&target_endpoint_id) {
+            return Err(ConfigError::Invalid(format!(
+                "path probe target_endpoint_id must exist as an enabled peer in security.peers: {target_endpoint_id}"
             )));
         }
         let pair = (controller_endpoint_id, target_endpoint_id);

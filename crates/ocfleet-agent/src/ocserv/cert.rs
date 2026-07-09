@@ -1,4 +1,3 @@
-use std::fs;
 use std::path::Path;
 
 use base64::Engine;
@@ -11,7 +10,10 @@ use ocfleet_protocol::ocserv::{
 use sha2::{Digest, Sha256};
 use time::{Date, Month, OffsetDateTime, PrimitiveDateTime, Time};
 
-use crate::ocserv::{OcservReadonlyError, OcservReadonlyProvider, sanitize};
+use crate::ocserv::{
+    OcservReadonlyError, OcservReadonlyProvider, sanitize,
+    trusted_file::{PermissionPolicy, read_bounded_trusted_file},
+};
 
 const CERT_MAX_BYTES: u64 = 1024 * 1024;
 
@@ -160,48 +162,14 @@ fn invalid_cert(name: &str, status: OcservCertStatus) -> OcservCertExpiry {
 }
 
 fn read_bounded_regular_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>, OcservReadonlyError> {
-    let metadata = fs::symlink_metadata(path).map_err(|_| {
-        OcservReadonlyError::new(
-            ErrorCode::OcservProviderUnavailable,
-            "ocserv certificate is unavailable",
-        )
-    })?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(OcservReadonlyError::new(
-            ErrorCode::OcservProviderUnsafeSource,
-            "ocserv certificate source is unsafe",
-        ));
-    }
-    if metadata.len() > max_bytes {
-        return Err(OcservReadonlyError::new(
-            ErrorCode::OcservOutputBoundExceeded,
-            "ocserv certificate is too large",
-        ));
-    }
-    reject_world_writable(&metadata)?;
-    fs::read(path).map_err(|_| {
-        OcservReadonlyError::new(
-            ErrorCode::OcservProviderUnavailable,
-            "ocserv certificate is unavailable",
-        )
-    })
-}
-
-#[cfg(unix)]
-fn reject_world_writable(metadata: &fs::Metadata) -> Result<(), OcservReadonlyError> {
-    use std::os::unix::fs::PermissionsExt;
-    if metadata.permissions().mode() & 0o002 != 0 {
-        return Err(OcservReadonlyError::new(
-            ErrorCode::OcservProviderUnsafeSource,
-            "ocserv certificate source is unsafe",
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn reject_world_writable(_metadata: &fs::Metadata) -> Result<(), OcservReadonlyError> {
-    Ok(())
+    read_bounded_trusted_file(
+        path,
+        max_bytes,
+        PermissionPolicy::TrustedReadable,
+        "ocserv certificate is unavailable",
+        "ocserv certificate source is unsafe",
+        "ocserv certificate is too large",
+    )
 }
 
 fn parse_certificate(bytes: &[u8]) -> Option<ParsedCertificate> {

@@ -341,6 +341,24 @@ fn jsonl_audit_writer_rejects_final_path_symlink() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn private_file_reader_rejects_hardlinked_private_file() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("iroh.secret");
+    let hardlink = dir.path().join("iroh-hardlink.secret");
+    std::fs::write(&path, "secret\n").expect("write private file");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    std::fs::hard_link(&path, &hardlink).expect("create hardlink");
+
+    let err = ocfleet_agent::private_file::open_existing_private_read(&path)
+        .expect_err("hardlinked private file must be rejected");
+
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+}
+
 #[test]
 fn rejected_audit_limiter_suppresses_repeated_resource_rejections_and_bounds_buckets() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -637,6 +655,16 @@ fn authorization_enforces_source_side_path_probe_allowlist() {
             enabled: false,
         },
     ];
+    config.security.peers = vec![
+        PeerConfig {
+            endpoint_id: allowed_target_id.to_string(),
+            enabled: true,
+        },
+        PeerConfig {
+            endpoint_id: disabled_target_id.to_string(),
+            enabled: true,
+        },
+    ];
 
     let authz = AgentAuthorization::from_security_config(&config.security)
         .expect("authorization table builds");
@@ -656,6 +684,50 @@ fn authorization_enforces_source_side_path_probe_allowlist() {
     assert_eq!(
         authz.path_probe_decision(&controller_id, &source_id, &source_id),
         PathProbeDecision::SelfTarget
+    );
+}
+
+#[test]
+fn authorization_rejects_path_probe_when_target_is_not_enabled_peer() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let controller_id = iroh::SecretKey::generate().public();
+    let missing_peer_id = iroh::SecretKey::generate().public();
+    let disabled_peer_id = iroh::SecretKey::generate().public();
+    let source_id = iroh::SecretKey::generate().public();
+    let mut config = test_agent_config(
+        dir.path(),
+        vec![ControllerConfig {
+            endpoint_id: controller_id.to_string(),
+            role: "viewer".to_string(),
+        }],
+    );
+    config.security.peers = vec![PeerConfig {
+        endpoint_id: disabled_peer_id.to_string(),
+        enabled: false,
+    }];
+    config.security.path_probes = vec![
+        PathProbeConfig {
+            controller_endpoint_id: controller_id.to_string(),
+            target_endpoint_id: missing_peer_id.to_string(),
+            enabled: true,
+        },
+        PathProbeConfig {
+            controller_endpoint_id: controller_id.to_string(),
+            target_endpoint_id: disabled_peer_id.to_string(),
+            enabled: true,
+        },
+    ];
+
+    let authz = AgentAuthorization::from_security_config(&config.security)
+        .expect("authorization table builds");
+
+    assert_eq!(
+        authz.path_probe_decision(&controller_id, &missing_peer_id, &source_id),
+        PathProbeDecision::Missing
+    );
+    assert_eq!(
+        authz.path_probe_decision(&controller_id, &disabled_peer_id, &source_id),
+        PathProbeDecision::Missing
     );
 }
 

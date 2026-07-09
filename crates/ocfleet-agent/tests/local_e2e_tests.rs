@@ -1094,6 +1094,10 @@ async fn spawn_local_path_probe_agents(
     );
     source_config.node.id = "source-ocserv-01".to_string();
     if source_authorizes_target {
+        source_config.security.peers = vec![PeerConfig {
+            endpoint_id: target_id.to_string(),
+            enabled: true,
+        }];
         source_config.security.path_probes = vec![PathProbeConfig {
             controller_endpoint_id: controller_id.to_string(),
             target_endpoint_id: target_id.to_string(),

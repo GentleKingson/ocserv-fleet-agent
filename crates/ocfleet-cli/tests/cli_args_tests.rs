@@ -355,6 +355,8 @@ fn parses_enroll_request_create_command() {
                 command:
                     EnrollRequestCommand::Create {
                         token,
+                        token_file,
+                        token_stdin,
                         agent_public_key,
                         fingerprint,
                         requested_endpoint_id,
@@ -367,12 +369,93 @@ fn parses_enroll_request_create_command() {
         panic!("expected enroll request create command");
     };
 
-    assert_eq!(token, "secret-token");
+    assert_eq!(token.as_deref(), Some("secret-token"));
+    assert_eq!(token_file, None);
+    assert!(!token_stdin);
     assert_eq!(agent_public_key, "agent-public-key");
     assert_eq!(fingerprint, "agent-fingerprint");
     assert_eq!(requested_endpoint_id.as_deref(), Some("requested-endpoint"));
     assert_eq!(hostname, "hk-ocserv-01");
     assert_eq!(agent_version, "0.1.0");
+}
+
+#[test]
+fn parses_enroll_request_create_token_file_and_stdin_sources() {
+    let cli = Cli::parse_from([
+        "ocfleet",
+        "enroll",
+        "request",
+        "create",
+        "--token-file",
+        "/run/secrets/ocfleet-token",
+        "--agent-public-key",
+        "agent-public-key",
+        "--fingerprint",
+        "agent-fingerprint",
+        "--hostname",
+        "hk-ocserv-01",
+        "--agent-version",
+        "0.1.0",
+    ]);
+
+    let Command::Enroll {
+        command:
+            EnrollCommand::Request {
+                command:
+                    EnrollRequestCommand::Create {
+                        token,
+                        token_file,
+                        token_stdin,
+                        ..
+                    },
+            },
+    } = cli.command
+    else {
+        panic!("expected enroll request create command");
+    };
+
+    assert_eq!(token, None);
+    assert_eq!(
+        token_file.as_deref(),
+        Some(std::path::Path::new("/run/secrets/ocfleet-token"))
+    );
+    assert!(!token_stdin);
+
+    let cli = Cli::parse_from([
+        "ocfleet",
+        "enroll",
+        "request",
+        "create",
+        "--token-stdin",
+        "--agent-public-key",
+        "agent-public-key",
+        "--fingerprint",
+        "agent-fingerprint",
+        "--hostname",
+        "hk-ocserv-01",
+        "--agent-version",
+        "0.1.0",
+    ]);
+
+    let Command::Enroll {
+        command:
+            EnrollCommand::Request {
+                command:
+                    EnrollRequestCommand::Create {
+                        token,
+                        token_file,
+                        token_stdin,
+                        ..
+                    },
+            },
+    } = cli.command
+    else {
+        panic!("expected enroll request create command");
+    };
+
+    assert_eq!(token, None);
+    assert_eq!(token_file, None);
+    assert!(token_stdin);
 }
 
 #[test]

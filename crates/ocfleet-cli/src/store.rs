@@ -13,8 +13,9 @@ use uuid::Uuid;
 
 use crate::audit::AuditEvent;
 use crate::input_validation::{
-    validate_actor, validate_agent_version, validate_description, validate_endpoint_id,
-    validate_hostname, validate_label_json, validate_reason,
+    validate_actor, validate_agent_fingerprint, validate_agent_public_key, validate_agent_version,
+    validate_description, validate_endpoint_id, validate_hostname, validate_label_json,
+    validate_reason,
 };
 use crate::private_file::{self, PrivateFileError};
 
@@ -1154,6 +1155,14 @@ impl Store {
         actor: &str,
     ) -> Result<JoinRequestRecord, StoreError> {
         validate_actor(actor).map_err(StoreError::InvalidInput)?;
+        validate_agent_public_key(&request.agent_public_key).map_err(StoreError::InvalidInput)?;
+        validate_agent_fingerprint(&request.fingerprint).map_err(StoreError::InvalidInput)?;
+        let requested_endpoint_id = request
+            .requested_endpoint_id
+            .as_deref()
+            .map(validate_endpoint_id)
+            .transpose()
+            .map_err(|err| StoreError::InvalidInput(format!("requested_endpoint_id: {err}")))?;
         validate_hostname(&request.hostname).map_err(StoreError::InvalidInput)?;
         validate_agent_version(&request.agent_version).map_err(StoreError::InvalidInput)?;
         validate_label_json(&request.requested_labels_json, "requested_labels")
@@ -1212,7 +1221,7 @@ impl Store {
                 JoinRequestStatus::Pending.as_str(),
                 request.agent_public_key.as_str(),
                 request.fingerprint.as_str(),
-                request.requested_endpoint_id.as_deref(),
+                requested_endpoint_id.as_deref(),
                 request.hostname.as_str(),
                 request.agent_version.as_str(),
                 request.requested_labels_json.to_string(),
@@ -1238,7 +1247,7 @@ impl Store {
                 "fingerprint": request.fingerprint.clone(),
                 "hostname": request.hostname.clone(),
                 "agent_version": request.agent_version.clone(),
-                "requested_endpoint_id": request.requested_endpoint_id.clone(),
+                "requested_endpoint_id": requested_endpoint_id.clone(),
                 "requested_labels": request.requested_labels_json.clone(),
                 "correlation_id": correlation_id.clone(),
             })),
@@ -1284,6 +1293,13 @@ impl Store {
                 request_id: approval.request_id.clone(),
                 status: before.status.as_str().to_string(),
             });
+        }
+        if let Some(requested_endpoint_id) = &before.requested_endpoint_id
+            && requested_endpoint_id != &endpoint_id
+        {
+            return Err(StoreError::InvalidInput(
+                "approved endpoint_id must match requested_endpoint_id".to_string(),
+            ));
         }
         if get_endpoint_trust_tx(&tx, &endpoint_id)?.is_some() {
             return Err(StoreError::EndpointAlreadyExists(endpoint_id));

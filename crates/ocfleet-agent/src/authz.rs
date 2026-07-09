@@ -151,6 +151,9 @@ impl AgentAuthorization {
         if self.controllers.contains(target_endpoint_id) {
             return PathProbeDecision::TargetIsController;
         }
+        if !self.enabled_peers.contains(target_endpoint_id) {
+            return PathProbeDecision::Missing;
+        }
         let pair = (*controller_endpoint_id, *target_endpoint_id);
         if self.enabled_path_probes.contains(&pair) {
             PathProbeDecision::Allowed

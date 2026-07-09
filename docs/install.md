@@ -79,7 +79,8 @@ Create the agent user and directories:
 
 ```bash
 sudo useradd --system --home-dir /var/lib/ocfleet-agent --shell /usr/sbin/nologin ocfleet || true
-sudo install -d -o ocfleet -g ocfleet -m 0700 /etc/ocfleet-agent /var/lib/ocfleet-agent /var/log/ocfleet-agent
+sudo install -d -o root -g ocfleet -m 0750 /etc/ocfleet-agent
+sudo install -d -o ocfleet -g ocfleet -m 0700 /var/lib/ocfleet-agent /var/log/ocfleet-agent
 ```
 
 Generate an agent SecretKey:
@@ -122,6 +123,15 @@ EOF
 sudo chown root:ocfleet /etc/ocfleet-agent/agent.toml
 sudo chmod 0640 /etc/ocfleet-agent/agent.toml
 ```
+
+The agent fails closed if the config file is a symlink, hardlink, non-regular
+file, group/world-writable file, or if `/etc/ocfleet-agent` is group/world
+writable. Keep the owner as `root` or `ocfleet`.
+
+Audit writes are also fail-closed: if both the primary audit log and bounded
+spool cannot accept an event, the affected RPC fails instead of returning an
+unaudited success. Put `/var/log/ocfleet-agent` and `/var/lib/ocfleet-agent` on
+monitored storage with enough quota for the configured spool.
 
 Install the systemd unit:
 

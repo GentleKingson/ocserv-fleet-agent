@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
@@ -156,9 +156,22 @@ pub enum EnrollTokenCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum EnrollRequestCommand {
+    #[command(group(
+        ArgGroup::new("token_source")
+            .required(true)
+            .multiple(false)
+            .args(["token", "token_file", "token_stdin"])
+    ))]
     Create {
+        #[arg(
+            long,
+            help = "Enrollment token as a command-line argument (discouraged; prefer --token-file or --token-stdin)"
+        )]
+        token: Option<String>,
+        #[arg(long, value_name = "PATH")]
+        token_file: Option<PathBuf>,
         #[arg(long)]
-        token: String,
+        token_stdin: bool,
         #[arg(long)]
         agent_public_key: String,
         #[arg(long)]

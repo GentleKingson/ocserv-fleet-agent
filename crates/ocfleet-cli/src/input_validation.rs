@@ -5,6 +5,8 @@ const MAX_ACTOR_LEN: usize = 128;
 const MAX_REASON_LEN: usize = 256;
 const MAX_DESCRIPTION_LEN: usize = 256;
 const MAX_AGENT_VERSION_LEN: usize = 64;
+const MAX_AGENT_PUBLIC_KEY_LEN: usize = 256;
+const MAX_FINGERPRINT_LEN: usize = 128;
 const MAX_HOSTNAME_LEN: usize = 253;
 const MAX_SELECTOR_LEN: usize = 128;
 const MAX_LABEL_ENTRIES: usize = 32;
@@ -32,6 +34,16 @@ pub fn validate_description(value: &str) -> Result<(), String> {
 
 pub fn validate_agent_version(value: &str) -> Result<(), String> {
     validate_printable_text(value, "agent_version", MAX_AGENT_VERSION_LEN)
+}
+
+pub fn validate_agent_public_key(value: &str) -> Result<(), String> {
+    validate_printable_text(value, "agent_public_key", MAX_AGENT_PUBLIC_KEY_LEN)?;
+    validate_no_ascii_whitespace(value.trim(), "agent_public_key")
+}
+
+pub fn validate_agent_fingerprint(value: &str) -> Result<(), String> {
+    validate_printable_text(value, "fingerprint", MAX_FINGERPRINT_LEN)?;
+    validate_no_ascii_whitespace(value.trim(), "fingerprint")
 }
 
 pub fn validate_selector(value: &str) -> Result<(), String> {
@@ -128,4 +140,12 @@ fn validate_printable_text(value: &str, field: &'static str, max_len: usize) -> 
         return Err(format!("{field} must contain only printable ASCII"));
     }
     Ok(())
+}
+
+fn validate_no_ascii_whitespace(value: &str, field: &'static str) -> Result<(), String> {
+    if value.bytes().any(|byte| byte.is_ascii_whitespace()) {
+        Err(format!("{field} must not contain ASCII whitespace"))
+    } else {
+        Ok(())
+    }
 }

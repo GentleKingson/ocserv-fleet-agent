@@ -3,13 +3,15 @@ use ocfleet_protocol::method::{
     OCSERV_SESSIONS_SUMMARY, OCSERV_VERSION, classify_phase_one_method,
 };
 use ocfleet_protocol::ocserv::{
-    OcservCertExpiry, OcservCertExpiryResponse, OcservCertStatus, OcservConfigFingerprint,
-    OcservConfigFingerprintResponse, OcservFieldStatus, OcservFreshness, OcservReadonlyMeta,
-    OcservReadonlySource, OcservServiceEnabledState, OcservServiceState, OcservServiceSummary,
+    OcservCertExpiry, OcservCertExpiryResponse, OcservCertStatus, OcservCollectorStatus,
+    OcservConfigFingerprint, OcservConfigFingerprintResponse, OcservFieldStatus, OcservFreshness,
+    OcservLiveReadonlyMetadata, OcservReadonlyMeta, OcservReadonlySource,
+    OcservServiceEnabledState, OcservServiceState, OcservServiceSummary,
     OcservServiceSummaryRequest, OcservServiceSummaryResponse, OcservSessionsSummary,
     OcservSessionsSummaryRequest, OcservSessionsSummaryResponse, OcservVersionRequest,
     OcservVersionResponse, is_valid_ocserv_collected_at, is_valid_ocserv_name,
-    is_valid_ocserv_version, is_valid_sha256_hex, validate_ocserv_response_json_size,
+    is_valid_ocserv_version, is_valid_sha256_hex, is_valid_sha256_short_hex,
+    validate_ocserv_response_json_size,
 };
 use serde_json::json;
 
@@ -54,6 +56,10 @@ fn ocserv_enums_serialize_as_stable_snake_case() {
     assert_eq!(
         serde_json::to_value(OcservFieldStatus::Unavailable).expect("serialize field status"),
         json!("unavailable")
+    );
+    assert_eq!(
+        serde_json::to_value(OcservCollectorStatus::Partial).expect("serialize collector status"),
+        json!("partial")
     );
 }
 
@@ -111,6 +117,47 @@ fn ocserv_meta_collected_at_is_bounded() {
 }
 
 #[test]
+fn ocserv_live_metadata_is_bounded_low_sensitive_shape() {
+    assert!(is_valid_sha256_short_hex("abcdef123456"));
+    assert!(!is_valid_sha256_short_hex("gabcdef"));
+    assert!(!is_valid_sha256_short_hex(&"a".repeat(64)));
+
+    let response = OcservServiceSummaryResponse {
+        service: OcservServiceSummary {
+            state: OcservServiceState::Running,
+            enabled: OcservServiceEnabledState::Enabled,
+            since: None,
+        },
+        meta: meta(),
+        live: Some(OcservLiveReadonlyMetadata {
+            collector_status: OcservCollectorStatus::Ok,
+            last_snapshot_at: "2026-07-07T12:00:00Z".to_string(),
+            auth_failure_count_rolling: Some(2),
+            connection_failure_count_rolling: Some(1),
+            cert_min_days_remaining: Some(42),
+            config_fingerprint_short: Some("abcdef123456".to_string()),
+        }),
+    };
+    validate_ocserv_response_json_size(&response).expect("live response remains bounded");
+    let text = serde_json::to_string(&response).expect("serialize live response");
+
+    for forbidden in [
+        "username",
+        "client_ip",
+        "session_id",
+        "subject",
+        "serial",
+        "ocserv.conf",
+        "BEGIN CERTIFICATE",
+    ] {
+        assert!(
+            !text.contains(forbidden),
+            "forbidden marker leaked: {forbidden}"
+        );
+    }
+}
+
+#[test]
 fn ocserv_responses_are_closed_low_sensitive_shapes() {
     let response = OcservServiceSummaryResponse {
         service: OcservServiceSummary {
@@ -119,6 +166,7 @@ fn ocserv_responses_are_closed_low_sensitive_shapes() {
             since: Some("2026-07-07T12:00:00Z".to_string()),
         },
         meta: meta(),
+        live: None,
     };
     let value = serde_json::to_value(&response).expect("serialize service summary");
     let object = value.as_object().expect("response object");
@@ -155,6 +203,7 @@ fn ocserv_response_json_never_contains_forbidden_field_names() {
                 since: Some("2026-07-07T12:00:00Z".to_string()),
             },
             meta: meta(),
+            live: None,
         })
         .expect("service json"),
         serde_json::to_value(OcservVersionResponse {

@@ -68,6 +68,7 @@ impl OcservReadonlyProvider for SnapshotOcservReadonlyProvider {
         sanitize::service_summary(OcservServiceSummaryResponse {
             service,
             meta: snapshot_meta(snapshot.collected_at),
+            live: None,
         })
     }
 

@@ -4,9 +4,7 @@ use ocfleet_protocol::ocserv::{
     OcservServiceSummaryResponse, OcservSessionsSummaryResponse, OcservVersionResponse,
 };
 
-use crate::ocserv::{
-    CertificateExpiryProvider, ConfigFingerprintProvider, SnapshotOcservReadonlyProvider,
-};
+use crate::ocserv::{CertificateExpiryProvider, ConfigFingerprintProvider};
 
 pub trait OcservReadonlyProvider: Send + Sync {
     fn service_summary(&self) -> Result<OcservServiceSummaryResponse, OcservReadonlyError>;
@@ -96,14 +94,14 @@ fn truncate_to_boundary(value: &mut String, max_bytes: usize) {
 }
 
 pub struct CompositeOcservReadonlyProvider {
-    snapshot: SnapshotOcservReadonlyProvider,
+    snapshot: Box<dyn OcservReadonlyProvider>,
     certs: CertificateExpiryProvider,
     config: ConfigFingerprintProvider,
 }
 
 impl CompositeOcservReadonlyProvider {
     pub fn new(
-        snapshot: SnapshotOcservReadonlyProvider,
+        snapshot: Box<dyn OcservReadonlyProvider>,
         certs: CertificateExpiryProvider,
         config: ConfigFingerprintProvider,
     ) -> Self {

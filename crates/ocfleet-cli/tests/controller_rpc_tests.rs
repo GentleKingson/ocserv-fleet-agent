@@ -124,6 +124,14 @@ fn controller_rpc_ocserv_observation_summary_drops_raw_dto_fields() {
         OCSERV_SERVICE_SUMMARY,
         &json!({
             "service": {"state": "running", "enabled": "enabled", "since": "2026-07-08T00:00:00Z"},
+            "live": {
+                "collector_status": "ok",
+                "last_snapshot_at": "2026-07-08T00:00:00Z",
+                "auth_failure_count_rolling": 2,
+                "connection_failure_count_rolling": 1,
+                "cert_min_days_remaining": 42,
+                "config_fingerprint_short": "abcdef123456"
+            },
             "meta": {"source": "provider", "collected_at": "2026-07-08T00:00:00Z", "freshness": "live"},
             "username": "alice",
             "client_ip": "10.0.0.2",
@@ -134,6 +142,11 @@ fn controller_rpc_ocserv_observation_summary_drops_raw_dto_fields() {
     assert_eq!(service["result_class"], "low_sensitive_summary");
     assert_eq!(service["service_state"], "running");
     assert_eq!(service["service_enabled"], "enabled");
+    assert_eq!(service["collector_status"], "ok");
+    assert_eq!(service["auth_failure_count_rolling"], 2);
+    assert_eq!(service["connection_failure_count_rolling"], 1);
+    assert_eq!(service["cert_min_days_remaining"], 42);
+    assert_eq!(service["config_fingerprint_short"], "abcdef123456");
     assert!(service.get("service").is_none());
     assert!(service.get("meta").is_none());
 

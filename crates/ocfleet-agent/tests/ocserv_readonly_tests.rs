@@ -1,11 +1,12 @@
 use ocfleet_agent::ocserv::{
-    CertificateExpiryProvider, ConfigFingerprintProvider, DisabledOcservReadonlyProvider,
-    OcservReadonlyProvider, SnapshotOcservReadonlyProvider,
+    CertificateExpiryProvider, CollectorSnapshotOcservReadonlyProvider, ConfigFingerprintProvider,
+    DisabledOcservReadonlyProvider, OcservReadonlyProvider, SnapshotOcservReadonlyProvider,
 };
 use ocfleet_config::agent::{OcservCertificateConfig, OcservConfigFingerprintConfig};
 use ocfleet_protocol::error::ErrorCode;
-use ocfleet_protocol::ocserv::{OcservCertStatus, OcservFieldStatus};
+use ocfleet_protocol::ocserv::{OcservCertStatus, OcservCollectorStatus, OcservFieldStatus};
 use std::path::Path;
+use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 
 #[test]
 fn disabled_ocserv_provider_returns_low_sensitive_unavailable_error() {
@@ -135,6 +136,209 @@ fn snapshot_collected_at_rejects_path_like_content() {
         .expect_err("path-like collected_at rejected");
     assert_eq!(err.code(), ErrorCode::OcservProviderInvalidData);
     assert!(!err.message().contains("/etc/ocserv"));
+}
+
+#[test]
+fn collector_snapshot_provider_accepts_v2_low_sensitive_schema() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let snapshot = write_collector_snapshot(
+        dir.path(),
+        &format!(
+            r#"{{
+  "schema_version": "ocfleet.ocserv.snapshot.v2",
+  "collected_at": "{}",
+  "collector_status": "ok",
+  "service_state": "running",
+  "enabled_state": "enabled",
+  "version": "1.3.0",
+  "session_total": 12,
+  "auth_failure_count_rolling": 2,
+  "connection_failure_count_rolling": 1,
+  "cert_min_days_remaining": 42,
+  "config_fingerprint_short": "abcdef123456"
+}}"#,
+            fresh_timestamp()
+        ),
+    );
+    let provider = CollectorSnapshotOcservReadonlyProvider::new(snapshot);
+
+    let service = provider.service_summary().expect("service summary");
+    assert_eq!(service.service.state.to_string(), "running");
+    assert_eq!(service.service.enabled.to_string(), "enabled");
+    let live = service.live.expect("live metadata");
+    assert_eq!(live.collector_status, OcservCollectorStatus::Ok);
+    assert_eq!(live.auth_failure_count_rolling, Some(2));
+    assert_eq!(live.connection_failure_count_rolling, Some(1));
+    assert_eq!(live.cert_min_days_remaining, Some(42));
+    assert_eq!(
+        live.config_fingerprint_short.as_deref(),
+        Some("abcdef123456")
+    );
+
+    let version = provider.version().expect("version");
+    assert_eq!(version.version.as_deref(), Some("1.3.0"));
+    assert_eq!(version.status, OcservFieldStatus::Available);
+
+    let sessions = provider.sessions_summary().expect("sessions");
+    assert_eq!(sessions.sessions.total, Some(12));
+    assert_eq!(sessions.sessions.status, OcservFieldStatus::Available);
+}
+
+#[test]
+fn collector_snapshot_provider_rejects_stale_snapshot() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let snapshot = write_collector_snapshot(
+        dir.path(),
+        &format!(
+            r#"{{
+  "schema_version": "ocfleet.ocserv.snapshot.v2",
+  "collected_at": "{}",
+  "collector_status": "stale",
+  "service_state": "unknown",
+  "enabled_state": "unknown"
+}}"#,
+            stale_timestamp()
+        ),
+    );
+    let provider = CollectorSnapshotOcservReadonlyProvider::new(snapshot);
+
+    let err = provider
+        .service_summary()
+        .expect_err("stale collector snapshot rejected");
+    assert_eq!(err.code(), ErrorCode::OcservProviderUnavailable);
+    assert!(!err.message().contains("journal"));
+}
+
+#[test]
+fn collector_snapshot_provider_rejects_forbidden_fields() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let snapshot = write_collector_snapshot(
+        dir.path(),
+        &format!(
+            r#"{{
+  "schema_version": "ocfleet.ocserv.snapshot.v2",
+  "collected_at": "{}",
+  "collector_status": "ok",
+  "service_state": "running",
+  "enabled_state": "enabled",
+  "username": "alice"
+}}"#,
+            fresh_timestamp()
+        ),
+    );
+    let provider = CollectorSnapshotOcservReadonlyProvider::new(snapshot);
+
+    let err = provider
+        .service_summary()
+        .expect_err("forbidden field rejected");
+    assert_eq!(err.code(), ErrorCode::OcservProviderInvalidData);
+    assert!(!err.message().contains("alice"));
+}
+
+#[test]
+fn collector_snapshot_provider_rejects_oversized_string() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let snapshot = write_collector_snapshot(
+        dir.path(),
+        &format!(
+            r#"{{
+  "schema_version": "ocfleet.ocserv.snapshot.v2",
+  "collected_at": "{}",
+  "collector_status": "ok",
+  "service_state": "running",
+  "enabled_state": "enabled",
+  "version": "{}"
+}}"#,
+            fresh_timestamp(),
+            "1".repeat(65)
+        ),
+    );
+    let provider = CollectorSnapshotOcservReadonlyProvider::new(snapshot);
+
+    let err = provider.version().expect_err("oversized version rejected");
+    assert_eq!(err.code(), ErrorCode::OcservProviderInvalidData);
+}
+
+#[test]
+fn collector_snapshot_provider_rejects_invalid_schema() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let snapshot = write_collector_snapshot(
+        dir.path(),
+        &format!(
+            r#"{{
+  "schema_version": "ocfleet.ocserv.snapshot.v1",
+  "collected_at": "{}",
+  "collector_status": "ok",
+  "service_state": "running",
+  "enabled_state": "enabled"
+}}"#,
+            fresh_timestamp()
+        ),
+    );
+    let provider = CollectorSnapshotOcservReadonlyProvider::new(snapshot);
+
+    let err = provider
+        .service_summary()
+        .expect_err("invalid schema rejected");
+    assert_eq!(err.code(), ErrorCode::OcservProviderInvalidData);
+}
+
+#[test]
+fn collector_snapshot_provider_rejects_invalid_ranges_and_fingerprints() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let snapshot = write_collector_snapshot(
+        dir.path(),
+        &format!(
+            r#"{{
+  "schema_version": "ocfleet.ocserv.snapshot.v2",
+  "collected_at": "{}",
+  "collector_status": "ok",
+  "service_state": "running",
+  "enabled_state": "enabled",
+  "auth_failure_count_rolling": 1000001,
+  "config_fingerprint_short": "not-hex"
+}}"#,
+            fresh_timestamp()
+        ),
+    );
+    let provider = CollectorSnapshotOcservReadonlyProvider::new(snapshot);
+
+    let err = provider
+        .service_summary()
+        .expect_err("invalid ranges rejected");
+    assert_eq!(err.code(), ErrorCode::OcservProviderInvalidData);
+}
+
+#[test]
+fn collector_snapshot_provider_output_is_low_sensitive() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let snapshot = write_collector_snapshot(
+        dir.path(),
+        &format!(
+            r#"{{
+  "schema_version": "ocfleet.ocserv.snapshot.v2",
+  "collected_at": "{}",
+  "collector_status": "partial",
+  "service_state": "failed",
+  "enabled_state": "enabled",
+  "session_total": 0,
+  "cert_min_days_remaining": -1
+}}"#,
+            fresh_timestamp()
+        ),
+    );
+    let provider = CollectorSnapshotOcservReadonlyProvider::new(snapshot);
+    let text = serde_json::to_string(&provider.service_summary().expect("service")).expect("json");
+
+    for marker in [
+        "username",
+        "client_ip",
+        "session_id",
+        "/etc/ocserv",
+        "BEGIN CERTIFICATE",
+    ] {
+        assert!(!text.contains(marker), "forbidden marker leaked: {marker}");
+    }
 }
 
 #[test]
@@ -441,6 +645,25 @@ fn der_tlv(tag: u8, value: &[u8]) -> Vec<u8> {
     }
     out.extend_from_slice(value);
     out
+}
+
+fn write_collector_snapshot(dir: &Path, text: &str) -> std::path::PathBuf {
+    let snapshot = dir.join("ocserv-live-snapshot.json");
+    std::fs::write(&snapshot, text).expect("write collector snapshot");
+    make_private(&snapshot);
+    snapshot
+}
+
+fn fresh_timestamp() -> String {
+    OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .expect("format fresh timestamp")
+}
+
+fn stale_timestamp() -> String {
+    (OffsetDateTime::now_utc() - Duration::hours(2))
+        .format(&Rfc3339)
+        .expect("format stale timestamp")
 }
 
 #[cfg(unix)]

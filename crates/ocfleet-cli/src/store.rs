@@ -455,6 +455,17 @@ impl Store {
             .map_err(StoreError::from)
     }
 
+    pub fn list_nodes_limited(&self, limit: u64) -> Result<Vec<NodeRecord>, StoreError> {
+        let limit = u64_to_i64(limit)?;
+        let mut stmt = self.conn.prepare(
+            "SELECT node_id, endpoint_id, name, region, role, enabled
+             FROM nodes ORDER BY node_id LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit], node_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
     pub fn list_probe_history(
         &self,
         node_filter: Option<&str>,
@@ -537,6 +548,10 @@ impl Store {
     }
 
     pub fn insert_observability_job(&self, job: &ObservabilityJobRecord) -> Result<(), StoreError> {
+        validate_low_sensitive_json(&job.selector_json, "observability job selector")?;
+        if let Some(pair) = &job.pair_selector_json {
+            validate_low_sensitive_json(pair, "observability job pair selector")?;
+        }
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
             "INSERT INTO observability_jobs
@@ -568,6 +583,22 @@ impl Store {
              ORDER BY job_id",
         )?;
         let rows = stmt.query_map([], observability_job_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub fn list_observability_jobs_limited(
+        &self,
+        limit: u64,
+    ) -> Result<Vec<ObservabilityJobRecord>, StoreError> {
+        let limit = u64_to_i64(limit)?;
+        let mut stmt = self.conn.prepare(
+            "SELECT job_id, kind, selector_json, pair_selector_json, interval_seconds, jitter_seconds, timeout_ms, enabled, next_run_at, last_run_at, created_at, updated_at
+             FROM observability_jobs
+             ORDER BY job_id
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit], observability_job_from_row)?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(StoreError::from)
     }
@@ -659,6 +690,7 @@ impl Store {
     }
 
     pub fn insert_observability_run(&self, run: &ObservabilityRunInsert) -> Result<(), StoreError> {
+        validate_low_sensitive_json(&run.summary_json, "observability run summary")?;
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
             "INSERT INTO observability_runs
@@ -685,6 +717,7 @@ impl Store {
         status: &str,
         summary_json: &Value,
     ) -> Result<(), StoreError> {
+        validate_low_sensitive_json(summary_json, "observability run summary")?;
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
             "UPDATE observability_runs
@@ -742,6 +775,7 @@ impl Store {
         &self,
         observation: &ProbeObservationInsert,
     ) -> Result<(), StoreError> {
+        validate_low_sensitive_json(&observation.summary_json, "observation summary")?;
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
             "INSERT INTO probe_observations
@@ -873,6 +907,8 @@ impl Store {
         &self,
         snapshot: &HealthSnapshotRecord,
     ) -> Result<(), StoreError> {
+        validate_low_sensitive_json(&snapshot.degraded_methods_json, "health degraded methods")?;
+        validate_low_sensitive_json(&snapshot.summary_json, "health summary")?;
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
             "INSERT INTO health_snapshots
@@ -933,6 +969,7 @@ impl Store {
     }
 
     pub fn upsert_alert_event(&self, alert: &AlertEventRecord) -> Result<(), StoreError> {
+        validate_low_sensitive_json(&alert.detail_json, "alert detail")?;
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
             "INSERT INTO alert_events
@@ -974,6 +1011,22 @@ impl Store {
              ORDER BY last_seen_at DESC, alert_id",
         )?;
         let rows = stmt.query_map([], alert_event_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub fn list_alert_events_limited(
+        &self,
+        limit: u64,
+    ) -> Result<Vec<AlertEventRecord>, StoreError> {
+        let limit = u64_to_i64(limit)?;
+        let mut stmt = self.conn.prepare(
+            "SELECT alert_id, dedupe_key, node_id, severity, state, reason_code, first_seen_at, last_seen_at, last_sent_at, resolved_at, detail_json
+             FROM alert_events
+             ORDER BY last_seen_at DESC, alert_id
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit], alert_event_from_row)?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(StoreError::from)
     }
@@ -1828,8 +1881,32 @@ fn create_database_file_if_missing(path: &Path) -> Result<bool, StoreError> {
 }
 
 fn insert_audit_tx(tx: &Transaction<'_>, event: &AuditEvent) -> Result<(), StoreError> {
+    validate_actor(&event.actor).map_err(StoreError::InvalidInput)?;
+    if event.ts.len() > 64 || OffsetDateTime::parse(&event.ts, &Rfc3339).is_err() {
+        return Err(StoreError::InvalidInput(
+            "audit timestamp must be bounded RFC3339".to_string(),
+        ));
+    }
+    validate_audit_text(&event.event, "audit event", 128)?;
+    for (field, value, max) in [
+        ("audit node_id", event.node_id.as_deref(), 128_usize),
+        ("audit endpoint_id", event.endpoint_id.as_deref(), 128_usize),
+        ("audit method", event.method.as_deref(), 128_usize),
+        ("audit request_id", event.request_id.as_deref(), 128_usize),
+        ("audit params_hash", event.params_hash.as_deref(), 128_usize),
+        ("audit error_code", event.error_code.as_deref(), 128_usize),
+    ] {
+        if let Some(value) = value {
+            validate_audit_text(value, field, max)?;
+        }
+    }
+    validate_low_sensitive_json(&event.detail_json, "audit detail")?;
     let ok = event.ok.map(|v| if v { 1_i64 } else { 0_i64 });
-    let duration_ms = event.duration_ms.map(|v| v as i64);
+    let duration_ms = event
+        .duration_ms
+        .map(i64::try_from)
+        .transpose()
+        .map_err(|_| StoreError::InvalidInput("audit duration_ms exceeds i64".to_string()))?;
     tx.execute(
         "INSERT INTO controller_audit_log
          (ts, actor, event, node_id, endpoint_id, method, request_id, params_hash, ok, error_code, duration_ms, detail_json)
@@ -1849,6 +1926,21 @@ fn insert_audit_tx(tx: &Transaction<'_>, event: &AuditEvent) -> Result<(), Store
             event.detail_json.to_string(),
         ],
     )?;
+    Ok(())
+}
+
+fn validate_audit_text(value: &str, field: &str, max: usize) -> Result<(), StoreError> {
+    if value.is_empty()
+        || value.len() > max
+        || value
+            .bytes()
+            .any(|byte| !byte.is_ascii() || byte.is_ascii_control())
+        || forbidden_stored_value(value, None)
+    {
+        return Err(StoreError::InvalidInput(format!(
+            "{field} is not a bounded low-sensitive value"
+        )));
+    }
     Ok(())
 }
 
@@ -2409,6 +2501,200 @@ fn validate_health_policy(policy: &HealthPolicyRecord) -> Result<(), StoreError>
         ));
     }
     Ok(())
+}
+
+pub(crate) fn validate_low_sensitive_json(value: &Value, field: &str) -> Result<(), StoreError> {
+    const MAX_BYTES: usize = 16 * 1024;
+    let encoded = serde_json::to_vec(value)
+        .map_err(|err| StoreError::InvalidInput(format!("{field} is invalid JSON: {err}")))?;
+    if encoded.len() > MAX_BYTES {
+        return Err(StoreError::InvalidInput(format!(
+            "{field} exceeds {MAX_BYTES} bytes"
+        )));
+    }
+    let mut entries = 0_usize;
+    validate_low_sensitive_json_value(value, field, 0, &mut entries, None)
+}
+
+fn validate_low_sensitive_json_value(
+    value: &Value,
+    field: &str,
+    depth: usize,
+    entries: &mut usize,
+    key_context: Option<&str>,
+) -> Result<(), StoreError> {
+    const MAX_DEPTH: usize = 8;
+    const MAX_ENTRIES: usize = 256;
+    const MAX_STRING_BYTES: usize = 512;
+
+    if depth > MAX_DEPTH {
+        return Err(StoreError::InvalidInput(format!(
+            "{field} exceeds nesting limit"
+        )));
+    }
+    match value {
+        Value::Object(map) => {
+            for (key, value) in map {
+                *entries += 1;
+                if *entries > MAX_ENTRIES {
+                    return Err(StoreError::InvalidInput(format!(
+                        "{field} exceeds entry limit"
+                    )));
+                }
+                if key.len() > 64 || forbidden_stored_key(key) {
+                    return Err(StoreError::InvalidInput(format!(
+                        "{field} contains a forbidden field"
+                    )));
+                }
+                validate_low_sensitive_json_value(value, field, depth + 1, entries, Some(key))?;
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                *entries += 1;
+                if *entries > MAX_ENTRIES {
+                    return Err(StoreError::InvalidInput(format!(
+                        "{field} exceeds entry limit"
+                    )));
+                }
+                validate_low_sensitive_json_value(value, field, depth + 1, entries, key_context)?;
+            }
+        }
+        Value::String(value) => {
+            if value.len() > MAX_STRING_BYTES
+                || value
+                    .bytes()
+                    .any(|byte| !byte.is_ascii() || byte.is_ascii_control())
+                || forbidden_stored_value(value, key_context)
+            {
+                return Err(StoreError::InvalidInput(format!(
+                    "{field} contains an unsafe string"
+                )));
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+    Ok(())
+}
+
+fn forbidden_stored_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    if matches!(key.as_str(), "token_id" | "hmac_key_id" | "key_id") {
+        return false;
+    }
+    let compact = key
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .collect::<String>();
+    if [
+        "body",
+        "user_name",
+        "client_ip",
+        "client_address",
+        "ip_address",
+        "assigned_vpn_ip",
+        "session_id",
+        "session_token",
+        "certificate_san",
+        "certificate_pem",
+        "private_key",
+        "config_content",
+        "provider_selector",
+    ]
+    .contains(&key.as_str())
+    {
+        return true;
+    }
+    if [
+        "rawbody",
+        "username",
+        "clientip",
+        "sessionid",
+        "sessiontoken",
+        "privatekey",
+        "apitoken",
+        "apikey",
+        "hmackey",
+        "authorization",
+        "bearertoken",
+        "stdout",
+        "stderr",
+    ]
+    .iter()
+    .any(|marker| compact.contains(marker))
+    {
+        return true;
+    }
+    key.split(['_', '-']).any(|segment| {
+        matches!(
+            segment,
+            "raw"
+                | "stdout"
+                | "stderr"
+                | "username"
+                | "user"
+                | "account"
+                | "password"
+                | "secret"
+                | "credential"
+                | "token"
+                | "cookie"
+                | "authorization"
+                | "san"
+                | "subject"
+                | "issuer"
+                | "serial"
+                | "command"
+                | "shell"
+                | "script"
+                | "journal"
+        )
+    })
+}
+
+fn forbidden_stored_value(value: &str, key_context: Option<&str>) -> bool {
+    let value = value.to_ascii_lowercase();
+    if [
+        "/etc/",
+        "/home/",
+        "/users/",
+        "/run/secrets/",
+        "/var/log",
+        "systemctl",
+        "journalctl",
+        "occtl",
+        "shell.exec",
+        "command.run",
+        "file.read",
+        "username",
+        "client_ip",
+        "session_id",
+        "password=",
+        "password:",
+        "secret=",
+        "secret:",
+        "token=",
+        "token:",
+        "authorization:",
+        "bearer ",
+        "-----begin certificate-----",
+        "-----begin private key-----",
+    ]
+    .iter()
+    .any(|marker| value.contains(marker))
+    {
+        return true;
+    }
+    let contains_ip = value
+        .split(|character: char| !(character.is_ascii_hexdigit() || matches!(character, '.' | ':')))
+        .any(|part| {
+            let sentence_trimmed = part.trim_end_matches(['.', ':']);
+            part.parse::<std::net::IpAddr>().is_ok()
+                || part.parse::<std::net::SocketAddr>().is_ok()
+                || sentence_trimmed.parse::<std::net::IpAddr>().is_ok()
+                || sentence_trimmed.parse::<std::net::SocketAddr>().is_ok()
+        });
+    contains_ip && !matches!(key_context, Some("endpoint_host" | "host_allow"))
 }
 
 fn validate_u64_range(name: &str, value: u64, min: u64, max: u64) -> Result<(), StoreError> {

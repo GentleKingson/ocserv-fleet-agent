@@ -57,7 +57,7 @@ fn observability_store_tests_inserts_webhook_hook_and_delivery_attempt() {
         hook_id: "webhook-1".to_string(),
         name: "ops".to_string(),
         hook_type: "webhook".to_string(),
-        endpoint_url: "https://93.184.216.34/alerts?token=redacted-in-output".to_string(),
+        endpoint_url: "https://93.184.216.34/alerts".to_string(),
         endpoint_url_redacted: "https://93.184.216.34/<redacted>".to_string(),
         endpoint_host: "93.184.216.34".to_string(),
         host_allow: vec!["93.184.216.34".to_string()],
@@ -186,6 +186,61 @@ fn observability_store_tests_inserts_and_lists_probe_observation() {
     assert_eq!(observations[0].ok, observation.ok);
     assert_eq!(observations[0].duration_ms, observation.duration_ms);
     assert_eq!(observations[0].summary_json, observation.summary_json);
+}
+
+#[test]
+fn observability_store_tests_rejects_forbidden_or_unbounded_summary_storage() {
+    let (_dir, store, _db) = open_temp_store();
+    for summary_json in [
+        json!({"username": "alice"}),
+        json!({"user": "alice"}),
+        json!({"client_address": "10.0.0.2"}),
+        json!({"secret": "hunter2"}),
+        json!({"api_token": "opaque123"}),
+        json!({"sessionToken": "opaque123"}),
+        json!({"authorization": "opaque123"}),
+        json!({"cookie": "opaque123"}),
+        json!({"cert_san": "vpn.example.test"}),
+        json!({"message": "client_ip=10.0.0.2"}),
+        json!({"message": "10.0.0.2"}),
+        json!({"message": "peer=10.0.0.2"}),
+        json!({"message": "peer=10.0.0.2:443"}),
+        json!({"message": "from 10.0.0.2."}),
+        json!({"message": "peer 10.0.0.2:"}),
+        json!({"message": "peer=[2001:db8::1]"}),
+        json!({"raw_body": "opaque"}),
+        json!({"value": "x".repeat(513)}),
+        json!({"values": (0..257).collect::<Vec<_>>() }),
+    ] {
+        let observation = ProbeObservationInsert {
+            observation_id: format!("obs-{}", uuid::Uuid::new_v4()),
+            run_id: None,
+            node_id: Some("hk-ocserv-01".to_string()),
+            endpoint_id: Some("endpoint-1".to_string()),
+            method: "probe.controller.ping".to_string(),
+            ok: Some(false),
+            error_code: Some("RPC_TIMEOUT".to_string()),
+            duration_ms: Some(42),
+            observed_at: "2026-07-08T07:30:00Z".to_string(),
+            expires_at: None,
+            result_class: "controller_rpc_summary".to_string(),
+            summary_json,
+        };
+        let result = store.insert_probe_observation(&observation);
+        assert!(
+            result.is_err(),
+            "unsafe summary was accepted: {}",
+            observation.summary_json
+        );
+        let err = result.expect_err("checked error");
+        assert!(err.to_string().contains("observation summary"));
+    }
+    assert!(
+        store
+            .list_probe_observations(None, 10)
+            .expect("list observations")
+            .is_empty()
+    );
 }
 
 #[test]

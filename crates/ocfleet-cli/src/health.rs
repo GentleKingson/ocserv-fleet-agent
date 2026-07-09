@@ -100,6 +100,7 @@ struct NodeHealth {
     last_success_at: Option<String>,
     last_failure_at: Option<String>,
     last_error_code: Option<String>,
+    consecutive_unreachable_failures: u64,
     degraded_methods: Vec<String>,
 }
 
@@ -116,6 +117,7 @@ impl NodeHealth {
             "last_success_at": self.last_success_at,
             "last_failure_at": self.last_failure_at,
             "last_error_code": self.last_error_code,
+            "consecutive_unreachable_failures": self.consecutive_unreachable_failures,
             "degraded_methods": self.degraded_methods,
         })
     }
@@ -278,6 +280,7 @@ fn compute_node_health(
             .and_then(|record| record.error_code.clone())
     });
     let degraded_methods = degraded_methods(&observations);
+    let unreachable_failures = consecutive_unreachable_controller_ping_failures(&observations);
 
     let status = if !node.enabled {
         HealthStatus::Disabled
@@ -287,7 +290,7 @@ fn compute_node_health(
         HealthStatus::Unknown
     } else if latest_is_stale_or_expired(generated_at, &observations, policy.stale_window_seconds) {
         HealthStatus::Stale
-    } else if latest_controller_ping_is_unreachable(&observations) {
+    } else if unreachable_failures >= policy.unreachable_consecutive_failures {
         HealthStatus::Unreachable
     } else if !degraded_methods.is_empty() || latest_controller_ping_failed(&observations) {
         HealthStatus::Degraded
@@ -306,6 +309,7 @@ fn compute_node_health(
         last_success_at,
         last_failure_at,
         last_error_code,
+        consecutive_unreachable_failures: unreachable_failures,
         degraded_methods,
     })
 }
@@ -366,14 +370,24 @@ fn latest_is_stale_or_expired(
         .is_none_or(|freshness| freshness > stale_window_seconds)
 }
 
-fn latest_controller_ping_is_unreachable(observations: &[ProbeObservationRecord]) -> bool {
-    latest_for_method(observations, PROBE_CONTROLLER_PING).is_some_and(|record| {
-        record.ok == Some(false)
-            && record
-                .error_code
-                .as_deref()
-                .is_some_and(is_unreachable_error_code)
-    })
+fn consecutive_unreachable_controller_ping_failures(
+    observations: &[ProbeObservationRecord],
+) -> u64 {
+    let mut pings = observations
+        .iter()
+        .filter(|record| record.method == PROBE_CONTROLLER_PING)
+        .collect::<Vec<_>>();
+    pings.sort_by(|left, right| right.observed_at.cmp(&left.observed_at));
+    pings
+        .into_iter()
+        .take_while(|record| {
+            record.ok == Some(false)
+                && record
+                    .error_code
+                    .as_deref()
+                    .is_some_and(is_unreachable_error_code)
+        })
+        .count() as u64
 }
 
 fn latest_controller_ping_failed(observations: &[ProbeObservationRecord]) -> bool {
@@ -507,6 +521,7 @@ fn upsert_health_snapshot(
             "role": row.role,
             "status": row.status.as_str(),
             "endpoint_status": row.endpoint_status,
+            "consecutive_failures": row.consecutive_unreachable_failures,
         }),
     })?;
     Ok(())

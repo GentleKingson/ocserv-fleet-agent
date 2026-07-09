@@ -21,6 +21,7 @@ pub const MAX_WEBHOOK_ATTEMPTS: u64 = 5;
 pub const MAX_WEBHOOK_RESPONSE_BYTES: usize = 4 * 1024;
 pub const MAX_HMAC_SECRET_BYTES: usize = 4 * 1024;
 pub const MIN_HMAC_SECRET_BYTES: usize = 16;
+const MAX_WEBHOOK_PATH_BYTES: usize = 128;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatedWebhookEndpoint {
@@ -151,6 +152,22 @@ pub fn validate_webhook_endpoint(
     }
     if url.fragment().is_some() {
         bail!("webhook URL must not contain a fragment");
+    }
+    if url.query().is_some() {
+        bail!("webhook URL must not contain a query; store secrets only in the private HMAC file");
+    }
+    let path = url.path();
+    if path.len() > MAX_WEBHOOK_PATH_BYTES
+        || !path.bytes().all(|byte| {
+            byte == b'/'
+                || byte.is_ascii_alphanumeric()
+                || matches!(byte, b'.' | b'_' | b'-' | b'~')
+        })
+    {
+        bail!("webhook URL path must be a bounded non-secret path");
+    }
+    if !matches!(path, "/" | "/alerts" | "/webhook" | "/ocfleet/alerts") {
+        bail!("webhook URL path is not in the fixed low-sensitive path catalog");
     }
     let host = url
         .host_str()

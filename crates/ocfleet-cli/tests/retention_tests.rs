@@ -252,6 +252,7 @@ fn retention_tests_apply_dry_run_does_not_delete() {
     let database_arg = database.to_string_lossy().into_owned();
     let store = Store::open(&database).expect("open store");
     insert_observation(&store, "obs-old", "2026-01-01T00:00:00Z");
+    let audit_count_before = store.audit_count().expect("count audit before dry-run");
     drop(store);
 
     let output = run_ocfleet(&[
@@ -270,6 +271,11 @@ fn retention_tests_apply_dry_run_does_not_delete() {
     assert!(stdout.contains("dry_run=true"));
 
     let store = Store::open(&database).expect("reopen store");
+    assert_eq!(
+        store.audit_count().expect("count audit after dry-run"),
+        audit_count_before,
+        "retention dry-run must not write audit rows"
+    );
     assert_eq!(
         store
             .list_probe_observations(None, 10)

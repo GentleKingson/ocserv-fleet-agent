@@ -1,9 +1,13 @@
 [package]
 name = "ocfleet-cli"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+
+[features]
+default = []
+postgres-backend = []
 
 [[bin]]
 name = "ocfleet"
@@ -23,6 +27,7 @@ ring.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_yaml_ng.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 time.workspace = true

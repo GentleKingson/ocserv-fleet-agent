@@ -309,7 +309,7 @@ fn health_summary_tests_cert_expiring_status_reports_degraded() {
 }
 
 #[test]
-fn health_summary_tests_recent_controller_ping_failed_reports_unreachable() {
+fn health_summary_tests_one_recent_controller_ping_failure_reports_degraded() {
     let dir = tempfile::tempdir().expect("temp dir");
     let database = dir.path().join("controller.sqlite");
     let database_arg = database.to_string_lossy().into_owned();
@@ -340,7 +340,7 @@ fn health_summary_tests_recent_controller_ping_failed_reports_unreachable() {
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     assert!(stdout.contains("node_id=hk-ocserv-01"));
-    assert!(stdout.contains("status=unreachable"));
+    assert!(stdout.contains("status=degraded"));
     assert!(stdout.contains("last_error_code=RPC_TIMEOUT"));
 }
 

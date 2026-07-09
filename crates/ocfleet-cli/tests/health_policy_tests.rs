@@ -254,6 +254,14 @@ fn health_policy_tests_unreachable_failure_threshold_controls_alerts() {
 
     assert_eq!(value["alerts"][0]["reason_code"], "NODE_UNREACHABLE");
     assert_eq!(value["alerts"][0]["summary"]["consecutive_failures"], 2);
+    let health = run_ocfleet(&[
+        "--database",
+        &database_arg,
+        "health",
+        "node",
+        "hk-ocserv-01",
+    ]);
+    assert!(String::from_utf8_lossy(&health.stdout).contains("status=unreachable"));
 }
 
 #[test]

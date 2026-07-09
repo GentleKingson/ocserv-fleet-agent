@@ -72,7 +72,7 @@ async fn main() -> anyhow::Result<()> {
             event.ok = Some(true);
             event.detail_json = serde_json::json!({
                 "created_database": opened.created_database,
-                "created_secret_key": secret_key.created,
+                "created_identity_file": secret_key.created,
                 "schema_version": store.current_schema_version()?,
             });
             store.insert_audit(&event)?;
@@ -456,6 +456,7 @@ fn resolve_enrollment_token(
     token_file: Option<PathBuf>,
     token_stdin: bool,
 ) -> anyhow::Result<String> {
+    const MAX_ENROLLMENT_TOKEN_BYTES: usize = 512;
     let source_count =
         usize::from(token.is_some()) + usize::from(token_file.is_some()) + usize::from(token_stdin);
     if source_count != 1 {
@@ -467,15 +468,24 @@ fn resolve_enrollment_token(
     let raw = if let Some(token) = token {
         token
     } else if let Some(path) = token_file {
-        std::fs::read_to_string(&path)
-            .with_context(|| format!("failed to read enrollment token file: {}", path.display()))?
+        let file = ocfleet_cli::private_file::open_existing_private_read(&path)
+            .with_context(|| "failed to open private enrollment token file")?;
+        let mut text = String::new();
+        file.take((MAX_ENROLLMENT_TOKEN_BYTES + 1) as u64)
+            .read_to_string(&mut text)
+            .context("failed to read enrollment token file")?;
+        text
     } else {
         let mut text = String::new();
         std::io::stdin()
+            .take((MAX_ENROLLMENT_TOKEN_BYTES + 1) as u64)
             .read_to_string(&mut text)
             .context("failed to read enrollment token from stdin")?;
         text
     };
+    if raw.len() > MAX_ENROLLMENT_TOKEN_BYTES {
+        bail!("enrollment token exceeds {MAX_ENROLLMENT_TOKEN_BYTES} bytes");
+    }
     let token = raw.trim_end_matches(['\r', '\n']).to_string();
     if token.is_empty() {
         bail!("enrollment token must not be empty");
@@ -1114,7 +1124,7 @@ fn run_probe_topology_command(store: &Store) -> anyhow::Result<()> {
         "disabled_node_count": disabled_node_count,
         "registry_potential_pair_count": registry_potential_pair_count,
         "registry_authorizes_probe": false,
-        "authoritative_authorization": "security.path_probes+security.peers",
+        "authoritative_policy": "security.path_probes+security.peers",
         "topology_discovery": false,
         "no_probe_executed": true,
         "no_config_generated": true,
@@ -1161,9 +1171,9 @@ fn run_probe_summary_command(
         "target_endpoint_id": target_endpoint_id,
         "target_status": target_status,
         "registry_authorizes_probe": false,
-        "required_source_authorization": "security.path_probes",
-        "required_target_authorization": "security.peers",
-        "supported_commands": ["probe ping", "probe path"],
+        "required_source_policy": "security.path_probes",
+        "required_target_policy": "security.peers",
+        "supported_probe_methods": ["probe.controller.ping", "probe.path.echo"],
         "no_probe_executed": true,
     });
     store.insert_audit(&event)?;

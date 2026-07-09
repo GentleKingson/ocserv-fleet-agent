@@ -299,7 +299,7 @@ Rules:
   `health-snapshots`, and `alert-events`.
 - retention must not delete node registry rows, endpoint trust rows,
   enrollment rows, current scheduler configuration, or controller audit rows.
-- retention apply runs must write controller audit metadata about row counts,
+- non-dry-run retention apply runs must write controller audit metadata about row counts,
   scope, cutoff, and report checksum.
 
 ## Current CLI And API Surface
@@ -406,10 +406,11 @@ ocfleet retention apply --scope observations --batch-size 1000 --limit 10000
 Retention commands modify retention policy and prune local SQLite history only.
 They do not call agents. `retention explain` reports the effective policy,
 cutoff, matched count, and oldest/newest candidate timestamps without deleting
-rows or writing audit. `retention apply` reports `matched_count`, cutoff, policy
-row cap, oldest/newest candidate timestamps, deleted rows, batch count, and a
-SHA-256 report checksum. Actual deletes are split into bounded batches;
-controller audit rows are never deleted by retention.
+rows or writing audit. `retention apply --dry-run` likewise performs no delete
+and writes no audit row. A non-dry-run `retention apply` reports
+`matched_count`, cutoff, policy row cap, oldest/newest candidate timestamps,
+deleted rows, batch count, and a SHA-256 report checksum. Actual deletes are
+split into bounded batches; controller audit rows are never deleted by retention.
 
 ### Alerts
 
@@ -420,7 +421,7 @@ ocfleet alert list --state open --severity critical --node hk-ocserv-01 --json
 ocfleet alert test jsonl_file:./private-alerts/test.jsonl
 ocfleet alert deliver --hook jsonl_file:./private-alerts/alerts.jsonl --limit 100
 ocfleet alert deliver --hook jsonl_file:./private-alerts/alerts.jsonl --limit 100 --dry-run
-ocfleet alert hook add-webhook --name ops-alerts --url https://alerts.example.com/ocfleet --hmac-secret-file ./webhook.secret --host-allow alerts.example.com
+ocfleet alert hook add-webhook --name ops-alerts --url https://alerts.example.com/ocfleet/alerts --hmac-secret-file ./webhook.secret --host-allow alerts.example.com
 ocfleet alert hook list --json
 ocfleet alert hook test <hook-id> --dry-run --hmac-secret-file ./webhook.secret
 ocfleet alert deliver --hook webhook:<hook-id> --limit 100 --dry-run
@@ -549,7 +550,7 @@ Phase 12 keeps the project security posture:
   journal selectors, scripts, or file selectors.
 - no automatic trust generation, no TOFU, no automatic path-probe
   authorization, and no mesh enumeration.
-- all scheduler job creation, enable/disable, one-shot runs, retention apply,
+- all scheduler job creation, enable/disable, one-shot runs, non-dry-run retention apply,
   alert silence, alert resolve, and audit export operations write controller
   audit entries.
 - dashboard/API reads use a read-only SQLite connection and must not mutate
@@ -559,12 +560,12 @@ Phase 12 keeps the project security posture:
 
 Health state is derived, not authoritative. Current CLI status labels are:
 
-- `healthy`: recent relevant observations succeeded and no active alert affects the
-  scope.
+- `healthy`: recent relevant observations succeeded and no current observation
+  indicates degradation. Alert state is reported separately and is not a health input.
 - `degraded`: at least one scheduled method is unavailable, stale, or failed,
   but enough observations remain available for useful status.
-- `unreachable`: endpoint trust is inactive or recent controller ping failures
-  indicate the node cannot be reached.
+- `unreachable`: endpoint trust is inactive or consecutive controller ping
+  failures meet the configured unreachable threshold.
 - `stale`: observations exist but are older than the configured health window.
 - `disabled`: the controller registry node is disabled.
 - `unknown`: no relevant observations exist yet.

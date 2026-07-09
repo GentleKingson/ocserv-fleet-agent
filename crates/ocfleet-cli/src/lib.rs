@@ -18,5 +18,6 @@ pub mod retention;
 pub mod rpc_client;
 pub mod scheduler;
 pub mod store;
+pub mod trust_policy;
 
 pub const CLI_VERSION: &str = env!("CARGO_PKG_VERSION");

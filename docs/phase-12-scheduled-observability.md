@@ -445,7 +445,7 @@ See `docs/alert-delivery-jsonl.md` for the JSONL payload schema and
 
 ```bash
 ocfleet audit export --from 2026-07-01T00:00:00Z --to 2026-07-08T00:00:00Z --format jsonl --output ./audit-export.jsonl
-ocfleet audit export --from 2026-07-01T00:00:00Z --to 2026-07-08T00:00:00Z --output ./audit-export.jsonl --redact strict --include-checksum
+ocfleet audit export --from 2026-07-01T00:00:00Z --to 2026-07-08T00:00:00Z --output ./audit-export.jsonl --redact strict --include-checksum --sign-with-key-file ./audit-signing-key.pk8
 ```
 
 Audit export reads bounded windows from controller SQLite and writes sanitized
@@ -453,9 +453,11 @@ controller audit records as JSONL. The window is mandatory and capped, row count
 is bounded by `--max-rows`, output uses private `0600` create-new files under a
 private `0700` parent, and `--include-checksum` writes a SHA-256 sidecar. Default
 redaction hides secret-like fields; strict redaction hashes actor, node,
-endpoint, and request identifiers. The `audit.export` audit row is written after
-the file is produced, so it is not included in that export window snapshot. See
-`docs/audit-export.md` for redaction mode and private output path details.
+endpoint, and request identifiers. `--sign-with-key-file` writes an optional
+Ed25519 signature sidecar from a private PKCS#8 key file. The `audit.export`
+audit row is written after the file is produced, so it is not included in that
+export window snapshot. See `docs/audit-export.md` for redaction mode, signing,
+and private output path details.
 
 ### Experimental Read-only Web/API Dashboard
 
@@ -625,7 +627,7 @@ ocfleet alert silence <dedupe-key> --for-duration 24h --reason "smoke silence"
 ocfleet alert resolve <dedupe-key> --reason "smoke resolved"
 
 ocfleet audit export --from 2026-07-01T00:00:00Z --to 2026-07-08T00:00:00Z --format jsonl --output ./audit-export.jsonl
-ocfleet audit export --from 2026-07-01T00:00:00Z --to 2026-07-08T00:00:00Z --output ./audit-export.jsonl --redact default --include-checksum
+ocfleet audit export --from 2026-07-01T00:00:00Z --to 2026-07-08T00:00:00Z --output ./audit-export.jsonl --redact default --include-checksum --sign-with-key-file ./audit-signing-key.pk8
 ```
 
 Additional acceptance requirements:

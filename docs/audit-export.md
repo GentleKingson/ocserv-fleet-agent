@@ -14,6 +14,7 @@ ocfleet audit export \
   --output /var/lib/ocfleet-controller/exports/audit-20260701.jsonl \
   --redact default \
   --include-checksum \
+  --sign-with-key-file /var/lib/ocfleet-controller/audit-signing-key.pk8 \
   --max-rows 10000
 ```
 
@@ -47,6 +48,12 @@ When `--include-checksum` is set, a SHA-256 sidecar is written next to the JSONL
 file. The `audit.export` audit row is written after the export snapshot is
 produced, so that audit row is not included in the same output file.
 
+When `--sign-with-key-file` is set, `ocfleet` reads an Ed25519 PKCS#8 private
+key from a private file and writes an `.sig` JSON sidecar next to the export.
+The sidecar contains the algorithm, signed file name, content SHA-256, public
+key, signature, and signing timestamp. It does not contain the private key or key
+file path. Signing is optional and does not change the exported JSONL payload.
+
 ## Verification
 
 ```bash
@@ -56,3 +63,8 @@ sha256sum -c audit-20260701.jsonl.sha256
 On platforms without `sha256sum`, use an equivalent SHA-256 tool and compare the
 digest in the sidecar. Keep exported files private and delete them according to
 your local audit retention policy.
+
+For signed exports, verify the `.sig` sidecar with the included Ed25519 public
+key and the exact JSONL bytes. Rotate signing keys by creating a new private key
+file, storing it under a private `0700` parent directory with `0600` file mode,
+and recording the public key fingerprint in your archive inventory.

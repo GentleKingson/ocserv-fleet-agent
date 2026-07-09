@@ -1,7 +1,9 @@
 use anyhow::{Context, bail};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use ring::signature::{Ed25519KeyPair, KeyPair};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 
@@ -16,6 +18,7 @@ pub const DEFAULT_MAX_AUDIT_EXPORT_ROWS: usize = 10_000;
 const MAX_AUDIT_EXPORT_ROWS: usize = 100_000;
 const MAX_AUDIT_EXPORT_RECORD_BYTES: usize = 16 * 1024;
 const MAX_AUDIT_EXPORT_BYTES: usize = 64 * 1024 * 1024;
+const MAX_AUDIT_EXPORT_SIGNING_KEY_BYTES: usize = 16 * 1024;
 const AUDIT_EXPORT_FAILED: &str = "AUDIT_EXPORT_FAILED";
 const AUDIT_EXPORT_TOO_MANY_ROWS: &str = "AUDIT_EXPORT_TOO_MANY_ROWS";
 
@@ -28,6 +31,7 @@ pub fn run_audit_command(store: &Store, command: AuditCommand) -> anyhow::Result
             output,
             redact,
             include_checksum,
+            sign_with_key_file,
             max_rows,
         } => run_audit_export(
             store,
@@ -38,6 +42,7 @@ pub fn run_audit_command(store: &Store, command: AuditCommand) -> anyhow::Result
                 output,
                 redact,
                 include_checksum,
+                sign_with_key_file,
                 max_rows,
             },
         ),
@@ -51,6 +56,7 @@ struct AuditExportOptions {
     output: PathBuf,
     redact: RedactionMode,
     include_checksum: bool,
+    sign_with_key_file: Option<PathBuf>,
     max_rows: usize,
 }
 
@@ -62,11 +68,14 @@ fn run_audit_export(store: &Store, options: AuditExportOptions) -> anyhow::Resul
             write_audit_export_audit(
                 store,
                 &options,
-                true,
-                summary.row_count,
-                summary.checksum.as_deref(),
+                AuditExportAuditOutcome {
+                    ok: true,
+                    row_count: summary.row_count,
+                    checksum: summary.checksum.as_deref(),
+                    signature: summary.signature.as_ref(),
+                    error_code: None,
+                },
                 &output_path_hash,
-                None,
             )?;
             println!("status=ok");
             println!("format=jsonl");
@@ -76,6 +85,10 @@ fn run_audit_export(store: &Store, options: AuditExportOptions) -> anyhow::Resul
             if let Some(checksum) = summary.checksum {
                 println!("checksum={checksum}");
             }
+            if summary.signature.is_some() {
+                println!("signature_algorithm=Ed25519");
+                println!("signature_sidecar=written");
+            }
             Ok(())
         }
         Err(err) => {
@@ -83,11 +96,14 @@ fn run_audit_export(store: &Store, options: AuditExportOptions) -> anyhow::Resul
             let _ = write_audit_export_audit(
                 store,
                 &options,
-                false,
-                0,
-                None,
+                AuditExportAuditOutcome {
+                    ok: false,
+                    row_count: 0,
+                    checksum: None,
+                    signature: None,
+                    error_code: Some(error_code),
+                },
                 &output_path_hash,
-                Some(error_code),
             );
             Err(err)
         }
@@ -98,6 +114,12 @@ struct AuditExportSummary {
     row_count: usize,
     bytes_written: usize,
     checksum: Option<String>,
+    signature: Option<SignatureSummary>,
+}
+
+struct SignatureSummary {
+    algorithm: &'static str,
+    public_key_fingerprint: String,
 }
 
 fn run_audit_export_inner(
@@ -125,6 +147,14 @@ fn run_audit_export_inner(
     }
     let checksum =
         write_jsonl_file(&options.output, &lines).with_context(|| "audit export failed")?;
+    let signature = if let Some(key_file) = &options.sign_with_key_file {
+        Some(
+            write_signature_sidecar(&options.output, &lines, key_file, &checksum)
+                .with_context(|| "audit export signing failed")?,
+        )
+    } else {
+        None
+    };
     let checksum = if options.include_checksum {
         write_checksum_sidecar(&options.output, &checksum)
             .with_context(|| "audit export failed")?;
@@ -136,6 +166,7 @@ fn run_audit_export_inner(
         row_count: rows.len(),
         bytes_written,
         checksum,
+        signature,
     })
 }
 
@@ -286,26 +317,91 @@ fn write_checksum_sidecar(path: &Path, checksum: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn write_signature_sidecar(
+    path: &Path,
+    lines: &[Vec<u8>],
+    key_file: &Path,
+    content_sha256: &str,
+) -> anyhow::Result<SignatureSummary> {
+    let key_bytes = read_signing_key_file(key_file)?;
+    let key_pair = Ed25519KeyPair::from_pkcs8(&key_bytes)
+        .map_err(|_| anyhow::anyhow!("invalid Ed25519 PKCS#8 signing key"))?;
+    let mut body = Vec::new();
+    for line in lines {
+        body.extend_from_slice(line);
+    }
+    let signature = key_pair.sign(&body);
+    let public_key = key_pair.public_key().as_ref();
+    let public_key_b64 = BASE64.encode(public_key);
+    let signature_b64 = BASE64.encode(signature.as_ref());
+    let signed_file = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("audit-export.jsonl");
+    let sidecar = json!({
+        "schema": "ocfleet.audit_export.signature.v1",
+        "algorithm": "Ed25519",
+        "signed_file": signed_file,
+        "content_sha256": content_sha256,
+        "public_key": public_key_b64,
+        "signature": signature_b64,
+        "signed_at": OffsetDateTime::now_utc().format(&Rfc3339)?,
+    });
+    let signature_path = signature_sidecar_path(path);
+    let mut file = private_file::open_private_create_new_strict(&signature_path)?;
+    serde_json::to_writer_pretty(&mut file, &sidecar)?;
+    file.write_all(b"\n")?;
+    Ok(SignatureSummary {
+        algorithm: "Ed25519",
+        public_key_fingerprint: format!("sha256:{}", &sha256_hex(public_key)[..16]),
+    })
+}
+
+fn read_signing_key_file(path: &Path) -> anyhow::Result<Vec<u8>> {
+    let file = private_file::open_existing_private_read(path)?;
+    let mut limited = file.take((MAX_AUDIT_EXPORT_SIGNING_KEY_BYTES + 1) as u64);
+    let mut bytes = Vec::new();
+    limited.read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_AUDIT_EXPORT_SIGNING_KEY_BYTES {
+        bail!("audit export signing key file is too large");
+    }
+    Ok(bytes)
+}
+
+fn signature_sidecar_path(path: &Path) -> PathBuf {
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some(extension) => path.with_extension(format!("{extension}.sig")),
+        None => path.with_extension("sig"),
+    }
+}
+
+struct AuditExportAuditOutcome<'a> {
+    ok: bool,
+    row_count: usize,
+    checksum: Option<&'a str>,
+    signature: Option<&'a SignatureSummary>,
+    error_code: Option<&'a str>,
+}
+
 fn write_audit_export_audit(
     store: &Store,
     options: &AuditExportOptions,
-    ok: bool,
-    row_count: usize,
-    checksum: Option<&str>,
+    outcome: AuditExportAuditOutcome<'_>,
     output_path_hash: &str,
-    error_code: Option<&str>,
 ) -> anyhow::Result<()> {
     let mut event = AuditEvent::new(local_actor(), "audit.export");
-    event.ok = Some(ok);
-    event.error_code = error_code.map(ToOwned::to_owned);
+    event.ok = Some(outcome.ok);
+    event.error_code = outcome.error_code.map(ToOwned::to_owned);
     event.detail_json = json!({
         "from": options.from,
         "to": options.to,
-        "row_count": row_count,
+        "row_count": outcome.row_count,
         "redaction_mode": redaction_mode_name(options.redact),
-        "checksum": checksum,
+        "checksum": outcome.checksum,
+        "signature_algorithm": outcome.signature.map(|summary| summary.algorithm),
+        "signature_public_key_fingerprint": outcome.signature.map(|summary| summary.public_key_fingerprint.as_str()),
         "output_path_hash": output_path_hash,
-        "error_code": error_code,
+        "error_code": outcome.error_code,
     });
     store.insert_audit(&event)?;
     Ok(())

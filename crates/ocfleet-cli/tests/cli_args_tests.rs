@@ -25,6 +25,15 @@ fn parses_global_defaults_and_init_command() {
 
     assert_eq!(cli.database, PathBuf::from("controller.sqlite"));
     assert_eq!(cli.secret_key, PathBuf::from("controller.secret"));
+    assert_eq!(cli.actor, None);
+    assert!(matches!(cli.command, Command::Init));
+}
+
+#[test]
+fn parses_global_actor_flag() {
+    let cli = Cli::parse_from(["ocfleet", "--actor", "alice@example.test", "init"]);
+
+    assert_eq!(cli.actor.as_deref(), Some("alice@example.test"));
     assert!(matches!(cli.command, Command::Init));
 }
 
@@ -588,6 +597,8 @@ fn parses_audit_export_command() {
         "--redact",
         "strict",
         "--include-checksum",
+        "--sign-with-key-file",
+        "state/audit-signing-key.pk8",
         "--max-rows",
         "500",
     ]);
@@ -601,6 +612,7 @@ fn parses_audit_export_command() {
                 output,
                 redact,
                 include_checksum,
+                sign_with_key_file,
                 max_rows,
             },
     } = cli.command
@@ -614,6 +626,10 @@ fn parses_audit_export_command() {
     assert_eq!(output, PathBuf::from("state/audit.jsonl"));
     assert_eq!(redact, RedactionMode::Strict);
     assert!(include_checksum);
+    assert_eq!(
+        sign_with_key_file,
+        Some(PathBuf::from("state/audit-signing-key.pk8"))
+    );
     assert_eq!(max_rows, 500);
 }
 
@@ -1082,6 +1098,33 @@ fn parses_trust_diff_modes() {
     assert_eq!(endpoint.as_deref(), Some("endpoint-one"));
     assert_eq!(format, TrustDiffFormat::Json);
     assert!(strict);
+}
+
+#[test]
+fn parses_trust_policy_commands() {
+    let cli = Cli::parse_from([
+        "ocfleet",
+        "trust",
+        "policy",
+        "validate",
+        "policy.toml",
+        "--json",
+    ]);
+
+    let Command::Trust {
+        command: TrustCommand::Policy { command },
+    } = cli.command
+    else {
+        panic!("expected trust policy command");
+    };
+
+    match command {
+        ocfleet_cli::args::TrustPolicyCommand::Validate { file, json } => {
+            assert_eq!(file, PathBuf::from("policy.toml"));
+            assert!(json);
+        }
+        _ => panic!("expected trust policy validate command"),
+    }
 }
 
 #[test]

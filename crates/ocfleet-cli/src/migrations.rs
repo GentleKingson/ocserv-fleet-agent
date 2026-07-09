@@ -62,6 +62,12 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         description: "Create retention policies and observability query indexes.",
         apply: apply_0006_retention_and_indexes,
     },
+    Migration {
+        version: 7,
+        name: "0007_health_policy",
+        description: "Create controller-local health and alert threshold policy.",
+        apply: apply_0007_health_policy,
+    },
 ];
 
 pub(crate) fn migrate_to_current(
@@ -581,6 +587,11 @@ fn apply_0006_retention_and_indexes(tx: &Transaction<'_>) -> Result<(), StoreErr
     Ok(())
 }
 
+fn apply_0007_health_policy(tx: &Transaction<'_>) -> Result<(), StoreError> {
+    tx.execute_batch(HEALTH_POLICY_SQL)?;
+    Ok(())
+}
+
 fn observability_tables_have_current_constraints(tx: &Transaction<'_>) -> Result<bool, StoreError> {
     let checks = [
         (
@@ -702,6 +713,23 @@ INSERT INTO retention_policies
 SELECT scope, max_age_days, max_rows, updated_at
 FROM retention_policies_legacy_v5;
 DROP TABLE retention_policies_legacy_v5;
+"#;
+
+const HEALTH_POLICY_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS health_policy (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  stale_window_seconds INTEGER NOT NULL CHECK (stale_window_seconds BETWEEN 60 AND 2592000),
+  unreachable_consecutive_failures INTEGER NOT NULL CHECK (unreachable_consecutive_failures BETWEEN 1 AND 100),
+  cert_warning_days INTEGER NOT NULL CHECK (cert_warning_days BETWEEN 1 AND 3650),
+  cert_critical_days INTEGER NOT NULL CHECK (cert_critical_days BETWEEN 0 AND 3650),
+  updated_at TEXT NOT NULL,
+  CHECK (cert_critical_days <= cert_warning_days)
+);
+
+INSERT OR IGNORE INTO health_policy
+  (id, stale_window_seconds, unreachable_consecutive_failures, cert_warning_days, cert_critical_days, updated_at)
+VALUES
+  (1, 86400, 3, 30, 7, 'default');
 "#;
 
 const OBSERVABILITY_V5_STRICT_REBUILD_SQL: &str = r#"

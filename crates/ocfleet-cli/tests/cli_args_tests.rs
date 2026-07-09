@@ -1,7 +1,8 @@
 use clap::{CommandFactory, Parser};
 use ocfleet_cli::args::{
     Cli, Command, EndpointCommand, EnrollCommand, EnrollRequestCommand, EnrollTokenCommand,
-    NodeCommand, OcservCommand, OcservSessionsCommand, ProbeCommand, TrustCommand, TrustDiffFormat,
+    HealthCommand, HealthPolicyCommand, NodeCommand, OcservCommand, OcservSessionsCommand,
+    ProbeCommand, TrustCommand, TrustDiffFormat,
 };
 use std::path::PathBuf;
 
@@ -102,6 +103,54 @@ fn parses_doctor_human_and_json_modes() {
         panic!("expected doctor command");
     };
     assert!(json);
+}
+
+#[test]
+fn parses_health_policy_commands() {
+    let cli = Cli::parse_from(["ocfleet", "health", "policy", "show"]);
+    let Command::Health {
+        command: HealthCommand::Policy {
+            command: HealthPolicyCommand::Show,
+        },
+    } = cli.command
+    else {
+        panic!("expected health policy show command");
+    };
+
+    let cli = Cli::parse_from([
+        "ocfleet",
+        "health",
+        "policy",
+        "set",
+        "--stale-window",
+        "24h",
+        "--unreachable-failures",
+        "3",
+        "--cert-warning-days",
+        "30",
+        "--cert-critical-days",
+        "7",
+    ]);
+    let Command::Health {
+        command:
+            HealthCommand::Policy {
+                command:
+                    HealthPolicyCommand::Set {
+                        stale_window,
+                        unreachable_failures,
+                        cert_warning_days,
+                        cert_critical_days,
+                    },
+            },
+    } = cli.command
+    else {
+        panic!("expected health policy set command");
+    };
+
+    assert_eq!(stale_window.as_deref(), Some("24h"));
+    assert_eq!(unreachable_failures, Some(3));
+    assert_eq!(cert_warning_days, Some(30));
+    assert_eq!(cert_critical_days, Some(7));
 }
 
 #[test]

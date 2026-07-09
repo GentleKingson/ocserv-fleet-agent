@@ -341,9 +341,15 @@ dashboard/API callers to trigger RPCs.
 ```bash
 ocfleet health summary
 ocfleet health node hk-ocserv-01
+ocfleet health policy show
+ocfleet health policy set --stale-window 24h --unreachable-failures 3 --cert-warning-days 30 --cert-critical-days 7
 ```
 
 Health commands read SQLite snapshots and observations. They do not run probes.
+Health policy commands update only controller-local SQLite thresholds for stale
+health windows, consecutive unreachable failures, and certificate warning or
+critical alert windows. Each policy update writes a controller audit record with
+the old and new bounded threshold values.
 
 ### Retention
 

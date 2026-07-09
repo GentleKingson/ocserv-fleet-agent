@@ -348,6 +348,25 @@ pub enum HealthCommand {
         #[arg(long)]
         json: bool,
     },
+    Policy {
+        #[command(subcommand)]
+        command: HealthPolicyCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum HealthPolicyCommand {
+    Show,
+    Set {
+        #[arg(long)]
+        stale_window: Option<String>,
+        #[arg(long)]
+        unreachable_failures: Option<u64>,
+        #[arg(long)]
+        cert_warning_days: Option<u64>,
+        #[arg(long)]
+        cert_critical_days: Option<u64>,
+    },
 }
 
 #[derive(Debug, Subcommand)]

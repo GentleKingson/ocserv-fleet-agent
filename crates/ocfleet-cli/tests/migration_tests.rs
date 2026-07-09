@@ -30,6 +30,7 @@ fn migration_tests_new_database_creates_all_current_tables_and_indexes() {
         "health_snapshots",
         "alert_events",
         "retention_policies",
+        "health_policy",
     ] {
         assert_schema_object_exists(&conn, "table", table);
     }
@@ -41,6 +42,7 @@ fn migration_tests_new_database_creates_all_current_tables_and_indexes() {
     ] {
         assert_schema_object_exists(&conn, "index", index);
     }
+    assert_eq!(table_count(&conn, "health_policy"), 1);
     assert_sqlite_checks_pass(&conn);
 }
 
@@ -90,7 +92,7 @@ fn migration_tests_rejects_future_schema_without_backup_or_rebuild() {
 }
 
 #[test]
-fn migration_tests_v1_through_v6_fixtures_upgrade_to_current() {
+fn migration_tests_legacy_fixtures_upgrade_to_current() {
     for version in 1..=CURRENT_SCHEMA_VERSION {
         let dir = tempfile::tempdir().expect("temp dir");
         let db = dir.path().join("controller.sqlite");
@@ -138,6 +140,8 @@ fn migration_tests_v1_through_v6_fixtures_upgrade_to_current() {
             }
         }
         assert_schema_object_exists(&conn, "table", "retention_policies");
+        assert_schema_object_exists(&conn, "table", "health_policy");
+        assert_eq!(table_count(&conn, "health_policy"), 1);
         assert_schema_object_exists(&conn, "index", "idx_probe_observations_run_id");
 
         let backups = backup_files(dir.path());
@@ -151,7 +155,10 @@ fn migration_tests_v1_through_v6_fixtures_upgrade_to_current() {
                     .contains(&format!("from-v{version}-to-v{CURRENT_SCHEMA_VERSION}"))
             );
         } else {
-            assert!(backups.is_empty(), "v6 fixture should not be backed up");
+            assert!(
+                backups.is_empty(),
+                "current fixture should not be backed up"
+            );
         }
     }
 }
@@ -177,7 +184,7 @@ fn migration_tests_backup_before_migrate_is_private_and_checksummed() {
         .and_then(|value| value.to_str())
         .expect("utf8 backup filename");
     assert!(backup_name.contains("controller.sqlite"));
-    assert!(backup_name.contains("from-v5-to-v6"));
+    assert!(backup_name.contains(&format!("from-v5-to-v{CURRENT_SCHEMA_VERSION}")));
     assert_private_file_mode(backup, 0o600);
     assert_private_file_mode(backup.parent().expect("backup parent"), 0o700);
 
@@ -273,7 +280,7 @@ fn migration_tests_large_v5_database_smoke_upgrades_without_data_loss() {
 }
 
 #[test]
-fn migration_tests_v6_rebuilds_legacy_retention_policy_constraints() {
+fn migration_tests_legacy_retention_policy_constraints_rebuild_to_current() {
     let dir = tempfile::tempdir().expect("temp dir");
     let db = dir.path().join("controller.sqlite");
     create_legacy_fixture(&db, 5, 0);
@@ -381,6 +388,9 @@ fn create_legacy_fixture(path: &Path, version: i64, rows: usize) {
     if version >= 6 {
         conn.execute_batch(V6_RETENTION_AND_INDEX_SQL)
             .expect("v6 schema");
+    }
+    if version >= 7 {
+        conn.execute_batch(V7_HEALTH_POLICY_SQL).expect("v7 schema");
     }
     for applied in 1..=version {
         conn.execute(
@@ -870,4 +880,20 @@ CREATE INDEX idx_probe_observations_run_id
   ON probe_observations(run_id);
 CREATE INDEX idx_alert_events_state_last_seen_at
   ON alert_events(state, last_seen_at);
+"#;
+
+const V7_HEALTH_POLICY_SQL: &str = r#"
+CREATE TABLE health_policy (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  stale_window_seconds INTEGER NOT NULL CHECK (stale_window_seconds BETWEEN 60 AND 2592000),
+  unreachable_consecutive_failures INTEGER NOT NULL CHECK (unreachable_consecutive_failures BETWEEN 1 AND 100),
+  cert_warning_days INTEGER NOT NULL CHECK (cert_warning_days BETWEEN 1 AND 3650),
+  cert_critical_days INTEGER NOT NULL CHECK (cert_critical_days BETWEEN 0 AND 3650),
+  updated_at TEXT NOT NULL,
+  CHECK (cert_critical_days <= cert_warning_days)
+);
+INSERT INTO health_policy
+  (id, stale_window_seconds, unreachable_consecutive_failures, cert_warning_days, cert_critical_days, updated_at)
+VALUES
+  (1, 86400, 3, 30, 7, 'default');
 "#;

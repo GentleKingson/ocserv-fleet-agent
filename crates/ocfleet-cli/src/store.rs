@@ -20,7 +20,11 @@ use crate::input_validation::{
 use crate::migrations;
 use crate::private_file::{self, PrivateFileError};
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 6;
+pub const CURRENT_SCHEMA_VERSION: i64 = 7;
+pub const DEFAULT_HEALTH_STALE_WINDOW_SECONDS: u64 = 24 * 60 * 60;
+pub const DEFAULT_HEALTH_UNREACHABLE_FAILURES: u64 = 3;
+pub const DEFAULT_HEALTH_CERT_WARNING_DAYS: u64 = 30;
+pub const DEFAULT_HEALTH_CERT_CRITICAL_DAYS: u64 = 7;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -194,6 +198,15 @@ pub struct RetentionPolicyRecord {
     pub scope: String,
     pub max_age_days: Option<u64>,
     pub max_rows: Option<u64>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HealthPolicyRecord {
+    pub stale_window_seconds: u64,
+    pub unreachable_consecutive_failures: u64,
+    pub cert_warning_days: u64,
+    pub cert_critical_days: u64,
     pub updated_at: String,
 }
 
@@ -803,6 +816,78 @@ impl Store {
                 policy.updated_at.as_str(),
             ],
         )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn default_health_policy() -> HealthPolicyRecord {
+        HealthPolicyRecord {
+            stale_window_seconds: DEFAULT_HEALTH_STALE_WINDOW_SECONDS,
+            unreachable_consecutive_failures: DEFAULT_HEALTH_UNREACHABLE_FAILURES,
+            cert_warning_days: DEFAULT_HEALTH_CERT_WARNING_DAYS,
+            cert_critical_days: DEFAULT_HEALTH_CERT_CRITICAL_DAYS,
+            updated_at: "default".to_string(),
+        }
+    }
+
+    pub fn get_health_policy(&self) -> Result<HealthPolicyRecord, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT stale_window_seconds, unreachable_consecutive_failures, cert_warning_days, cert_critical_days, updated_at
+                 FROM health_policy
+                 WHERE id = 1",
+                [],
+                health_policy_from_row,
+            )
+            .optional()
+            .map(|policy| policy.unwrap_or_else(Self::default_health_policy))
+            .map_err(StoreError::from)
+    }
+
+    pub fn set_health_policy(
+        &self,
+        policy: &HealthPolicyRecord,
+        actor: &str,
+    ) -> Result<(), StoreError> {
+        validate_actor(actor).map_err(StoreError::InvalidInput)?;
+        validate_health_policy(policy)?;
+        let tx = self.conn.unchecked_transaction()?;
+        let old_policy = tx
+            .query_row(
+                "SELECT stale_window_seconds, unreachable_consecutive_failures, cert_warning_days, cert_critical_days, updated_at
+                 FROM health_policy
+                 WHERE id = 1",
+                [],
+                health_policy_from_row,
+            )
+            .optional()?
+            .unwrap_or_else(Self::default_health_policy);
+        tx.execute(
+            "INSERT INTO health_policy
+             (id, stale_window_seconds, unreachable_consecutive_failures, cert_warning_days, cert_critical_days, updated_at)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(id) DO UPDATE SET
+               stale_window_seconds = excluded.stale_window_seconds,
+               unreachable_consecutive_failures = excluded.unreachable_consecutive_failures,
+               cert_warning_days = excluded.cert_warning_days,
+               cert_critical_days = excluded.cert_critical_days,
+               updated_at = excluded.updated_at",
+            params![
+                u64_to_i64(policy.stale_window_seconds)?,
+                u64_to_i64(policy.unreachable_consecutive_failures)?,
+                u64_to_i64(policy.cert_warning_days)?,
+                u64_to_i64(policy.cert_critical_days)?,
+                policy.updated_at.as_str(),
+            ],
+        )?;
+        let mut event = AuditEvent::new(actor, "health.policy.set");
+        event.ok = Some(true);
+        event.detail_json = serde_json::json!({
+            "policy_class": "health_thresholds",
+            "old_value": health_policy_audit_json(&old_policy),
+            "new_value": health_policy_audit_json(policy),
+        });
+        insert_audit_tx(&tx, &event)?;
         tx.commit()?;
         Ok(())
     }
@@ -1791,6 +1876,57 @@ fn retention_policy_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Retent
         max_age_days: max_age_days.map(i64_to_u64).transpose()?,
         max_rows: max_rows.map(i64_to_u64).transpose()?,
         updated_at: row.get(3)?,
+    })
+}
+
+fn health_policy_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HealthPolicyRecord> {
+    Ok(HealthPolicyRecord {
+        stale_window_seconds: i64_to_u64(row.get(0)?)?,
+        unreachable_consecutive_failures: i64_to_u64(row.get(1)?)?,
+        cert_warning_days: i64_to_u64(row.get(2)?)?,
+        cert_critical_days: i64_to_u64(row.get(3)?)?,
+        updated_at: row.get(4)?,
+    })
+}
+
+fn validate_health_policy(policy: &HealthPolicyRecord) -> Result<(), StoreError> {
+    validate_u64_range(
+        "stale_window_seconds",
+        policy.stale_window_seconds,
+        60,
+        2_592_000,
+    )?;
+    validate_u64_range(
+        "unreachable_consecutive_failures",
+        policy.unreachable_consecutive_failures,
+        1,
+        100,
+    )?;
+    validate_u64_range("cert_warning_days", policy.cert_warning_days, 1, 3_650)?;
+    validate_u64_range("cert_critical_days", policy.cert_critical_days, 0, 3_650)?;
+    if policy.cert_critical_days > policy.cert_warning_days {
+        return Err(StoreError::InvalidInput(
+            "cert_critical_days must be less than or equal to cert_warning_days".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_u64_range(name: &str, value: u64, min: u64, max: u64) -> Result<(), StoreError> {
+    if !(min..=max).contains(&value) {
+        return Err(StoreError::InvalidInput(format!(
+            "{name} must be between {min} and {max}"
+        )));
+    }
+    Ok(())
+}
+
+fn health_policy_audit_json(policy: &HealthPolicyRecord) -> Value {
+    serde_json::json!({
+        "stale_window_seconds": policy.stale_window_seconds,
+        "unreachable_consecutive_failures": policy.unreachable_consecutive_failures,
+        "cert_warning_days": policy.cert_warning_days,
+        "cert_critical_days": policy.cert_critical_days,
     })
 }
 

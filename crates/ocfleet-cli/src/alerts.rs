@@ -8,11 +8,11 @@ use uuid::Uuid;
 
 use crate::args::AlertCommand;
 use crate::audit::AuditEvent;
+use crate::duration_args::parse_duration_seconds;
 use crate::input_validation::{local_actor, validate_reason};
-use crate::store::{AlertEventRecord, ProbeObservationRecord, Store};
+use crate::store::{AlertEventRecord, HealthPolicyRecord, ProbeObservationRecord, Store};
 
 const OBSERVATION_READ_LIMIT: u64 = 1_000;
-const NODE_UNREACHABLE_FAILURES: usize = 3;
 
 #[derive(Debug, Clone)]
 struct AlertCandidate {
@@ -42,8 +42,9 @@ pub fn run_alert_command(store: &Store, command: AlertCommand) -> anyhow::Result
 pub fn evaluate_alerts(store: &Store) -> anyhow::Result<Vec<AlertEventRecord>> {
     let now = now_rfc3339();
     let existing = store.list_alert_events()?;
+    let policy = store.get_health_policy()?;
     let mut updated = Vec::new();
-    for candidate in alert_candidates(store)? {
+    for candidate in alert_candidates(store, &policy)? {
         let record = upsert_candidate(store, &existing, candidate, &now)?;
         updated.push(record);
     }
@@ -149,10 +150,13 @@ fn run_alert_resolve(store: &Store, dedupe_key: &str, reason: &str) -> anyhow::R
     Ok(())
 }
 
-fn alert_candidates(store: &Store) -> anyhow::Result<Vec<AlertCandidate>> {
+fn alert_candidates(
+    store: &Store,
+    policy: &HealthPolicyRecord,
+) -> anyhow::Result<Vec<AlertCandidate>> {
     let mut candidates = Vec::new();
     candidates.extend(candidates_from_health_snapshots(store)?);
-    candidates.extend(candidates_from_probe_observations(store)?);
+    candidates.extend(candidates_from_probe_observations(store, policy)?);
     candidates.extend(candidates_from_endpoint_trust(store)?);
     candidates.sort_by(|left, right| left.dedupe_key.cmp(&right.dedupe_key));
     candidates.dedup_by(|left, right| left.dedupe_key == right.dedupe_key);
@@ -209,15 +213,26 @@ fn candidates_from_health_snapshots(store: &Store) -> anyhow::Result<Vec<AlertCa
     Ok(candidates)
 }
 
-fn candidates_from_probe_observations(store: &Store) -> anyhow::Result<Vec<AlertCandidate>> {
+fn candidates_from_probe_observations(
+    store: &Store,
+    policy: &HealthPolicyRecord,
+) -> anyhow::Result<Vec<AlertCandidate>> {
     let observations = store.list_probe_observations(None, OBSERVATION_READ_LIMIT)?;
     let mut candidates = Vec::new();
-    candidates.extend(node_unreachable_candidates(&observations));
-    candidates.extend(cert_expiry_candidates(&observations));
+    candidates.extend(node_unreachable_candidates(
+        &observations,
+        policy.unreachable_consecutive_failures,
+    )?);
+    candidates.extend(cert_expiry_candidates(&observations, policy)?);
     Ok(candidates)
 }
 
-fn node_unreachable_candidates(observations: &[ProbeObservationRecord]) -> Vec<AlertCandidate> {
+fn node_unreachable_candidates(
+    observations: &[ProbeObservationRecord],
+    threshold: u64,
+) -> anyhow::Result<Vec<AlertCandidate>> {
+    let threshold =
+        usize::try_from(threshold).context("unreachable failure threshold is too large")?;
     let mut grouped: BTreeMap<String, Vec<&ProbeObservationRecord>> = BTreeMap::new();
     for observation in observations
         .iter()
@@ -248,7 +263,7 @@ fn node_unreachable_candidates(observations: &[ProbeObservationRecord]) -> Vec<A
             }
             break;
         }
-        if failures >= NODE_UNREACHABLE_FAILURES {
+        if failures >= threshold {
             candidates.push(AlertCandidate {
                 dedupe_key: format!("node:{node_id}:node_unreachable"),
                 node_id: Some(node_id),
@@ -262,10 +277,17 @@ fn node_unreachable_candidates(observations: &[ProbeObservationRecord]) -> Vec<A
             });
         }
     }
-    candidates
+    Ok(candidates)
 }
 
-fn cert_expiry_candidates(observations: &[ProbeObservationRecord]) -> Vec<AlertCandidate> {
+fn cert_expiry_candidates(
+    observations: &[ProbeObservationRecord],
+    policy: &HealthPolicyRecord,
+) -> anyhow::Result<Vec<AlertCandidate>> {
+    let critical_days =
+        i64::try_from(policy.cert_critical_days).context("cert critical threshold is too large")?;
+    let warning_days =
+        i64::try_from(policy.cert_warning_days).context("cert warning threshold is too large")?;
     let mut latest_by_node: BTreeMap<String, &ProbeObservationRecord> = BTreeMap::new();
     for observation in observations
         .iter()
@@ -286,13 +308,13 @@ fn cert_expiry_candidates(observations: &[ProbeObservationRecord]) -> Vec<AlertC
         let Some(days_remaining) = min_days_remaining(&observation.summary_json) else {
             continue;
         };
-        let (severity, reason_code, suffix) = if days_remaining <= 7 {
+        let (severity, reason_code, suffix) = if days_remaining <= critical_days {
             (
                 "critical",
                 "CERT_EXPIRING_CRITICAL",
                 "cert_expiring_critical",
             )
-        } else if days_remaining <= 30 {
+        } else if days_remaining <= warning_days {
             ("warning", "CERT_EXPIRING_WARNING", "cert_expiring_warning")
         } else {
             continue;
@@ -309,7 +331,7 @@ fn cert_expiry_candidates(observations: &[ProbeObservationRecord]) -> Vec<AlertC
             }),
         });
     }
-    candidates
+    Ok(candidates)
 }
 
 fn candidates_from_endpoint_trust(store: &Store) -> anyhow::Result<Vec<AlertCandidate>> {
@@ -567,23 +589,9 @@ fn is_unreachable_error_code(code: &str) -> bool {
 }
 
 fn parse_duration(value: &str) -> anyhow::Result<Duration> {
-    let Some(unit) = value.chars().last() else {
-        bail!("duration must use s, m, h, or d suffix");
-    };
-    let number = &value[..value.len().saturating_sub(unit.len_utf8())];
-    let amount: i64 = number
-        .parse()
-        .with_context(|| format!("invalid duration value: {value}"))?;
-    if amount <= 0 {
-        bail!("duration must be greater than zero");
-    }
-    match unit {
-        's' => Ok(Duration::seconds(amount)),
-        'm' => Ok(Duration::minutes(amount)),
-        'h' => Ok(Duration::hours(amount)),
-        'd' => Ok(Duration::days(amount)),
-        _ => bail!("duration must use s, m, h, or d suffix"),
-    }
+    let seconds = parse_duration_seconds(value, "duration")?;
+    let seconds = i64::try_from(seconds).context("duration is too large")?;
+    Ok(Duration::seconds(seconds))
 }
 
 fn write_alert_audit(store: &Store, event_name: &str, detail_json: Value) -> anyhow::Result<()> {

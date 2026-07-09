@@ -34,6 +34,7 @@ fn observability_store_tests_new_observability_tables_exist() {
         "health_snapshots",
         "alert_events",
         "retention_policies",
+        "health_policy",
     ] {
         let exists: i64 = conn
             .query_row(

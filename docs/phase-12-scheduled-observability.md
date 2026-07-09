@@ -365,12 +365,16 @@ the old and new bounded threshold values.
 
 ```bash
 ocfleet retention show
-ocfleet retention set --table probe_observations --max-age 30d --max-rows 100000
-ocfleet retention apply
+ocfleet retention set observations --max-age 30d --max-rows 100000
+ocfleet retention apply --dry-run --scope observations --before 2026-07-01T00:00:00Z --json
+ocfleet retention apply --scope observations --batch-size 1000 --limit 10000
 ```
 
 Retention commands modify retention policy and prune local SQLite history only.
-They do not call agents.
+They do not call agents. `retention apply` reports `matched_count`, cutoff,
+policy row cap, oldest/newest candidate timestamps, deleted rows, batch count,
+and a SHA-256 report checksum. Actual deletes are split into bounded batches;
+controller audit rows are never deleted by retention.
 
 ### Alerts
 
@@ -393,12 +397,17 @@ scripts.
 ### Audit Export
 
 ```bash
-ocfleet audit export --since 2026-07-01T00:00:00Z --until 2026-07-08T00:00:00Z
-ocfleet audit export --format jsonl --output ./audit-export.jsonl
+ocfleet audit export --from 2026-07-01T00:00:00Z --to 2026-07-08T00:00:00Z --format jsonl --output ./audit-export.jsonl
+ocfleet audit export --from 2026-07-01T00:00:00Z --to 2026-07-08T00:00:00Z --output ./audit-export.jsonl --redact strict --include-checksum
 ```
 
 Audit export reads bounded windows from controller SQLite and writes sanitized
-controller audit records. It must not include raw response bodies.
+controller audit records as JSONL. The window is mandatory and capped, row count
+is bounded by `--max-rows`, output uses private `0600` create-new files under a
+private `0700` parent, and `--include-checksum` writes a SHA-256 sidecar. Default
+redaction hides secret-like fields; strict redaction hashes actor, node,
+endpoint, and request identifiers. The `audit.export` audit row is written after
+the file is produced, so it is not included in that export window snapshot.
 
 ### Read-only Web/API Dashboard
 
@@ -519,8 +528,9 @@ ocfleet health summary
 ocfleet health node hk-ocserv-01
 
 ocfleet retention show
-ocfleet retention set --table probe_observations --max-age 30d --max-rows 100000
-ocfleet retention apply
+ocfleet retention set observations --max-age 30d --max-rows 100000
+ocfleet retention apply --dry-run --scope observations --json
+ocfleet retention apply --scope observations --batch-size 1000 --limit 10000
 
 ocfleet alert list
 ocfleet alert test jsonl_file:./private-alerts/test.jsonl
@@ -528,8 +538,8 @@ ocfleet alert deliver --hook jsonl_file:./private-alerts/alerts.jsonl --limit 10
 ocfleet alert silence <alert-id> --until 2026-08-01T00:00:00Z
 ocfleet alert resolve <alert-id> --reason "smoke resolved"
 
-ocfleet audit export --since 2026-07-01T00:00:00Z --until 2026-07-08T00:00:00Z
-ocfleet audit export --format jsonl --output ./audit-export.jsonl
+ocfleet audit export --from 2026-07-01T00:00:00Z --to 2026-07-08T00:00:00Z --format jsonl --output ./audit-export.jsonl
+ocfleet audit export --from 2026-07-01T00:00:00Z --to 2026-07-08T00:00:00Z --output ./audit-export.jsonl --redact default --include-checksum
 
 ocfleet-api --database controller.sqlite --read-only --listen 127.0.0.1:8080
 curl --fail http://127.0.0.1:8080/health/summary

@@ -97,6 +97,15 @@ fn audit_count(database: &Path) -> i64 {
         .expect("count audit")
 }
 
+fn observation_count(database: &Path) -> i64 {
+    Connection::open(database)
+        .expect("open db")
+        .query_row("SELECT count(*) FROM probe_observations", [], |row| {
+            row.get(0)
+        })
+        .expect("count observations")
+}
+
 fn run_count(database: &Path) -> i64 {
     Connection::open(database)
         .expect("open db")
@@ -117,6 +126,22 @@ fn latest_audit(database: &Path) -> (String, Value) {
         .expect("latest audit");
     (
         event,
+        serde_json::from_str(&detail).expect("parse detail json"),
+    )
+}
+
+fn latest_audit_with_ok(database: &Path) -> (String, i64, Value) {
+    let (event, ok, detail): (String, i64, String) = Connection::open(database)
+        .expect("open db")
+        .query_row(
+            "SELECT event, ok, detail_json FROM controller_audit_log ORDER BY id DESC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("latest audit");
+    (
+        event,
+        ok,
         serde_json::from_str(&detail).expect("parse detail json"),
     )
 }
@@ -238,7 +263,10 @@ fn retention_tests_apply_dry_run_does_not_delete() {
     ]);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("scope=observations"));
+    assert!(stdout.contains("matched_count=1"));
     assert!(stdout.contains("deleted_count=1"));
+    assert!(stdout.contains("oldest_candidate=2026-01-01T00:00:00Z"));
+    assert!(stdout.contains("newest_candidate=2026-01-01T00:00:00Z"));
     assert!(stdout.contains("dry_run=true"));
 
     let store = Store::open(&database).expect("reopen store");
@@ -249,6 +277,115 @@ fn retention_tests_apply_dry_run_does_not_delete() {
             .len(),
         1
     );
+}
+
+#[test]
+fn retention_tests_apply_json_report_includes_window_and_candidates() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let database_arg = database.to_string_lossy().into_owned();
+    let store = Store::open(&database).expect("open store");
+    insert_observation(&store, "obs-old", "2026-01-01T00:00:00Z");
+    insert_observation(&store, "obs-new", "2026-07-08T00:00:00Z");
+    drop(store);
+
+    let output = run_ocfleet(&[
+        "--database",
+        &database_arg,
+        "retention",
+        "apply",
+        "--dry-run",
+        "--scope",
+        "observations",
+        "--before",
+        "2026-06-01T00:00:00Z",
+        "--json",
+    ]);
+    let report: Value = serde_json::from_slice(&output.stdout).expect("valid JSON report");
+
+    assert_eq!(report["dry_run"], true);
+    assert_eq!(report["scopes"].as_array().expect("scopes").len(), 1);
+    let scope = &report["scopes"][0];
+    assert_eq!(scope["scope"], "observations");
+    assert_eq!(scope["cutoff"], "2026-06-01T00:00:00Z");
+    assert_eq!(scope["matched_count"], 1);
+    assert_eq!(scope["rows_deleted"], 0);
+    assert_eq!(scope["oldest_candidate"], "2026-01-01T00:00:00Z");
+    assert_eq!(scope["newest_candidate"], "2026-01-01T00:00:00Z");
+    assert!(scope["report_checksum"].as_str().expect("checksum").len() >= 64);
+}
+
+#[test]
+fn retention_tests_apply_deletes_in_batches_and_audits_report() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let database_arg = database.to_string_lossy().into_owned();
+    let store = Store::open(&database).expect("open store");
+    for index in 0..5 {
+        insert_observation(&store, &format!("obs-old-{index}"), "2026-01-01T00:00:00Z");
+    }
+    drop(store);
+
+    let output = run_ocfleet(&[
+        "--database",
+        &database_arg,
+        "retention",
+        "apply",
+        "--scope",
+        "observations",
+        "--before",
+        "2026-06-01T00:00:00Z",
+        "--limit",
+        "3",
+        "--batch-size",
+        "2",
+    ]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("matched_count=5"));
+    assert!(stdout.contains("rows_deleted=3"));
+    assert!(stdout.contains("batch_count=2"));
+    assert_eq!(observation_count(&database), 2);
+
+    let (event, ok, detail) = latest_audit_with_ok(&database);
+    assert_eq!(event, "retention.apply");
+    assert_eq!(ok, 1);
+    assert_eq!(detail["scope"], "observations");
+    assert_eq!(detail["dry_run"], false);
+    assert_eq!(detail["matched_count"], 5);
+    assert_eq!(detail["deleted_count"], 3);
+    assert_eq!(detail["batch_count"], 2);
+    assert!(detail["report_checksum"].as_str().expect("checksum").len() >= 64);
+}
+
+#[test]
+fn retention_tests_apply_no_window_policy_is_noop_without_full_delete() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let database_arg = database.to_string_lossy().into_owned();
+    let store = Store::open(&database).expect("open store");
+    insert_observation(&store, "obs-old", "2026-01-01T00:00:00Z");
+    store
+        .set_retention_policy(&ocfleet_cli::store::RetentionPolicyRecord {
+            scope: "observations".to_string(),
+            max_age_days: None,
+            max_rows: None,
+            updated_at: "2026-07-09T00:00:00Z".to_string(),
+        })
+        .expect("set no-op policy");
+    drop(store);
+
+    let output = run_ocfleet(&[
+        "--database",
+        &database_arg,
+        "retention",
+        "apply",
+        "--scope",
+        "observations",
+    ]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("matched_count=0"));
+    assert!(stdout.contains("rows_deleted=0"));
+    assert_eq!(observation_count(&database), 1);
 }
 
 #[test]

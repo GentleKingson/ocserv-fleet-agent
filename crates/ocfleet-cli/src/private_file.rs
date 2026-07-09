@@ -24,6 +24,10 @@ pub fn open_private_create_new(path: &Path) -> Result<File, PrivateFileError> {
     open_private_create_new_impl(path)
 }
 
+pub fn open_private_create_new_strict(path: &Path) -> Result<File, PrivateFileError> {
+    open_private_create_new_strict_impl(path)
+}
+
 pub fn open_private_append_create(path: &Path) -> Result<File, PrivateFileError> {
     open_private_append_create_impl(path)
 }
@@ -49,6 +53,24 @@ fn open_private_create_new_impl(path: &Path) -> Result<File, PrivateFileError> {
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)?;
     validate_private_file_handle(&file)?;
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn open_private_create_new_strict_impl(path: &Path) -> Result<File, PrivateFileError> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    ensure_private_parent(path)?;
+    validate_strict_private_parent(path)?;
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    validate_private_file_handle(&file)?;
+    validate_strict_private_file_mode(&file)?;
     Ok(file)
 }
 
@@ -218,6 +240,12 @@ fn validate_private_file_handle(file: &File) -> Result<(), PrivateFileError> {
 
 #[cfg(not(unix))]
 fn open_private_create_new_impl(path: &Path) -> Result<File, PrivateFileError> {
+    let _ = path;
+    Err(PrivateFileError::UnsupportedPlatform)
+}
+
+#[cfg(not(unix))]
+fn open_private_create_new_strict_impl(path: &Path) -> Result<File, PrivateFileError> {
     let _ = path;
     Err(PrivateFileError::UnsupportedPlatform)
 }

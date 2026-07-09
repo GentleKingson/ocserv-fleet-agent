@@ -39,15 +39,17 @@ The role model is intentionally small:
 | `operator` | Controller-local operational mutations: scheduler job enable/disable/run, retention policy changes, alert silence/resolve/delivery. |
 | `security-admin` | Enrollment approval, EndpointID rotate/revoke/quarantine, trust policy review, and future explicitly audited trust apply operations. |
 
-The local CLI does not enforce RBAC in this slice; it relies on OS user, file
-permissions, and the resolved audit actor. The API foundation exposes only
-read-only `GET` routes today and maps the static bearer token to the `viewer`
-role. Any future API write route must require authenticated RBAC and must not be
-available anonymously.
+`ocfleet_cli::governance` implements this fixed policy vocabulary and tests the
+three role boundaries. The local CLI does not enforce RBAC in this slice; it
+relies on OS user, file permissions, and the resolved audit actor. The API
+returns only `viewer` principals for local or bearer-authenticated requests and
+exposes only read-only `GET` routes. Any future API write route must require
+authenticated RBAC and must not be available anonymously.
 
 ## Audit Model
 
-Every controller SQLite mutation must write a controller audit row with:
+The target contract is that every controller SQLite mutation writes a
+controller audit row with:
 
 - resolved actor
 - event name
@@ -61,11 +63,20 @@ bodies, raw stdout/stderr, raw logs, raw config, certificate material, usernames
 client IPs, or session IDs. Retention policies do not delete
 `controller_audit_log`; long-term audit handling is export/archive based.
 
+Current enforcement is partial and must not be overstated. Health policy,
+enrollment approval, and endpoint lifecycle mutations are actor-bound and
+audited in their SQLite transaction. Several older node, scheduler, retention,
+and alert call sites still perform the mutation and audit insert as separate
+transactions. The backend traits expose only the already-atomic subset through
+`StoreWriter`; migrating the remaining call sites is required before claiming
+fully fail-closed controller mutation audit. The API remains read-only while
+that work is incomplete.
+
 ## Trust Policy Workflow
 
 Trust policy as code is a review and drift-detection workflow:
 
-1. Operators edit a TOML policy file in version control.
+1. Operators edit a TOML or YAML policy file in version control.
 2. `ocfleet trust policy validate <file>` checks schema, fixed lifecycle states,
    EndpointID shape, duplicate IDs, and explicit path-probe pairs.
 3. `ocfleet trust policy diff <file>` compares the policy to controller SQLite

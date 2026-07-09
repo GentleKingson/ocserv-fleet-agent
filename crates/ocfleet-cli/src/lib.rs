@@ -8,6 +8,7 @@ pub mod audit_export;
 pub mod controller_rpc;
 pub mod doctor;
 pub mod duration_args;
+pub mod governance;
 pub mod health;
 pub mod identity;
 pub mod input_validation;

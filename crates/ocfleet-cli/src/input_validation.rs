@@ -32,8 +32,14 @@ pub fn resolve_process_actor(explicit_actor: Option<&str>) -> Result<String, Str
     if let Some(actor) = explicit_actor {
         return normalize_actor(actor).map_err(|err| format!("--actor {err}"));
     }
-    if let Ok(actor) = std::env::var("OCFLEET_ACTOR") {
-        return normalize_actor(&actor).map_err(|err| format!("OCFLEET_ACTOR {err}"));
+    match std::env::var("OCFLEET_ACTOR") {
+        Ok(actor) => {
+            return normalize_actor(&actor).map_err(|err| format!("OCFLEET_ACTOR {err}"));
+        }
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err("OCFLEET_ACTOR must be valid UTF-8".to_string());
+        }
+        Err(std::env::VarError::NotPresent) => {}
     }
     Ok(local_user_actor())
 }

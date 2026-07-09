@@ -2,6 +2,11 @@ use rusqlite::Connection;
 use std::path::Path;
 use std::process::Command;
 
+#[cfg(unix)]
+use std::ffi::OsString;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStringExt;
+
 fn run_init_with_user(database: &Path, secret_key: &Path, user: Option<&str>) {
     let mut command = Command::new(env!("CARGO_BIN_EXE_ocfleet"));
     command
@@ -139,4 +144,28 @@ fn init_audit_actor_rejects_control_characters_and_overlong_user() {
 
         assert_eq!(latest_actor(&database), "local-cli");
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn explicit_actor_environment_rejects_non_utf8_without_fallback() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let secret_key = dir.path().join("controller.secret");
+    let output = Command::new(env!("CARGO_BIN_EXE_ocfleet"))
+        .arg("--database")
+        .arg(&database)
+        .arg("--secret-key")
+        .arg(&secret_key)
+        .arg("init")
+        .env("USER", "fallback-user")
+        .env("OCFLEET_ACTOR", OsString::from_vec(vec![0xff, 0xfe]))
+        .output()
+        .expect("run ocfleet init");
+
+    assert!(!output.status.success());
+    assert!(!database.exists());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("OCFLEET_ACTOR must be valid UTF-8"));
+    assert!(!stderr.contains("fallback-user"));
 }

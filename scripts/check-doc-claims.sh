@@ -23,12 +23,9 @@ if [[ ! -f "$README_PATH" ]]; then
 fi
 
 require_contains "Phase 12 CLI observability is partially implemented / active implementation."
-require_contains "Web/API dashboard is planned / not implemented yet."
+require_contains "Web/API dashboard is experimentally implemented as a read-only observation surface."
 require_contains "not production-complete"
-
-if grep -Fq "ocfleet-api" "$README_PATH"; then
-  fail "README must not mention ocfleet-api as an available binary"
-fi
+require_contains "experimental read-only \`ocfleet-api\`"
 
 what_it_does="$(
   awk '

@@ -255,6 +255,9 @@ fn ocserv_known_but_forbidden_methods_remain_not_allowed() {
     for method in [
         "ocserv.reload",
         "ocserv.restart",
+        "ocserv.config.apply",
+        "ocserv.config.rollback",
+        "ocserv.session.disconnect",
         "ocserv.user.list",
         "ocserv.sessions.list",
         "ocserv.logs.query",

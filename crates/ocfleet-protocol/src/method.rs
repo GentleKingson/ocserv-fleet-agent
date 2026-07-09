@@ -18,6 +18,11 @@ pub const OCSERV_VERSION: &str = "ocserv.version";
 pub const OCSERV_SESSIONS_SUMMARY: &str = "ocserv.sessions.summary";
 pub const OCSERV_CERT_EXPIRY: &str = "ocserv.cert.expiry";
 pub const OCSERV_CONFIG_FINGERPRINT: &str = "ocserv.config.fingerprint";
+pub const OCSERV_RELOAD: &str = "ocserv.reload";
+pub const OCSERV_RESTART: &str = "ocserv.restart";
+pub const OCSERV_CONFIG_APPLY: &str = "ocserv.config.apply";
+pub const OCSERV_CONFIG_ROLLBACK: &str = "ocserv.config.rollback";
+pub const OCSERV_SESSION_DISCONNECT: &str = "ocserv.session.disconnect";
 
 pub fn classify_phase_one_method(method: &str) -> MethodStatus {
     match method {
@@ -31,6 +36,11 @@ pub fn classify_phase_one_method(method: &str) -> MethodStatus {
         | OCSERV_CONFIG_FINGERPRINT => MethodStatus::Allowed,
         "ocserv.service.status"
         | "ocserv.status"
+        | OCSERV_RELOAD
+        | OCSERV_RESTART
+        | OCSERV_CONFIG_APPLY
+        | OCSERV_CONFIG_ROLLBACK
+        | OCSERV_SESSION_DISCONNECT
         | "ocserv.users.list"
         | "ocserv.users.get"
         | "ocserv.logs.recent"

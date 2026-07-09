@@ -183,6 +183,175 @@ service_name = "ocserv.service"
 }
 
 #[test]
+fn agent_config_controlled_writes_feature_is_default_disabled() {
+    let config: AgentConfig = toml::from_str(
+        r#"
+[node]
+id = "hk-ocserv-01"
+region = "hk"
+role = "ocserv"
+
+[iroh]
+secret_key_path = "/tmp/iroh.secret"
+
+[security]
+
+[audit]
+path = "/tmp/ocfleet-audit.log"
+
+[controlled_writes]
+enabled = true
+
+[controlled_writes.ocserv_reload]
+enabled = true
+local_identity = "ocserv-primary"
+"#,
+    )
+    .expect("controlled writes config should parse");
+
+    let err = validate_agent_config(&config)
+        .expect_err("controlled writes must be compile-time disabled by default");
+    assert!(matches!(
+        err,
+        ConfigError::Invalid(message) if message.contains("controlled writes are disabled")
+    ));
+}
+
+#[test]
+#[cfg(feature = "controlled-writes")]
+fn agent_config_accepts_controlled_writes_only_with_feature_enabled() {
+    let config: AgentConfig = toml::from_str(
+        r#"
+[node]
+id = "hk-ocserv-01"
+region = "hk"
+role = "ocserv"
+
+[iroh]
+secret_key_path = "/tmp/iroh.secret"
+
+[security]
+
+[audit]
+path = "/tmp/ocfleet-audit.log"
+
+[controlled_writes]
+enabled = true
+
+[controlled_writes.ocserv_reload]
+enabled = true
+local_identity = "ocserv-primary"
+
+[controlled_writes.ocserv_restart]
+enabled = false
+emergency_only = true
+local_identity = "ocserv-primary"
+"#,
+    )
+    .expect("controlled writes config should parse");
+
+    validate_agent_config(&config).expect("feature-enabled local policy should validate");
+    assert!(config.controlled_writes.enabled);
+    assert!(config.controlled_writes.ocserv_reload.enabled);
+    assert_eq!(
+        config
+            .controlled_writes
+            .ocserv_reload
+            .local_identity
+            .as_deref(),
+        Some("ocserv-primary")
+    );
+}
+
+#[test]
+fn agent_config_rejects_controlled_write_operation_without_global_enable() {
+    let config: AgentConfig = toml::from_str(
+        r#"
+[node]
+id = "hk-ocserv-01"
+region = "hk"
+role = "ocserv"
+
+[iroh]
+secret_key_path = "/tmp/iroh.secret"
+
+[security]
+
+[audit]
+path = "/tmp/ocfleet-audit.log"
+
+[controlled_writes.ocserv_restart]
+enabled = true
+emergency_only = true
+"#,
+    )
+    .expect("controlled writes config should parse");
+
+    let err = validate_agent_config(&config)
+        .expect_err("operation policy must not enable without global gate");
+    assert!(matches!(
+        err,
+        ConfigError::Invalid(message)
+            if message.contains("controlled_writes.enabled must be true")
+    ));
+}
+
+#[test]
+fn agent_config_rejects_unknown_controlled_writes_fields() {
+    let err = toml::from_str::<AgentConfig>(
+        r#"
+[node]
+id = "hk-ocserv-01"
+region = "hk"
+role = "ocserv"
+
+[iroh]
+secret_key_path = "/tmp/iroh.secret"
+
+[security]
+
+[audit]
+path = "/tmp/ocfleet-audit.log"
+
+[controlled_writes]
+enabled = false
+command = "systemctl restart ocserv"
+"#,
+    )
+    .expect_err("unknown controlled writes fields must be rejected");
+    assert!(err.to_string().contains("unknown field"));
+}
+
+#[test]
+fn agent_config_rejects_unknown_controlled_write_operation_policy_fields() {
+    let err = toml::from_str::<AgentConfig>(
+        r#"
+[node]
+id = "hk-ocserv-01"
+region = "hk"
+role = "ocserv"
+
+[iroh]
+secret_key_path = "/tmp/iroh.secret"
+
+[security]
+
+[audit]
+path = "/tmp/ocfleet-audit.log"
+
+[controlled_writes]
+enabled = false
+
+[controlled_writes.ocserv_reload]
+enabled = false
+unit = "ocserv.service"
+"#,
+    )
+    .expect_err("unknown operation policy fields must be rejected");
+    assert!(err.to_string().contains("unknown field"));
+}
+
+#[test]
 fn agent_config_rejects_phase_one_logs_section() {
     let config: AgentConfig = toml::from_str(
         r#"
@@ -478,6 +647,12 @@ fn agent_config_defaults_include_resource_limits() {
     assert_eq!(config.ocserv_readonly.snapshot_path, None);
     assert!(config.ocserv_readonly.certificates.is_empty());
     assert!(config.ocserv_readonly.config_fingerprint.is_none());
+    assert!(!config.controlled_writes.enabled);
+    assert!(!config.controlled_writes.ocserv_reload.enabled);
+    assert!(!config.controlled_writes.ocserv_restart.enabled);
+    assert!(!config.controlled_writes.ocserv_config_apply.enabled);
+    assert!(!config.controlled_writes.ocserv_config_rollback.enabled);
+    assert!(!config.controlled_writes.ocserv_session_disconnect.enabled);
 
     assert!(config.security.peers.is_empty());
     assert!(config.security.path_probes.is_empty());

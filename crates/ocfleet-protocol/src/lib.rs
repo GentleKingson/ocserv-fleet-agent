@@ -1,4 +1,6 @@
 pub mod constants;
+#[cfg(feature = "controlled-writes")]
+pub mod controlled_write;
 pub mod enrollment;
 pub mod error;
 pub mod frame;

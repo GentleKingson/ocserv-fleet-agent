@@ -32,6 +32,8 @@ pub struct AgentConfig {
     #[serde(default)]
     pub ocserv_readonly: OcservReadonlyConfig,
     #[serde(default)]
+    pub controlled_writes: ControlledWritesConfig,
+    #[serde(default)]
     pub ocserv: Option<toml::Value>,
     #[serde(default)]
     pub logs: Option<toml::Value>,
@@ -168,6 +170,34 @@ pub struct OcservCertificateConfig {
 pub struct OcservConfigFingerprintConfig {
     pub name: String,
     pub config_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ControlledWritesConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub ocserv_reload: ControlledWriteOperationPolicy,
+    #[serde(default)]
+    pub ocserv_restart: ControlledWriteOperationPolicy,
+    #[serde(default)]
+    pub ocserv_config_apply: ControlledWriteOperationPolicy,
+    #[serde(default)]
+    pub ocserv_config_rollback: ControlledWriteOperationPolicy,
+    #[serde(default)]
+    pub ocserv_session_disconnect: ControlledWriteOperationPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ControlledWriteOperationPolicy {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub local_identity: Option<String>,
+    #[serde(default)]
+    pub emergency_only: bool,
 }
 
 #[derive(Deserialize)]
@@ -312,6 +342,7 @@ pub fn validate_agent_config(config: &AgentConfig) -> Result<(), ConfigError> {
         ));
     }
     validate_ocserv_readonly_config(&config.ocserv_readonly)?;
+    validate_controlled_writes_config(&config.controlled_writes)?;
     let mut controller_endpoint_ids = HashSet::new();
     for controller in &config.security.controllers {
         validate_controller_endpoint_id(&controller.endpoint_id)
@@ -502,6 +533,68 @@ pub fn validate_agent_config(config: &AgentConfig) -> Result<(), ConfigError> {
         return Err(ConfigError::Invalid(
             "rejected_peer_log_bucket_ttl_seconds must be >= rejected_peer_log_aggregate_interval_seconds".to_string(),
         ));
+    }
+    Ok(())
+}
+
+fn validate_controlled_writes_config(config: &ControlledWritesConfig) -> Result<(), ConfigError> {
+    let has_operation_enabled = config.ocserv_reload.enabled
+        || config.ocserv_restart.enabled
+        || config.ocserv_config_apply.enabled
+        || config.ocserv_config_rollback.enabled
+        || config.ocserv_session_disconnect.enabled;
+    if has_operation_enabled && !config.enabled {
+        return Err(ConfigError::Invalid(
+            "controlled_writes.enabled must be true before any operation policy can be enabled"
+                .to_string(),
+        ));
+    }
+    #[cfg(not(feature = "controlled-writes"))]
+    if config.enabled || has_operation_enabled {
+        return Err(ConfigError::Invalid(
+            "controlled writes are disabled at compile time".to_string(),
+        ));
+    }
+    #[cfg(feature = "controlled-writes")]
+    {
+        validate_controlled_write_policy("ocserv_reload", &config.ocserv_reload)?;
+        validate_controlled_write_policy("ocserv_restart", &config.ocserv_restart)?;
+        validate_controlled_write_policy("ocserv_config_apply", &config.ocserv_config_apply)?;
+        validate_controlled_write_policy("ocserv_config_rollback", &config.ocserv_config_rollback)?;
+        validate_controlled_write_policy(
+            "ocserv_session_disconnect",
+            &config.ocserv_session_disconnect,
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "controlled-writes")]
+fn validate_controlled_write_policy(
+    field: &'static str,
+    policy: &ControlledWriteOperationPolicy,
+) -> Result<(), ConfigError> {
+    if let Some(identity) = &policy.local_identity {
+        validate_safe_local_identity(identity, field)?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "controlled-writes")]
+fn validate_safe_local_identity(value: &str, field: &'static str) -> Result<(), ConfigError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.len() > 128 {
+        return Err(ConfigError::Invalid(format!(
+            "controlled_writes.{field}.local_identity must be 1-128 bytes"
+        )));
+    }
+    if !trimmed
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'@' | b':'))
+    {
+        return Err(ConfigError::Invalid(format!(
+            "controlled_writes.{field}.local_identity contains unsupported characters"
+        )));
     }
     Ok(())
 }

@@ -13,14 +13,13 @@ fn open_temp_store() -> (tempfile::TempDir, Store, std::path::PathBuf) {
 }
 
 #[test]
-fn observability_store_tests_new_database_uses_schema_version_6() {
+fn observability_store_tests_new_database_uses_current_schema_version() {
     let (_dir, store, _db) = open_temp_store();
 
     assert_eq!(
         store.current_schema_version().expect("version"),
         CURRENT_SCHEMA_VERSION
     );
-    assert_eq!(CURRENT_SCHEMA_VERSION, 6);
 }
 
 #[test]

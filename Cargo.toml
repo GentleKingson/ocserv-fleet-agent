@@ -20,7 +20,7 @@ chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 iroh = "1.0.1"
 libc = "0.2"
-rusqlite = { version = "0.34", features = ["bundled"] }
+rusqlite = { version = "0.34", features = ["backup", "bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

@@ -56,6 +56,10 @@ pub enum Command {
         #[command(subcommand)]
         command: RetentionCommand,
     },
+    Audit {
+        #[command(subcommand)]
+        command: AuditCommand,
+    },
     Health {
         #[command(subcommand)]
         command: HealthCommand,
@@ -331,6 +335,16 @@ pub enum RetentionCommand {
     Apply {
         #[arg(long)]
         dry_run: bool,
+        #[arg(long, value_enum)]
+        scope: Option<RetentionScope>,
+        #[arg(long)]
+        before: Option<String>,
+        #[arg(long)]
+        limit: Option<u64>,
+        #[arg(long)]
+        json: bool,
+        #[arg(long, default_value_t = 1_000)]
+        batch_size: u64,
     },
 }
 
@@ -343,6 +357,38 @@ pub enum RetentionScope {
     HealthSnapshots,
     #[value(name = "alert-events")]
     AlertEvents,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AuditCommand {
+    Export {
+        #[arg(long)]
+        from: String,
+        #[arg(long)]
+        to: String,
+        #[arg(long, value_enum, default_value_t = AuditExportFormat::Jsonl)]
+        format: AuditExportFormat,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long, value_enum, default_value_t = RedactionMode::Default)]
+        redact: RedactionMode,
+        #[arg(long)]
+        include_checksum: bool,
+        #[arg(long, default_value_t = crate::audit_export::DEFAULT_MAX_AUDIT_EXPORT_ROWS)]
+        max_rows: usize,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum AuditExportFormat {
+    Jsonl,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum RedactionMode {
+    None,
+    Default,
+    Strict,
 }
 
 #[derive(Debug, Subcommand)]

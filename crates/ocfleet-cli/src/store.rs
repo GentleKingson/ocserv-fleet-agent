@@ -202,6 +202,30 @@ pub struct RetentionPolicyRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetentionCandidateReport {
+    pub matched_count: u64,
+    pub oldest_timestamp: Option<String>,
+    pub newest_timestamp: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditRecord {
+    pub id: i64,
+    pub ts: String,
+    pub actor: String,
+    pub event: String,
+    pub node_id: Option<String>,
+    pub endpoint_id: Option<String>,
+    pub method: Option<String>,
+    pub request_id: Option<String>,
+    pub params_hash: Option<String>,
+    pub ok: Option<bool>,
+    pub error_code: Option<String>,
+    pub duration_ms: Option<u64>,
+    pub detail_json: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HealthPolicyRecord {
     pub stale_window_seconds: u64,
     pub unreachable_consecutive_failures: u64,
@@ -898,8 +922,33 @@ impl Store {
         cutoff: Option<&str>,
         max_rows: Option<u64>,
     ) -> Result<u64, StoreError> {
+        Ok(self
+            .retention_candidate_report(scope, cutoff, max_rows)?
+            .matched_count)
+    }
+
+    pub fn retention_candidate_report(
+        &self,
+        scope: &str,
+        cutoff: Option<&str>,
+        max_rows: Option<u64>,
+    ) -> Result<RetentionCandidateReport, StoreError> {
         let target = retention_target(scope)?;
-        count_retention_candidates_for_target(&self.conn, target, cutoff, max_rows)
+        retention_candidate_report_for_target(&self.conn, target, cutoff, max_rows)
+    }
+
+    pub fn prune_retention_scope_batch(
+        &self,
+        scope: &str,
+        cutoff: Option<&str>,
+        max_rows: Option<u64>,
+        batch_size: u64,
+    ) -> Result<u64, StoreError> {
+        let target = retention_target(scope)?;
+        let tx = self.conn.unchecked_transaction()?;
+        let deleted = prune_retention_target_batch(&tx, target, cutoff, max_rows, batch_size)?;
+        tx.commit()?;
+        Ok(deleted)
     }
 
     pub fn prune_probe_observations(
@@ -996,6 +1045,25 @@ impl Store {
             .query_row("SELECT count(*) FROM controller_audit_log", [], |row| {
                 row.get(0)
             })?)
+    }
+
+    pub fn list_audit_window(
+        &self,
+        from: &str,
+        to: &str,
+        limit: usize,
+    ) -> Result<Vec<AuditRecord>, StoreError> {
+        let limit = usize_to_i64(limit)?;
+        let mut stmt = self.conn.prepare(
+            "SELECT id, ts, actor, event, node_id, endpoint_id, method, request_id, params_hash, ok, error_code, duration_ms, detail_json
+             FROM controller_audit_log
+             WHERE ts >= ?1 AND ts < ?2
+             ORDER BY ts ASC, id ASC
+             LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![from, to, limit], audit_record_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
     }
 
     pub fn hash_enrollment_token(token: &str) -> String {
@@ -1701,6 +1769,31 @@ fn probe_history_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProbeHist
     })
 }
 
+fn audit_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuditRecord> {
+    let ok: Option<i64> = row.get(9)?;
+    let duration_ms: Option<i64> = row.get(11)?;
+    let detail_json: Option<String> = row.get(12)?;
+    Ok(AuditRecord {
+        id: row.get(0)?,
+        ts: row.get(1)?,
+        actor: row.get(2)?,
+        event: row.get(3)?,
+        node_id: row.get(4)?,
+        endpoint_id: row.get(5)?,
+        method: row.get(6)?,
+        request_id: row.get(7)?,
+        params_hash: row.get(8)?,
+        ok: ok.map(|value| i64_to_bool(value, 9)).transpose()?,
+        error_code: row.get(10)?,
+        duration_ms: duration_ms.and_then(|value| u64::try_from(value).ok()),
+        detail_json: detail_json
+            .as_deref()
+            .map(|value| parse_json_column(value, 12))
+            .transpose()?
+            .unwrap_or(Value::Null),
+    })
+}
+
 fn observability_job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ObservabilityJobRecord> {
     let selector_json: String = row.get(2)?;
     let pair_selector_json: Option<String> = row.get(3)?;
@@ -1960,51 +2053,74 @@ fn retention_target(scope: &str) -> Result<RetentionTarget, StoreError> {
     }
 }
 
-fn count_retention_candidates_for_target(
+fn retention_candidate_report_for_target(
     conn: &Connection,
     target: RetentionTarget,
     cutoff: Option<&str>,
     max_rows: Option<u64>,
-) -> Result<u64, StoreError> {
-    let count: i64 = match (cutoff, max_rows) {
-        (None, None) => return Ok(0),
+) -> Result<RetentionCandidateReport, StoreError> {
+    let (count, oldest, newest): (i64, Option<String>, Option<String>) = match (cutoff, max_rows) {
+        (None, None) => {
+            return Ok(RetentionCandidateReport {
+                matched_count: 0,
+                oldest_timestamp: None,
+                newest_timestamp: None,
+            });
+        }
         (Some(cutoff), None) => conn.query_row(
             &format!(
-                "SELECT count(*) FROM {} WHERE {} < ?1",
-                target.table, target.timestamp_column
+                "SELECT count(*), min({}), max({}) FROM {} WHERE {} < ?1",
+                target.timestamp_column,
+                target.timestamp_column,
+                target.table,
+                target.timestamp_column
             ),
             [cutoff],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?,
         (None, Some(max_rows)) => {
             let max_rows = u64_to_i64(max_rows)?;
             conn.query_row(
                 &format!(
-                    "SELECT count(*) FROM {} WHERE rowid IN (
+                    "SELECT count(*), min({}), max({}) FROM {} WHERE rowid IN (
                        SELECT rowid FROM {} ORDER BY {} DESC, rowid DESC LIMIT -1 OFFSET ?1
                      )",
-                    target.table, target.table, target.timestamp_column
+                    target.timestamp_column,
+                    target.timestamp_column,
+                    target.table,
+                    target.table,
+                    target.timestamp_column
                 ),
                 [max_rows],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )?
         }
         (Some(cutoff), Some(max_rows)) => {
             let max_rows = u64_to_i64(max_rows)?;
             conn.query_row(
                 &format!(
-                    "SELECT count(*) FROM {} WHERE {} < ?1 OR rowid IN (
+                    "SELECT count(*), min({}), max({}) FROM {} WHERE {} < ?1 OR rowid IN (
                        SELECT rowid FROM {} ORDER BY {} DESC, rowid DESC LIMIT -1 OFFSET ?2
                      )",
-                    target.table, target.timestamp_column, target.table, target.timestamp_column
+                    target.timestamp_column,
+                    target.timestamp_column,
+                    target.table,
+                    target.timestamp_column,
+                    target.table,
+                    target.timestamp_column
                 ),
                 params![cutoff, max_rows],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )?
         }
     };
-    u64::try_from(count)
-        .map_err(|err| StoreError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(err))))
+    Ok(RetentionCandidateReport {
+        matched_count: u64::try_from(count).map_err(|err| {
+            StoreError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(err)))
+        })?,
+        oldest_timestamp: oldest,
+        newest_timestamp: newest,
+    })
 }
 
 fn prune_retention_target(
@@ -2013,37 +2129,81 @@ fn prune_retention_target(
     cutoff: Option<&str>,
     max_rows: Option<u64>,
 ) -> Result<u64, StoreError> {
+    let mut total = 0_u64;
+    loop {
+        let deleted = prune_retention_target_batch(tx, target, cutoff, max_rows, 1_000)?;
+        if deleted == 0 {
+            break;
+        }
+        total = total.checked_add(deleted).ok_or_else(|| {
+            StoreError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                io::Error::other("retention delete count overflow"),
+            )))
+        })?;
+    }
+    Ok(total)
+}
+
+fn prune_retention_target_batch(
+    tx: &Transaction<'_>,
+    target: RetentionTarget,
+    cutoff: Option<&str>,
+    max_rows: Option<u64>,
+    batch_size: u64,
+) -> Result<u64, StoreError> {
+    if batch_size == 0 {
+        return Ok(0);
+    }
+    let batch_size = u64_to_i64(batch_size)?;
     let deleted = match (cutoff, max_rows) {
         (None, None) => 0,
         (Some(cutoff), None) => tx.execute(
             &format!(
-                "DELETE FROM {} WHERE {} < ?1",
-                target.table, target.timestamp_column
+                "DELETE FROM {} WHERE rowid IN (
+                   SELECT rowid FROM {} WHERE {} < ?1
+                   ORDER BY {} ASC, rowid ASC LIMIT ?2
+                 )",
+                target.table, target.table, target.timestamp_column, target.timestamp_column
             ),
-            [cutoff],
+            params![cutoff, batch_size],
         )?,
         (None, Some(max_rows)) => {
             let max_rows = u64_to_i64(max_rows)?;
             tx.execute(
                 &format!(
                     "DELETE FROM {} WHERE rowid IN (
-                       SELECT rowid FROM {} ORDER BY {} DESC, rowid DESC LIMIT -1 OFFSET ?1
+                       SELECT rowid FROM {} WHERE rowid IN (
+                         SELECT rowid FROM {} ORDER BY {} DESC, rowid DESC LIMIT -1 OFFSET ?1
+                       )
+                       ORDER BY {} ASC, rowid ASC LIMIT ?2
                      )",
-                    target.table, target.table, target.timestamp_column
+                    target.table,
+                    target.table,
+                    target.table,
+                    target.timestamp_column,
+                    target.timestamp_column
                 ),
-                [max_rows],
+                params![max_rows, batch_size],
             )?
         }
         (Some(cutoff), Some(max_rows)) => {
             let max_rows = u64_to_i64(max_rows)?;
             tx.execute(
                 &format!(
-                    "DELETE FROM {} WHERE {} < ?1 OR rowid IN (
-                       SELECT rowid FROM {} ORDER BY {} DESC, rowid DESC LIMIT -1 OFFSET ?2
+                    "DELETE FROM {} WHERE rowid IN (
+                       SELECT rowid FROM {} WHERE {} < ?1 OR rowid IN (
+                         SELECT rowid FROM {} ORDER BY {} DESC, rowid DESC LIMIT -1 OFFSET ?2
+                       )
+                       ORDER BY {} ASC, rowid ASC LIMIT ?3
                      )",
-                    target.table, target.timestamp_column, target.table, target.timestamp_column
+                    target.table,
+                    target.table,
+                    target.timestamp_column,
+                    target.table,
+                    target.timestamp_column,
+                    target.timestamp_column
                 ),
-                params![cutoff, max_rows],
+                params![cutoff, max_rows, batch_size],
             )?
         }
     };
@@ -2144,6 +2304,11 @@ fn option_u64_to_i64(value: Option<u64>) -> Result<Option<i64>, StoreError> {
 }
 
 fn u64_to_i64(value: u64) -> Result<i64, StoreError> {
+    i64::try_from(value)
+        .map_err(|err| StoreError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(err))))
+}
+
+fn usize_to_i64(value: usize) -> Result<i64, StoreError> {
     i64::try_from(value)
         .map_err(|err| StoreError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(err))))
 }

@@ -1,8 +1,9 @@
 use clap::{CommandFactory, Parser};
 use ocfleet_cli::args::{
-    AlertCommand, Cli, Command, EndpointCommand, EnrollCommand, EnrollRequestCommand,
-    EnrollTokenCommand, HealthCommand, HealthPolicyCommand, NodeCommand, OcservCommand,
-    OcservSessionsCommand, ProbeCommand, TrustCommand, TrustDiffFormat,
+    AlertCommand, AuditCommand, AuditExportFormat, Cli, Command, EndpointCommand, EnrollCommand,
+    EnrollRequestCommand, EnrollTokenCommand, HealthCommand, HealthPolicyCommand, NodeCommand,
+    OcservCommand, OcservSessionsCommand, ProbeCommand, RedactionMode, RetentionCommand,
+    RetentionScope, TrustCommand, TrustDiffFormat,
 };
 use std::path::PathBuf;
 
@@ -181,6 +182,93 @@ fn parses_alert_deliver_command() {
     assert_eq!(hook, "jsonl_file:state/alerts.jsonl");
     assert_eq!(limit, 25);
     assert!(dry_run);
+}
+
+#[test]
+fn parses_retention_apply_report_options() {
+    let cli = Cli::parse_from([
+        "ocfleet",
+        "retention",
+        "apply",
+        "--dry-run",
+        "--scope",
+        "observations",
+        "--before",
+        "2026-07-01T00:00:00Z",
+        "--limit",
+        "25",
+        "--batch-size",
+        "10",
+        "--json",
+    ]);
+
+    let Command::Retention {
+        command:
+            RetentionCommand::Apply {
+                dry_run,
+                scope,
+                before,
+                limit,
+                json,
+                batch_size,
+            },
+    } = cli.command
+    else {
+        panic!("expected retention apply command");
+    };
+
+    assert!(dry_run);
+    assert_eq!(scope, Some(RetentionScope::Observations));
+    assert_eq!(before.as_deref(), Some("2026-07-01T00:00:00Z"));
+    assert_eq!(limit, Some(25));
+    assert_eq!(batch_size, 10);
+    assert!(json);
+}
+
+#[test]
+fn parses_audit_export_command() {
+    let cli = Cli::parse_from([
+        "ocfleet",
+        "audit",
+        "export",
+        "--from",
+        "2026-07-01T00:00:00Z",
+        "--to",
+        "2026-07-02T00:00:00Z",
+        "--format",
+        "jsonl",
+        "--output",
+        "state/audit.jsonl",
+        "--redact",
+        "strict",
+        "--include-checksum",
+        "--max-rows",
+        "500",
+    ]);
+
+    let Command::Audit {
+        command:
+            AuditCommand::Export {
+                from,
+                to,
+                format,
+                output,
+                redact,
+                include_checksum,
+                max_rows,
+            },
+    } = cli.command
+    else {
+        panic!("expected audit export command");
+    };
+
+    assert_eq!(from, "2026-07-01T00:00:00Z");
+    assert_eq!(to, "2026-07-02T00:00:00Z");
+    assert_eq!(format, AuditExportFormat::Jsonl);
+    assert_eq!(output, PathBuf::from("state/audit.jsonl"));
+    assert_eq!(redact, RedactionMode::Strict);
+    assert!(include_checksum);
+    assert_eq!(max_rows, 500);
 }
 
 #[test]

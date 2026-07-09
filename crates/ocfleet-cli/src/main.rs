@@ -3,10 +3,10 @@ use clap::Parser;
 use ocfleet_cli::alerts::run_alert_command;
 use ocfleet_cli::args::{
     Cli, Command, EndpointCommand, EnrollCommand, EnrollRequestCommand, EnrollTokenCommand,
-    NodeCommand, OcservCommand, OcservSessionsCommand, ProbeCommand, RetentionCommand,
-    RetentionScope, TrustCommand, TrustDiffFormat,
+    NodeCommand, OcservCommand, OcservSessionsCommand, ProbeCommand, TrustCommand, TrustDiffFormat,
 };
 use ocfleet_cli::audit::AuditEvent;
+use ocfleet_cli::audit_export::run_audit_command;
 use ocfleet_cli::controller_rpc::{
     FixedControllerRpc, OcservCommandAudit, RpcAuditRecord, RpcCommandFailure, elapsed_ms,
     error_code_from_name, execute_fixed_node_rpc, execute_ocserv_rpc, execute_optional_ocserv_rpc,
@@ -25,10 +25,11 @@ use ocfleet_cli::ocserv_output::{
     OcservStatusView, assert_low_sensitive_ocserv_output, format_cert_human, format_cert_json,
     format_sessions_human, format_status_json, format_status_view_human,
 };
+use ocfleet_cli::retention::run_retention_command;
 use ocfleet_cli::scheduler::run_schedule_command;
 use ocfleet_cli::store::{
     ApprovalInput, EndpointTrustRecord, EnrollmentTokenInsert, JoinRequestInsert, NodeInsert,
-    NodeRecord, ProbeHistoryRecord, ProbeObservationRecord, RetentionPolicyRecord, Store,
+    NodeRecord, ProbeHistoryRecord, ProbeObservationRecord, Store,
 };
 use ocfleet_config::validation::{
     canonicalize_node_endpoint_id, validate_node_id, validate_region, validate_role,
@@ -326,6 +327,10 @@ async fn main() -> anyhow::Result<()> {
             let store = Store::open(&cli.database).context("failed to open controller database")?;
             run_retention_command(&store, command)?;
         }
+        Command::Audit { command } => {
+            let store = Store::open(&cli.database).context("failed to open controller database")?;
+            run_audit_command(&store, command)?;
+        }
         Command::Health { command } => {
             let store = Store::open(&cli.database).context("failed to open controller database")?;
             run_health_command(&store, command)?;
@@ -486,191 +491,12 @@ fn parse_ttl(value: &str) -> anyhow::Result<Duration> {
     }
 }
 
-fn run_retention_command(store: &Store, command: RetentionCommand) -> anyhow::Result<()> {
-    match command {
-        RetentionCommand::Show => run_retention_show(store),
-        RetentionCommand::Set {
-            scope,
-            max_age,
-            max_rows,
-        } => run_retention_set(store, scope, max_age.as_deref(), max_rows),
-        RetentionCommand::Apply { dry_run } => run_retention_apply(store, dry_run),
-    }
-}
-
-fn run_retention_show(store: &Store) -> anyhow::Result<()> {
-    for scope in RETENTION_SCOPES {
-        let policy = effective_retention_policy(store, scope)?;
-        println!(
-            "scope={} max_age_days={} max_rows={} updated_at={}",
-            policy.scope,
-            optional_u64(policy.max_age_days),
-            optional_u64(policy.max_rows),
-            policy.updated_at
-        );
-    }
-    println!("scope=controller_audit_log retention=never");
-    Ok(())
-}
-
-fn run_retention_set(
-    store: &Store,
-    scope: RetentionScope,
-    max_age: Option<&str>,
-    max_rows: Option<usize>,
-) -> anyhow::Result<()> {
-    let scope_name = retention_scope_name(scope);
-    let mut policy = effective_retention_policy(store, scope_name)?;
-    if let Some(max_age) = max_age {
-        policy.max_age_days = Some(parse_retention_max_age_days(max_age)?);
-    }
-    if let Some(max_rows) = max_rows {
-        if max_rows == 0 {
-            bail!("--max-rows must be greater than zero");
-        }
-        policy.max_rows = Some(max_rows as u64);
-    }
-    policy.updated_at = now_rfc3339();
-    store.set_retention_policy(&policy)?;
-    let mut event = AuditEvent::new(local_actor(), "retention.set");
-    event.ok = Some(true);
-    event.detail_json = json!({
-        "scope": policy.scope.as_str(),
-        "max_age_days": policy.max_age_days,
-        "max_rows": policy.max_rows,
-    });
-    store.insert_audit(&event)?;
-    println!("scope={}", policy.scope);
-    println!("max_age_days={}", optional_u64(policy.max_age_days));
-    println!("max_rows={}", optional_u64(policy.max_rows));
-    Ok(())
-}
-
-fn run_retention_apply(store: &Store, dry_run: bool) -> anyhow::Result<()> {
-    for scope in RETENTION_SCOPES {
-        let policy = effective_retention_policy(store, scope)?;
-        let cutoff = retention_cutoff(&policy)?;
-        let candidate_count =
-            store.count_retention_candidates(scope, cutoff.as_deref(), policy.max_rows)?;
-        let deleted_count = if dry_run {
-            candidate_count
-        } else {
-            match *scope {
-                "observations" => {
-                    store.prune_probe_observations(cutoff.as_deref(), policy.max_rows)?
-                }
-                "observability-runs" => {
-                    store.prune_observability_runs(cutoff.as_deref(), policy.max_rows)?
-                }
-                "health-snapshots" => {
-                    store.prune_health_snapshots(cutoff.as_deref(), policy.max_rows)?
-                }
-                "alert-events" => store.prune_alert_events(cutoff.as_deref(), policy.max_rows)?,
-                _ => unreachable!("fixed retention scope list"),
-            }
-        };
-        println!(
-            "scope={} cutoff={} deleted_count={} dry_run={}",
-            scope,
-            cutoff.as_deref().unwrap_or("<none>"),
-            deleted_count,
-            dry_run
-        );
-        let mut event = AuditEvent::new(local_actor(), "retention.apply");
-        event.ok = Some(true);
-        event.detail_json = json!({
-            "scope": scope,
-            "cutoff": cutoff,
-            "deleted_count": deleted_count,
-            "dry_run": dry_run,
-        });
-        store.insert_audit(&event)?;
-    }
-    println!("scope=controller_audit_log retention=never deleted_count=0 dry_run={dry_run}");
-    Ok(())
-}
-
-const RETENTION_SCOPES: &[&str] = &[
-    "observations",
-    "observability-runs",
-    "health-snapshots",
-    "alert-events",
-];
-
-fn retention_scope_name(scope: RetentionScope) -> &'static str {
-    match scope {
-        RetentionScope::Observations => "observations",
-        RetentionScope::ObservabilityRuns => "observability-runs",
-        RetentionScope::HealthSnapshots => "health-snapshots",
-        RetentionScope::AlertEvents => "alert-events",
-    }
-}
-
-fn default_retention_policy(scope: &str) -> RetentionPolicyRecord {
-    let (max_age_days, max_rows) = match scope {
-        "observations" => (Some(30), Some(100_000)),
-        "observability-runs" => (Some(30), Some(100_000)),
-        "health-snapshots" => (Some(30), None),
-        "alert-events" => (Some(180), None),
-        _ => (None, None),
-    };
-    RetentionPolicyRecord {
-        scope: scope.to_string(),
-        max_age_days,
-        max_rows,
-        updated_at: "default".to_string(),
-    }
-}
-
-fn effective_retention_policy(store: &Store, scope: &str) -> anyhow::Result<RetentionPolicyRecord> {
-    Ok(store
-        .get_retention_policy(scope)?
-        .unwrap_or_else(|| default_retention_policy(scope)))
-}
-
-fn retention_cutoff(policy: &RetentionPolicyRecord) -> anyhow::Result<Option<String>> {
-    let Some(max_age_days) = policy.max_age_days else {
-        return Ok(None);
-    };
-    let days = i64::try_from(max_age_days).context("retention max age is too large")?;
-    Ok(Some(
-        (OffsetDateTime::now_utc() - Duration::days(days))
-            .format(&Rfc3339)
-            .expect("RFC3339 formatting succeeds"),
-    ))
-}
-
-fn parse_retention_max_age_days(value: &str) -> anyhow::Result<u64> {
-    let seconds = parse_duration_seconds(value, "--max-age")?;
-    const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
-    if seconds % SECONDS_PER_DAY != 0 {
-        bail!("--max-age must resolve to whole days");
-    }
-    let days = seconds / SECONDS_PER_DAY;
-    if days == 0 {
-        bail!("--max-age must be at least one day");
-    }
-    Ok(days)
-}
-
 fn duration_cutoff_rfc3339(value: &str, label: &str) -> anyhow::Result<String> {
     let seconds = parse_duration_seconds(value, label)?;
     let seconds = i64::try_from(seconds).with_context(|| format!("{label} is too large"))?;
     Ok((OffsetDateTime::now_utc() - Duration::seconds(seconds))
         .format(&Rfc3339)
         .expect("RFC3339 formatting succeeds"))
-}
-
-fn now_rfc3339() -> String {
-    OffsetDateTime::now_utc()
-        .format(&Rfc3339)
-        .expect("RFC3339 formatting succeeds")
-}
-
-fn optional_u64(value: Option<u64>) -> String {
-    value
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "<none>".to_string())
 }
 
 #[derive(Debug, Clone)]

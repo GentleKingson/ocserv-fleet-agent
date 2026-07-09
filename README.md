@@ -62,7 +62,7 @@ production-complete.
   agent `collector_snapshot` provider.
 - Supports governance foundation commands:
   - `--actor` and `OCFLEET_ACTOR` for consistent controller audit identity
-  - `ocfleet trust policy validate <file>` for TOML policy schema checks
+  - `ocfleet trust policy validate <file>` for TOML/YAML policy schema checks
   - `ocfleet trust policy diff <file>` for advisory registry/trust drift review
 - Supports fixed RPC methods:
   - `node.ping`
@@ -414,7 +414,11 @@ target/debug/ocfleet audit export \
   --output ./audit-export.jsonl \
   --include-checksum
 target/debug/ocfleet trust policy validate ./trust-policy.toml --json
+target/debug/ocfleet trust policy validate ./trust-policy.yaml --json
 target/debug/ocfleet trust policy diff ./trust-policy.toml --json
+install -d -m 0700 ./trust-policy-review
+target/debug/ocfleet trust policy diff ./trust-policy.toml \
+  --format markdown --output ./trust-policy-review/trust-policy-diff.md
 ```
 
 These commands operate inside the controller boundary. Scheduler jobs use only

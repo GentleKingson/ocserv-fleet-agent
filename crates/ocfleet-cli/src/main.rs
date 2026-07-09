@@ -4,6 +4,7 @@ use ocfleet_cli::alerts::run_alert_command;
 use ocfleet_cli::args::{
     Cli, Command, EndpointCommand, EnrollCommand, EnrollRequestCommand, EnrollTokenCommand,
     NodeCommand, OcservCommand, OcservSessionsCommand, ProbeCommand, TrustCommand, TrustDiffFormat,
+    TrustPolicyCommand,
 };
 use ocfleet_cli::audit::AuditEvent;
 use ocfleet_cli::audit_export::run_audit_command;
@@ -33,7 +34,7 @@ use ocfleet_cli::store::{
     ApprovalInput, EndpointTrustRecord, EnrollmentTokenInsert, JoinRequestInsert, NodeInsert,
     NodeRecord, ProbeHistoryRecord, ProbeObservationRecord, Store,
 };
-use ocfleet_cli::trust_policy::run_trust_policy_command;
+use ocfleet_cli::trust_policy::{run_trust_policy_diff, run_trust_policy_validate};
 use ocfleet_config::validation::{
     canonicalize_node_endpoint_id, validate_node_id, validate_region, validate_role,
 };
@@ -296,17 +297,32 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Command::Trust { command } => {
-            let store = Store::open(&cli.database).context("failed to open controller database")?;
-            match command {
-                TrustCommand::Diff {
-                    endpoint,
-                    format,
-                    strict,
-                } => run_trust_diff_command(&store, endpoint.as_deref(), format, strict)?,
-                TrustCommand::Policy { command } => run_trust_policy_command(&store, command)?,
+        Command::Trust { command } => match command {
+            TrustCommand::Diff {
+                endpoint,
+                format,
+                strict,
+            } => {
+                let store =
+                    Store::open(&cli.database).context("failed to open controller database")?;
+                run_trust_diff_command(&store, endpoint.as_deref(), format, strict)?;
             }
-        }
+            TrustCommand::Policy { command } => match command {
+                TrustPolicyCommand::Validate { file, json } => {
+                    run_trust_policy_validate(&file, json)?;
+                }
+                TrustPolicyCommand::Diff {
+                    file,
+                    json,
+                    format,
+                    output,
+                } => {
+                    let store =
+                        Store::open(&cli.database).context("failed to open controller database")?;
+                    run_trust_policy_diff(&store, &file, json, format, output.as_deref())?;
+                }
+            },
+        },
         Command::Ocserv { command } => {
             let store = Store::open(&cli.database).context("failed to open controller database")?;
             match command {

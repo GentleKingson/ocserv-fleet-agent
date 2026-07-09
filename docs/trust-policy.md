@@ -6,21 +6,34 @@ current implementation supports local validation and diff only:
 ```bash
 ocfleet trust policy validate ./trust-policy.toml
 ocfleet trust policy validate ./trust-policy.toml --json
+ocfleet trust policy validate ./trust-policy.yaml --json
 ocfleet trust policy diff ./trust-policy.toml
 ocfleet trust policy diff ./trust-policy.toml --json
+install -d -m 0700 ./trust-policy-review
+ocfleet trust policy diff ./trust-policy.toml --format markdown \
+  --output ./trust-policy-review/trust-policy-diff.md
 ```
 
 There is no `apply` command in this slice. These commands do not contact agents,
 do not modify SQLite trust state, do not approve enrollment, and do not generate
 path-probe authorization.
 
-## TOML Schema
+`validate` is a pure file operation and does not open, create, or migrate the
+controller database. `diff` opens the controller store through the normal CLI
+store lifecycle to compare declared state; it performs no trust mutation or
+audit insert.
 
-TOML parsing is implemented today. YAML uses the same field model but remains a
-documented future parser choice until dependency and compatibility review.
+## TOML And YAML Schema
+
+`.toml`, `.yaml`, and `.yml` use the same deny-unknown-fields data model. Input
+is a bounded regular file. Parsing never contacts an agent or changes trust.
 
 ```toml
 version = 1
+
+[metadata]
+name = "production-fleet"
+revision = "rev-2026-07"
 
 [[nodes]]
 node_id = "hk-ocserv-01"
@@ -54,7 +67,10 @@ enabled = true
 
 Allowed lifecycle values are `active`, `rotated`, `revoked`, and
 `quarantined`. Path probes must always name one explicit source node and one
-explicit target node.
+explicit target node. Every path-probe pair also requires a matching explicit
+peer pair and at least one explicit controller; validation never infers either
+relationship. A rotated, revoked, or quarantined node must set `enabled=false`
+and cannot appear in a peer relationship.
 
 ## Forbidden Fields
 
@@ -71,9 +87,19 @@ against the controller SQLite registry:
 - missing or extra nodes
 - node endpoint, region, role, or enabled mismatches
 - missing, extra, or lifecycle-mismatched EndpointIDs
+- missing or unexpected controller allowlist entries
+- missing or unexpected peer allowlist entries
+- missing or unexpected explicit controller/target path-probe pairs
 
 The diff is advisory. Operators must use existing explicit audited CLI commands
 to make any change. This preserves the no-TOFU and no-automatic-trust boundary.
+
+`--format markdown --output <path>` writes a bounded PR-review summary using
+strict private create-new file semantics. The parent must be `0700`; the output
+is `0600`. The summary contains only the policy basename, bounded identifiers,
+enum/status values, and counts. Diff items have deterministic ordering and are
+capped at 512; `total_diff_count` and `truncated` make truncation explicit. It is
+still advisory and does not mutate controller state.
 
 ## YAML Shape
 
@@ -81,6 +107,9 @@ The equivalent YAML shape is:
 
 ```yaml
 version: 1
+metadata:
+  name: production-fleet
+  revision: rev-2026-07
 nodes:
   - node_id: hk-ocserv-01
     endpoint_id: <agent-endpoint-id>
@@ -100,5 +129,13 @@ path_probes:
     enabled: true
 ```
 
-The CLI currently rejects `.yaml` and `.yml` with a clear message rather than
-silently accepting an unreviewed parser.
+TOML and YAML validation reports and diff semantics are equivalent. Duplicate
+nodes, EndpointIDs, controllers, peers, path-probe pairs, wildcard EndpointIDs,
+automatic-trust fields, and unknown fields are rejected.
+
+## CI Review Helper
+
+`scripts/check-trust-policy.sh examples/trust-policy.toml` validates a policy
+with an isolated nonexistent database path and fails if validation creates that
+file. It is validation-only: it does not apply policy, approve enrollment,
+authorize probes, or contact agents.

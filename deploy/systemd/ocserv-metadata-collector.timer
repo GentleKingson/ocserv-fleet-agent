@@ -1,0 +1,11 @@
+[Unit]
+Description=Run ocfleet local ocserv metadata collector periodically
+
+[Timer]
+OnCalendar=hourly
+AccuracySec=5min
+Persistent=false
+Unit=ocserv-metadata-collector.service
+
+[Install]
+WantedBy=timers.target

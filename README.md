@@ -57,6 +57,9 @@ production-complete.
 - Supports experimental read-only `ocfleet-api` / Web dashboard access for
   health snapshots, jobs, runs, observations, alerts, and bounded redacted audit
   export views.
+- Supports a local `ocfleet-ocserv-collector` snapshot normalizer for
+  operator-managed low-sensitive ocserv aggregate metadata consumed by the
+  agent `collector_snapshot` provider.
 - Supports governance foundation commands:
   - `--actor` and `OCFLEET_ACTOR` for consistent controller audit identity
   - `ocfleet trust policy validate <file>` for TOML policy schema checks
@@ -134,6 +137,28 @@ target/debug/ocfleet-api \
 
 The API opens SQLite in read-only mode and serves only `GET` observation routes.
 Non-loopback listeners require `--auth-token-file`.
+
+Optionally generate a local ocserv metadata collector config and write a private
+snapshot for the agent `collector_snapshot` provider:
+
+```bash
+umask 077
+install -d -m 0700 ./agent-state
+target/debug/ocfleet-ocserv-collector --print-example-config > ./ocserv-collector.toml
+chmod 0600 ./ocserv-collector.toml
+
+# Set collected_at to the producer time for the exact aggregate values before
+# the real write. Collector reruns preserve it and cannot refresh stale data.
+
+target/debug/ocfleet-ocserv-collector \
+  --check \
+  --config ./ocserv-collector.toml \
+  --output ./agent-state/ocserv-live-snapshot.json
+
+target/debug/ocfleet-ocserv-collector \
+  --config ./ocserv-collector.toml \
+  --output ./agent-state/ocserv-live-snapshot.json
+```
 
 Create an agent config:
 

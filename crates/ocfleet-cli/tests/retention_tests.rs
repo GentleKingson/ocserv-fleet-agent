@@ -316,6 +316,47 @@ fn retention_tests_apply_json_report_includes_window_and_candidates() {
 }
 
 #[test]
+fn retention_tests_explain_is_dry_run_and_does_not_delete_or_audit() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let database_arg = database.to_string_lossy().into_owned();
+    let store = Store::open(&database).expect("open store");
+    insert_observation(&store, "obs-old", "2026-01-01T00:00:00Z");
+    insert_observation(&store, "obs-new", "2026-07-08T00:00:00Z");
+    store
+        .set_retention_policy(&ocfleet_cli::store::RetentionPolicyRecord {
+            scope: "observations".to_string(),
+            max_age_days: None,
+            max_rows: Some(1),
+            updated_at: "2026-07-09T00:00:00Z".to_string(),
+        })
+        .expect("set policy");
+    drop(store);
+    let audit_before = audit_count(&database);
+
+    let output = run_ocfleet(&[
+        "--database",
+        &database_arg,
+        "retention",
+        "explain",
+        "--scope",
+        "observations",
+        "--json",
+    ]);
+    let report: Value = serde_json::from_slice(&output.stdout).expect("valid explain JSON");
+
+    assert_eq!(report["scope"], "observations");
+    assert_eq!(report["dry_run"], true);
+    assert_eq!(report["effective_policy"]["max_rows"], 1);
+    assert_eq!(report["cutoff"], Value::Null);
+    assert_eq!(report["matched_count"], 1);
+    assert_eq!(report["oldest_candidate"], "2026-01-01T00:00:00Z");
+    assert_eq!(report["newest_candidate"], "2026-01-01T00:00:00Z");
+    assert_eq!(observation_count(&database), 2);
+    assert_eq!(audit_count(&database), audit_before);
+}
+
+#[test]
 fn retention_tests_apply_deletes_in_batches_and_audits_report() {
     let dir = tempfile::tempdir().expect("temp dir");
     let database = dir.path().join("controller.sqlite");

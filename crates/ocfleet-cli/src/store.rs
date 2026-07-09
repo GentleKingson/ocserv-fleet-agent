@@ -133,6 +133,19 @@ pub struct ObservabilityRunInsert {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservabilityRunRecord {
+    pub run_id: String,
+    pub job_id: Option<String>,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+    pub status: String,
+    pub triggered_by: String,
+    pub summary_json: Value,
+    pub observation_count: u64,
+    pub failed_observation_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProbeObservationInsert {
     pub observation_id: String,
     pub run_id: Option<String>,
@@ -529,6 +542,22 @@ impl Store {
             .map_err(StoreError::from)
     }
 
+    pub fn get_observability_job(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<ObservabilityJobRecord>, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT job_id, kind, selector_json, pair_selector_json, interval_seconds, jitter_seconds, timeout_ms, enabled, next_run_at, last_run_at, created_at, updated_at
+                 FROM observability_jobs
+                 WHERE job_id = ?1",
+                [job_id],
+                observability_job_from_row,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
     pub fn list_observability_jobs_tolerant(
         &self,
     ) -> Result<Vec<ObservabilityJobLoadResult>, StoreError> {
@@ -544,6 +573,23 @@ impl Store {
             .map(observability_job_load_from_raw)
             .collect::<Vec<_>>();
         Ok(jobs)
+    }
+
+    pub fn get_observability_job_tolerant(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<ObservabilityJobLoadResult>, StoreError> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT job_id, kind, selector_json, pair_selector_json, interval_seconds, jitter_seconds, timeout_ms, enabled, next_run_at, last_run_at, created_at, updated_at
+                 FROM observability_jobs
+                 WHERE job_id = ?1",
+                [job_id],
+                raw_observability_job_from_row,
+            )
+            .optional()?;
+        Ok(row.map(observability_job_load_from_raw))
     }
 
     pub fn set_observability_job_enabled(
@@ -620,6 +666,46 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    pub fn list_observability_runs(
+        &self,
+        limit: u64,
+    ) -> Result<Vec<ObservabilityRunRecord>, StoreError> {
+        let limit = u64_to_i64(limit)?;
+        let mut stmt = self.conn.prepare(
+            "SELECT r.run_id, r.job_id, r.started_at, r.finished_at, r.status, r.triggered_by, r.summary_json,
+                    COUNT(o.observation_id) AS observation_count,
+                    COALESCE(SUM(CASE WHEN o.ok = 0 THEN 1 ELSE 0 END), 0) AS failed_observation_count
+             FROM observability_runs r
+             LEFT JOIN probe_observations o ON o.run_id = r.run_id
+             GROUP BY r.run_id, r.job_id, r.started_at, r.finished_at, r.status, r.triggered_by, r.summary_json
+             ORDER BY r.started_at DESC, r.run_id DESC
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit], observability_run_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub fn get_observability_run(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<ObservabilityRunRecord>, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT r.run_id, r.job_id, r.started_at, r.finished_at, r.status, r.triggered_by, r.summary_json,
+                        COUNT(o.observation_id) AS observation_count,
+                        COALESCE(SUM(CASE WHEN o.ok = 0 THEN 1 ELSE 0 END), 0) AS failed_observation_count
+                 FROM observability_runs r
+                 LEFT JOIN probe_observations o ON o.run_id = r.run_id
+                 WHERE r.run_id = ?1
+                 GROUP BY r.run_id, r.job_id, r.started_at, r.finished_at, r.status, r.triggered_by, r.summary_json",
+                [run_id],
+                observability_run_from_row,
+            )
+            .optional()
+            .map_err(StoreError::from)
     }
 
     pub fn insert_probe_observation(
@@ -714,6 +800,45 @@ impl Store {
         }
     }
 
+    pub fn list_probe_observations_filtered(
+        &self,
+        node_filter: Option<&str>,
+        method_filter: Option<&str>,
+        limit: u64,
+    ) -> Result<Vec<ProbeObservationRecord>, StoreError> {
+        let limit = u64_to_i64(limit)?;
+        let mut stmt = self.conn.prepare(
+            "SELECT observation_id, run_id, node_id, endpoint_id, method, ok, error_code, duration_ms, observed_at, expires_at, result_class, summary_json
+             FROM probe_observations
+             WHERE (?1 IS NULL OR node_id = ?1)
+               AND (?2 IS NULL OR method = ?2)
+             ORDER BY observed_at DESC, observation_id DESC
+             LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(
+            params![node_filter, method_filter, limit],
+            probe_observation_from_row,
+        )?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub fn get_probe_observation(
+        &self,
+        observation_id: &str,
+    ) -> Result<Option<ProbeObservationRecord>, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT observation_id, run_id, node_id, endpoint_id, method, ok, error_code, duration_ms, observed_at, expires_at, result_class, summary_json
+                 FROM probe_observations
+                 WHERE observation_id = ?1",
+                [observation_id],
+                probe_observation_from_row,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
     pub fn upsert_health_snapshot(
         &self,
         snapshot: &HealthSnapshotRecord,
@@ -761,6 +886,22 @@ impl Store {
             .map_err(StoreError::from)
     }
 
+    pub fn list_health_snapshots_limited(
+        &self,
+        limit: u64,
+    ) -> Result<Vec<HealthSnapshotRecord>, StoreError> {
+        let limit = u64_to_i64(limit)?;
+        let mut stmt = self.conn.prepare(
+            "SELECT node_id, endpoint_id, computed_at, status, freshness_seconds, last_success_at, last_failure_at, last_error_code, degraded_methods_json, summary_json
+             FROM health_snapshots
+             ORDER BY computed_at DESC, node_id
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit], health_snapshot_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
     pub fn upsert_alert_event(&self, alert: &AlertEventRecord) -> Result<(), StoreError> {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
@@ -803,6 +944,25 @@ impl Store {
              ORDER BY last_seen_at DESC, alert_id",
         )?;
         let rows = stmt.query_map([], alert_event_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub fn list_alert_events_filtered(
+        &self,
+        state: Option<&str>,
+        severity: Option<&str>,
+        node_id: Option<&str>,
+    ) -> Result<Vec<AlertEventRecord>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT alert_id, dedupe_key, node_id, severity, state, reason_code, first_seen_at, last_seen_at, last_sent_at, resolved_at, detail_json
+             FROM alert_events
+             WHERE (?1 IS NULL OR state = ?1)
+               AND (?2 IS NULL OR severity = ?2)
+               AND (?3 IS NULL OR node_id = ?3)
+             ORDER BY last_seen_at DESC, alert_id",
+        )?;
+        let rows = stmt.query_map(params![state, severity, node_id], alert_event_from_row)?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(StoreError::from)
     }
@@ -1903,6 +2063,23 @@ fn observability_job_load_from_raw(raw: RawObservabilityJobRow) -> Observability
         last_run_at: raw.last_run_at,
         created_at: raw.created_at,
         updated_at: raw.updated_at,
+    })
+}
+
+fn observability_run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ObservabilityRunRecord> {
+    let summary_json: String = row.get(6)?;
+    let observation_count: i64 = row.get(7)?;
+    let failed_observation_count: i64 = row.get(8)?;
+    Ok(ObservabilityRunRecord {
+        run_id: row.get(0)?,
+        job_id: row.get(1)?,
+        started_at: row.get(2)?,
+        finished_at: row.get(3)?,
+        status: row.get(4)?,
+        triggered_by: row.get(5)?,
+        summary_json: parse_json_column(&summary_json, 6)?,
+        observation_count: i64_to_u64(observation_count)?,
+        failed_observation_count: i64_to_u64(failed_observation_count)?,
     })
 }
 

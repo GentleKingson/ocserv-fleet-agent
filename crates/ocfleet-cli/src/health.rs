@@ -8,7 +8,7 @@ use ocfleet_protocol::method::{
 use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
-use crate::args::{HealthCommand, HealthPolicyCommand};
+use crate::args::{HealthCommand, HealthPolicyCommand, HealthSnapshotCommand};
 use crate::audit::AuditEvent;
 use crate::duration_args::parse_duration_seconds;
 use crate::input_validation::local_actor;
@@ -17,12 +17,14 @@ use crate::store::{
 };
 
 const OBSERVATION_READ_LIMIT: u64 = 1_000;
+const MAX_HEALTH_SNAPSHOT_LIMIT: u64 = 1_000;
 
 pub fn run_health_command(store: &Store, command: HealthCommand) -> anyhow::Result<()> {
     match command {
         HealthCommand::Summary { json } => run_health_summary(store, json),
         HealthCommand::Node { node_id, json } => run_health_node(store, &node_id, json),
         HealthCommand::Policy { command } => run_health_policy_command(store, command),
+        HealthCommand::Snapshot { command } => run_health_snapshot_command(store, command),
     }
 }
 
@@ -193,6 +195,48 @@ fn run_health_policy_command(store: &Store, command: HealthPolicyCommand) -> any
             policy.updated_at = now_rfc3339();
             store.set_health_policy(&policy, &local_actor())?;
             print_health_policy(&policy);
+            Ok(())
+        }
+    }
+}
+
+fn run_health_snapshot_command(
+    store: &Store,
+    command: HealthSnapshotCommand,
+) -> anyhow::Result<()> {
+    match command {
+        HealthSnapshotCommand::List { limit, json } => {
+            let limit = validate_snapshot_limit(limit)?;
+            let snapshots = store.list_health_snapshots_limited(limit)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "schema": "ocfleet.health_snapshots.v1",
+                        "limit": limit,
+                        "snapshot_count": snapshots.len(),
+                        "snapshots": snapshots.iter().map(snapshot_to_json).collect::<Vec<_>>(),
+                        "limitation": "latest_per_node",
+                    }))?
+                );
+            } else {
+                println!("limit={limit}");
+                println!("snapshot_count={}", snapshots.len());
+                println!("limitation=latest_per_node");
+                for snapshot in &snapshots {
+                    println!(
+                        "node_id={} endpoint_id={} computed_at={} status={} freshness_seconds={} last_success_at={} last_failure_at={} last_error_code={}",
+                        snapshot.node_id,
+                        snapshot.endpoint_id.as_deref().unwrap_or("<none>"),
+                        snapshot.computed_at,
+                        snapshot.status,
+                        option_u64(snapshot.freshness_seconds),
+                        snapshot.last_success_at.as_deref().unwrap_or("<none>"),
+                        snapshot.last_failure_at.as_deref().unwrap_or("<none>"),
+                        snapshot.last_error_code.as_deref().unwrap_or("<none>"),
+                    );
+                }
+            }
             Ok(())
         }
     }
@@ -478,6 +522,7 @@ fn print_health_output(
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
+                "schema": "ocfleet.health.v1",
                 "generated_at": generated_at,
                 "summary": counts.to_json(),
                 "nodes": rows.iter().map(NodeHealth::to_json).collect::<Vec<_>>(),
@@ -538,6 +583,28 @@ fn option_u64(value: Option<u64>) -> String {
     value
         .map(|value| value.to_string())
         .unwrap_or_else(|| "<none>".to_string())
+}
+
+fn snapshot_to_json(snapshot: &HealthSnapshotRecord) -> Value {
+    json!({
+        "node_id": snapshot.node_id,
+        "endpoint_id": snapshot.endpoint_id,
+        "computed_at": snapshot.computed_at,
+        "status": snapshot.status,
+        "freshness_seconds": snapshot.freshness_seconds,
+        "last_success_at": snapshot.last_success_at,
+        "last_failure_at": snapshot.last_failure_at,
+        "last_error_code": snapshot.last_error_code,
+        "degraded_methods": snapshot.degraded_methods_json,
+        "summary": snapshot.summary_json,
+    })
+}
+
+fn validate_snapshot_limit(limit: u64) -> anyhow::Result<u64> {
+    if limit == 0 || limit > MAX_HEALTH_SNAPSHOT_LIMIT {
+        bail!("--limit must be between 1 and {MAX_HEALTH_SNAPSHOT_LIMIT}");
+    }
+    Ok(limit)
 }
 
 fn now_rfc3339() -> String {

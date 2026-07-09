@@ -273,6 +273,42 @@ fn audit_export_tests_default_redaction_hides_secret_fields() {
 
 #[test]
 #[cfg(unix)]
+fn audit_export_tests_none_redaction_keeps_identifiers_but_still_redacts_secret_like_fields() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let database_arg = database.to_string_lossy().into_owned();
+    let output_path = dir.path().join("exports").join("audit.jsonl");
+    let output_arg = output_path.to_string_lossy().into_owned();
+    let store = Store::open(&database).expect("open store");
+    seed_audit(&store, 3, "2026-07-09T00:00:00Z");
+    drop(store);
+
+    run_ocfleet(&[
+        "--database",
+        &database_arg,
+        "audit",
+        "export",
+        "--from",
+        "2026-07-08T00:00:00Z",
+        "--to",
+        "2026-07-10T00:00:00Z",
+        "--output",
+        &output_arg,
+        "--redact",
+        "none",
+    ]);
+
+    let row = exported_lines(&output_path).remove(0);
+    assert_eq!(row["actor"], "operator-3@example.test");
+    assert_eq!(row["node_id"], "node-3");
+    assert_eq!(row["endpoint_id"], "endpoint-3");
+    assert_eq!(row["request_id"], "request-3");
+    assert_eq!(row["detail"]["api_token"], "<redacted>");
+    assert_eq!(row["detail"]["nested"]["private_key"], "<redacted>");
+}
+
+#[test]
+#[cfg(unix)]
 fn audit_export_tests_strict_redaction_hides_identifiers() {
     let dir = tempfile::tempdir().expect("temp dir");
     let database = dir.path().join("controller.sqlite");

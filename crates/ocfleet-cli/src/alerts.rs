@@ -1,4 +1,5 @@
 use anyhow::Context;
+use ocfleet_config::validation::validate_node_id;
 use ocfleet_protocol::enrollment::EndpointStatus;
 use ocfleet_protocol::method::{OCSERV_CERT_EXPIRY, OCSERV_SERVICE_SUMMARY, PROBE_CONTROLLER_PING};
 use serde_json::{Map, Value, json};
@@ -9,7 +10,7 @@ use uuid::Uuid;
 use crate::alert_delivery::{
     deliver_jsonl_alerts, parse_alert_hook, validate_delivery_limit, write_jsonl_test_event,
 };
-use crate::args::AlertCommand;
+use crate::args::{AlertCommand, AlertSeverity, AlertState};
 use crate::audit::AuditEvent;
 use crate::duration_args::parse_duration_seconds;
 use crate::input_validation::{local_actor, validate_reason};
@@ -39,7 +40,12 @@ pub struct AlertEvaluationSummary {
 
 pub fn run_alert_command(store: &Store, command: AlertCommand) -> anyhow::Result<()> {
     match command {
-        AlertCommand::List { json } => run_alert_list(store, json),
+        AlertCommand::List {
+            state,
+            severity,
+            node,
+            json,
+        } => run_alert_list(store, state, severity, node.as_deref(), json),
         AlertCommand::Test { hook } => run_alert_test(store, &hook),
         AlertCommand::Deliver {
             hook,
@@ -92,18 +98,36 @@ fn evaluate_alert_records(
     Ok((updated, summary))
 }
 
-fn run_alert_list(store: &Store, json_output: bool) -> anyhow::Result<()> {
-    evaluate_alerts(store)?;
-    let alerts = store.list_alert_events()?;
+fn run_alert_list(
+    store: &Store,
+    state: Option<AlertState>,
+    severity: Option<AlertSeverity>,
+    node: Option<&str>,
+    json_output: bool,
+) -> anyhow::Result<()> {
+    if let Some(node) = node {
+        validate_node_id(node)?;
+    }
+    evaluate_alerts_and_audit(store)?;
+    let state_filter = state.map(alert_state_name);
+    let severity_filter = severity.map(alert_severity_name);
+    let alerts = store.list_alert_events_filtered(state_filter, severity_filter, node)?;
     if json_output {
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "generated_at": now_rfc3339(),
+                "state_filter": state_filter,
+                "severity_filter": severity_filter,
+                "node_filter": node,
+                "alert_count": alerts.len(),
                 "alerts": alerts.iter().map(alert_to_json).collect::<Vec<_>>(),
             }))?
         );
     } else {
+        println!("state_filter={}", state_filter.unwrap_or("<all>"));
+        println!("severity_filter={}", severity_filter.unwrap_or("<all>"));
+        println!("node_filter={}", node.unwrap_or("<all>"));
         println!("alert_count={}", alerts.len());
         for alert in &alerts {
             println!(
@@ -163,7 +187,7 @@ fn run_alert_deliver(store: &Store, hook: &str, limit: u64, dry_run: bool) -> an
             return Err(err);
         }
     };
-    evaluate_alerts(store)?;
+    evaluate_alerts_and_audit(store)?;
     let alerts = store
         .list_alert_events()?
         .into_iter()
@@ -209,6 +233,14 @@ fn run_alert_deliver(store: &Store, hook: &str, limit: u64, dry_run: bool) -> an
     println!("bytes_written={}", summary.bytes_written);
     println!("dry_run={dry_run}");
     Ok(())
+}
+
+fn evaluate_alerts_and_audit(store: &Store) -> anyhow::Result<AlertEvaluationSummary> {
+    let summary = evaluate_alerts_with_summary(store)?;
+    if summary.created_or_updated_count > 0 {
+        write_alert_evaluation_audit(store, &summary)?;
+    }
+    Ok(summary)
 }
 
 fn run_alert_silence(
@@ -689,6 +721,38 @@ fn parse_duration(value: &str) -> anyhow::Result<Duration> {
     let seconds = parse_duration_seconds(value, "duration")?;
     let seconds = i64::try_from(seconds).context("duration is too large")?;
     Ok(Duration::seconds(seconds))
+}
+
+fn alert_state_name(state: AlertState) -> &'static str {
+    match state {
+        AlertState::Open => "open",
+        AlertState::Silenced => "silenced",
+        AlertState::Resolved => "resolved",
+    }
+}
+
+fn alert_severity_name(severity: AlertSeverity) -> &'static str {
+    match severity {
+        AlertSeverity::Warning => "warning",
+        AlertSeverity::Critical => "critical",
+    }
+}
+
+fn write_alert_evaluation_audit(
+    store: &Store,
+    summary: &AlertEvaluationSummary,
+) -> anyhow::Result<()> {
+    let mut event = AuditEvent::new(local_actor(), "alert.evaluate");
+    event.ok = Some(true);
+    event.detail_json = json!({
+        "evaluated_candidates": summary.evaluated_candidates,
+        "upserted_alerts": summary.upserted_alerts,
+        "open_alerts": summary.open_alerts,
+        "silenced_alerts": summary.silenced_alerts,
+        "created_or_updated_count": summary.created_or_updated_count,
+    });
+    store.insert_audit(&event)?;
+    Ok(())
 }
 
 fn write_alert_audit(store: &Store, event_name: &str, detail_json: Value) -> anyhow::Result<()> {

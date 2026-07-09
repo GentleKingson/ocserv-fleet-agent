@@ -62,6 +62,34 @@ fn seed_alert(store: &Store, dedupe_key: &str) {
         .expect("seed alert");
 }
 
+fn upsert_alert(
+    store: &Store,
+    alert_id: &str,
+    dedupe_key: &str,
+    node_id: Option<&str>,
+    severity: &str,
+    state: &str,
+) {
+    store
+        .upsert_alert_event(&AlertEventRecord {
+            alert_id: alert_id.to_string(),
+            dedupe_key: dedupe_key.to_string(),
+            node_id: node_id.map(ToOwned::to_owned),
+            severity: severity.to_string(),
+            state: state.to_string(),
+            reason_code: "NODE_STALE".to_string(),
+            first_seen_at: "2026-07-08T00:00:00Z".to_string(),
+            last_seen_at: "2026-07-08T00:00:00Z".to_string(),
+            last_sent_at: None,
+            resolved_at: (state == "resolved").then(|| "2026-07-08T01:00:00Z".to_string()),
+            detail_json: json!({
+                "methods": ["probe.controller.ping"],
+                "summary": {"status": "stale"}
+            }),
+        })
+        .expect("seed alert");
+}
+
 fn seed_stale_health_snapshot(store: &Store) {
     store
         .upsert_health_snapshot(&HealthSnapshotRecord {
@@ -148,6 +176,62 @@ fn alert_hooks_tests_alert_list_json_is_valid() {
 }
 
 #[test]
+fn alert_hooks_tests_alert_list_filters_state_severity_and_node() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let database_arg = database.to_string_lossy().into_owned();
+    let store = Store::open(&database).expect("open store");
+    upsert_alert(
+        &store,
+        "alert-critical-open",
+        "node:hk-ocserv-01:critical",
+        Some("hk-ocserv-01"),
+        "critical",
+        "open",
+    );
+    upsert_alert(
+        &store,
+        "alert-warning-open",
+        "node:hk-ocserv-01:warning",
+        Some("hk-ocserv-01"),
+        "warning",
+        "open",
+    );
+    upsert_alert(
+        &store,
+        "alert-critical-resolved",
+        "node:sg-ocserv-01:critical",
+        Some("sg-ocserv-01"),
+        "critical",
+        "resolved",
+    );
+    drop(store);
+
+    let output = run_ocfleet(&[
+        "--database",
+        &database_arg,
+        "alert",
+        "list",
+        "--state",
+        "open",
+        "--severity",
+        "critical",
+        "--node",
+        "hk-ocserv-01",
+        "--json",
+    ]);
+    let value: Value = serde_json::from_slice(&output.stdout).expect("valid JSON");
+    assert_eq!(value["state_filter"], "open");
+    assert_eq!(value["severity_filter"], "critical");
+    assert_eq!(value["node_filter"], "hk-ocserv-01");
+    let alerts = value["alerts"].as_array().expect("alerts");
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0]["dedupe_key"], "node:hk-ocserv-01:critical");
+    assert_eq!(alerts[0]["severity"], "critical");
+    assert_eq!(alerts[0]["state"], "open");
+}
+
+#[test]
 fn alert_hooks_tests_upsert_same_dedupe_key_does_not_create_duplicate() {
     let dir = tempfile::tempdir().expect("temp dir");
     let database = dir.path().join("controller.sqlite");
@@ -163,6 +247,24 @@ fn alert_hooks_tests_upsert_same_dedupe_key_does_not_create_duplicate() {
     let alerts = store.list_alert_events().expect("list alerts");
     assert_eq!(alerts.len(), 1);
     assert_eq!(alerts[0].dedupe_key, "node:hk-ocserv-01:node_stale");
+}
+
+#[test]
+fn alert_hooks_tests_alert_list_writes_evaluation_audit_when_rows_are_upserted() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let database_arg = database.to_string_lossy().into_owned();
+    let store = Store::open(&database).expect("open store");
+    seed_stale_health_snapshot(&store);
+    drop(store);
+
+    run_ocfleet(&["--database", &database_arg, "alert", "list"]);
+
+    let (event, ok, detail) = latest_audit_with_ok(&database);
+    assert_eq!(event, "alert.evaluate");
+    assert_eq!(ok, 1);
+    assert_eq!(detail["evaluated_candidates"], 1);
+    assert_eq!(detail["created_or_updated_count"], 1);
 }
 
 #[test]
@@ -188,6 +290,31 @@ fn alert_hooks_tests_resolve_changes_state() {
     let alerts = store.list_alert_events().expect("list alerts");
     assert_eq!(alerts[0].state, "resolved");
     assert!(alerts[0].resolved_at.is_some());
+}
+
+#[test]
+fn alert_hooks_tests_resolve_writes_audit() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let database_arg = database.to_string_lossy().into_owned();
+    let store = Store::open(&database).expect("open store");
+    seed_alert(&store, "node:hk-ocserv-01:node_stale");
+    drop(store);
+
+    run_ocfleet(&[
+        "--database",
+        &database_arg,
+        "alert",
+        "resolve",
+        "node:hk-ocserv-01:node_stale",
+        "--reason",
+        "operator verified recovery",
+    ]);
+
+    let (event, detail) = latest_audit(&database);
+    assert_eq!(event, "alert.resolve");
+    assert_eq!(detail["dedupe_key"], "node:hk-ocserv-01:node_stale");
+    assert_eq!(detail["reason"], "operator verified recovery");
 }
 
 #[test]

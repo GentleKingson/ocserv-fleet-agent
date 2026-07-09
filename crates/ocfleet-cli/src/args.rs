@@ -52,6 +52,10 @@ pub enum Command {
         #[command(subcommand)]
         command: ScheduleCommand,
     },
+    Observation {
+        #[command(subcommand)]
+        command: ObservationCommand,
+    },
     Retention {
         #[command(subcommand)]
         command: RetentionCommand,
@@ -262,14 +266,20 @@ pub enum ScheduleCommand {
         command: ScheduleJobCommand,
     },
     Run {
+        #[command(subcommand)]
+        command: Option<ScheduleRunCommand>,
         #[arg(long)]
         once: bool,
+        #[arg(long)]
+        job_id: Option<String>,
         #[arg(
             long,
             default_value_t = 1,
             help = "Maximum concurrent scheduler RPCs (1-32)"
         )]
         max_concurrency: usize,
+        #[arg(long)]
+        json: bool,
     },
     Daemon {
         #[arg(
@@ -281,12 +291,32 @@ pub enum ScheduleCommand {
         #[arg(long, default_value_t = 60)]
         tick_seconds: u64,
     },
-    Status,
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ScheduleRunCommand {
+    List {
+        #[arg(long, default_value_t = 50)]
+        limit: u64,
+        #[arg(long)]
+        json: bool,
+    },
+    Show {
+        run_id: String,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
 pub enum ScheduleJobCommand {
     Add {
+        #[arg(long)]
+        name: Option<String>,
         #[arg(long, value_enum)]
         kind: ScheduleJobKind,
         #[arg(long)]
@@ -298,12 +328,44 @@ pub enum ScheduleJobCommand {
         #[arg(long)]
         target_node_id: Option<String>,
     },
-    List,
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    Show {
+        job_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    Validate {
+        job_id: String,
+        #[arg(long)]
+        json: bool,
+    },
     Enable {
         job_id: String,
     },
     Disable {
         job_id: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ObservationCommand {
+    List {
+        #[arg(long)]
+        node: Option<String>,
+        #[arg(long)]
+        method: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: u64,
+        #[arg(long)]
+        json: bool,
+    },
+    Show {
+        observation_id: String,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -345,6 +407,12 @@ pub enum RetentionCommand {
         json: bool,
         #[arg(long, default_value_t = 1_000)]
         batch_size: u64,
+    },
+    Explain {
+        #[arg(long, value_enum)]
+        scope: RetentionScope,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -406,6 +474,20 @@ pub enum HealthCommand {
         #[command(subcommand)]
         command: HealthPolicyCommand,
     },
+    Snapshot {
+        #[command(subcommand)]
+        command: HealthSnapshotCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum HealthSnapshotCommand {
+    List {
+        #[arg(long, default_value_t = 50)]
+        limit: u64,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -426,6 +508,12 @@ pub enum HealthPolicyCommand {
 #[derive(Debug, Subcommand)]
 pub enum AlertCommand {
     List {
+        #[arg(long, value_enum)]
+        state: Option<AlertState>,
+        #[arg(long, value_enum)]
+        severity: Option<AlertSeverity>,
+        #[arg(long)]
+        node: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -452,4 +540,17 @@ pub enum AlertCommand {
         #[arg(long)]
         reason: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum AlertState {
+    Open,
+    Silenced,
+    Resolved,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum AlertSeverity {
+    Warning,
+    Critical,
 }

@@ -176,6 +176,75 @@ fn nonce_cache_enforces_caps_without_evicting_live_replay_entries() {
 }
 
 #[test]
+fn nonce_cache_zero_ttl_releases_capacity_and_allows_same_nonce_reuse() {
+    let mut cache = NonceCache::with_limits(1, 1);
+
+    assert_eq!(
+        cache.register("remote-a", "nonce-1", Duration::ZERO),
+        NonceDecision::Accepted
+    );
+    assert_eq!(
+        cache.register("remote-a", "nonce-1", Duration::from_secs(60)),
+        NonceDecision::Accepted
+    );
+    assert_eq!(
+        cache.register("remote-a", "nonce-2", Duration::from_secs(60)),
+        NonceDecision::ResourceExhausted {
+            scope: NonceLimitScope::PerPeer,
+            limit: 1,
+        }
+    );
+    assert_eq!(
+        cache.register("remote-b", "nonce-1", Duration::from_secs(60)),
+        NonceDecision::ResourceExhausted {
+            scope: NonceLimitScope::Global,
+            limit: 1,
+        }
+    );
+}
+
+#[test]
+fn nonce_cache_accepts_same_nonce_for_different_remote_endpoints() {
+    let mut cache = NonceCache::with_limits(2, 1);
+    let ttl = Duration::from_secs(60);
+
+    assert_eq!(
+        cache.register("remote-a", "shared-nonce", ttl),
+        NonceDecision::Accepted
+    );
+    assert_eq!(
+        cache.register("remote-b", "shared-nonce", ttl),
+        NonceDecision::Accepted
+    );
+}
+
+#[test]
+fn nonce_cache_global_limit_zero_fails_closed() {
+    let mut cache = NonceCache::with_limits(0, 1);
+
+    assert_eq!(
+        cache.register("remote-a", "nonce-1", Duration::from_secs(60)),
+        NonceDecision::ResourceExhausted {
+            scope: NonceLimitScope::Global,
+            limit: 0,
+        }
+    );
+}
+
+#[test]
+fn nonce_cache_per_peer_limit_zero_fails_closed() {
+    let mut cache = NonceCache::with_limits(1, 0);
+
+    assert_eq!(
+        cache.register("remote-a", "nonce-1", Duration::from_secs(60)),
+        NonceDecision::ResourceExhausted {
+            scope: NonceLimitScope::PerPeer,
+            limit: 0,
+        }
+    );
+}
+
+#[test]
 fn jsonl_audit_writer_appends_lines_and_creates_parent_directory() {
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("audit").join("agent.jsonl");

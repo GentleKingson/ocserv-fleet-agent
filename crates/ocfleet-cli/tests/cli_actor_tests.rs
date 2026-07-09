@@ -10,6 +10,7 @@ fn run_init_with_user(database: &Path, secret_key: &Path, user: Option<&str>) {
         .arg("--secret-key")
         .arg(secret_key)
         .arg("init");
+    command.env_remove("OCFLEET_ACTOR");
     match user {
         Some(value) => {
             command.env("USER", value);
@@ -51,6 +52,40 @@ fn init_audit_actor_falls_back_when_user_is_missing_or_blank() {
     }
 }
 
+fn run_init_with_actor(
+    database: &Path,
+    secret_key: &Path,
+    actor_flag: Option<&str>,
+    actor_env: Option<&str>,
+) {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ocfleet"));
+    command.arg("--database").arg(database);
+    if let Some(actor) = actor_flag {
+        command.arg("--actor").arg(actor);
+    }
+    command
+        .arg("--secret-key")
+        .arg(secret_key)
+        .arg("init")
+        .env("USER", "fallback-user");
+    match actor_env {
+        Some(value) => {
+            command.env("OCFLEET_ACTOR", value);
+        }
+        None => {
+            command.env_remove("OCFLEET_ACTOR");
+        }
+    }
+
+    let output = command.output().expect("run ocfleet init");
+    assert!(
+        output.status.success(),
+        "init failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[test]
 fn init_audit_actor_uses_non_blank_user() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -60,6 +95,33 @@ fn init_audit_actor_uses_non_blank_user() {
     run_init_with_user(&database, &secret_key, Some("alice"));
 
     assert_eq!(latest_actor(&database), "alice");
+}
+
+#[test]
+fn init_audit_actor_uses_explicit_actor_before_environment() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let secret_key = dir.path().join("controller.secret");
+
+    run_init_with_actor(
+        &database,
+        &secret_key,
+        Some("flag-actor@example.test"),
+        Some("env-actor@example.test"),
+    );
+
+    assert_eq!(latest_actor(&database), "flag-actor@example.test");
+}
+
+#[test]
+fn init_audit_actor_uses_ocfleet_actor_environment() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let secret_key = dir.path().join("controller.secret");
+
+    run_init_with_actor(&database, &secret_key, None, Some("env-actor@example.test"));
+
+    assert_eq!(latest_actor(&database), "env-actor@example.test");
 }
 
 #[test]

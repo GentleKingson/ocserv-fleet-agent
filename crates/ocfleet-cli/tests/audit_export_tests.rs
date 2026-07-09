@@ -1,5 +1,8 @@
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use ocfleet_cli::audit::AuditEvent;
 use ocfleet_cli::store::Store;
+use ring::rand::SystemRandom;
+use ring::signature::{ED25519, Ed25519KeyPair, UnparsedPublicKey};
 use rusqlite::Connection;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -147,6 +150,72 @@ fn audit_export_tests_writes_jsonl_checksum_and_audit_not_included() {
     assert_eq!(detail["checksum"], expected);
     assert!(detail.get("output_path_hash").is_some());
     assert!(detail.get("output").is_none());
+}
+
+#[test]
+#[cfg(unix)]
+fn audit_export_tests_writes_ed25519_signature_without_secret_leak() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let database_arg = database.to_string_lossy().into_owned();
+    let output_path = dir.path().join("exports").join("audit.jsonl");
+    let output_arg = output_path.to_string_lossy().into_owned();
+    let key_path = dir.path().join("audit-signing-key.pk8");
+    let key_arg = key_path.to_string_lossy().into_owned();
+    let rng = SystemRandom::new();
+    let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).expect("generate key");
+    fs::write(&key_path, pkcs8.as_ref()).expect("write signing key");
+    fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600)).expect("chmod signing key");
+    let store = Store::open(&database).expect("open store");
+    seed_audit(&store, 9, "2026-07-09T00:00:00Z");
+    drop(store);
+
+    let output = run_ocfleet(&[
+        "--database",
+        &database_arg,
+        "audit",
+        "export",
+        "--from",
+        "2026-07-08T00:00:00Z",
+        "--to",
+        "2026-07-10T00:00:00Z",
+        "--output",
+        &output_arg,
+        "--sign-with-key-file",
+        &key_arg,
+    ]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("signature_algorithm=Ed25519"));
+
+    let signature_path = output_path.with_extension("jsonl.sig");
+    let sidecar: Value =
+        serde_json::from_str(&fs::read_to_string(&signature_path).expect("read signature"))
+            .expect("signature json");
+    assert_eq!(sidecar["schema"], "ocfleet.audit_export.signature.v1");
+    assert_eq!(sidecar["algorithm"], "Ed25519");
+    let public_key = BASE64
+        .decode(sidecar["public_key"].as_str().expect("public key"))
+        .expect("decode public key");
+    let signature = BASE64
+        .decode(sidecar["signature"].as_str().expect("signature"))
+        .expect("decode signature");
+    UnparsedPublicKey::new(&ED25519, public_key)
+        .verify(&fs::read(&output_path).expect("read export"), &signature)
+        .expect("signature verifies");
+
+    let exported_text = fs::read_to_string(&output_path).expect("read export text");
+    let sidecar_text = fs::read_to_string(&signature_path).expect("read sidecar text");
+    let private_key_marker = BASE64.encode(pkcs8.as_ref());
+    assert!(!exported_text.contains(&private_key_marker));
+    assert!(!sidecar_text.contains(&private_key_marker));
+    assert!(!exported_text.contains("private-key-value"));
+
+    let (event, ok, detail) = latest_audit(&database);
+    assert_eq!(event, "audit.export");
+    assert_eq!(ok, 1);
+    assert_eq!(detail["signature_algorithm"], "Ed25519");
+    assert!(detail.get("signing_key").is_none());
+    assert!(detail.get("signature_public_key_fingerprint").is_some());
 }
 
 #[test]

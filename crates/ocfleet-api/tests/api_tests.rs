@@ -110,6 +110,31 @@ async fn forbidden_methods_do_not_write() {
 }
 
 #[tokio::test]
+async fn authenticated_viewer_token_has_no_mutating_routes() {
+    let fixture = Fixture::new();
+    let token_file = fixture.write_token_file(TOKEN);
+    let router = fixture.router(Some(token_file));
+    let before = table_counts(&fixture.database);
+
+    for (method, uri) in [
+        (Method::POST, "/jobs/job-a/run"),
+        (Method::POST, "/alerts/alert-a/resolve"),
+        (Method::POST, "/alerts/alert-a/silence"),
+        (Method::PUT, "/jobs/job-a"),
+        (Method::PATCH, "/alerts/alert-a"),
+        (Method::DELETE, "/alerts/alert-a"),
+    ] {
+        let (status, _) = text_request(router.clone(), method, uri, Some(TOKEN)).await;
+        assert!(matches!(
+            status,
+            StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
+        ));
+    }
+
+    assert_eq!(table_counts(&fixture.database), before);
+}
+
+#[tokio::test]
 async fn read_only_queries_do_not_mutate_sqlite_state() {
     let fixture = Fixture::new();
     let before = table_counts(&fixture.database);

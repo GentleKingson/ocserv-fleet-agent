@@ -10,6 +10,8 @@ pub struct Cli {
     pub database: PathBuf,
     #[arg(long, default_value = "controller.secret")]
     pub secret_key: PathBuf,
+    #[arg(long, global = true)]
+    pub actor: Option<String>,
     #[command(subcommand)]
     pub command: Command,
 }
@@ -230,6 +232,24 @@ pub enum TrustCommand {
         #[arg(long)]
         strict: bool,
     },
+    Policy {
+        #[command(subcommand)]
+        command: TrustPolicyCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TrustPolicyCommand {
+    Validate {
+        file: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    Diff {
+        file: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -442,6 +462,8 @@ pub enum AuditCommand {
         redact: RedactionMode,
         #[arg(long)]
         include_checksum: bool,
+        #[arg(long)]
+        sign_with_key_file: Option<PathBuf>,
         #[arg(long, default_value_t = crate::audit_export::DEFAULT_MAX_AUDIT_EXPORT_ROWS)]
         max_rows: usize,
     },

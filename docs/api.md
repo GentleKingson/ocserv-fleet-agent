@@ -41,6 +41,12 @@ The token file must be private: regular file, owned by the current user, no
 symlink or hardlink, not group/world readable, and under a private parent
 directory. Clients send `Authorization: Bearer <token>`.
 
+The current API role is `viewer`: all implemented routes are read-only `GET`
+observation routes. The RBAC foundation reserves `operator` and
+`security-admin` for future authenticated mutation surfaces, but no such routes
+exist today. Any future non-GET API route must require authentication and an
+explicit role check.
+
 ## Response Shape
 
 Every JSON response includes `generated_at`.

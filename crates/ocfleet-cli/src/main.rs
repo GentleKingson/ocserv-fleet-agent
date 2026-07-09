@@ -19,7 +19,8 @@ use ocfleet_cli::duration_args::parse_duration_seconds;
 use ocfleet_cli::health::run_health_command;
 use ocfleet_cli::identity::load_or_create_secret_key_with_status;
 use ocfleet_cli::input_validation::{
-    local_actor, validate_agent_version, validate_description, validate_hostname, validate_reason,
+    configure_process_actor, local_actor, validate_agent_version, validate_description,
+    validate_hostname, validate_reason,
 };
 use ocfleet_cli::observation::run_observation_command;
 use ocfleet_cli::ocserv_output::{
@@ -32,6 +33,7 @@ use ocfleet_cli::store::{
     ApprovalInput, EndpointTrustRecord, EnrollmentTokenInsert, JoinRequestInsert, NodeInsert,
     NodeRecord, ProbeHistoryRecord, ProbeObservationRecord, Store,
 };
+use ocfleet_cli::trust_policy::run_trust_policy_command;
 use ocfleet_config::validation::{
     canonicalize_node_endpoint_id, validate_node_id, validate_region, validate_role,
 };
@@ -56,6 +58,7 @@ use uuid::Uuid;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    configure_process_actor(cli.actor.as_deref()).map_err(anyhow::Error::msg)?;
     tracing_subscriber::fmt::init();
 
     match cli.command {
@@ -301,6 +304,7 @@ async fn main() -> anyhow::Result<()> {
                     format,
                     strict,
                 } => run_trust_diff_command(&store, endpoint.as_deref(), format, strict)?,
+                TrustCommand::Policy { command } => run_trust_policy_command(&store, command)?,
             }
         }
         Command::Ocserv { command } => {

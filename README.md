@@ -12,6 +12,8 @@ production-complete.
 - Phase 11 ocserv low-sensitive read-only RPCs are implemented.
 - Phase 12 CLI observability is partially implemented / active implementation.
 - Web/API dashboard is experimentally implemented as a read-only observation surface.
+- Governance foundation work has started: actor identity, trust policy
+  validation/diff, and optional signed audit export are implemented.
 - The project is not production-complete.
 
 ## What It Does
@@ -51,9 +53,14 @@ production-complete.
   - `ocfleet retention` policy, dry-run explanation, and pruning for
     observability history tables
   - `ocfleet audit export` for bounded redacted JSONL controller audit windows
+    with optional checksum and Ed25519 signature sidecars
 - Supports experimental read-only `ocfleet-api` / Web dashboard access for
   health snapshots, jobs, runs, observations, alerts, and bounded redacted audit
   export views.
+- Supports governance foundation commands:
+  - `--actor` and `OCFLEET_ACTOR` for consistent controller audit identity
+  - `ocfleet trust policy validate <file>` for TOML policy schema checks
+  - `ocfleet trust policy diff <file>` for advisory registry/trust drift review
 - Supports fixed RPC methods:
   - `node.ping`
   - `node.info`
@@ -78,6 +85,8 @@ The current implementation is intentionally narrow. It does not provide:
 - automatic active trust on first contact or TOFU registration
 - Web/API endpoints that trigger agent RPCs, run scheduler jobs, resolve or
   silence alerts, mutate retention policy, modify trust, or change node state
+- a Postgres controller backend; SQLite remains the implemented backend, while
+  Postgres is an optional future design track
 
 All local capabilities must be exposed through fixed RPC methods. There is no `shell.exec`, `command.run`, `occtl.raw`, `journalctl.raw`, or equivalent generic execution interface.
 
@@ -92,7 +101,7 @@ cargo build --workspace
 Initialize the controller:
 
 ```bash
-target/debug/ocfleet init
+target/debug/ocfleet --actor alice@example.com init
 ```
 
 This creates or reuses:
@@ -377,7 +386,10 @@ target/debug/ocfleet audit export \
   --from 2026-07-01T00:00:00Z \
   --to 2026-07-08T00:00:00Z \
   --format jsonl \
-  --output ./audit-export.jsonl
+  --output ./audit-export.jsonl \
+  --include-checksum
+target/debug/ocfleet trust policy validate ./trust-policy.toml --json
+target/debug/ocfleet trust policy diff ./trust-policy.toml --json
 ```
 
 These commands operate inside the controller boundary. Scheduler jobs use only
@@ -413,6 +425,10 @@ Networking must allow the controller to reach the agent through iroh using the r
 - `docs/phase-12-scheduled-observability.md`: Phase 12 CLI observability and read-only API/dashboard status.
 - `docs/api.md`: experimental read-only HTTP API routes, auth, and redaction rules.
 - `docs/dashboard.md`: experimental static dashboard behavior and limits.
+- `docs/governance.md`: operator identity, RBAC roles, audit model, and trust policy workflow.
+- `docs/trust-policy.md`: trust policy as code schema, validation, and diff behavior.
+- `docs/backend.md`: SQLite contract and optional Postgres backend plan.
+- `docs/archive-export.md`: long-term history archive and signed audit export guidance.
 
 ## Security Notes
 

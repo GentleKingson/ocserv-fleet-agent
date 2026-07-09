@@ -9,6 +9,27 @@ use sha2::{Digest, Sha256};
 const MAX_TOKEN_BYTES: usize = 4_096;
 const MIN_TOKEN_BYTES: usize = 32;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    Viewer,
+    Operator,
+    SecurityAdmin,
+}
+
+impl Role {
+    pub fn permits(self, required: Role) -> bool {
+        self.rank() >= required.rank()
+    }
+
+    fn rank(self) -> u8 {
+        match self {
+            Self::Viewer => 0,
+            Self::Operator => 1,
+            Self::SecurityAdmin => 2,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct AuthToken {
     digest: [u8; 32],
@@ -98,5 +119,14 @@ mod tests {
                 .expect("header"),
         );
         assert!(token.verify_headers(&headers));
+    }
+
+    #[test]
+    fn role_hierarchy_is_explicit_for_future_write_routes() {
+        assert!(Role::Viewer.permits(Role::Viewer));
+        assert!(!Role::Viewer.permits(Role::Operator));
+        assert!(Role::Operator.permits(Role::Viewer));
+        assert!(!Role::Operator.permits(Role::SecurityAdmin));
+        assert!(Role::SecurityAdmin.permits(Role::Operator));
     }
 }

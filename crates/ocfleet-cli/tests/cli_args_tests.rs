@@ -1,11 +1,11 @@
 use clap::{CommandFactory, Parser};
 use ocfleet_cli::args::{
-    AlertCommand, AlertSeverity, AlertState, AuditCommand, AuditExportFormat, Cli, Command,
-    EndpointCommand, EnrollCommand, EnrollRequestCommand, EnrollTokenCommand, HealthCommand,
-    HealthPolicyCommand, HealthSnapshotCommand, NodeCommand, ObservationCommand, OcservCommand,
-    OcservSessionsCommand, ProbeCommand, RedactionMode, RetentionCommand, RetentionScope,
-    ScheduleCommand, ScheduleJobCommand, ScheduleJobKind, ScheduleRunCommand, TrustCommand,
-    TrustDiffFormat,
+    AlertCommand, AlertHookCommand, AlertSeverity, AlertState, AuditCommand, AuditExportFormat,
+    Cli, Command, EndpointCommand, EnrollCommand, EnrollRequestCommand, EnrollTokenCommand,
+    HealthCommand, HealthPolicyCommand, HealthSnapshotCommand, NodeCommand, ObservationCommand,
+    OcservCommand, OcservSessionsCommand, ProbeCommand, RedactionMode, RetentionCommand,
+    RetentionScope, ScheduleCommand, ScheduleJobCommand, ScheduleJobKind, ScheduleRunCommand,
+    TrustCommand, TrustDiffFormat,
 };
 use std::path::PathBuf;
 
@@ -175,6 +175,7 @@ fn parses_alert_deliver_command() {
                 hook,
                 limit,
                 dry_run,
+                hmac_secret_file,
             },
     } = cli.command
     else {
@@ -184,6 +185,95 @@ fn parses_alert_deliver_command() {
     assert_eq!(hook, "jsonl_file:state/alerts.jsonl");
     assert_eq!(limit, 25);
     assert!(dry_run);
+    assert!(hmac_secret_file.is_none());
+}
+
+#[test]
+fn parses_alert_webhook_hook_commands() {
+    let cli = Cli::parse_from([
+        "ocfleet",
+        "alert",
+        "hook",
+        "add-webhook",
+        "--name",
+        "ops",
+        "--url",
+        "https://alerts.example.com/ocfleet",
+        "--hmac-secret-file",
+        "state/webhook.secret",
+        "--host-allow",
+        "alerts.example.com",
+        "--max-attempts",
+        "2",
+        "--timeout-ms",
+        "1500",
+    ]);
+    let Command::Alert {
+        command:
+            AlertCommand::Hook {
+                command:
+                    AlertHookCommand::AddWebhook {
+                        name,
+                        url,
+                        hmac_secret_file,
+                        host_allow,
+                        max_attempts,
+                        timeout_ms,
+                    },
+            },
+    } = cli.command
+    else {
+        panic!("expected alert hook add-webhook command");
+    };
+    assert_eq!(name, "ops");
+    assert_eq!(url, "https://alerts.example.com/ocfleet");
+    assert_eq!(hmac_secret_file, PathBuf::from("state/webhook.secret"));
+    assert_eq!(host_allow, vec!["alerts.example.com".to_string()]);
+    assert_eq!(max_attempts, 2);
+    assert_eq!(timeout_ms, 1500);
+
+    let cli = Cli::parse_from(["ocfleet", "alert", "hook", "list", "--json"]);
+    let Command::Alert {
+        command:
+            AlertCommand::Hook {
+                command: AlertHookCommand::List { json },
+            },
+    } = cli.command
+    else {
+        panic!("expected alert hook list command");
+    };
+    assert!(json);
+
+    let cli = Cli::parse_from([
+        "ocfleet",
+        "alert",
+        "hook",
+        "test",
+        "webhook-1",
+        "--dry-run",
+        "--hmac-secret-file",
+        "state/webhook.secret",
+    ]);
+    let Command::Alert {
+        command:
+            AlertCommand::Hook {
+                command:
+                    AlertHookCommand::Test {
+                        hook_id,
+                        dry_run,
+                        hmac_secret_file,
+                    },
+            },
+    } = cli.command
+    else {
+        panic!("expected alert hook test command");
+    };
+    assert_eq!(hook_id, "webhook-1");
+    assert!(dry_run);
+    assert_eq!(
+        hmac_secret_file,
+        Some(PathBuf::from("state/webhook.secret"))
+    );
 }
 
 #[test]

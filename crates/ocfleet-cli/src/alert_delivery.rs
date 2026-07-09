@@ -13,12 +13,14 @@ pub const MAX_JSONL_PAYLOAD_BYTES: usize = 16 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AlertHook {
     JsonlFile { path: PathBuf },
+    Webhook { hook_id: String },
 }
 
 impl AlertHook {
     pub fn hook_type(&self) -> &'static str {
         match self {
             Self::JsonlFile { .. } => "jsonl_file",
+            Self::Webhook { .. } => "webhook",
         }
     }
 }
@@ -49,9 +51,11 @@ pub fn parse_alert_hook(value: &str) -> anyhow::Result<AlertHook> {
         }
         "webhook" => {
             if rest.is_empty() {
-                bail!("webhook hook requires a url");
+                bail!("webhook hook requires a hook id");
             }
-            bail!("webhook hooks are disabled until HTTPS/HMAC/SSRF protections are implemented");
+            Ok(AlertHook::Webhook {
+                hook_id: rest.to_string(),
+            })
         }
         _ => bail!("unsupported alert hook type: {kind}"),
     }
@@ -67,6 +71,7 @@ pub fn validate_delivery_limit(limit: u64) -> anyhow::Result<usize> {
 pub fn write_jsonl_test_event(hook: &AlertHook) -> anyhow::Result<JsonlWriteSummary> {
     match hook {
         AlertHook::JsonlFile { path } => write_jsonl_payloads(path, [jsonl_test_payload()], false),
+        AlertHook::Webhook { .. } => bail!("use alert hook test for webhook hooks"),
     }
 }
 
@@ -79,13 +84,18 @@ pub fn deliver_jsonl_alerts(
         AlertHook::JsonlFile { path } => {
             write_jsonl_payloads(path, alerts.iter().map(alert_delivery_payload), dry_run)
         }
+        AlertHook::Webhook { .. } => bail!("use webhook alert delivery for webhook hooks"),
     }
 }
 
 pub fn alert_delivery_payload(alert: &AlertEventRecord) -> Value {
+    alert_delivery_payload_for_hook(alert, "jsonl_file")
+}
+
+pub fn alert_delivery_payload_for_hook(alert: &AlertEventRecord, hook_type: &str) -> Value {
     json!({
         "schema": "ocfleet.alert.v1",
-        "hook_type": "jsonl_file",
+        "hook_type": hook_type,
         "alert_id": alert.alert_id,
         "dedupe_key": alert.dedupe_key,
         "node_id": alert.node_id,

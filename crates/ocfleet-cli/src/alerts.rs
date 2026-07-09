@@ -8,13 +8,26 @@ use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
 use crate::alert_delivery::{
-    deliver_jsonl_alerts, parse_alert_hook, validate_delivery_limit, write_jsonl_test_event,
+    JsonlWriteSummary, deliver_jsonl_alerts, parse_alert_hook, validate_delivery_limit,
+    write_jsonl_test_event,
 };
-use crate::args::{AlertCommand, AlertSeverity, AlertState};
+use crate::alert_webhook::{
+    MAX_WEBHOOK_ATTEMPTS, MAX_WEBHOOK_TIMEOUT_MS, MIN_WEBHOOK_TIMEOUT_MS, ReqwestWebhookSender,
+    WebhookHttpResult, WebhookSender, build_webhook_request, hmac_key_id,
+    is_retryable_webhook_error, read_hmac_secret_file, validate_webhook_endpoint,
+    webhook_error_for_status, webhook_payload_bytes,
+};
+use crate::args::{AlertCommand, AlertHookCommand, AlertSeverity, AlertState};
 use crate::audit::AuditEvent;
 use crate::duration_args::parse_duration_seconds;
 use crate::input_validation::{local_actor, validate_reason};
-use crate::store::{AlertEventRecord, HealthPolicyRecord, ProbeObservationRecord, Store};
+use crate::store::{
+    AlertDeliveryAttemptRecord, AlertEventRecord, AlertWebhookHookRecord, HealthPolicyRecord,
+    ProbeObservationRecord, Store,
+};
+use std::path::Path;
+use std::thread;
+use std::time::Duration as StdDuration;
 
 const OBSERVATION_READ_LIMIT: u64 = 1_000;
 const ALERT_DELIVERY_ERROR_CODE: &str = "ALERT_DELIVERY_FAILED";
@@ -38,8 +51,17 @@ pub struct AlertEvaluationSummary {
     pub created_or_updated_count: usize,
 }
 
+struct DeliveryAttemptOutcome<'a> {
+    attempt_no: u64,
+    status: &'a str,
+    http_status_class: Option<&'a str>,
+    error_code: Option<&'a str>,
+    bytes_sent: usize,
+}
+
 pub fn run_alert_command(store: &Store, command: AlertCommand) -> anyhow::Result<()> {
     match command {
+        AlertCommand::Hook { command } => run_alert_hook_command(store, command),
         AlertCommand::List {
             state,
             severity,
@@ -51,7 +73,8 @@ pub fn run_alert_command(store: &Store, command: AlertCommand) -> anyhow::Result
             hook,
             limit,
             dry_run,
-        } => run_alert_deliver(store, &hook, limit, dry_run),
+            hmac_secret_file,
+        } => run_alert_deliver(store, &hook, limit, dry_run, hmac_secret_file.as_deref()),
         AlertCommand::Silence {
             dedupe_key,
             for_duration,
@@ -146,6 +169,138 @@ fn run_alert_list(
     Ok(())
 }
 
+fn run_alert_hook_command(store: &Store, command: AlertHookCommand) -> anyhow::Result<()> {
+    match command {
+        AlertHookCommand::AddWebhook {
+            name,
+            url,
+            hmac_secret_file,
+            host_allow,
+            max_attempts,
+            timeout_ms,
+        } => run_alert_hook_add_webhook(
+            store,
+            &name,
+            &url,
+            &hmac_secret_file,
+            host_allow,
+            max_attempts,
+            timeout_ms,
+        ),
+        AlertHookCommand::List { json } => run_alert_hook_list(store, json),
+        AlertHookCommand::Test {
+            hook_id,
+            dry_run,
+            hmac_secret_file,
+        } => run_alert_hook_test(store, &hook_id, dry_run, hmac_secret_file.as_deref()),
+    }
+}
+
+fn run_alert_hook_add_webhook(
+    store: &Store,
+    name: &str,
+    url: &str,
+    hmac_secret_file: &Path,
+    host_allow: Vec<String>,
+    max_attempts: u64,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    crate::input_validation::validate_description(name).map_err(anyhow::Error::msg)?;
+    if !(1..=MAX_WEBHOOK_ATTEMPTS).contains(&max_attempts) {
+        anyhow::bail!("max_attempts must be between 1 and {MAX_WEBHOOK_ATTEMPTS}");
+    }
+    if !(MIN_WEBHOOK_TIMEOUT_MS..=MAX_WEBHOOK_TIMEOUT_MS).contains(&timeout_ms) {
+        anyhow::bail!(
+            "timeout_ms must be between {MIN_WEBHOOK_TIMEOUT_MS} and {MAX_WEBHOOK_TIMEOUT_MS}"
+        );
+    }
+    let endpoint = validate_webhook_endpoint(url, &host_allow)?;
+    let secret = read_hmac_secret_file(hmac_secret_file)?;
+    let now = now_rfc3339();
+    let hook = AlertWebhookHookRecord {
+        hook_id: format!("webhook-{}", Uuid::new_v4().simple()),
+        name: name.trim().to_string(),
+        hook_type: "webhook".to_string(),
+        endpoint_url: endpoint.url,
+        endpoint_url_redacted: endpoint.redacted_url,
+        endpoint_host: endpoint.host,
+        host_allow: endpoint.host_allow,
+        hmac_key_id: hmac_key_id(&secret),
+        enabled: true,
+        max_attempts,
+        timeout_ms,
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    store.insert_alert_webhook_hook(&hook)?;
+    write_alert_hook_audit(store, "alert.hook.add_webhook", &hook)?;
+    println!("hook_id={}", hook.hook_id);
+    println!("hook_type=webhook");
+    println!("name={}", hook.name);
+    println!("endpoint_host={}", hook.endpoint_host);
+    println!("endpoint_url={}", hook.endpoint_url_redacted);
+    println!("hmac_key_id={}", hook.hmac_key_id);
+    println!("enabled={}", hook.enabled);
+    Ok(())
+}
+
+fn run_alert_hook_list(store: &Store, json_output: bool) -> anyhow::Result<()> {
+    let hooks = store.list_alert_webhook_hooks()?;
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "generated_at": now_rfc3339(),
+                "hook_count": hooks.len(),
+                "hooks": hooks.iter().map(webhook_hook_to_json).collect::<Vec<_>>(),
+            }))?
+        );
+    } else {
+        println!("hook_count={}", hooks.len());
+        for hook in hooks {
+            println!(
+                "hook_id={} name={} hook_type={} enabled={} endpoint_host={} endpoint_url={} hmac_key_id={} max_attempts={} timeout_ms={}",
+                hook.hook_id,
+                hook.name,
+                hook.hook_type,
+                hook.enabled,
+                hook.endpoint_host,
+                hook.endpoint_url_redacted,
+                hook.hmac_key_id,
+                hook.max_attempts,
+                hook.timeout_ms,
+            );
+        }
+    }
+    Ok(())
+}
+
+fn run_alert_hook_test(
+    store: &Store,
+    hook_id: &str,
+    dry_run: bool,
+    hmac_secret_file: Option<&Path>,
+) -> anyhow::Result<()> {
+    let hook = load_webhook_hook(store, hook_id)?;
+    validate_webhook_endpoint(&hook.endpoint_url, &hook.host_allow)?;
+    if let Some(path) = hmac_secret_file {
+        let secret = read_hmac_secret_file(path)?;
+        if hmac_key_id(&secret) != hook.hmac_key_id {
+            anyhow::bail!("webhook HMAC secret does not match hook key id");
+        }
+    }
+    if !dry_run {
+        anyhow::bail!("webhook test requires --dry-run");
+    }
+    println!("status=ok");
+    println!("hook_id={}", hook.hook_id);
+    println!("hook_type=webhook");
+    println!("endpoint_host={}", hook.endpoint_host);
+    println!("endpoint_url={}", hook.endpoint_url_redacted);
+    println!("dry_run=true");
+    Ok(())
+}
+
 fn run_alert_test(_store: &Store, hook: &str) -> anyhow::Result<()> {
     let hook = parse_alert_hook(hook)?;
     let summary = write_jsonl_test_event(&hook)?;
@@ -156,7 +311,13 @@ fn run_alert_test(_store: &Store, hook: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_alert_deliver(store: &Store, hook: &str, limit: u64, dry_run: bool) -> anyhow::Result<()> {
+fn run_alert_deliver(
+    store: &Store,
+    hook: &str,
+    limit: u64,
+    dry_run: bool,
+    hmac_secret_file: Option<&Path>,
+) -> anyhow::Result<()> {
     let hook = match parse_alert_hook(hook) {
         Ok(hook) => hook,
         Err(err) => {
@@ -195,7 +356,23 @@ fn run_alert_deliver(store: &Store, hook: &str, limit: u64, dry_run: bool) -> an
         .take(limit)
         .collect::<Vec<_>>();
 
-    let summary = match deliver_jsonl_alerts(&hook, &alerts, dry_run) {
+    let summary = match &hook {
+        crate::alert_delivery::AlertHook::JsonlFile { .. } => {
+            deliver_jsonl_alerts(&hook, &alerts, dry_run)
+        }
+        crate::alert_delivery::AlertHook::Webhook { hook_id } => {
+            let sender = ReqwestWebhookSender::new()?;
+            deliver_webhook_alerts_with_sender(
+                store,
+                hook_id,
+                &alerts,
+                dry_run,
+                hmac_secret_file,
+                &sender,
+            )
+        }
+    };
+    let summary = match summary {
         Ok(summary) => summary,
         Err(err) => {
             write_alert_delivery_audit(
@@ -233,6 +410,135 @@ fn run_alert_deliver(store: &Store, hook: &str, limit: u64, dry_run: bool) -> an
     println!("bytes_written={}", summary.bytes_written);
     println!("dry_run={dry_run}");
     Ok(())
+}
+
+pub fn deliver_webhook_alerts_with_sender(
+    store: &Store,
+    hook_id: &str,
+    alerts: &[AlertEventRecord],
+    dry_run: bool,
+    hmac_secret_file: Option<&Path>,
+    sender: &dyn WebhookSender,
+) -> anyhow::Result<JsonlWriteSummary> {
+    let hook = load_webhook_hook(store, hook_id)?;
+    if !hook.enabled {
+        anyhow::bail!("webhook hook is disabled");
+    }
+    let secret = if dry_run {
+        None
+    } else {
+        let path = hmac_secret_file.context("webhook delivery requires --hmac-secret-file")?;
+        let secret = read_hmac_secret_file(path)?;
+        if hmac_key_id(&secret) != hook.hmac_key_id {
+            anyhow::bail!("webhook HMAC secret does not match hook key id");
+        }
+        Some(secret)
+    };
+    validate_webhook_endpoint(&hook.endpoint_url, &hook.host_allow)?;
+
+    let mut bytes_sent = 0_usize;
+    for alert in alerts {
+        if dry_run {
+            let payload = crate::alert_delivery::alert_delivery_payload_for_hook(alert, "webhook");
+            let body = webhook_payload_bytes(&payload)?;
+            bytes_sent = bytes_sent
+                .checked_add(body.len())
+                .context("alert delivery byte count overflow")?;
+            insert_delivery_attempt(
+                store,
+                alert,
+                &hook,
+                DeliveryAttemptOutcome {
+                    attempt_no: 1,
+                    status: "dry_run",
+                    http_status_class: None,
+                    error_code: None,
+                    bytes_sent: body.len(),
+                },
+            )?;
+            continue;
+        }
+
+        let secret = secret.as_deref().expect("secret present for non-dry-run");
+        let mut final_error = None;
+        for attempt_no in 1..=hook.max_attempts {
+            let timestamp = now_rfc3339();
+            let delivery_id = format!("delivery-{}", Uuid::new_v4().simple());
+            let request = build_webhook_request(&hook, alert, secret, &timestamp, &delivery_id)?;
+            let request_bytes = request.body.len();
+            let result = sender.send(&request);
+            match result {
+                WebhookHttpResult::Completed(response) => {
+                    let error_code = webhook_error_for_status(response.status_code);
+                    if error_code.is_none() {
+                        bytes_sent = bytes_sent
+                            .checked_add(request_bytes)
+                            .context("alert delivery byte count overflow")?;
+                        insert_delivery_attempt(
+                            store,
+                            alert,
+                            &hook,
+                            DeliveryAttemptOutcome {
+                                attempt_no,
+                                status: "succeeded",
+                                http_status_class: Some(response.status_class.as_str()),
+                                error_code: None,
+                                bytes_sent: request_bytes,
+                            },
+                        )?;
+                        final_error = None;
+                        break;
+                    }
+                    let error_code = error_code.expect("checked above");
+                    insert_delivery_attempt(
+                        store,
+                        alert,
+                        &hook,
+                        DeliveryAttemptOutcome {
+                            attempt_no,
+                            status: "failed",
+                            http_status_class: Some(response.status_class.as_str()),
+                            error_code: Some(error_code),
+                            bytes_sent: request_bytes,
+                        },
+                    )?;
+                    final_error = Some(error_code);
+                    if !is_retryable_webhook_error(error_code) || attempt_no == hook.max_attempts {
+                        break;
+                    }
+                }
+                WebhookHttpResult::Failed(failure) => {
+                    insert_delivery_attempt(
+                        store,
+                        alert,
+                        &hook,
+                        DeliveryAttemptOutcome {
+                            attempt_no,
+                            status: "failed",
+                            http_status_class: None,
+                            error_code: Some(failure.error_code),
+                            bytes_sent: request_bytes,
+                        },
+                    )?;
+                    final_error = Some(failure.error_code);
+                    if !is_retryable_webhook_error(failure.error_code)
+                        || attempt_no == hook.max_attempts
+                    {
+                        break;
+                    }
+                }
+            }
+            bounded_backoff(attempt_no);
+        }
+        if let Some(error_code) = final_error {
+            anyhow::bail!("webhook alert delivery failed: {error_code}");
+        }
+    }
+
+    Ok(JsonlWriteSummary {
+        record_count: alerts.len(),
+        bytes_written: bytes_sent,
+    })
 }
 
 fn evaluate_alerts_and_audit(store: &Store) -> anyhow::Result<AlertEvaluationSummary> {
@@ -575,6 +881,37 @@ fn find_alert(store: &Store, dedupe_key: &str) -> anyhow::Result<AlertEventRecor
         .with_context(|| format!("alert not found: {dedupe_key}"))
 }
 
+fn load_webhook_hook(store: &Store, hook_id: &str) -> anyhow::Result<AlertWebhookHookRecord> {
+    store
+        .get_alert_webhook_hook(hook_id)?
+        .with_context(|| format!("webhook hook not found: {hook_id}"))
+}
+
+fn insert_delivery_attempt(
+    store: &Store,
+    alert: &AlertEventRecord,
+    hook: &AlertWebhookHookRecord,
+    outcome: DeliveryAttemptOutcome<'_>,
+) -> anyhow::Result<()> {
+    store.insert_alert_delivery_attempt(&AlertDeliveryAttemptRecord {
+        attempt_id: format!("attempt-{}", Uuid::new_v4().simple()),
+        alert_id: alert.alert_id.clone(),
+        hook_id: hook.hook_id.clone(),
+        attempt_no: outcome.attempt_no,
+        attempted_at: now_rfc3339(),
+        status: outcome.status.to_string(),
+        http_status_class: outcome.http_status_class.map(str::to_string),
+        error_code: outcome.error_code.map(str::to_string),
+        bytes_sent: u64::try_from(outcome.bytes_sent).context("bytes_sent is too large")?,
+    })?;
+    Ok(())
+}
+
+fn bounded_backoff(attempt_no: u64) {
+    let millis = 100_u64.saturating_mul(attempt_no.min(MAX_WEBHOOK_ATTEMPTS));
+    thread::sleep(StdDuration::from_millis(millis));
+}
+
 fn alert_to_json(alert: &AlertEventRecord) -> Value {
     json!({
         "alert_id": alert.alert_id,
@@ -589,6 +926,23 @@ fn alert_to_json(alert: &AlertEventRecord) -> Value {
         "resolved_at": alert.resolved_at,
         "methods": alert_methods(alert),
         "summary": alert_summary(alert),
+    })
+}
+
+fn webhook_hook_to_json(hook: &AlertWebhookHookRecord) -> Value {
+    json!({
+        "hook_id": hook.hook_id,
+        "name": hook.name,
+        "hook_type": hook.hook_type,
+        "enabled": hook.enabled,
+        "endpoint_host": hook.endpoint_host,
+        "endpoint_url": hook.endpoint_url_redacted,
+        "host_allow": hook.host_allow,
+        "hmac_key_id": hook.hmac_key_id,
+        "max_attempts": hook.max_attempts,
+        "timeout_ms": hook.timeout_ms,
+        "created_at": hook.created_at,
+        "updated_at": hook.updated_at,
     })
 }
 
@@ -759,6 +1113,28 @@ fn write_alert_audit(store: &Store, event_name: &str, detail_json: Value) -> any
     let mut event = AuditEvent::new(local_actor(), event_name);
     event.ok = Some(true);
     event.detail_json = detail_json;
+    store.insert_audit(&event)?;
+    Ok(())
+}
+
+fn write_alert_hook_audit(
+    store: &Store,
+    event_name: &str,
+    hook: &AlertWebhookHookRecord,
+) -> anyhow::Result<()> {
+    let mut event = AuditEvent::new(local_actor(), event_name);
+    event.ok = Some(true);
+    event.detail_json = json!({
+        "hook_id": hook.hook_id,
+        "hook_type": hook.hook_type,
+        "name": hook.name,
+        "endpoint_host": hook.endpoint_host,
+        "endpoint_url": hook.endpoint_url_redacted,
+        "hmac_key_id": hook.hmac_key_id,
+        "enabled": hook.enabled,
+        "max_attempts": hook.max_attempts,
+        "timeout_ms": hook.timeout_ms,
+    });
     store.insert_audit(&event)?;
     Ok(())
 }

@@ -507,6 +507,10 @@ pub enum HealthPolicyCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum AlertCommand {
+    Hook {
+        #[command(subcommand)]
+        command: AlertHookCommand,
+    },
     List {
         #[arg(long, value_enum)]
         state: Option<AlertState>,
@@ -527,6 +531,8 @@ pub enum AlertCommand {
         limit: u64,
         #[arg(long)]
         dry_run: bool,
+        #[arg(long, value_name = "PATH")]
+        hmac_secret_file: Option<PathBuf>,
     },
     Silence {
         dedupe_key: String,
@@ -539,6 +545,35 @@ pub enum AlertCommand {
         dedupe_key: String,
         #[arg(long)]
         reason: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AlertHookCommand {
+    AddWebhook {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        url: String,
+        #[arg(long, value_name = "PATH")]
+        hmac_secret_file: PathBuf,
+        #[arg(long = "host-allow", required = true)]
+        host_allow: Vec<String>,
+        #[arg(long, default_value_t = crate::alert_webhook::DEFAULT_WEBHOOK_MAX_ATTEMPTS)]
+        max_attempts: u64,
+        #[arg(long, default_value_t = crate::alert_webhook::DEFAULT_WEBHOOK_TIMEOUT_MS)]
+        timeout_ms: u64,
+    },
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    Test {
+        hook_id: String,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long, value_name = "PATH")]
+        hmac_secret_file: Option<PathBuf>,
     },
 }
 

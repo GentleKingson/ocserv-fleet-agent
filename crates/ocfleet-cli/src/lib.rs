@@ -1,4 +1,5 @@
 pub mod alert_delivery;
+pub mod alert_webhook;
 pub mod alerts;
 pub mod args;
 pub mod audit;

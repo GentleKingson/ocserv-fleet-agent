@@ -11,10 +11,15 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build:
     name: ${{ matrix.artifact_arch }}
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
     permissions:
       contents: read
     strategy:
@@ -35,41 +40,144 @@ jobs:
       - name: Resolve release version
         id: version
         shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          version="${{ inputs.version }}"
+          version="$INPUT_VERSION"
           case "$version" in
             v*) ;;
             *) version="v$version" ;;
           esac
+          if [[ "${#version}" -gt 64 ]]; then
+            printf 'invalid release version: maximum length is 64 characters\n' >&2
+            exit 2
+          fi
+          [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?(\+[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]
+          if [[ "${GITHUB_REF_TYPE}" != "tag" || "${GITHUB_REF_NAME}" != "$version" ]]; then
+            printf 'release workflow must run from the matching tag: %s\n' "$version" >&2
+            exit 1
+          fi
           printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
           printf 'Resolved release version: %s\n' "$version"
 
       - name: Install Rust toolchain
-        run: rustup toolchain install stable --profile minimal
+        run: rustup toolchain install 1.96.1 --profile minimal
 
       - name: Build release binaries
-        run: ./scripts/build-release.sh "${{ steps.version.outputs.version }}"
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: ./scripts/build-release.sh "$VERSION"
 
       - name: Verify release checksums
-        run: ./scripts/verify-checksums.sh "dist/${{ steps.version.outputs.version }}/SHA256SUMS"
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: ./scripts/verify-checksums.sh "dist/$VERSION/SHA256SUMS"
 
       - name: Check expected artifacts
         shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          ARTIFACT_ARCH: ${{ matrix.artifact_arch }}
         run: |
           set -euo pipefail
-          version="${{ steps.version.outputs.version }}"
-          artifact_arch="${{ matrix.artifact_arch }}"
-          test -x "dist/$version/ocfleet-$version-$artifact_arch"
-          test -x "dist/$version/ocfleet-agent-$version-$artifact_arch"
-          test -f "dist/$version/SHA256SUMS"
+          test -x "dist/$VERSION/ocfleet-$VERSION-$ARTIFACT_ARCH"
+          test -x "dist/$VERSION/ocfleet-agent-$VERSION-$ARTIFACT_ARCH"
+          test -x "dist/$VERSION/ocfleet-api-$VERSION-$ARTIFACT_ARCH"
+          test -x "dist/$VERSION/ocfleet-ocserv-collector-$VERSION-$ARTIFACT_ARCH"
+          test -f "dist/$VERSION/SHA256SUMS"
 
       - name: Upload draft artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ocfleet-${{ steps.version.outputs.version }}-${{ matrix.artifact_arch }}
           if-no-files-found: error
+          retention-days: 7
           path: |
             dist/${{ steps.version.outputs.version }}/ocfleet-${{ steps.version.outputs.version }}-${{ matrix.artifact_arch }}
             dist/${{ steps.version.outputs.version }}/ocfleet-agent-${{ steps.version.outputs.version }}-${{ matrix.artifact_arch }}
+            dist/${{ steps.version.outputs.version }}/ocfleet-api-${{ steps.version.outputs.version }}-${{ matrix.artifact_arch }}
+            dist/${{ steps.version.outputs.version }}/ocfleet-ocserv-collector-${{ steps.version.outputs.version }}-${{ matrix.artifact_arch }}
             dist/${{ steps.version.outputs.version }}/SHA256SUMS
+
+  draft-release:
+    name: Create GitHub draft release
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout tagged source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download candidate artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: release-artifacts
+
+      - name: Assemble and verify release files
+        id: version
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          version="$INPUT_VERSION"
+          case "$version" in
+            v*) ;;
+            *) version="v$version" ;;
+          esac
+          if [[ "${#version}" -gt 64 ]]; then
+            printf 'invalid release version: maximum length is 64 characters\n' >&2
+            exit 2
+          fi
+          [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?(\+[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]
+          git rev-parse --verify "refs/tags/$version^{commit}" >/dev/null
+          test "$(git rev-parse HEAD)" = "$(git rev-parse "refs/tags/$version^{commit}")"
+          mkdir -p release-files
+          for artifact_arch in linux-x86_64 linux-aarch64; do
+            for binary in ocfleet ocfleet-agent ocfleet-api ocfleet-ocserv-collector; do
+              artifact="$binary-$version-$artifact_arch"
+              mapfile -d '' -t matches < <(
+                find release-artifacts -type f -name "$artifact" -print0
+              )
+              if [[ "${#matches[@]}" -ne 1 ]]; then
+                printf 'expected exactly one artifact named %s, found %s\n' \
+                  "$artifact" "${#matches[@]}" >&2
+                exit 1
+              fi
+              install -m 0755 "${matches[0]}" "release-files/$artifact"
+            done
+          done
+          (
+            cd release-files
+            export LC_ALL=C
+            sha256sum ocfleet-* > SHA256SUMS
+            sha256sum -c SHA256SUMS
+          )
+          notes="docs/release-notes/$version.md"
+          test -f "$notes"
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+          printf 'notes=%s\n' "$notes" >> "$GITHUB_OUTPUT"
+
+      - name: Create tag-bound draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+          NOTES: ${{ steps.version.outputs.notes }}
+        run: |
+          set -euo pipefail
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            printf 'release already exists: %s\n' "$VERSION" >&2
+            exit 1
+          fi
+          gh release create "$VERSION" release-files/* \
+            --draft \
+            --verify-tag \
+            --title "ocfleet $VERSION" \
+            --notes-file "$NOTES"

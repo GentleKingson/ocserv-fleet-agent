@@ -8,7 +8,7 @@ if [ ! -f "$checksum_file" ]; then
   exit 1
 fi
 
-checksum_dir="$(CDPATH= cd -- "$(dirname -- "$checksum_file")" && pwd)"
+checksum_dir="$(CDPATH='' cd -- "$(dirname -- "$checksum_file")" && pwd -P)"
 checksum_name="$(basename -- "$checksum_file")"
 
 (

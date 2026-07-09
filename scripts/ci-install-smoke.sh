@@ -18,6 +18,20 @@ case "$version" in
   v*) ;;
   *) version="v$version" ;;
 esac
+case "$version" in
+  *[!0-9A-Za-z.+-]*)
+    printf 'invalid release version: unsupported character\n' >&2
+    exit 2
+    ;;
+esac
+if [[ "${#version}" -gt 64 ]]; then
+  printf 'invalid release version: maximum length is 64 characters\n' >&2
+  exit 2
+fi
+if ! printf '%s\n' "$version" | LC_ALL=C grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?(\+[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$'; then
+  printf 'invalid release version\n' >&2
+  exit 2
+fi
 
 case "$arch" in
   linux-x86_64|x86_64|amd64) artifact_arch="linux-x86_64" ;;
@@ -28,10 +42,12 @@ case "$arch" in
     ;;
 esac
 
-repo_root="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+repo_root="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 dist_dir="$repo_root/dist/$version"
 ocfleet_artifact="$dist_dir/ocfleet-$version-$artifact_arch"
 agent_artifact="$dist_dir/ocfleet-agent-$version-$artifact_arch"
+api_artifact="$dist_dir/ocfleet-api-$version-$artifact_arch"
+collector_artifact="$dist_dir/ocfleet-ocserv-collector-$version-$artifact_arch"
 
 if [[ ! -x "$ocfleet_artifact" ]]; then
   printf 'missing executable release artifact: %s\n' "$ocfleet_artifact" >&2
@@ -41,6 +57,12 @@ if [[ ! -x "$agent_artifact" ]]; then
   printf 'missing executable release artifact: %s\n' "$agent_artifact" >&2
   exit 1
 fi
+for artifact in "$api_artifact" "$collector_artifact"; do
+  if [[ ! -x "$artifact" ]]; then
+    printf 'missing executable release artifact: %s\n' "$artifact" >&2
+    exit 1
+  fi
+done
 
 printf 'install_smoke version=%s arch=%s image=%s\n' "$version" "$artifact_arch" "$distro_image"
 
@@ -70,11 +92,18 @@ rm -rf /var/lib/apt/lists/*
 
 install -m 0755 "$dist_dir/ocfleet-$version-$artifact_arch" /usr/local/bin/ocfleet
 install -m 0755 "$dist_dir/ocfleet-agent-$version-$artifact_arch" /usr/local/bin/ocfleet-agent
+install -m 0755 "$dist_dir/ocfleet-api-$version-$artifact_arch" /usr/local/bin/ocfleet-api
+install -m 0755 "$dist_dir/ocfleet-ocserv-collector-$version-$artifact_arch" /usr/local/bin/ocfleet-ocserv-collector
 
-ocfleet --version
-ocfleet-agent --version
-file /usr/local/bin/ocfleet
-file /usr/local/bin/ocfleet-agent
+expected_version="${version#v}"
+for binary in ocfleet ocfleet-agent ocfleet-api ocfleet-ocserv-collector; do
+  reported="$("$binary" --version)"
+  if [[ "$reported" != "$binary $expected_version" ]]; then
+    printf 'installed binary version mismatch for %s: %s\n' "$binary" "$reported" >&2
+    exit 1
+  fi
+  file "/usr/local/bin/$binary"
+done
 
 if ! id -u ocfleet >/dev/null 2>&1; then
   useradd --system --home-dir /var/lib/ocfleet --shell /usr/sbin/nologin ocfleet
@@ -91,13 +120,23 @@ test "$(stat -c '%a' /etc/ocfleet)" = "755"
 test "$(stat -c '%U:%G %a' /var/lib/ocfleet)" = "ocfleet:ocfleet 700"
 test "$(stat -c '%U:%G %a' /var/log/ocfleet)" = "ocfleet:ocfleet 700"
 
-if [[ -f "$repo_root/deploy/systemd/ocfleet-agent.service" ]]; then
-  systemd-analyze verify "$repo_root/deploy/systemd/ocfleet-agent.service"
-else
-  printf 'No reusable systemd unit fixture found; skipping unit syntax verification.\n'
-fi
+systemd_units=(
+  "$repo_root/deploy/systemd/ocfleet-agent.service"
+  "$repo_root/deploy/systemd/ocserv-metadata-collector.service"
+  "$repo_root/deploy/systemd/ocserv-metadata-collector.timer"
+)
+for unit in "${systemd_units[@]}"; do
+  if [[ ! -f "$unit" ]]; then
+    printf 'missing required systemd unit: %s\n' "$unit" >&2
+    exit 1
+  fi
+done
+systemd-analyze verify "${systemd_units[@]}"
 
 ocfleet doctor --help >/dev/null
+ocfleet-agent --help >/dev/null
+ocfleet-api --help >/dev/null
+ocfleet-ocserv-collector --help >/dev/null
 
 smoke_dir="$(mktemp -d /tmp/ocfleet-install-smoke.XXXXXX)"
 cleanup() {
@@ -113,7 +152,7 @@ ocfleet --database "$database" --secret-key "$secret_key" init >/dev/null
 
 test -s "$secret_key"
 case "$(stat -c '%a' "$secret_key")" in
-  600|640) ;;
+  600) ;;
   *)
     printf 'unexpected SecretKey mode: %s\n' "$(stat -c '%a' "$secret_key")" >&2
     exit 1

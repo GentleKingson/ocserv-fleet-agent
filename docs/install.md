@@ -5,6 +5,10 @@ This guide installs the `v0.2.x` read-only MVP baseline on Linux with systemd. C
 - controller host: runs the `ocfleet` CLI and stores controller SQLite state.
 - agent host: runs `ocfleet-agent` on an ocserv node.
 
+The release also includes the optional read-only `ocfleet-api` process and the
+operator-run `ocfleet-ocserv-collector` snapshot normalizer. Neither binary
+adds a remote write capability.
+
 Replace placeholder EndpointIDs before running RPC smoke tests.
 
 For backup and hardening details, keep these guides next to this install runbook:
@@ -33,7 +37,13 @@ cd ocserv-fleet-agent
 cat dist/v0.2.0/SHA256SUMS
 ```
 
-The manual `Release Draft` GitHub Actions workflow builds the same Linux `x86_64` and `aarch64` binary artifacts and uploads them with `SHA256SUMS` as workflow artifacts. It does not publish crates.io packages or create a GitHub Release.
+Each supported architecture produces four binaries: `ocfleet`,
+`ocfleet-agent`, `ocfleet-api`, and `ocfleet-ocserv-collector`. The manual
+`Release Draft` GitHub Actions workflow builds them for Linux `x86_64` and
+`aarch64`, verifies the combined checksums, and creates a draft GitHub Release.
+Run that workflow from the exact existing version tag and provide the same tag
+as its version input; branch dispatches and mismatched tags fail closed. The
+workflow does not publish crates.io packages.
 
 Install binaries:
 
@@ -43,15 +53,30 @@ ARCH="$(uname -m)"
 case "$ARCH" in arm64) ARCH="aarch64";; amd64) ARCH="x86_64";; esac
 sudo install -m 0755 "dist/v0.2.0/ocfleet-v0.2.0-$OS-$ARCH" /usr/local/bin/ocfleet
 sudo install -m 0755 "dist/v0.2.0/ocfleet-agent-v0.2.0-$OS-$ARCH" /usr/local/bin/ocfleet-agent
-ocfleet --help
-ocfleet-agent --help
+sudo install -m 0755 "dist/v0.2.0/ocfleet-api-v0.2.0-$OS-$ARCH" /usr/local/bin/ocfleet-api
+sudo install -m 0755 "dist/v0.2.0/ocfleet-ocserv-collector-v0.2.0-$OS-$ARCH" /usr/local/bin/ocfleet-ocserv-collector
+for binary in ocfleet ocfleet-agent ocfleet-api ocfleet-ocserv-collector; do
+  "$binary" --version
+done
 ```
+
+Installing a binary does not enable a service. Keep the API loopback-only
+unless a private bearer-token file is configured, and follow
+[`docs/collector.md`](collector.md) before enabling the local collector timer.
 
 ## CI Install Smoke Coverage
 
-The release binaries are smoke-tested in GitHub Actions on Debian Trixie and Ubuntu 24.04 for both `linux-x86_64` and `linux-aarch64` artifacts. The CI gate builds the binaries, verifies `SHA256SUMS`, installs them into minimal distro containers, and checks the install layout, directory permissions, SecretKey file mode, `ocfleet doctor`, JSON doctor output parsing, reusable systemd unit syntax, and basic binary executability.
+The four release binaries are smoke-tested in GitHub Actions on Debian Trixie
+and Ubuntu 24.04 for both `linux-x86_64` and `linux-aarch64` artifacts. The CI
+gate builds the binaries, verifies `SHA256SUMS`, installs them into minimal
+distro containers, and checks the install layout, directory permissions,
+SecretKey file mode, `ocfleet doctor`, JSON doctor output parsing, checked-in
+agent and collector systemd unit syntax, exact binary versions, and basic
+binary executability.
 
-This is not `.deb` package support. The smoke containers do not run `systemctl start`; they only use `systemd-analyze verify` for the checked-in unit file because systemd is not PID 1 in the containers.
+This is not `.deb` package support. The smoke containers do not run
+`systemctl start`; they only use `systemd-analyze verify` for the checked-in
+unit files because systemd is not PID 1 in the containers.
 
 ## Controller Setup
 
@@ -282,6 +307,8 @@ sqlite3 /var/lib/ocfleet-controller/controller.sqlite 'PRAGMA integrity_check;'
 sudo cp -a /var/lib/ocfleet-controller/controller.sqlite /var/backups/ocfleet/controller.sqlite.pre-upgrade.$(date -u +%Y%m%dT%H%M%SZ)
 sudo install -m 0755 "dist/v0.2.0/ocfleet-v0.2.0-$OS-$ARCH" /usr/local/bin/ocfleet
 sudo install -m 0755 "dist/v0.2.0/ocfleet-agent-v0.2.0-$OS-$ARCH" /usr/local/bin/ocfleet-agent
+sudo install -m 0755 "dist/v0.2.0/ocfleet-api-v0.2.0-$OS-$ARCH" /usr/local/bin/ocfleet-api
+sudo install -m 0755 "dist/v0.2.0/ocfleet-ocserv-collector-v0.2.0-$OS-$ARCH" /usr/local/bin/ocfleet-ocserv-collector
 ocfleet --database /var/lib/ocfleet-controller/controller.sqlite --secret-key /var/lib/ocfleet-controller/controller.secret doctor
 sudo systemctl start ocfleet-agent
 ```
@@ -324,6 +351,7 @@ sudo rm -f /etc/systemd/system/ocfleet-agent.service
 sudo rm -rf /etc/systemd/system/ocfleet-agent.service.d
 sudo systemctl daemon-reload
 sudo rm -f /usr/local/bin/ocfleet /usr/local/bin/ocfleet-agent
+sudo rm -f /usr/local/bin/ocfleet-api /usr/local/bin/ocfleet-ocserv-collector
 ```
 
 Remove state only after backups are confirmed:

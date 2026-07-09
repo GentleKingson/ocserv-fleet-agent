@@ -61,7 +61,7 @@ jobs:
         run: bash scripts/check-doc-claims.sh
 
       - name: Install Rust toolchain
-        run: rustup toolchain install stable --profile minimal --component rustfmt
+        run: rustup toolchain install 1.96.1 --profile minimal --component rustfmt
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -79,10 +79,13 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust toolchain
-        run: rustup toolchain install stable --profile minimal --component clippy
+        run: rustup toolchain install 1.96.1 --profile minimal --component clippy
 
-      - name: Run clippy
+      - name: Run Clippy with default features
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run Clippy with all features
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
   test:
     name: cargo test
@@ -97,10 +100,13 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust toolchain
-        run: rustup toolchain install stable --profile minimal
+        run: rustup toolchain install 1.96.1 --profile minimal
 
-      - name: Run tests
+      - name: Run tests with default features
         run: cargo test --workspace -j1 -- --test-threads=1
+
+      - name: Run tests with all features
+        run: cargo test --workspace --all-features -j1 -- --test-threads=1
 
   supply-chain:
     name: Supply-chain checks
@@ -117,17 +123,20 @@ jobs:
       - name: Check GitHub Actions pinning
         run: ./scripts/check-github-actions-pinning.sh
 
+      - name: Check release version validation
+        run: ./scripts/test-release-version-validation.sh
+
       - name: Install Rust toolchain
-        run: rustup toolchain install stable --profile minimal
+        run: rustup toolchain install 1.96.1 --profile minimal
 
       - name: Install cargo-deny
-        run: cargo install cargo-deny --locked
+        run: cargo install cargo-deny --version 0.19.4 --locked
 
       - name: Run cargo-deny
-        run: cargo deny check
+        run: cargo deny --all-features --locked check
 
       - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
+        run: cargo install cargo-audit --version 0.22.2 --locked
 
       - name: Run cargo-audit
         run: cargo audit --ignore RUSTSEC-2024-0436

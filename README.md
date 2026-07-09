@@ -445,6 +445,7 @@ Networking must allow the controller to reach the agent through iroh using the r
 - `crates/ocfleet-cli`: controller CLI, SQLite state, controller audit, and RPC client.
 - `docs/install.md`: install, upgrade, SecretKey, systemd, and smoke-test guide.
 - `docs/troubleshooting.md`: operational failure modes and `ocfleet doctor` interpretation.
+- `docs/release-notes/v0.2.0.md`: v0.2.0 read-only release-candidate notes and known limitations.
 - `docs/release-notes/v0.1.0.md`: v0.1.0 release notes and known limitations.
 - `docs/status.md`: implementation status by feature and CLI surface.
 - `docs/roadmap.md`: forward roadmap from the current documentation baseline.

@@ -25,6 +25,7 @@ jobs:
   install-smoke:
     name: ${{ matrix.distro }} ${{ matrix.artifact_arch }}
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
     permissions:
       contents: read
     strategy:
@@ -57,12 +58,14 @@ jobs:
       - name: Resolve release version
         id: version
         shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
             version="${GITHUB_REF_NAME}"
           elif [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
-            version="${{ inputs.version }}"
+            version="$INPUT_VERSION"
           else
             version="v0.2.0"
           fi
@@ -70,26 +73,42 @@ jobs:
             v*) ;;
             *) version="v$version" ;;
           esac
+          if [[ "${#version}" -gt 64 ]]; then
+            printf 'invalid release version: maximum length is 64 characters\n' >&2
+            exit 2
+          fi
+          [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?(\+[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]
           printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
           printf 'Resolved release version: %s\n' "$version"
 
       - name: Install Rust toolchain
-        run: rustup toolchain install stable --profile minimal
+        run: rustup toolchain install 1.96.1 --profile minimal
 
       - name: Build release binaries
-        run: ./scripts/build-release.sh "${{ steps.version.outputs.version }}"
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: ./scripts/build-release.sh "$VERSION"
 
       - name: Verify release checksums
-        run: ./scripts/verify-checksums.sh "dist/${{ steps.version.outputs.version }}/SHA256SUMS"
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: ./scripts/verify-checksums.sh "dist/$VERSION/SHA256SUMS"
 
       - name: Check matrix release artifacts
         shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          ARTIFACT_ARCH: ${{ matrix.artifact_arch }}
         run: |
           set -euo pipefail
-          version="${{ steps.version.outputs.version }}"
-          artifact_arch="${{ matrix.artifact_arch }}"
-          test -x "dist/$version/ocfleet-$version-$artifact_arch"
-          test -x "dist/$version/ocfleet-agent-$version-$artifact_arch"
+          test -x "dist/$VERSION/ocfleet-$VERSION-$ARTIFACT_ARCH"
+          test -x "dist/$VERSION/ocfleet-agent-$VERSION-$ARTIFACT_ARCH"
+          test -x "dist/$VERSION/ocfleet-api-$VERSION-$ARTIFACT_ARCH"
+          test -x "dist/$VERSION/ocfleet-ocserv-collector-$VERSION-$ARTIFACT_ARCH"
 
       - name: Run install smoke
-        run: ./scripts/ci-install-smoke.sh "${{ steps.version.outputs.version }}" "${{ matrix.artifact_arch }}" "${{ matrix.distro_image }}"
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          ARTIFACT_ARCH: ${{ matrix.artifact_arch }}
+          DISTRO_IMAGE: ${{ matrix.distro_image }}
+        run: ./scripts/ci-install-smoke.sh "$VERSION" "$ARTIFACT_ARCH" "$DISTRO_IMAGE"

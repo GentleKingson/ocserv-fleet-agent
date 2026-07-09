@@ -1,4 +1,5 @@
 use ocfleet_cli::store::{ProbeObservationInsert, Store};
+use rusqlite::Connection;
 use serde_json::{Value, json};
 use std::process::{Command, Output};
 
@@ -46,15 +47,7 @@ fn seed_observation(store: &Store, observation_id: &str) {
             observed_at: "2026-07-08T00:00:00Z".to_string(),
             expires_at: None,
             result_class: "controller_rpc_summary".to_string(),
-            summary_json: json!({
-                "result_class": "controller_rpc_summary",
-                "safe_count": 1,
-                "raw_body": "username=alice client_ip=10.0.0.2",
-                "username": "alice",
-                "client_ip": "10.0.0.2",
-                "session_id": "session-secret",
-                "message": "read failed for /etc/passwd"
-            }),
+            summary_json: json!({"result_class": "controller_rpc_summary", "safe_count": 1}),
         })
         .expect("seed observation");
 }
@@ -86,6 +79,27 @@ fn observation_tests_list_and_show_redact_summary_and_filter() {
     let store = Store::open(&database).expect("open store");
     seed_observation(&store, "obs-safe-1");
     drop(store);
+    Connection::open(&database)
+        .expect("open legacy fixture database")
+        .execute(
+            "UPDATE probe_observations SET summary_json = ?1 WHERE observation_id = ?2",
+            rusqlite::params![
+                json!({
+                    "result_class": "controller_rpc_summary",
+                    "safe_count": 1,
+                    "raw_body": "username=alice client_ip=10.0.0.2",
+                    "username": "alice",
+                    "client_ip": "10.0.0.2",
+                    "session_id": "session-secret",
+                    "message": "read failed for /etc/passwd",
+                    "oversized": "x".repeat(257),
+                    "oversized_array": (0..300).collect::<Vec<_>>()
+                })
+                .to_string(),
+                "obs-safe-1"
+            ],
+        )
+        .expect("seed contaminated legacy summary");
 
     let output = run_ocfleet(&[
         "--database",
@@ -108,6 +122,17 @@ fn observation_tests_list_and_show_redact_summary_and_filter() {
     assert_eq!(
         payload["observations"][0]["summary"]["message"],
         "<redacted>"
+    );
+    assert_eq!(
+        payload["observations"][0]["summary"]["oversized"],
+        "<redacted>"
+    );
+    assert!(
+        payload["observations"][0]["summary"]["oversized_array"]
+            .as_array()
+            .expect("bounded array")
+            .len()
+            <= 256
     );
     assert_no_forbidden_observation_payload(&payload);
 

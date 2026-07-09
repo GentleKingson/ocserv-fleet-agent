@@ -1,20 +1,25 @@
-use axum::extract::{Path as AxumPath, Query, State};
-use axum::http::HeaderMap;
-use axum::response::Html;
+use axum::extract::rejection::QueryRejection;
+use axum::extract::{Path as AxumPath, Query, Request, State};
+use axum::http::{HeaderMap, HeaderValue, header};
+use axum::middleware::{self, Next};
+use axum::response::{Html, Response};
 use axum::routing::get;
 use axum::{Json, Router};
+use base64::Engine as _;
 use ocfleet_cli::args::RedactionMode;
 use ocfleet_cli::audit_export::validate_window;
 use serde::Deserialize;
 use serde_json::json;
+use sha2::{Digest, Sha256};
+use std::sync::{Arc, OnceLock};
 
 use crate::args::ApiConfig;
-use crate::auth::AuthToken;
+use crate::auth::{AuthToken, Principal};
 use crate::projections::{
     alert_to_json, audit_to_json, health_node_to_json, health_summary_to_json, job_to_json,
     observation_record_to_json, run_to_json,
 };
-use crate::readonly_store::ReadOnlyStore;
+use crate::readonly_store::{ApiReadStore, ReadOnlyStore};
 use crate::responses::{
     ApiError, ApiResult, ListResponse, SingleResponse, SummaryResponse, list_response, now_rfc3339,
     single_response, summary_response,
@@ -22,10 +27,11 @@ use crate::responses::{
 use crate::web::DASHBOARD_HTML;
 
 const DEFAULT_QUERY_LIMIT: u64 = 50;
+static DASHBOARD_CSP: OnceLock<HeaderValue> = OnceLock::new();
 
 #[derive(Clone)]
 pub struct AppState {
-    store: ReadOnlyStore,
+    store: Arc<dyn ApiReadStore>,
     max_limit: u64,
     redact: RedactionMode,
     auth_token: Option<AuthToken>,
@@ -34,7 +40,7 @@ pub struct AppState {
 impl AppState {
     pub fn from_config(config: ApiConfig) -> Self {
         Self {
-            store: ReadOnlyStore::new(config.database),
+            store: Arc::new(ReadOnlyStore::new(config.database)),
             max_limit: config.max_limit,
             redact: config.redact,
             auth_token: config.auth_token,
@@ -43,6 +49,10 @@ impl AppState {
 
     pub fn check_readable(&self) -> rusqlite::Result<()> {
         self.store.check_readable()
+    }
+
+    pub fn validate_startup(&self) -> Result<(), crate::readonly_store::StoreValidationError> {
+        self.store.validate_startup()
     }
 }
 
@@ -62,11 +72,46 @@ pub fn build_router(state: AppState) -> Router {
         .route("/alerts", get(alerts))
         .route("/alerts/{lookup}", get(alert))
         .route("/audit/export", get(audit_export))
+        .fallback(route_not_found)
+        .method_not_allowed_fallback(method_not_allowed)
         .with_state(state)
+        .layer(middleware::from_fn(response_security_headers))
 }
 
-async fn dashboard() -> Html<&'static str> {
-    Html(DASHBOARD_HTML)
+async fn response_security_headers(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response.headers_mut().insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    response
+}
+
+async fn dashboard() -> (HeaderMap, Html<&'static str>) {
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CONTENT_SECURITY_POLICY, dashboard_csp().clone());
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    (headers, Html(DASHBOARD_HTML))
+}
+
+async fn route_not_found() -> ApiError {
+    ApiError::not_found("route not found")
+}
+
+async fn method_not_allowed() -> ApiError {
+    ApiError::method_not_allowed()
 }
 
 async fn healthz(
@@ -136,9 +181,10 @@ async fn job(
 async fn runs(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(query): Query<RunsQuery>,
+    query: Result<Query<RunsQuery>, QueryRejection>,
 ) -> ApiResult<Json<ListResponse>> {
     authorize(&state, &headers)?;
+    let query = parse_query(query)?;
     let limit = bounded_limit(query.limit, state.max_limit)?;
     if let Some(job_id) = &query.job_id {
         validate_identifier("job_id", job_id)?;
@@ -172,9 +218,10 @@ async fn run(
 async fn observations(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(query): Query<ObservationsQuery>,
+    query: Result<Query<ObservationsQuery>, QueryRejection>,
 ) -> ApiResult<Json<ListResponse>> {
     authorize(&state, &headers)?;
+    let query = parse_query(query)?;
     let limit = bounded_limit(query.limit, state.max_limit)?;
     if let Some(node_id) = &query.node_id {
         validate_identifier("node_id", node_id)?;
@@ -209,9 +256,10 @@ async fn observation(
 async fn alerts(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(query): Query<AlertsQuery>,
+    query: Result<Query<AlertsQuery>, QueryRejection>,
 ) -> ApiResult<Json<ListResponse>> {
     authorize(&state, &headers)?;
+    let query = parse_query(query)?;
     let limit = bounded_limit(query.limit, state.max_limit)?;
     if let Some(state_filter) = &query.state {
         validate_allowed("state", state_filter, &["open", "silenced", "resolved"])?;
@@ -247,9 +295,10 @@ async fn alert(
 async fn audit_export(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(query): Query<AuditExportQuery>,
+    query: Result<Query<AuditExportQuery>, QueryRejection>,
 ) -> ApiResult<Json<ListResponse>> {
     authorize(&state, &headers)?;
+    let query = parse_query(query)?;
     let from = query
         .from
         .as_deref()
@@ -259,7 +308,7 @@ async fn audit_export(
         .as_deref()
         .ok_or_else(|| ApiError::bad_request("to is required"))?;
     validate_window(from, to).map_err(|err| ApiError::bad_request(err.to_string()))?;
-    let max_rows = bounded_limit(query.max_rows, state.max_limit)?;
+    let max_rows = bounded_value(query.max_rows, state.max_limit, "max_rows")?;
     let redact = parse_redaction(query.redact.as_deref(), state.redact)?;
     let query_limit = max_rows
         .checked_add(1)
@@ -277,11 +326,12 @@ async fn audit_export(
     Ok(list_response(max_rows, items))
 }
 
-fn authorize(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
+fn authorize(state: &AppState, headers: &HeaderMap) -> ApiResult<Principal> {
     match &state.auth_token {
-        Some(token) if token.verify_headers(headers) => Ok(()),
-        Some(_) => Err(ApiError::unauthorized()),
-        None => Ok(()),
+        Some(token) => token
+            .authenticate_headers(headers)
+            .ok_or_else(ApiError::unauthorized),
+        None => Ok(Principal::local_viewer()),
     }
 }
 
@@ -293,13 +343,23 @@ fn db<T>(result: rusqlite::Result<T>) -> ApiResult<T> {
 }
 
 fn bounded_limit(value: Option<u64>, max_limit: u64) -> ApiResult<u64> {
-    let limit = value.unwrap_or(DEFAULT_QUERY_LIMIT.min(max_limit));
-    if limit == 0 || limit > max_limit {
+    bounded_value(value, max_limit, "limit")
+}
+
+fn bounded_value(value: Option<u64>, maximum: u64, name: &str) -> ApiResult<u64> {
+    let value = value.unwrap_or(DEFAULT_QUERY_LIMIT.min(maximum));
+    if value == 0 || value > maximum {
         return Err(ApiError::bad_request(format!(
-            "limit must be between 1 and {max_limit}"
+            "{name} must be between 1 and {maximum}"
         )));
     }
-    Ok(limit)
+    Ok(value)
+}
+
+fn parse_query<T>(query: Result<Query<T>, QueryRejection>) -> ApiResult<T> {
+    query
+        .map(|Query(query)| query)
+        .map_err(|_| ApiError::bad_request("invalid or unsupported query parameters"))
 }
 
 fn parse_redaction(value: Option<&str>, default: RedactionMode) -> ApiResult<RedactionMode> {
@@ -340,7 +400,36 @@ fn validate_identifier(field: &str, value: &str) -> ApiResult<()> {
     }
 }
 
+fn dashboard_csp() -> &'static HeaderValue {
+    DASHBOARD_CSP.get_or_init(|| {
+        let style_hash = csp_hash(extract_tag_body(DASHBOARD_HTML, "<style>", "</style>"));
+        let script_hash = csp_hash(extract_tag_body(DASHBOARD_HTML, "<script>", "</script>"));
+        HeaderValue::from_str(&format!(
+            "default-src 'none'; script-src 'sha256-{script_hash}'; style-src 'sha256-{style_hash}'; connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+        ))
+        .expect("dashboard CSP header is valid")
+    })
+}
+
+fn extract_tag_body(html: &'static str, open: &str, close: &str) -> &'static str {
+    let start = html
+        .find(open)
+        .map(|offset| offset + open.len())
+        .expect("dashboard tag open marker exists");
+    let end = html[start..]
+        .find(close)
+        .map(|offset| start + offset)
+        .expect("dashboard tag close marker exists");
+    &html[start..end]
+}
+
+fn csp_hash(value: &str) -> String {
+    let digest = Sha256::digest(value.as_bytes());
+    base64::engine::general_purpose::STANDARD.encode(digest)
+}
+
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RunsQuery {
     limit: Option<u64>,
     job_id: Option<String>,
@@ -348,6 +437,7 @@ struct RunsQuery {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ObservationsQuery {
     limit: Option<u64>,
     node_id: Option<String>,
@@ -355,6 +445,7 @@ struct ObservationsQuery {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AlertsQuery {
     state: Option<String>,
     severity: Option<String>,
@@ -363,6 +454,7 @@ struct AlertsQuery {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AuditExportQuery {
     from: Option<String>,
     to: Option<String>,

@@ -166,7 +166,9 @@ fn run_retention_apply(
             limit,
             batch_size,
         )?;
-        write_retention_apply_audit(store, &report)?;
+        if !dry_run {
+            write_retention_apply_audit(store, &report)?;
+        }
         reports.push(report);
     }
 

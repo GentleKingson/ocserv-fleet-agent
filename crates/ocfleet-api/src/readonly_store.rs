@@ -1,8 +1,10 @@
+use std::io;
 use std::path::{Path, PathBuf};
 
+use ocfleet_cli::private_file::{self, PrivateFileError};
 use ocfleet_cli::store::{
-    AlertEventRecord, AuditRecord, HealthSnapshotRecord, NodeRecord, ObservabilityJobRecord,
-    ObservabilityRunRecord, ProbeObservationRecord,
+    AlertEventRecord, AuditRecord, CURRENT_SCHEMA_VERSION, HealthSnapshotRecord, NodeRecord,
+    ObservabilityJobRecord, ObservabilityRunRecord, ProbeObservationRecord,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, params, types::Type};
 use serde_json::Value;
@@ -18,6 +20,60 @@ pub struct NodeHealthRecord {
     pub snapshot: Option<HealthSnapshotRecord>,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum StoreValidationError {
+    #[error("controller database private-file validation failed")]
+    UnsafeDatabaseFiles(#[source] PrivateFileError),
+    #[error("controller database SQLite error: {0}")]
+    Sqlite(#[from] rusqlite::Error),
+    #[error("controller database schema version is {actual:?}; expected {expected}")]
+    SchemaVersion { actual: Option<i64>, expected: i64 },
+    #[error("controller database required table is missing: {0}")]
+    MissingTable(&'static str),
+    #[error("controller database quick_check failed")]
+    QuickCheck,
+}
+
+pub trait ApiReadStore: Send + Sync {
+    fn validate_startup(&self) -> Result<(), StoreValidationError>;
+    fn check_readable(&self) -> rusqlite::Result<()>;
+    fn list_node_health(&self, limit: u64) -> rusqlite::Result<Vec<NodeHealthRecord>>;
+    fn get_node_health(&self, node_id: &str) -> rusqlite::Result<Option<NodeHealthRecord>>;
+    fn list_jobs(&self, limit: u64) -> rusqlite::Result<Vec<ObservabilityJobRecord>>;
+    fn get_job(&self, job_id: &str) -> rusqlite::Result<Option<ObservabilityJobRecord>>;
+    fn list_runs(
+        &self,
+        limit: u64,
+        job_id: Option<&str>,
+        status: Option<&str>,
+    ) -> rusqlite::Result<Vec<ObservabilityRunRecord>>;
+    fn get_run(&self, run_id: &str) -> rusqlite::Result<Option<ObservabilityRunRecord>>;
+    fn list_observations(
+        &self,
+        limit: u64,
+        node_id: Option<&str>,
+        method: Option<&str>,
+    ) -> rusqlite::Result<Vec<ProbeObservationRecord>>;
+    fn get_observation(
+        &self,
+        observation_id: &str,
+    ) -> rusqlite::Result<Option<ProbeObservationRecord>>;
+    fn list_alerts(
+        &self,
+        limit: u64,
+        state: Option<&str>,
+        severity: Option<&str>,
+        node_id: Option<&str>,
+    ) -> rusqlite::Result<Vec<AlertEventRecord>>;
+    fn get_alert(&self, lookup: &str) -> rusqlite::Result<Option<AlertEventRecord>>;
+    fn list_audit_window(
+        &self,
+        from: &str,
+        to: &str,
+        limit: u64,
+    ) -> rusqlite::Result<Vec<AuditRecord>>;
+}
+
 impl ReadOnlyStore {
     pub fn new(database: PathBuf) -> Self {
         Self { database }
@@ -28,6 +84,33 @@ impl ReadOnlyStore {
         let _: i64 = conn.query_row("SELECT count(*) FROM schema_migrations", [], |row| {
             row.get(0)
         })?;
+        Ok(())
+    }
+
+    pub fn validate_startup(&self) -> Result<(), StoreValidationError> {
+        prepare_database_files(&self.database)
+            .map_err(StoreValidationError::UnsafeDatabaseFiles)?;
+        let conn = self.open_conn()?;
+        for table in REQUIRED_API_TABLES {
+            if !table_exists(&conn, table)? {
+                return Err(StoreValidationError::MissingTable(table));
+            }
+        }
+
+        let actual = conn.query_row("SELECT max(version) FROM schema_migrations", [], |row| {
+            row.get::<_, Option<i64>>(0)
+        })?;
+        if actual != Some(CURRENT_SCHEMA_VERSION) {
+            return Err(StoreValidationError::SchemaVersion {
+                actual,
+                expected: CURRENT_SCHEMA_VERSION,
+            });
+        }
+
+        let quick_check: String = conn.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+        if quick_check != "ok" {
+            return Err(StoreValidationError::QuickCheck);
+        }
         Ok(())
     }
 
@@ -242,11 +325,153 @@ impl ReadOnlyStore {
     }
 }
 
+impl ApiReadStore for ReadOnlyStore {
+    fn validate_startup(&self) -> Result<(), StoreValidationError> {
+        Self::validate_startup(self)
+    }
+
+    fn check_readable(&self) -> rusqlite::Result<()> {
+        Self::check_readable(self)
+    }
+
+    fn list_node_health(&self, limit: u64) -> rusqlite::Result<Vec<NodeHealthRecord>> {
+        Self::list_node_health(self, limit)
+    }
+
+    fn get_node_health(&self, node_id: &str) -> rusqlite::Result<Option<NodeHealthRecord>> {
+        Self::get_node_health(self, node_id)
+    }
+
+    fn list_jobs(&self, limit: u64) -> rusqlite::Result<Vec<ObservabilityJobRecord>> {
+        Self::list_jobs(self, limit)
+    }
+
+    fn get_job(&self, job_id: &str) -> rusqlite::Result<Option<ObservabilityJobRecord>> {
+        Self::get_job(self, job_id)
+    }
+
+    fn list_runs(
+        &self,
+        limit: u64,
+        job_id: Option<&str>,
+        status: Option<&str>,
+    ) -> rusqlite::Result<Vec<ObservabilityRunRecord>> {
+        Self::list_runs(self, limit, job_id, status)
+    }
+
+    fn get_run(&self, run_id: &str) -> rusqlite::Result<Option<ObservabilityRunRecord>> {
+        Self::get_run(self, run_id)
+    }
+
+    fn list_observations(
+        &self,
+        limit: u64,
+        node_id: Option<&str>,
+        method: Option<&str>,
+    ) -> rusqlite::Result<Vec<ProbeObservationRecord>> {
+        Self::list_observations(self, limit, node_id, method)
+    }
+
+    fn get_observation(
+        &self,
+        observation_id: &str,
+    ) -> rusqlite::Result<Option<ProbeObservationRecord>> {
+        Self::get_observation(self, observation_id)
+    }
+
+    fn list_alerts(
+        &self,
+        limit: u64,
+        state: Option<&str>,
+        severity: Option<&str>,
+        node_id: Option<&str>,
+    ) -> rusqlite::Result<Vec<AlertEventRecord>> {
+        Self::list_alerts(self, limit, state, severity, node_id)
+    }
+
+    fn get_alert(&self, lookup: &str) -> rusqlite::Result<Option<AlertEventRecord>> {
+        Self::get_alert(self, lookup)
+    }
+
+    fn list_audit_window(
+        &self,
+        from: &str,
+        to: &str,
+        limit: u64,
+    ) -> rusqlite::Result<Vec<AuditRecord>> {
+        Self::list_audit_window(self, from, to, limit)
+    }
+}
+
 fn open_read_only_connection(path: &Path) -> rusqlite::Result<Connection> {
+    prepare_database_files(path).map_err(|_| rusqlite::Error::InvalidPath(path.to_path_buf()))?;
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     conn.pragma_update(None, "busy_timeout", 5_000)?;
     conn.pragma_update(None, "query_only", "ON")?;
+    conn.pragma_update(None, "trusted_schema", "OFF")?;
+    validate_database_files(path).map_err(|_| rusqlite::Error::InvalidPath(path.to_path_buf()))?;
     Ok(conn)
+}
+
+const REQUIRED_API_TABLES: [&str; 8] = [
+    "schema_migrations",
+    "nodes",
+    "health_snapshots",
+    "observability_jobs",
+    "observability_runs",
+    "probe_observations",
+    "alert_events",
+    "controller_audit_log",
+];
+
+fn table_exists(conn: &Connection, table: &str) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
+        [table],
+        |row| row.get(0),
+    )
+}
+
+fn validate_database_files(path: &Path) -> Result<(), PrivateFileError> {
+    private_file::validate_existing_private_file(path)?;
+    for sidecar in sqlite_sidecar_paths(path) {
+        match std::fs::symlink_metadata(&sidecar) {
+            Ok(_) => private_file::validate_existing_private_file(&sidecar)?,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(PrivateFileError::Io(err)),
+        }
+    }
+    Ok(())
+}
+
+fn prepare_database_files(path: &Path) -> Result<(), PrivateFileError> {
+    private_file::validate_existing_private_file(path)?;
+    for sidecar in sqlite_sidecar_paths(path) {
+        match std::fs::symlink_metadata(&sidecar) {
+            Ok(_) => private_file::validate_existing_private_file(&sidecar)?,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                match private_file::open_private_create_new(&sidecar) {
+                    Ok(file) => drop(file),
+                    Err(PrivateFileError::Io(err))
+                        if err.kind() == io::ErrorKind::AlreadyExists =>
+                    {
+                        private_file::validate_existing_private_file(&sidecar)?;
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+            Err(err) => return Err(PrivateFileError::Io(err)),
+        }
+    }
+    validate_database_files(path)
+}
+
+fn sqlite_sidecar_paths(path: &Path) -> [PathBuf; 2] {
+    let mut wal = path.as_os_str().to_os_string();
+    wal.push("-wal");
+    let mut shm = path.as_os_str().to_os_string();
+    shm.push("-shm");
+    [PathBuf::from(wal), PathBuf::from(shm)]
 }
 
 fn node_health_from_row(row: &Row<'_>) -> rusqlite::Result<NodeHealthRecord> {

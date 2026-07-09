@@ -95,23 +95,22 @@ Provider composition remains fixed:
 
 ## Local Collector vs Direct Fixed Provider
 
-The implemented slice is file/snapshot ingestion only. The repository does not
-ship an `ocfleet-ocserv-collector` binary yet.
+The repository ships `ocfleet-ocserv-collector` as a local, operator-run,
+snapshot-only normalizer for the v2 JSON document. It does not call local service
+managers, ocserv administration tools, log readers, shells, or scripts. It reads
+a private local TOML input, validates bounded aggregate fields, preserves the
+producer-provided `collected_at` timestamp, and writes only the low-sensitive
+snapshot schema listed above. Re-running it never refreshes that timestamp.
 
-A local operator may deploy a separate collector that writes the fixed JSON
-document to the configured private path. That collector is outside controller
-control: it must use only local operator configuration, parse any local source
-strictly, and write only the low-sensitive allowed fields listed above.
-
-A future `ocfleet-ocserv-collector` binary, if added, should follow the same
-rules:
+The collector remains outside controller control:
 
 - local-only configuration
-- no controller-selected source
-- strict parser from local source to v2 snapshot
+- no controller-selected source or output path
 - no raw output persistence
-- private output path
+- private atomic snapshot output
 - bounded field lengths and counts
+
+See `docs/collector.md` for the CLI, config format, and systemd timer.
 
 ## Snapshot Example
 
@@ -133,39 +132,44 @@ rules:
 
 ## systemd Timer Example
 
-This example assumes a separately managed local collector binary that writes the
-fixed snapshot file. It is not controlled by ocfleet and is not invoked by the
-controller.
+The repository includes hardened opt-in example units in `deploy/systemd/`.
+They run the local normalizer and write the fixed snapshot file. The service is
+not controlled by ocfleet and is not invoked by the controller. A timer run
+preserves producer time, so it cannot make static values look current.
 
 `/etc/systemd/system/ocserv-metadata-collector.service`:
 
 ```ini
 [Unit]
-Description=Write low-sensitive ocserv metadata snapshot for ocfleet
+Description=ocfleet local ocserv metadata collector
 
 [Service]
 Type=oneshot
-User=ocfleet-agent
-Group=ocfleet-agent
-ExecStart=/usr/local/sbin/ocserv-metadata-collector --output /var/lib/ocfleet-agent/ocserv-live-snapshot.json
+User=ocfleet
+Group=ocfleet
 UMask=0077
+StateDirectory=ocfleet-agent
+StateDirectoryMode=0700
+ExecStart=/usr/local/bin/ocfleet-ocserv-collector --config /etc/ocfleet-collector/collector.toml --output /var/lib/ocfleet-agent/ocserv-live-snapshot.json
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/var/lib/ocfleet-agent
+ReadOnlyPaths=/etc/ocfleet-collector/collector.toml
 ```
 
 `/etc/systemd/system/ocserv-metadata-collector.timer`:
 
 ```ini
 [Unit]
-Description=Refresh low-sensitive ocserv metadata snapshot for ocfleet
+Description=Run ocfleet local ocserv metadata collector periodically
 
 [Timer]
-OnBootSec=1min
-OnUnitActiveSec=5min
-AccuracySec=30s
+OnCalendar=hourly
+AccuracySec=5min
+Persistent=false
+Unit=ocserv-metadata-collector.service
 
 [Install]
 WantedBy=timers.target

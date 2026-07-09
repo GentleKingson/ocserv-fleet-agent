@@ -1,5 +1,5 @@
 use anyhow::{Context, bail};
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -162,81 +162,9 @@ where
 }
 
 fn alert_methods(alert: &AlertEventRecord) -> Vec<String> {
-    alert
-        .detail_json
-        .get("methods")
-        .map(string_array)
-        .unwrap_or_default()
+    crate::alert_projection::methods_from_detail(&alert.detail_json)
 }
 
 fn alert_summary(alert: &AlertEventRecord) -> Value {
-    alert
-        .detail_json
-        .get("summary")
-        .map(safe_summary)
-        .unwrap_or_else(|| json!({}))
-}
-
-fn safe_summary(value: &Value) -> Value {
-    match value {
-        Value::Object(map) => {
-            let mut output = Map::new();
-            for (key, value) in map {
-                if !allowed_summary_key(key) {
-                    continue;
-                }
-                output.insert(key.clone(), safe_summary(value));
-            }
-            Value::Object(output)
-        }
-        Value::Array(values) => Value::Array(values.iter().map(safe_summary).collect()),
-        Value::String(value) if forbidden_payload_value(value) => {
-            Value::String("<redacted>".to_string())
-        }
-        _ => value.clone(),
-    }
-}
-
-fn allowed_summary_key(key: &str) -> bool {
-    matches!(
-        key,
-        "status"
-            | "last_error_code"
-            | "freshness_seconds"
-            | "consecutive_failures"
-            | "days_remaining"
-            | "endpoint_id"
-            | "endpoint_status"
-            | "result_class"
-    )
-}
-
-fn forbidden_payload_value(value: &str) -> bool {
-    let value = value.to_ascii_lowercase();
-    [
-        "/etc/",
-        "/var/log",
-        "systemctl",
-        "journalctl",
-        "occtl",
-        "username",
-        "client_ip",
-        "client-ip",
-        "client ip",
-        "session_id",
-        "session-id",
-        "session id",
-    ]
-    .iter()
-    .any(|marker| value.contains(marker))
-}
-
-fn string_array(value: &Value) -> Vec<String> {
-    value
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .map(ToOwned::to_owned)
-        .collect()
+    crate::alert_projection::summary_from_detail(&alert.detail_json)
 }

@@ -638,6 +638,7 @@ fn candidates_from_health_snapshots(store: &Store) -> anyhow::Result<Vec<AlertCa
                 summary: json!({
                     "status": snapshot.status,
                     "last_error_code": snapshot.last_error_code,
+                    "consecutive_failures": snapshot.summary_json.get("consecutive_failures"),
                 }),
             }),
             "stale" => candidates.push(AlertCandidate {
@@ -830,7 +831,10 @@ fn upsert_candidate(
         .map(|alert| object_from_value(alert.detail_json.clone()))
         .unwrap_or_default();
     detail.insert("methods".to_string(), json!(candidate.methods));
-    detail.insert("summary".to_string(), safe_summary(&candidate.summary));
+    detail.insert(
+        "summary".to_string(),
+        crate::alert_projection::project_summary(&candidate.summary),
+    );
     let record = AlertEventRecord {
         alert_id: existing
             .map(|alert| alert.alert_id.clone())
@@ -947,73 +951,11 @@ fn webhook_hook_to_json(hook: &AlertWebhookHookRecord) -> Value {
 }
 
 fn alert_methods(alert: &AlertEventRecord) -> Vec<String> {
-    alert
-        .detail_json
-        .get("methods")
-        .map(string_array)
-        .unwrap_or_default()
+    crate::alert_projection::methods_from_detail(&alert.detail_json)
 }
 
 fn alert_summary(alert: &AlertEventRecord) -> Value {
-    alert
-        .detail_json
-        .get("summary")
-        .map(safe_summary)
-        .unwrap_or_else(|| json!({}))
-}
-
-fn safe_summary(value: &Value) -> Value {
-    match value {
-        Value::Object(map) => {
-            let mut output = Map::new();
-            for (key, value) in map {
-                if !allowed_summary_key(key) {
-                    continue;
-                }
-                output.insert(key.clone(), safe_summary(value));
-            }
-            Value::Object(output)
-        }
-        Value::Array(values) => Value::Array(values.iter().map(safe_summary).collect()),
-        Value::String(value) if forbidden_payload_value(value) => {
-            Value::String("<redacted>".to_string())
-        }
-        _ => value.clone(),
-    }
-}
-
-fn allowed_summary_key(key: &str) -> bool {
-    matches!(
-        key,
-        "status"
-            | "last_error_code"
-            | "freshness_seconds"
-            | "consecutive_failures"
-            | "days_remaining"
-            | "endpoint_id"
-            | "endpoint_status"
-            | "result_class"
-    )
-}
-
-fn forbidden_payload_value(value: &str) -> bool {
-    let value = value.to_ascii_lowercase();
-    [
-        "/etc/",
-        "/var/log",
-        "systemctl",
-        "journalctl",
-        "occtl",
-        "username",
-        "client_ip",
-        "client-ip",
-        "client ip",
-        "session_id",
-        "session-id",
-        "session id",
-    ]
-    .iter()
-    .any(|marker| value.contains(marker))
+    crate::alert_projection::summary_from_detail(&alert.detail_json)
 }
 
 fn object_from_value(value: Value) -> Map<String, Value> {
@@ -1129,7 +1071,6 @@ fn write_alert_hook_audit(
         "hook_type": hook.hook_type,
         "name": hook.name,
         "endpoint_host": hook.endpoint_host,
-        "endpoint_url": hook.endpoint_url_redacted,
         "hmac_key_id": hook.hmac_key_id,
         "enabled": hook.enabled,
         "max_attempts": hook.max_attempts,

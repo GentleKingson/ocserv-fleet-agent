@@ -5,7 +5,7 @@ use ocfleet_cli::args::{
     HealthCommand, HealthPolicyCommand, HealthSnapshotCommand, NodeCommand, ObservationCommand,
     OcservCommand, OcservSessionsCommand, ProbeCommand, RedactionMode, RetentionCommand,
     RetentionScope, ScheduleCommand, ScheduleJobCommand, ScheduleJobKind, ScheduleRunCommand,
-    TrustCommand, TrustDiffFormat,
+    TrustCommand, TrustDiffFormat, TrustPolicyDiffFormat,
 };
 use std::path::PathBuf;
 
@@ -1124,6 +1124,40 @@ fn parses_trust_policy_commands() {
             assert!(json);
         }
         _ => panic!("expected trust policy validate command"),
+    }
+
+    let cli = Cli::parse_from([
+        "ocfleet",
+        "trust",
+        "policy",
+        "diff",
+        "policy.toml",
+        "--format",
+        "markdown",
+        "--output",
+        "summary.md",
+    ]);
+
+    let Command::Trust {
+        command: TrustCommand::Policy { command },
+    } = cli.command
+    else {
+        panic!("expected trust policy command");
+    };
+
+    match command {
+        ocfleet_cli::args::TrustPolicyCommand::Diff {
+            file,
+            json,
+            format,
+            output,
+        } => {
+            assert_eq!(file, PathBuf::from("policy.toml"));
+            assert!(!json);
+            assert_eq!(format, TrustPolicyDiffFormat::Markdown);
+            assert_eq!(output, Some(PathBuf::from("summary.md")));
+        }
+        _ => panic!("expected trust policy diff command"),
     }
 }
 

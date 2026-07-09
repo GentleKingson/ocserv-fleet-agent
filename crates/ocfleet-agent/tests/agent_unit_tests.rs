@@ -16,6 +16,10 @@ use ocfleet_config::agent::{
     AgentConfig, AuditConfig, ControllerConfig, IrohConfig, NodeConfig, OcservReadonlyProviderKind,
     PathProbeConfig, PeerConfig, SecurityConfig,
 };
+#[cfg(feature = "controlled-writes")]
+use ocfleet_config::agent::{
+    ControlledWriteOperationPolicy, ControlledWritesConfig, validate_agent_config,
+};
 use ocfleet_protocol::constants::PROTOCOL_VERSION;
 use ocfleet_protocol::enrollment::{EndpointStatus, TrustBundle};
 use ocfleet_protocol::error::ErrorCode;
@@ -1474,6 +1478,59 @@ async fn handle_request_rejects_future_controlled_write_methods_by_default() {
             response.error.as_ref().expect("error").code,
             ErrorCode::MethodNotAllowed,
             "{method} must remain rejected until controlled writes are wired and enabled"
+        );
+    }
+}
+
+#[cfg(feature = "controlled-writes")]
+#[tokio::test]
+async fn feature_enabled_policy_still_has_no_live_controlled_write_dispatch() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let controller_id = iroh::SecretKey::generate().public();
+    let mut config = test_agent_config(
+        dir.path(),
+        vec![ControllerConfig {
+            endpoint_id: controller_id.to_string(),
+            role: "viewer".to_string(),
+        }],
+    );
+    let enabled_policy = ControlledWriteOperationPolicy {
+        enabled: true,
+        local_identity: Some("ocserv-primary".to_string()),
+        emergency_only: true,
+    };
+    config.controlled_writes = ControlledWritesConfig {
+        enabled: true,
+        ocserv_reload: enabled_policy.clone(),
+        ocserv_restart: enabled_policy.clone(),
+        ocserv_config_apply: enabled_policy.clone(),
+        ocserv_config_rollback: enabled_policy.clone(),
+        ocserv_session_disconnect: ControlledWriteOperationPolicy::default(),
+    };
+    validate_agent_config(&config).expect("feature-enabled dry-run policy config");
+    let state = test_server_state_from_config(config, "agent-endpoint-1");
+    let controller = test_controller_remote(&state);
+
+    for (index, method) in [
+        OCSERV_RELOAD,
+        OCSERV_RESTART,
+        OCSERV_CONFIG_APPLY,
+        OCSERV_CONFIG_ROLLBACK,
+        OCSERV_SESSION_DISCONNECT,
+    ]
+    .iter()
+    .enumerate()
+    {
+        let response = handle_request(
+            &state,
+            &controller,
+            test_rpc_request(method, valid_nonce(60 + index as u8)),
+        )
+        .await;
+        assert_eq!(
+            response.error.as_ref().expect("error").code,
+            ErrorCode::MethodNotAllowed,
+            "{method} must remain rejected even with the scaffold feature and policy enabled"
         );
     }
 }

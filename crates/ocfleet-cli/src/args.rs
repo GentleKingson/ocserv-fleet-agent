@@ -247,9 +247,20 @@ pub enum TrustPolicyCommand {
     },
     Diff {
         file: PathBuf,
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["format", "output"])]
         json: bool,
+        #[arg(long, value_enum, default_value_t = TrustPolicyDiffFormat::Human)]
+        format: TrustPolicyDiffFormat,
+        #[arg(long)]
+        output: Option<PathBuf>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum TrustPolicyDiffFormat {
+    Human,
+    Json,
+    Markdown,
 }
 
 #[derive(Debug, Subcommand)]

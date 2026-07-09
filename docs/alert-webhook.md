@@ -35,7 +35,7 @@ they add, test, or deliver a webhook through `--hmac-secret-file`.
 ```bash
 ocfleet alert hook add-webhook \
   --name ops-alerts \
-  --url https://alerts.example.com/ocfleet \
+  --url https://alerts.example.com/ocfleet/alerts \
   --hmac-secret-file /var/lib/ocfleet-controller/webhook.secret \
   --host-allow alerts.example.com \
   --max-attempts 3 \
@@ -50,7 +50,8 @@ ocfleet alert deliver --hook webhook:<hook-id> --limit 100 --hmac-secret-file /v
 Limits:
 
 - URL scheme must be `https`.
-- URL must not include userinfo or fragments.
+- URL must not include userinfo, query parameters, or fragments.
+- URL path must be one of `/`, `/alerts`, `/webhook`, or `/ocfleet/alerts`.
 - Host must match one configured `--host-allow` entry.
 - Resolved IPs must not be loopback, private, link-local, multicast,
   unspecified, shared carrier-grade NAT, or metadata addresses.
@@ -138,8 +139,8 @@ store or notify using low-sensitive fields only
 ## Audit Behavior
 
 Adding a webhook writes `alert.hook.add_webhook` with the hook id, hook type,
-name, endpoint host, redacted endpoint URL, HMAC key id, enabled state, attempts,
-and timeout. It does not store the secret or the URL path/query.
+endpoint host, HMAC key id, enabled state, attempts, and timeout. Audit detail
+does not store the secret, full URL, or URL path/query.
 
 Delivery writes `alert.delivery` success or failure rows with hook type,
 alert count, byte count, dry-run state, and a low-sensitive error code when

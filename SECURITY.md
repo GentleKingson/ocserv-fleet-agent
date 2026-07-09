@@ -55,6 +55,19 @@ The ocserv methods are low-sensitive summaries only. They must not return raw
 certificate content, raw config content, command output, local file paths, or
 local operating-system error details.
 
+## Read-Only API, Dashboard, and Collector
+
+`ocfleet-api` exposes a `GET`-only observation surface. Loopback listeners may
+support local operator use without a token; non-loopback startup requires a
+private bearer-token file. The API and dashboard cannot trigger agent RPC,
+scheduler work, trust/registry changes, retention changes, or alert mutations.
+
+`ocfleet-ocserv-collector` is an operator-run local snapshot normalizer. It is
+not callable through agent RPC, the controller, the scheduler, the API, or the
+dashboard. Its output is the fixed low-sensitive aggregate snapshot schema; it
+must not emit raw source material, user/session/network identifiers,
+certificate identity, config, logs, command text, stdout, or stderr.
+
 ## Forbidden Capabilities
 
 The agent must not expose generic local execution or raw local
@@ -123,3 +136,8 @@ CodeQL runs separately with read-only repository permissions plus
 `security-events: write` for uploading analysis results. GitHub Actions should
 use least-privilege permissions, fixed tool versions, and full-length commit SHA
 pinning for third-party actions where practical.
+
+The release workflow accepts only bounded version input, requires an existing
+matching tag, verifies the compiled version of all four release binaries, and
+creates a draft release with a combined `SHA256SUMS`. It does not create tags or
+publish crates.io packages.

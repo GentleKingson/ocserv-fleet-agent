@@ -83,6 +83,7 @@ check_uses_ref() {
 
 for file in "${workflow_files[@]}"; do
   line_no=0
+  # shellcheck disable=SC2094 # check_uses_ref reports the filename but never writes it.
   while IFS= read -r line || [[ -n "$line" ]]; do
     line_no=$((line_no + 1))
     if [[ "$line" =~ ^[[:space:]-]*uses:[[:space:]]*([^[:space:]#]+) ]]; then

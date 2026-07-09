@@ -120,22 +120,75 @@ pub fn observation_to_json(observation: &ProbeObservationRecord) -> Value {
 }
 
 pub fn safe_observation_summary(value: &Value) -> Value {
+    let mut budget = ProjectionBudget {
+        entries_remaining: 256,
+        string_bytes_remaining: 4_096,
+    };
+    safe_observation_summary_inner(value, 0, &mut budget)
+}
+
+struct ProjectionBudget {
+    entries_remaining: usize,
+    string_bytes_remaining: usize,
+}
+
+fn safe_observation_summary_inner(
+    value: &Value,
+    depth: usize,
+    budget: &mut ProjectionBudget,
+) -> Value {
+    if depth >= 8 {
+        return Value::String("<redacted>".to_string());
+    }
     match value {
         Value::Object(map) => {
+            if budget.entries_remaining == 0 {
+                return Value::String("<redacted>".to_string());
+            }
             let mut output = Map::new();
-            for (key, value) in map {
-                if forbidden_summary_key(key) {
-                    continue;
-                }
-                output.insert(key.clone(), safe_observation_summary(value));
+            let members = map
+                .iter()
+                .filter(|(key, _)| key.len() <= 64 && !forbidden_summary_key(key))
+                .take(budget.entries_remaining)
+                .collect::<Vec<_>>();
+            // Reserve sibling keys before projecting child containers so one
+            // attacker-controlled branch cannot make later scalar fields vanish.
+            budget.entries_remaining -= members.len();
+            for (key, value) in members {
+                output.insert(
+                    key.clone(),
+                    safe_observation_summary_inner(value, depth + 1, budget),
+                );
             }
             Value::Object(output)
         }
-        Value::Array(values) => Value::Array(values.iter().map(safe_observation_summary).collect()),
-        Value::String(value) if forbidden_summary_value(value) => {
-            Value::String("<redacted>".to_string())
+        Value::Array(values) => {
+            if budget.entries_remaining == 0 {
+                return Value::String("<redacted>".to_string());
+            }
+            let mut output = Vec::new();
+            let take = values.len().min(budget.entries_remaining);
+            budget.entries_remaining -= take;
+            for value in values.iter().take(take) {
+                output.push(safe_observation_summary_inner(value, depth + 1, budget));
+            }
+            Value::Array(output)
         }
-        _ => value.clone(),
+        Value::String(value) => {
+            if value.len() > 256
+                || value.len() > budget.string_bytes_remaining
+                || value
+                    .bytes()
+                    .any(|byte| !byte.is_ascii() || byte.is_ascii_control())
+                || forbidden_summary_value(value)
+            {
+                Value::String("<redacted>".to_string())
+            } else {
+                budget.string_bytes_remaining -= value.len();
+                Value::String(value.clone())
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => value.clone(),
     }
 }
 

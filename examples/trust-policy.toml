@@ -1,0 +1,34 @@
+version = 1
+
+[metadata]
+name = "example-fleet"
+revision = "rev-1"
+
+[[nodes]]
+node_id = "hk-ocserv-01"
+endpoint_id = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
+region = "hk"
+role = "ocserv"
+lifecycle = "active"
+enabled = true
+
+[[nodes]]
+node_id = "sg-ocserv-01"
+endpoint_id = "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c"
+region = "sg"
+role = "ocserv"
+lifecycle = "active"
+enabled = true
+
+[[controllers]]
+endpoint_id = "fc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025"
+role = "viewer"
+
+[[peers]]
+source_node_id = "hk-ocserv-01"
+peer_node_id = "sg-ocserv-01"
+
+[[path_probes]]
+source_node_id = "hk-ocserv-01"
+target_node_id = "sg-ocserv-01"
+enabled = true

@@ -9,6 +9,7 @@ fn controlled_write_design_keeps_required_safety_gates() {
         .expect("workspace root");
     let doc = fs::read_to_string(repo.join("docs/controlled-write-operations.md"))
         .expect("controlled write design doc");
+    let normalized = doc.split_whitespace().collect::<Vec<_>>().join(" ");
 
     for required in [
         "This phase adds no working",
@@ -21,8 +22,9 @@ fn controlled_write_design_keeps_required_safety_gates() {
         "The controller must never supply local",
         "service units, paths, commands, selectors, scripts, or package names.",
     ] {
+        let required = required.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(
-            doc.contains(required),
+            normalized.contains(&required),
             "controlled write design doc is missing required safety text: {required}"
         );
     }

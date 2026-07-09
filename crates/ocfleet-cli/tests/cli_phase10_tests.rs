@@ -2,6 +2,10 @@ use ocfleet_cli::store::{EnrollmentTokenInsert, JoinRequestInsert, NodeInsert, S
 use ocfleet_protocol::enrollment::{EndpointStatus, JoinRequestStatus};
 use rusqlite::Connection;
 use serde_json::Value;
+#[cfg(unix)]
+use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -223,6 +227,9 @@ fn enroll_request_create_reads_token_from_file_and_stdin() {
         ];
         let output = if source == "file" {
             std::fs::write(&token_file, format!("{token_plaintext}\n")).expect("write token file");
+            #[cfg(unix)]
+            fs::set_permissions(&token_file, fs::Permissions::from_mode(0o600))
+                .expect("chmod token file");
             args.extend(["--token-file", token_file_arg.as_str()]);
             args.extend([
                 "--agent-public-key",
@@ -259,6 +266,71 @@ fn enroll_request_create_reads_token_from_file_and_stdin() {
             .expect("load token")
             .expect("token exists");
         assert_eq!(token.used_count, 1);
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn enroll_request_create_rejects_unsafe_or_oversized_token_files() {
+    for fixture in ["world-readable", "symlink", "hardlink", "oversized"] {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let database = dir.path().join("controller.sqlite");
+        let database_arg = database.to_string_lossy().into_owned();
+        let source = dir.path().join("token.source");
+        fs::write(
+            &source,
+            if fixture == "oversized" {
+                "x".repeat(513)
+            } else {
+                "token".into()
+            },
+        )
+        .expect("write token fixture");
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o600)).expect("chmod source");
+        let token_file = match fixture {
+            "world-readable" => {
+                fs::set_permissions(&source, fs::Permissions::from_mode(0o644))
+                    .expect("chmod unsafe source");
+                source.clone()
+            }
+            "symlink" => {
+                let path = dir.path().join("token.link");
+                std::os::unix::fs::symlink(&source, &path).expect("create symlink");
+                path
+            }
+            "hardlink" => {
+                let path = dir.path().join("token.hardlink");
+                fs::hard_link(&source, &path).expect("create hardlink");
+                path
+            }
+            "oversized" => source.clone(),
+            _ => unreachable!(),
+        };
+        let token_file_arg = token_file.to_string_lossy().into_owned();
+
+        let output = run_ocfleet_failure(&[
+            "--database",
+            &database_arg,
+            "enroll",
+            "request",
+            "create",
+            "--token-file",
+            &token_file_arg,
+            "--agent-public-key",
+            "agent-public-key",
+            "--fingerprint",
+            "agent-fingerprint",
+            "--hostname",
+            "hk-ocserv-01",
+            "--agent-version",
+            "0.1.0",
+        ]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("private enrollment token file")
+                || stderr.contains("exceeds 512 bytes"),
+            "unexpected error for {fixture}: {stderr}"
+        );
     }
 }
 

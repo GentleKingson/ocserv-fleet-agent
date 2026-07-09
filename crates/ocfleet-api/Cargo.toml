@@ -1,6 +1,6 @@
 [package]
 name = "ocfleet-api"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -12,9 +12,11 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
+base64.workspace = true
 clap.workspace = true
 ocfleet-cli = { path = "../ocfleet-cli" }
 ocfleet-config = { path = "../ocfleet-config" }
+ocfleet-protocol = { path = "../ocfleet-protocol" }
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true

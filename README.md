@@ -57,9 +57,12 @@ production-complete.
 - Supports experimental read-only `ocfleet-api` / Web dashboard access for
   health snapshots, jobs, runs, observations, alerts, and bounded redacted audit
   export views.
+- Supports a local `ocfleet-ocserv-collector` snapshot normalizer for
+  operator-managed low-sensitive ocserv aggregate metadata consumed by the
+  agent `collector_snapshot` provider.
 - Supports governance foundation commands:
   - `--actor` and `OCFLEET_ACTOR` for consistent controller audit identity
-  - `ocfleet trust policy validate <file>` for TOML policy schema checks
+  - `ocfleet trust policy validate <file>` for TOML/YAML policy schema checks
   - `ocfleet trust policy diff <file>` for advisory registry/trust drift review
 - Supports fixed RPC methods:
   - `node.ping`
@@ -134,6 +137,28 @@ target/debug/ocfleet-api \
 
 The API opens SQLite in read-only mode and serves only `GET` observation routes.
 Non-loopback listeners require `--auth-token-file`.
+
+Optionally generate a local ocserv metadata collector config and write a private
+snapshot for the agent `collector_snapshot` provider:
+
+```bash
+umask 077
+install -d -m 0700 ./agent-state
+target/debug/ocfleet-ocserv-collector --print-example-config > ./ocserv-collector.toml
+chmod 0600 ./ocserv-collector.toml
+
+# Set collected_at to the producer time for the exact aggregate values before
+# the real write. Collector reruns preserve it and cannot refresh stale data.
+
+target/debug/ocfleet-ocserv-collector \
+  --check \
+  --config ./ocserv-collector.toml \
+  --output ./agent-state/ocserv-live-snapshot.json
+
+target/debug/ocfleet-ocserv-collector \
+  --config ./ocserv-collector.toml \
+  --output ./agent-state/ocserv-live-snapshot.json
+```
 
 Create an agent config:
 
@@ -389,7 +414,11 @@ target/debug/ocfleet audit export \
   --output ./audit-export.jsonl \
   --include-checksum
 target/debug/ocfleet trust policy validate ./trust-policy.toml --json
+target/debug/ocfleet trust policy validate ./trust-policy.yaml --json
 target/debug/ocfleet trust policy diff ./trust-policy.toml --json
+install -d -m 0700 ./trust-policy-review
+target/debug/ocfleet trust policy diff ./trust-policy.toml \
+  --format markdown --output ./trust-policy-review/trust-policy-diff.md
 ```
 
 These commands operate inside the controller boundary. Scheduler jobs use only
@@ -416,6 +445,7 @@ Networking must allow the controller to reach the agent through iroh using the r
 - `crates/ocfleet-cli`: controller CLI, SQLite state, controller audit, and RPC client.
 - `docs/install.md`: install, upgrade, SecretKey, systemd, and smoke-test guide.
 - `docs/troubleshooting.md`: operational failure modes and `ocfleet doctor` interpretation.
+- `docs/release-notes/v0.2.0.md`: v0.2.0 read-only release-candidate notes and known limitations.
 - `docs/release-notes/v0.1.0.md`: v0.1.0 release notes and known limitations.
 - `docs/status.md`: implementation status by feature and CLI surface.
 - `docs/roadmap.md`: forward roadmap from the current documentation baseline.

@@ -1,0 +1,35 @@
+[Unit]
+Description=ocfleet local ocserv metadata collector
+Documentation=https://github.com/gentlekingson/ocserv-fleet-agent
+
+[Service]
+Type=oneshot
+User=ocfleet
+Group=ocfleet
+UMask=0077
+StateDirectory=ocfleet-agent
+StateDirectoryMode=0700
+ExecStart=/usr/local/bin/ocfleet-ocserv-collector --config /etc/ocfleet-collector/collector.toml --output /var/lib/ocfleet-agent/ocserv-live-snapshot.json
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+PrivateNetwork=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ReadWritePaths=/var/lib/ocfleet-agent
+ReadOnlyPaths=/etc/ocfleet-collector/collector.toml
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_UNIX
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=

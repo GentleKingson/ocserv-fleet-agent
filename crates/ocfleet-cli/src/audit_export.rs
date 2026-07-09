@@ -207,16 +207,16 @@ pub fn audit_record_payload(row: &AuditRecord, redact: RedactionMode) -> Value {
     let strict = redact == RedactionMode::Strict;
     json!({
         "id": row.id,
-        "ts": row.ts,
+        "ts": safe_timestamp(&row.ts),
         "actor": redact_top_level("actor", Some(row.actor.as_str()), strict),
-        "event": row.event,
+        "event": safe_top_level_token(&row.event),
         "node_id": redact_top_level("node_id", row.node_id.as_deref(), strict),
         "endpoint_id": redact_top_level("endpoint_id", row.endpoint_id.as_deref(), strict),
-        "method": row.method,
+        "method": row.method.as_deref().map(safe_rpc_method),
         "request_id": redact_top_level("request_id", row.request_id.as_deref(), strict),
-        "params_hash": row.params_hash,
+        "params_hash": row.params_hash.as_deref().map(safe_top_level_token),
         "ok": row.ok,
-        "error_code": row.error_code,
+        "error_code": row.error_code.as_deref().map(safe_top_level_token),
         "duration_ms": row.duration_ms,
         "detail": redact_value(&row.detail_json, redact),
     })
@@ -229,20 +229,71 @@ fn redact_top_level(key: &str, value: Option<&str>, strict: bool) -> Value {
     if strict && matches!(key, "actor" | "node_id" | "endpoint_id" | "request_id") {
         return Value::String(format!("sha256:{}", &sha256_hex(value.as_bytes())[..16]));
     }
+    if value.len() > 256
+        || value
+            .bytes()
+            .any(|byte| !byte.is_ascii() || byte.is_ascii_control())
+        || has_forbidden_detail_value(value)
+    {
+        return redacted();
+    }
     Value::String(value.to_string())
 }
 
+fn safe_timestamp(value: &str) -> Value {
+    if OffsetDateTime::parse(value, &Rfc3339).is_ok() {
+        Value::String(value.to_string())
+    } else {
+        redacted()
+    }
+}
+
+fn safe_top_level_token(value: &str) -> Value {
+    if value.len() <= 128 && is_safe_token(value) && !has_forbidden_detail_value(value) {
+        Value::String(value.to_string())
+    } else {
+        redacted()
+    }
+}
+
+fn safe_rpc_method(value: &str) -> Value {
+    if is_fixed_rpc_method(value) {
+        Value::String(value.to_string())
+    } else {
+        redacted()
+    }
+}
+
 fn redact_value(value: &Value, mode: RedactionMode) -> Value {
+    redact_detail_value(None, value, mode, 0)
+}
+
+fn redact_detail_value(
+    key: Option<&str>,
+    value: &Value,
+    mode: RedactionMode,
+    depth: usize,
+) -> Value {
+    const MAX_DETAIL_DEPTH: usize = 8;
+    const MAX_DETAIL_ENTRIES: usize = 64;
+    const MAX_DETAIL_STRING_BYTES: usize = 256;
+
+    if depth >= MAX_DETAIL_DEPTH {
+        return Value::String("<redacted>".to_string());
+    }
     match value {
         Value::Object(map) => {
             let mut output = Map::new();
-            for (key, value) in map {
-                if is_secret_key(key) {
-                    output.insert(key.clone(), Value::String("<redacted>".to_string()));
+            for (key, value) in map.iter().take(MAX_DETAIL_ENTRIES) {
+                if is_forbidden_detail_key(key) {
+                    output.insert(key.clone(), redacted());
                 } else if mode == RedactionMode::Strict && is_identifier_key(key) {
                     output.insert(key.clone(), redact_identifier_value(value));
                 } else {
-                    output.insert(key.clone(), redact_value(value, mode));
+                    output.insert(
+                        key.clone(),
+                        redact_detail_value(Some(key), value, mode, depth + 1),
+                    );
                 }
             }
             Value::Object(output)
@@ -250,11 +301,32 @@ fn redact_value(value: &Value, mode: RedactionMode) -> Value {
         Value::Array(values) => Value::Array(
             values
                 .iter()
-                .map(|value| redact_value(value, mode))
+                .take(MAX_DETAIL_ENTRIES)
+                .map(|value| redact_detail_value(key, value, mode, depth + 1))
                 .collect(),
         ),
-        _ => value.clone(),
+        Value::String(value) => {
+            let Some(key) = key else {
+                return redacted();
+            };
+            if value.len() > MAX_DETAIL_STRING_BYTES
+                || value
+                    .bytes()
+                    .any(|byte| !byte.is_ascii() || byte.is_ascii_control())
+                || has_forbidden_detail_value(value)
+                || !is_allowed_detail_string(key, value)
+            {
+                redacted()
+            } else {
+                Value::String(value.clone())
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => value.clone(),
     }
+}
+
+fn redacted() -> Value {
+    Value::String("<redacted>".to_string())
 }
 
 fn redact_identifier_value(value: &Value) -> Value {
@@ -266,7 +338,7 @@ fn redact_identifier_value(value: &Value) -> Value {
     }
 }
 
-fn is_secret_key(key: &str) -> bool {
+fn is_forbidden_detail_key(key: &str) -> bool {
     let key = key.to_ascii_lowercase();
     [
         "token",
@@ -276,13 +348,134 @@ fn is_secret_key(key: &str) -> bool {
         "hmac",
         "authorization",
         "cookie",
+        "username",
+        "user_name",
+        "account",
+        "client_ip",
+        "assigned_vpn_ip",
+        "source_address",
+        "destination_address",
+        "source_port",
+        "destination_port",
+        "session_id",
+        "session_token",
+        "certificate_subject",
+        "certificate_san",
+        "cert_subject",
+        "subject_alt_name",
+        "issuer",
+        "serial",
+        "pem",
+        "raw_",
+        "log",
+        "stdout",
+        "stderr",
+        "command",
+        "shell",
+        "script",
+        "journal",
+        "unit_name",
+        "provider_selector",
+        "path",
+        "dsn",
+        "url",
     ]
     .iter()
     .any(|needle| key.contains(needle))
 }
 
 fn is_identifier_key(key: &str) -> bool {
-    matches!(key, "actor" | "node_id" | "endpoint_id" | "request_id")
+    key == "actor"
+        || key == "node_id"
+        || key == "endpoint_id"
+        || key == "request_id"
+        || key.ends_with("_id")
+}
+
+fn is_allowed_detail_string(key: &str, value: &str) -> bool {
+    if matches!(key, "method" | "methods" | "degraded_methods") {
+        return is_fixed_rpc_method(value);
+    }
+    if is_identifier_key(key) {
+        return !value.trim().is_empty();
+    }
+    if key.ends_with("_at")
+        || matches!(
+            key,
+            "from"
+                | "to"
+                | "cutoff"
+                | "oldest_candidate"
+                | "newest_candidate"
+                | "checksum"
+                | "report_checksum"
+                | "params_hash"
+                | "fingerprint"
+                | "signature_public_key_fingerprint"
+        )
+    {
+        return is_safe_token(value);
+    }
+    matches!(
+        key,
+        "status"
+            | "state"
+            | "reason_code"
+            | "error_code"
+            | "kind"
+            | "hook_type"
+            | "policy_class"
+            | "scope"
+            | "triggered_by"
+            | "redaction_mode"
+            | "signature_algorithm"
+            | "http_status_class"
+            | "endpoint_status"
+            | "result_class"
+            | "operation_kind"
+            | "selector_kind"
+            | "role"
+            | "region"
+    ) && is_safe_token(value)
+}
+
+fn is_safe_token(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':'))
+        && value.parse::<std::net::IpAddr>().is_err()
+}
+
+fn is_fixed_rpc_method(value: &str) -> bool {
+    use ocfleet_protocol::method::{
+        MethodStatus, PROBE_PATH_ECHO, PROBE_PEER_ECHO, classify_phase_one_method,
+    };
+    classify_phase_one_method(value) != MethodStatus::Unknown
+        || matches!(value, PROBE_PATH_ECHO | PROBE_PEER_ECHO)
+}
+
+fn has_forbidden_detail_value(value: &str) -> bool {
+    let value = value.to_ascii_lowercase();
+    [
+        "/etc/",
+        "/var/",
+        "-----begin",
+        "systemctl",
+        "journalctl",
+        "occtl",
+        "username",
+        "client_ip",
+        "client ip",
+        "session_id",
+        "session id",
+        "raw config",
+        "raw log",
+        "stdout",
+        "stderr",
+    ]
+    .iter()
+    .any(|marker| value.contains(marker))
 }
 
 fn total_bytes(lines: &[Vec<u8>]) -> anyhow::Result<usize> {

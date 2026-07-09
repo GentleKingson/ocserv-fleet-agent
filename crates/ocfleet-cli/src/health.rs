@@ -1,4 +1,4 @@
-use anyhow::Context;
+use anyhow::{Context, bail};
 use ocfleet_config::validation::validate_node_id;
 use ocfleet_protocol::enrollment::EndpointStatus;
 use ocfleet_protocol::method::{
@@ -8,18 +8,21 @@ use ocfleet_protocol::method::{
 use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
-use crate::args::HealthCommand;
+use crate::args::{HealthCommand, HealthPolicyCommand};
 use crate::audit::AuditEvent;
+use crate::duration_args::parse_duration_seconds;
 use crate::input_validation::local_actor;
-use crate::store::{HealthSnapshotRecord, NodeRecord, ProbeObservationRecord, Store};
+use crate::store::{
+    HealthPolicyRecord, HealthSnapshotRecord, NodeRecord, ProbeObservationRecord, Store,
+};
 
-const STALE_THRESHOLD_SECONDS: u64 = 24 * 60 * 60;
 const OBSERVATION_READ_LIMIT: u64 = 1_000;
 
 pub fn run_health_command(store: &Store, command: HealthCommand) -> anyhow::Result<()> {
     match command {
         HealthCommand::Summary { json } => run_health_summary(store, json),
         HealthCommand::Node { node_id, json } => run_health_node(store, &node_id, json),
+        HealthCommand::Policy { command } => run_health_policy_command(store, command),
     }
 }
 
@@ -118,10 +121,11 @@ impl NodeHealth {
 
 fn run_health_summary(store: &Store, json_output: bool) -> anyhow::Result<()> {
     let generated_at = now_rfc3339();
+    let policy = store.get_health_policy()?;
     let nodes = store.list_nodes()?;
     let mut rows = Vec::with_capacity(nodes.len());
     for node in &nodes {
-        let row = compute_node_health(store, node, &generated_at)?;
+        let row = compute_node_health(store, node, &generated_at, &policy)?;
         upsert_health_snapshot(store, &row, &generated_at)?;
         rows.push(row);
     }
@@ -134,10 +138,11 @@ fn run_health_summary(store: &Store, json_output: bool) -> anyhow::Result<()> {
 fn run_health_node(store: &Store, node_id: &str, json_output: bool) -> anyhow::Result<()> {
     validate_node_id(node_id)?;
     let generated_at = now_rfc3339();
+    let policy = store.get_health_policy()?;
     let node = store
         .get_node(node_id)?
         .with_context(|| format!("node not found: {node_id}"))?;
-    let row = compute_node_health(store, &node, &generated_at)?;
+    let row = compute_node_health(store, &node, &generated_at, &policy)?;
     upsert_health_snapshot(store, &row, &generated_at)?;
     let rows = vec![row];
     let counts = health_counts(&rows);
@@ -146,10 +151,69 @@ fn run_health_node(store: &Store, node_id: &str, json_output: bool) -> anyhow::R
     Ok(())
 }
 
+fn run_health_policy_command(store: &Store, command: HealthPolicyCommand) -> anyhow::Result<()> {
+    match command {
+        HealthPolicyCommand::Show => {
+            let policy = store.get_health_policy()?;
+            print_health_policy(&policy);
+            Ok(())
+        }
+        HealthPolicyCommand::Set {
+            stale_window,
+            unreachable_failures,
+            cert_warning_days,
+            cert_critical_days,
+        } => {
+            if stale_window.is_none()
+                && unreachable_failures.is_none()
+                && cert_warning_days.is_none()
+                && cert_critical_days.is_none()
+            {
+                bail!("health policy set requires at least one threshold flag");
+            }
+            let mut policy = store.get_health_policy()?;
+            if let Some(value) = stale_window {
+                policy.stale_window_seconds = parse_duration_seconds(&value, "--stale-window")?;
+            }
+            if let Some(value) = unreachable_failures {
+                if value == 0 {
+                    bail!("--unreachable-failures must be greater than zero");
+                }
+                policy.unreachable_consecutive_failures = value;
+            }
+            if let Some(value) = cert_warning_days {
+                policy.cert_warning_days = value;
+            }
+            if let Some(value) = cert_critical_days {
+                policy.cert_critical_days = value;
+            }
+            if policy.cert_critical_days > policy.cert_warning_days {
+                bail!("--cert-critical-days must be less than or equal to --cert-warning-days");
+            }
+            policy.updated_at = now_rfc3339();
+            store.set_health_policy(&policy, &local_actor())?;
+            print_health_policy(&policy);
+            Ok(())
+        }
+    }
+}
+
+fn print_health_policy(policy: &HealthPolicyRecord) {
+    println!("stale_window_seconds={}", policy.stale_window_seconds);
+    println!(
+        "unreachable_consecutive_failures={}",
+        policy.unreachable_consecutive_failures
+    );
+    println!("cert_warning_days={}", policy.cert_warning_days);
+    println!("cert_critical_days={}", policy.cert_critical_days);
+    println!("updated_at={}", policy.updated_at);
+}
+
 fn compute_node_health(
     store: &Store,
     node: &NodeRecord,
     generated_at: &str,
+    policy: &HealthPolicyRecord,
 ) -> anyhow::Result<NodeHealth> {
     let endpoint_status = store
         .get_endpoint_trust(&node.endpoint_id)?
@@ -177,7 +241,7 @@ fn compute_node_health(
         HealthStatus::Unreachable
     } else if observations.is_empty() {
         HealthStatus::Unknown
-    } else if latest_is_stale_or_expired(generated_at, &observations) {
+    } else if latest_is_stale_or_expired(generated_at, &observations, policy.stale_window_seconds) {
         HealthStatus::Stale
     } else if latest_controller_ping_is_unreachable(&observations) {
         HealthStatus::Unreachable
@@ -239,7 +303,11 @@ fn latest_for_method<'a>(
         .max_by(|left, right| left.observed_at.cmp(&right.observed_at))
 }
 
-fn latest_is_stale_or_expired(generated_at: &str, observations: &[ProbeObservationRecord]) -> bool {
+fn latest_is_stale_or_expired(
+    generated_at: &str,
+    observations: &[ProbeObservationRecord],
+    stale_window_seconds: u64,
+) -> bool {
     let Some(latest) = latest_observation(observations) else {
         return false;
     };
@@ -251,7 +319,7 @@ fn latest_is_stale_or_expired(generated_at: &str, observations: &[ProbeObservati
         return true;
     }
     freshness_seconds(generated_at, &latest.observed_at)
-        .is_none_or(|freshness| freshness > STALE_THRESHOLD_SECONDS)
+        .is_none_or(|freshness| freshness > stale_window_seconds)
 }
 
 fn latest_controller_ping_is_unreachable(observations: &[ProbeObservationRecord]) -> bool {

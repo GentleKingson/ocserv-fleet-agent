@@ -15,6 +15,7 @@ use ocfleet_cli::controller_rpc::{
     write_ocserv_command_audit, write_rpc_audit,
 };
 use ocfleet_cli::doctor::{DoctorOptions, format_human, run_doctor};
+use ocfleet_cli::duration_args::parse_duration_seconds;
 use ocfleet_cli::health::run_health_command;
 use ocfleet_cli::identity::load_or_create_secret_key_with_status;
 use ocfleet_cli::input_validation::{
@@ -658,32 +659,6 @@ fn duration_cutoff_rfc3339(value: &str, label: &str) -> anyhow::Result<String> {
     Ok((OffsetDateTime::now_utc() - Duration::seconds(seconds))
         .format(&Rfc3339)
         .expect("RFC3339 formatting succeeds"))
-}
-
-fn parse_duration_seconds(value: &str, label: &str) -> anyhow::Result<u64> {
-    let Some(unit) = value.chars().last() else {
-        bail!("{label} must use s, m, h, or d suffix");
-    };
-    let number = &value[..value.len().saturating_sub(unit.len_utf8())];
-    if number.is_empty() {
-        bail!("{label} must include a positive number");
-    }
-    let amount: u64 = number
-        .parse()
-        .with_context(|| format!("invalid {label} value: {value}"))?;
-    if amount == 0 {
-        bail!("{label} must be greater than zero");
-    }
-    let multiplier = match unit {
-        's' => 1,
-        'm' => 60,
-        'h' => 60 * 60,
-        'd' => 24 * 60 * 60,
-        _ => bail!("{label} must use s, m, h, or d suffix"),
-    };
-    amount
-        .checked_mul(multiplier)
-        .with_context(|| format!("{label} is too large"))
 }
 
 fn now_rfc3339() -> String {

@@ -3,6 +3,7 @@ pub mod args;
 pub mod audit;
 pub mod controller_rpc;
 pub mod doctor;
+pub mod duration_args;
 pub mod health;
 pub mod identity;
 pub mod input_validation;

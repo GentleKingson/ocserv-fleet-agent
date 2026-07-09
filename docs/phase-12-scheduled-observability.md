@@ -5,12 +5,24 @@
 Phase 12 evolves `ocfleet` from manual read-only CLI probes into continuous
 controller-owned observability. The controller schedules fixed read-only RPCs,
 stores typed low-sensitive observations in SQLite, computes bounded health
-summaries, evaluates alert rules, exports audit data, and serves a read-only
-Web/API dashboard.
+summaries, evaluates alert rules, and exports audit data. A read-only Web/API
+dashboard remains planned and is not implemented in the current source tree.
 
 Phase 12 does not add new agent control powers. It reuses the current trust
 model, controller registry, controller audit log, and Phase 11 ocserv read-only
 RPC boundary.
+
+## Current Implementation Status
+
+| Surface | Current status | Current CLI or source state |
+| --- | --- | --- |
+| Scheduler | partially implemented / active implementation | `ocfleet schedule job add/list/enable/disable`, `ocfleet schedule run --once`, `ocfleet schedule daemon`, `ocfleet schedule status` |
+| Health | partially implemented / active implementation | `ocfleet health summary`, `ocfleet health node`, `ocfleet health policy show/set` |
+| Alerts | partially implemented / active implementation | `ocfleet alert list/test/deliver/silence/resolve`; only `jsonl_file:<path>` delivery is enabled |
+| Retention | partially implemented / active implementation | `ocfleet retention show/set/apply` for observability history scopes |
+| Audit export | partially implemented / active implementation | `ocfleet audit export --from ... --to ... --format jsonl --output ...` |
+| `ocfleet-api` / Web dashboard | planned / not implemented | No API binary, routes, or Web UI are present |
+| Webhook hooks | planned / not implemented | `webhook:` hooks are rejected until HTTPS/HMAC/SSRF protections are designed and implemented |
 
 ## Goals
 
@@ -25,8 +37,8 @@ RPC boundary.
   execution.
 - Add audit export for bounded controller audit windows and scheduled
   observability events.
-- Add a Web/API read-only dashboard for status, health, history, alerts, and
-  audit export visibility.
+- Later, add a Web/API read-only dashboard for status, health, history, alerts,
+  and audit export visibility.
 
 ## Non-goals
 
@@ -61,7 +73,7 @@ controller scheduler
   -> SQLite history
   -> health summary
   -> alert evaluation
-  -> read-only API/dashboard
+  -> future read-only API/dashboard
 ```
 
 The scheduler runs inside the controller boundary and uses the same local
@@ -71,7 +83,8 @@ configuration and never infers new trust.
 
 Each scheduled job resolves its target from static controller SQLite state:
 
-- node-target jobs resolve exactly one enabled node and active EndpointID.
+- non-path jobs resolve enabled nodes with active EndpointIDs from
+  controller-local selectors.
 - path jobs resolve one explicitly configured source node and one explicitly
   configured target node.
 - jobs fail closed if the node is missing, disabled, revoked, quarantined,
@@ -94,7 +107,7 @@ prefixes only.
 
 ## Allowed Scheduled Methods
 
-Only these methods are allowed in scheduled jobs:
+Only these methods are produced by current scheduled job kinds:
 
 - `probe.controller.ping`
 - `ocserv.service.summary`
@@ -111,76 +124,62 @@ conventions, or past success. Source-side authorization requires both
 `security.path_probes` and an enabled target entry in `security.peers`;
 target-side authorization remains `security.peers`.
 
-Unknown methods and known dangerous method names must be rejected at job
-creation time and again at run time. A scheduler implementation must use an
-allowlist, not a denylist.
+Unknown stored job kinds and known dangerous method names must be rejected before
+RPC execution. Scheduler implementations must use allowlists, not denylists.
 
-## Data Model Draft
+## Current SQLite Model
 
-Phase 12 should use additive SQLite migrations. These table names are reserved
-for the implementation design.
+Phase 12 currently uses additive migrations plus safe rebuild migrations for
+observability constraints. The current controller schema contains these
+controller-local tables. They store fixed low-sensitive summaries only.
 
 ### `observability_jobs`
 
 Stores scheduler configuration. This table is controller-local policy, not
-agent-local config.
-
-Draft columns:
+agent-local config. Current columns:
 
 - `job_id TEXT PRIMARY KEY`
-- `name TEXT NOT NULL`
-- `method TEXT NOT NULL`
-- `target_node_id TEXT`
-- `source_node_id TEXT`
-- `target_peer_node_id TEXT`
+- `kind TEXT NOT NULL`
+- `selector_json TEXT NOT NULL`
+- `pair_selector_json TEXT`
 - `interval_seconds INTEGER NOT NULL`
 - `jitter_seconds INTEGER NOT NULL DEFAULT 0`
+- `timeout_ms INTEGER NOT NULL`
 - `enabled INTEGER NOT NULL DEFAULT 1`
+- `next_run_at TEXT`
+- `last_run_at TEXT`
 - `created_at TEXT NOT NULL`
 - `updated_at TEXT NOT NULL`
-- `last_run_at TEXT`
-- `next_run_at TEXT`
-- `labels_json TEXT NOT NULL DEFAULT '{}'`
 
 Rules:
 
-- `method` must be one of the allowed scheduled methods.
-- node-target jobs must set `target_node_id` and leave path fields null.
-- path jobs must set `source_node_id` and `target_peer_node_id`.
+- `kind` is one of `controller-ping`, `ocserv-status`, `ocserv-cert`,
+  `ocserv-sessions`, or `path-probe`.
+- non-path jobs use a controller-local `role=<role>` or `node_id=<node-id>`
+  selector.
+- path jobs use `pair_selector_json` with explicit `source_node_id` and
+  `target_node_id`.
 - `interval_seconds` must be positive and bounded.
 - no column may store command text, local file paths, shell snippets, service
   units, journal queries, or agent-side selectors.
 
 ### `observability_runs`
 
-Stores one scheduler attempt per job execution.
-
-Draft columns:
+Stores one scheduler attempt per job execution. Current columns:
 
 - `run_id TEXT PRIMARY KEY`
-- `job_id TEXT NOT NULL`
+- `job_id TEXT`
 - `started_at TEXT NOT NULL`
 - `finished_at TEXT`
 - `status TEXT NOT NULL`
-- `method TEXT NOT NULL`
-- `node_id TEXT`
-- `endpoint_id TEXT`
-- `source_node_id TEXT`
-- `source_endpoint_id TEXT`
-- `target_node_id TEXT`
-- `target_endpoint_id TEXT`
-- `request_id TEXT`
-- `ok INTEGER`
-- `error_code TEXT`
-- `duration_ms INTEGER`
-- `observation_id TEXT`
-- `detail_json TEXT NOT NULL DEFAULT '{}'`
+- `triggered_by TEXT NOT NULL`
+- `summary_json TEXT NOT NULL`
 
 Rules:
 
-- `status` is one of `queued`, `running`, `succeeded`, `failed`, `skipped`, or
-  `expired`.
-- `detail_json` is metadata-only: method names, status, error codes, and fixed
+- `status` is one of `running`, `succeeded`, `failed`, or `skipped`.
+- `triggered_by` is currently `manual` or `scheduler.run.once`.
+- `summary_json` is metadata-only: counts, status, error codes, and fixed
   reason classes.
 - no raw RPC response, raw error text, stdout/stderr, path, log, username,
   client IP, session ID, certificate subject/SAN/issuer/serial, or config
@@ -188,22 +187,20 @@ Rules:
 
 ### `probe_observations`
 
-Stores typed low-sensitive observations produced by scheduled methods.
-
-Draft columns:
+Stores typed low-sensitive observations produced by scheduled methods. Current
+columns:
 
 - `observation_id TEXT PRIMARY KEY`
-- `run_id TEXT NOT NULL`
-- `observed_at TEXT NOT NULL`
-- `method TEXT NOT NULL`
+- `run_id TEXT`
 - `node_id TEXT`
 - `endpoint_id TEXT`
-- `source_node_id TEXT`
-- `source_endpoint_id TEXT`
-- `target_node_id TEXT`
-- `target_endpoint_id TEXT`
-- `result_class TEXT NOT NULL DEFAULT 'low_sensitive_summary'`
-- `status TEXT NOT NULL`
+- `method TEXT NOT NULL`
+- `ok INTEGER`
+- `error_code TEXT`
+- `duration_ms INTEGER`
+- `observed_at TEXT NOT NULL`
+- `expires_at TEXT`
+- `result_class TEXT NOT NULL`
 - `summary_json TEXT NOT NULL`
 
 `summary_json` is a closed per-method shape, for example:
@@ -230,23 +227,23 @@ Rules:
 
 ### `health_snapshots`
 
-Stores derived read-only health state for nodes and fleet views.
+Stores derived read-only health state for nodes. Current columns:
 
-Draft columns:
-
-- `snapshot_id TEXT PRIMARY KEY`
+- `node_id TEXT PRIMARY KEY`
+- `endpoint_id TEXT`
 - `computed_at TEXT NOT NULL`
-- `scope TEXT NOT NULL`
-- `node_id TEXT`
 - `status TEXT NOT NULL`
-- `severity TEXT NOT NULL`
-- `source_window_seconds INTEGER NOT NULL`
+- `freshness_seconds INTEGER`
+- `last_success_at TEXT`
+- `last_failure_at TEXT`
+- `last_error_code TEXT`
+- `degraded_methods_json TEXT NOT NULL`
 - `summary_json TEXT NOT NULL`
 
 Rules:
 
-- `scope` is `fleet` or `node`.
-- `status` is one of `ok`, `degraded`, `critical`, `unknown`, or `stale`.
+- `status` is one of `healthy`, `degraded`, `unreachable`, `stale`,
+  `disabled`, or `unknown`.
 - health is advisory and read-only. It must not modify nodes, trust, scheduler
   jobs, or agent state.
 - `summary_json` contains counts, timestamps, method availability, stale
@@ -255,30 +252,26 @@ Rules:
 ### `alert_events`
 
 Stores alert lifecycle events derived from health snapshots or observation
-rules.
-
-Draft columns:
+rules. Current columns:
 
 - `alert_id TEXT PRIMARY KEY`
-- `rule_id TEXT NOT NULL`
-- `opened_at TEXT NOT NULL`
-- `updated_at TEXT NOT NULL`
-- `resolved_at TEXT`
-- `silenced_until TEXT`
-- `status TEXT NOT NULL`
-- `severity TEXT NOT NULL`
+- `dedupe_key TEXT NOT NULL UNIQUE`
 - `node_id TEXT`
-- `method TEXT`
-- `observation_id TEXT`
-- `health_snapshot_id TEXT`
-- `message TEXT NOT NULL`
-- `delivery_state TEXT NOT NULL`
-- `detail_json TEXT NOT NULL DEFAULT '{}'`
+- `severity TEXT NOT NULL`
+- `state TEXT NOT NULL`
+- `reason_code TEXT NOT NULL`
+- `first_seen_at TEXT NOT NULL`
+- `last_seen_at TEXT NOT NULL`
+- `last_sent_at TEXT`
+- `resolved_at TEXT`
+- `detail_json TEXT NOT NULL`
 
 Rules:
 
-- `status` is `open`, `silenced`, or `resolved`.
-- `delivery_state` is `pending`, `sent`, `failed`, or `disabled`.
+- `state` is `open`, `silenced`, or `resolved`.
+- `reason_code` is a fixed low-sensitive enum such as `NODE_UNREACHABLE`,
+  `NODE_STALE`, `OCSERV_DEGRADED`, `CERT_EXPIRING_CRITICAL`,
+  `CERT_EXPIRING_WARNING`, or `ENDPOINT_INACTIVE`.
 - alert messages are bounded low-sensitive text.
 - alert hooks receive alert metadata and summary fields only.
 - local script execution, shell hooks, command hooks, and unbounded templates are
@@ -291,48 +284,53 @@ Rules:
 
 Stores retention limits for observability history.
 
-Draft columns:
+Current columns:
 
-- `policy_id TEXT PRIMARY KEY`
-- `target_table TEXT NOT NULL`
-- `max_age_seconds INTEGER NOT NULL`
+- `scope TEXT PRIMARY KEY`
+- `max_age_days INTEGER`
 - `max_rows INTEGER`
-- `enabled INTEGER NOT NULL DEFAULT 1`
 - `updated_at TEXT NOT NULL`
 
 Rules:
 
-- allowed `target_table` values are `observability_runs`,
-  `probe_observations`, `health_snapshots`, `alert_events`, and
-  `controller_audit_log`.
+- allowed `scope` values are `observations`, `observability-runs`,
+  `health-snapshots`, and `alert-events`.
 - retention must not delete node registry rows, endpoint trust rows,
-  enrollment rows, or current scheduler configuration.
+  enrollment rows, current scheduler configuration, or controller audit rows.
 - retention apply runs must write controller audit metadata about row counts,
-  target table, and policy ID.
+  scope, cutoff, and report checksum.
 
-## CLI Proposal
+## Current CLI Surface And Planned API
 
-Phase 12 should add these commands without changing the Phase 11 RPC boundary.
+The current Phase 12 CLI commands exist without changing the Phase 11 RPC
+boundary. Examples below match the current `ocfleet` argument parser.
 
 ### Scheduler
 
 ```bash
-ocfleet schedule job add --name ocserv-status \
-  --method ocserv.service.summary \
-  --node hk-ocserv-01 \
+ocfleet schedule job add \
+  --kind ocserv-status \
+  --selector node_id=hk-ocserv-01 \
   --interval 60s
 
-ocfleet schedule job add --name path-hk-to-sg \
-  --method probe.path.echo \
-  --source hk-ocserv-01 \
-  --target sg-ocserv-01 \
+ocfleet schedule job add \
+  --kind controller-ping \
+  --selector role=ocserv \
+  --interval 300s
+
+ocfleet schedule job add \
+  --kind path-probe \
+  --source-node-id hk-ocserv-01 \
+  --target-node-id sg-ocserv-01 \
   --interval 300s
 
 ocfleet schedule job list
 ocfleet schedule job enable <job-id>
 ocfleet schedule job disable <job-id>
-ocfleet schedule run --once <job-id>
-ocfleet schedule daemon
+ocfleet schedule run --once
+ocfleet schedule run --once --max-concurrency 4
+ocfleet schedule daemon --tick-seconds 60 --max-concurrency 4
+ocfleet schedule status
 ```
 
 `schedule daemon` runs scheduler loops only from local controller config and
@@ -341,16 +339,19 @@ dashboard/API callers to trigger RPCs.
 
 After `schedule run --once` and after each daemon tick, the controller evaluates
 local alert candidates from existing observations, health snapshots, and endpoint
-trust state. This phase only upserts local `alert_events`; it does not run
-jsonl, webhook, shell, exec, script, or other delivery hooks. `schedule run
---once` prints `alert_evaluation=ok|failed` and `alert_events=<count>`, and the
-scheduler audit detail records the same bounded summary.
+trust state. This phase only upserts local `alert_events`; it does not deliver
+JSONL files, call webhooks, execute shell, execute scripts, or perform
+remediation. `schedule run --once` prints `alert_evaluation=ok|failed` and
+`alert_events=<count>`, and the scheduler audit detail records the same bounded
+summary.
 
 ### Health
 
 ```bash
 ocfleet health summary
+ocfleet health summary --json
 ocfleet health node hk-ocserv-01
+ocfleet health node hk-ocserv-01 --json
 ocfleet health policy show
 ocfleet health policy set --stale-window 24h --unreachable-failures 3 --cert-warning-days 30 --cert-critical-days 7
 ```
@@ -380,10 +381,12 @@ controller audit rows are never deleted by retention.
 
 ```bash
 ocfleet alert list
+ocfleet alert list --json
 ocfleet alert test jsonl_file:./private-alerts/test.jsonl
 ocfleet alert deliver --hook jsonl_file:./private-alerts/alerts.jsonl --limit 100
-ocfleet alert silence <alert-id> --until 2026-08-01T00:00:00Z
-ocfleet alert resolve <alert-id> --reason "certificate renewed"
+ocfleet alert deliver --hook jsonl_file:./private-alerts/alerts.jsonl --limit 100 --dry-run
+ocfleet alert silence <dedupe-key> --for-duration 24h --reason "maintenance"
+ocfleet alert resolve <dedupe-key> --reason "certificate renewed"
 ```
 
 `alert test jsonl_file:<path>` writes a fixed synthetic JSONL test event after
@@ -409,13 +412,14 @@ redaction hides secret-like fields; strict redaction hashes actor, node,
 endpoint, and request identifiers. The `audit.export` audit row is written after
 the file is produced, so it is not included in that export window snapshot.
 
-### Read-only Web/API Dashboard
+### Planned Read-only Web/API Dashboard
 
 ```bash
 ocfleet-api --database controller.sqlite --read-only --listen 127.0.0.1:8080
 ```
 
-Draft read-only routes:
+The command above is a planned interface, not a current binary. No Web/API
+dashboard is implemented in the current source tree. Draft read-only routes:
 
 - `GET /health/summary`
 - `GET /health/nodes/{node_id}`
@@ -486,46 +490,52 @@ Phase 12 keeps the project security posture:
 - all scheduler job creation, enable/disable, one-shot runs, retention apply,
   alert silence, alert resolve, and audit export operations write controller
   audit entries.
-- dashboard/API reads must use a read-only SQLite connection where practical and
-  must not mutate scheduler state.
+- future dashboard/API reads must use a read-only SQLite connection where
+  practical and must not mutate scheduler state.
 
 ## Health Summary Semantics
 
-Health state is derived, not authoritative:
+Health state is derived, not authoritative. Current CLI status labels are:
 
-- `ok`: recent required observations succeeded and no active alert affects the
+- `healthy`: recent relevant observations succeeded and no active alert affects the
   scope.
 - `degraded`: at least one scheduled method is unavailable, stale, or failed,
   but enough observations remain available for useful status.
-- `critical`: a required observation class has crossed a critical rule, such as
-  repeated node ping failures or expired certificate status.
-- `unknown`: no relevant observations exist yet.
+- `unreachable`: endpoint trust is inactive or recent controller ping failures
+  indicate the node cannot be reached.
 - `stale`: observations exist but are older than the configured health window.
+- `disabled`: the controller registry node is disabled.
+- `unknown`: no relevant observations exist yet.
 
 Health summaries must include source timestamps and method coverage so operators
 can distinguish real failures from missing schedules.
 
 ## Definition of Done
 
-Phase 12 implementation is complete only when these gates pass:
+Phase 12 CLI observability changes should pass the standard workspace gates:
 
 ```bash
-cargo build --workspace
-cargo test --workspace
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace -j1 -- --test-threads=1
 ```
 
-Smoke commands for every new CLI/API surface:
+Smoke commands for current CLI surfaces:
 
 ```bash
-ocfleet schedule job add --name smoke-ping --method probe.controller.ping --node hk-ocserv-01 --interval 60s
+ocfleet schedule job add --kind controller-ping --selector node_id=hk-ocserv-01 --interval 60s
+ocfleet schedule job add --kind path-probe --source-node-id hk-ocserv-01 --target-node-id sg-ocserv-01 --interval 300s
 ocfleet schedule job list
 ocfleet schedule job disable <job-id>
 ocfleet schedule job enable <job-id>
-ocfleet schedule run --once <job-id>
-ocfleet schedule daemon --once
+ocfleet schedule run --once
+ocfleet schedule status
 
 ocfleet health summary
+ocfleet health summary --json
 ocfleet health node hk-ocserv-01
+ocfleet health node hk-ocserv-01 --json
+ocfleet health policy show
 
 ocfleet retention show
 ocfleet retention set observations --max-age 30d --max-rows 100000
@@ -533,29 +543,26 @@ ocfleet retention apply --dry-run --scope observations --json
 ocfleet retention apply --scope observations --batch-size 1000 --limit 10000
 
 ocfleet alert list
+ocfleet alert list --json
 ocfleet alert test jsonl_file:./private-alerts/test.jsonl
 ocfleet alert deliver --hook jsonl_file:./private-alerts/alerts.jsonl --limit 100 --dry-run
-ocfleet alert silence <alert-id> --until 2026-08-01T00:00:00Z
-ocfleet alert resolve <alert-id> --reason "smoke resolved"
+ocfleet alert silence <dedupe-key> --for-duration 24h --reason "smoke silence"
+ocfleet alert resolve <dedupe-key> --reason "smoke resolved"
 
 ocfleet audit export --from 2026-07-01T00:00:00Z --to 2026-07-08T00:00:00Z --format jsonl --output ./audit-export.jsonl
 ocfleet audit export --from 2026-07-01T00:00:00Z --to 2026-07-08T00:00:00Z --output ./audit-export.jsonl --redact default --include-checksum
-
-ocfleet-api --database controller.sqlite --read-only --listen 127.0.0.1:8080
-curl --fail http://127.0.0.1:8080/health/summary
-curl --fail http://127.0.0.1:8080/jobs
-curl --fail http://127.0.0.1:8080/alerts
 ```
 
 Additional acceptance requirements:
 
-- scheduler jobs reject forbidden methods and unknown methods.
+- scheduler jobs are limited to current fixed job kinds.
 - `probe.path.echo` jobs require explicit source and target node IDs.
 - scheduler never enumerates mesh pairs.
-- dashboard/API cannot trigger agent RPCs.
+- dashboard/API remains unimplemented until a separate read-only API design is
+  approved.
 - alert hooks cannot execute local scripts or commands.
 - history, health, alerts, dashboard, API, and audit export contain no raw
   response bodies.
 - retention policies prune only approved history tables.
 - controller audit records exist for job mutation, run completion, retention
-  apply, alert lifecycle operations, audit export, and API startup.
+  apply, alert lifecycle operations, and audit export.

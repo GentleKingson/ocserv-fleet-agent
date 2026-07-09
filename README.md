@@ -4,9 +4,15 @@ Read-only Rust control plane for ocserv fleets, with iroh EndpointID trust, a SQ
 
 ## Status
 
-`ocfleet` is currently a read-only MVP vertical slice. It is useful for validating the management channel, identity model, controller state, agent audit path, basic node discovery RPCs, and fixed Direction-Two probe RPCs.
+`ocfleet` is a read-only ocserv fleet observability/control-plane project. The
+current source tree is beyond the initial MVP slice, but it is still not
+production-complete.
 
-It is not a production-complete ocserv management platform yet.
+- Phase 10 enrollment/trust is implemented.
+- Phase 11 ocserv low-sensitive read-only RPCs are implemented.
+- Phase 12 CLI observability is partially implemented / active implementation.
+- Web/API dashboard is planned / not implemented yet.
+- The project is not production-complete.
 
 ## What It Does
 
@@ -28,6 +34,16 @@ It is not a production-complete ocserv management platform yet.
   - sessions summary
   - certificate expiry
   - config fingerprint
+- Supports Phase 12 CLI observability partially:
+  - `ocfleet schedule` for controller-local observation jobs using fixed job
+    kinds: `controller-ping`, `ocserv-status`, `ocserv-cert`,
+    `ocserv-sessions`, and `path-probe`
+  - `ocfleet health` summaries, node health views, and local health policy
+    thresholds derived from stored observations
+  - `ocfleet alert` list, silence, resolve, test, and private `jsonl_file`
+    delivery for bounded low-sensitive alert events
+  - `ocfleet retention` policy and pruning for observability history tables
+  - `ocfleet audit export` for bounded redacted JSONL controller audit windows
 - Supports fixed RPC methods:
   - `node.ping`
   - `node.info`
@@ -50,6 +66,8 @@ The current implementation is intentionally narrow. It does not provide:
 - `systemctl`, `occtl`, or `journalctl` passthrough adapters
 - certificate or config content output
 - automatic active trust on first contact or TOFU registration
+- Web/API dashboard or HTTP API access; that surface is planned but not
+  implemented yet
 
 All local capabilities must be exposed through fixed RPC methods. There is no `shell.exec`, `command.run`, `occtl.raw`, `journalctl.raw`, or equivalent generic execution interface.
 
@@ -289,7 +307,44 @@ RPC and path-probe authorization. These lifecycle commands are registry/trust
 operations only; they do not add diagnostic shell or service-control entry
 points.
 
-Phase 7 ocserv-aware read-only checks remain reserved because the current codebase has no approved safe fixed ocserv metadata source. See [`docs/direction-two-phase-7-ocserv-aware-readonly.md`](docs/direction-two-phase-7-ocserv-aware-readonly.md).
+Use the Phase 12 CLI observability surface:
+
+```bash
+target/debug/ocfleet schedule job add \
+  --kind controller-ping \
+  --selector node_id=hk-ocserv-01 \
+  --interval 60s
+
+target/debug/ocfleet schedule job add \
+  --kind path-probe \
+  --source-node-id source-ocserv-01 \
+  --target-node-id target-ocserv-01 \
+  --interval 300s
+
+target/debug/ocfleet schedule job list
+target/debug/ocfleet schedule run --once
+target/debug/ocfleet schedule status
+target/debug/ocfleet health summary
+target/debug/ocfleet alert list
+target/debug/ocfleet retention show
+target/debug/ocfleet audit export \
+  --from 2026-07-01T00:00:00Z \
+  --to 2026-07-08T00:00:00Z \
+  --format jsonl \
+  --output ./audit-export.jsonl
+```
+
+These commands operate inside the controller boundary. Scheduler jobs use only
+fixed job kinds; non-path jobs target `role=<role>` or `node_id=<node-id>`
+selectors, and path jobs require an explicit source/target node pair. Health,
+alerts, retention, and audit export use controller SQLite state and bounded
+low-sensitive summaries. Webhook alert hooks are disabled in the current source.
+
+The historical Phase 7 ocserv-aware read-only document remains as the
+conservative pre-Phase-11 boundary record. The implemented ocserv-aware surface is
+now the Phase 11 fixed read-only RPC contract. See
+[`docs/direction-two-phase-7-ocserv-aware-readonly.md`](docs/direction-two-phase-7-ocserv-aware-readonly.md)
+and [`docs/ocserv-readonly-spec.md`](docs/ocserv-readonly-spec.md).
 
 Networking must allow the controller to reach the agent through iroh using the registered EndpointID.
 
@@ -302,8 +357,11 @@ Networking must allow the controller to reach the agent through iroh using the r
 - `docs/install.md`: install, upgrade, SecretKey, systemd, and smoke-test guide.
 - `docs/troubleshooting.md`: operational failure modes and `ocfleet doctor` interpretation.
 - `docs/release-notes/v0.1.0.md`: v0.1.0 release notes and known limitations.
+- `docs/status.md`: implementation status by feature and CLI surface.
+- `docs/roadmap.md`: forward roadmap from the current documentation baseline.
 - `docs/phase-10-enrollment-trust.md`: Phase 10 onboarding and trust lifecycle guide.
 - `docs/ocserv-readonly-spec.md`: Phase 11 ocserv read-only RPC contract.
+- `docs/phase-12-scheduled-observability.md`: Phase 12 CLI observability status and remaining dashboard/API design.
 
 ## Security Notes
 

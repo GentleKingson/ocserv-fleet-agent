@@ -1,0 +1,20 @@
+# Project Status
+
+This page reflects the current source tree. It is not a production-complete
+claim, and planned items are not available unless marked implemented.
+
+| Feature | Current status | Main CLI | Main limits |
+| --- | --- | --- | --- |
+| Node registry | implemented | `ocfleet node add`, `ocfleet node list`, `ocfleet node enable`, `ocfleet node disable`, `ocfleet node remove`, `ocfleet node info` | Controller-local SQLite registry only; no discovery or automatic trust. |
+| Enrollment | implemented | `ocfleet enroll token create`, `ocfleet enroll request create`, `ocfleet enroll approve` | Tokens create pending join requests only; approval is manual and audited. |
+| Endpoint lifecycle | implemented | `ocfleet endpoint rotate`, `ocfleet endpoint revoke`, `ocfleet endpoint quarantine` | Registry/trust lifecycle only; no diagnostic shell or service control. |
+| Trust diff | implemented | `ocfleet trust diff`, `ocfleet trust diff --endpoint <endpoint-id>`, `ocfleet trust diff --format json`, `ocfleet trust diff --strict` | Reports controller trust drift; does not auto-remediate or create trust. |
+| Fixed RPC | implemented | `ocfleet ping`, `ocfleet node info`, `ocfleet probe ping`, `ocfleet probe path`, `ocfleet probe summary`, `ocfleet probe topology`, `ocfleet probe history`, `ocfleet probe observe` | Fixed methods and typed responses only; no raw command, file, log, or relay interface. |
+| ocserv readonly | implemented | `ocfleet ocserv status`, `ocfleet ocserv cert`, `ocfleet ocserv sessions summary` | Low-sensitive fixed RPCs only; controller cannot pass paths, commands, service units, or selectors. |
+| Path probe | implemented | `ocfleet probe path <source-node-id> <target-node-id>`; `ocfleet schedule job add --kind path-probe --source-node-id <source> --target-node-id <target> --interval <duration>` | Explicit source/target pair only; no mesh enumeration, generic payloads, or multi-hop probing. |
+| Scheduler | partially implemented / active implementation | `ocfleet schedule job add --kind <kind> --interval <duration> [--selector role=<role>]`, `ocfleet schedule job add --kind <kind> --interval <duration> [--selector node_id=<node-id>]`, `ocfleet schedule job list`, `ocfleet schedule job enable`, `ocfleet schedule job disable`, `ocfleet schedule run --once`, `ocfleet schedule daemon`, `ocfleet schedule status` | CLI and SQLite job/run/observation path exists; fixed job kinds only; Web/API cannot trigger scheduler work because Web/API is not implemented. |
+| Health | partially implemented / active implementation | `ocfleet health summary`, `ocfleet health summary --json`, `ocfleet health node <node-id>`, `ocfleet health policy show`, `ocfleet health policy set` | Derived advisory state from controller SQLite observations; no agent RPC is run by health commands. |
+| Alerts | partially implemented / active implementation | `ocfleet alert list`, `ocfleet alert list --json`, `ocfleet alert test jsonl_file:<path>`, `ocfleet alert deliver --hook jsonl_file:<path>`, `ocfleet alert silence <dedupe-key> --for-duration <duration> --reason <reason>`, `ocfleet alert resolve <dedupe-key> --reason <reason>` | JSONL file hook only; webhook hooks are rejected; no shell, script, command, or automatic remediation hooks. |
+| Retention | partially implemented / active implementation | `ocfleet retention show`, `ocfleet retention set <scope>`, `ocfleet retention apply` | Prunes only observability history scopes: `observations`, `observability-runs`, `health-snapshots`, and `alert-events`; controller audit rows are not deleted. |
+| Audit export | partially implemented / active implementation | `ocfleet audit export --from <rfc3339> --to <rfc3339> --format jsonl --output <path> [--redact none/default/strict] [--include-checksum] [--max-rows <n>]` | Bounded controller audit window only; writes private JSONL output and optional checksum sidecar. |
+| Web/API | planned / not implemented | None | No HTTP API binary, routes, or Web dashboard are present in the current source tree. |

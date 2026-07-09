@@ -386,6 +386,14 @@ pub enum AlertCommand {
     Test {
         hook: String,
     },
+    Deliver {
+        #[arg(long)]
+        hook: String,
+        #[arg(long, default_value_t = crate::alert_delivery::DEFAULT_DELIVERY_LIMIT)]
+        limit: u64,
+        #[arg(long)]
+        dry_run: bool,
+    },
     Silence {
         dedupe_key: String,
         #[arg(long)]

@@ -283,6 +283,9 @@ Rules:
 - alert hooks receive alert metadata and summary fields only.
 - local script execution, shell hooks, command hooks, and unbounded templates are
   forbidden.
+- current SQLite delivery tracking uses `last_sent_at`; first-phase JSONL
+  delivery failures are recorded in `alert.delivery` audit rows rather than a
+  delivery retry state machine.
 
 ### `retention_policies`
 
@@ -373,13 +376,18 @@ They do not call agents.
 
 ```bash
 ocfleet alert list
-ocfleet alert test --rule cert-expiring
+ocfleet alert test jsonl_file:./private-alerts/test.jsonl
+ocfleet alert deliver --hook jsonl_file:./private-alerts/alerts.jsonl --limit 100
 ocfleet alert silence <alert-id> --until 2026-08-01T00:00:00Z
 ocfleet alert resolve <alert-id> --reason "certificate renewed"
 ```
 
-`alert test` evaluates local rule configuration against existing SQLite data and
-fixed sample payloads. It must not call agents and must not execute local
+`alert test jsonl_file:<path>` writes a fixed synthetic JSONL test event after
+validating that the destination is in a private directory and is not a symlink,
+hardlink, world-readable file, or non-regular file. `alert deliver` evaluates
+local alert state, selects bounded open alerts, writes compact JSONL payloads,
+and updates `last_sent_at` after successful non-dry-run delivery. These commands
+must not call agents, expand shell syntax, read secrets, or execute local
 scripts.
 
 ### Audit Export
@@ -417,20 +425,22 @@ audited, non-RPC-triggering API mutations.
 ## Alert Hook Model
 
 Alert hooks are outbound notification integrations only. The first supported
-hook type should be a fixed-schema HTTPS webhook with a bounded JSON payload.
+hook type is `jsonl_file:<path>`, which appends compact fixed-schema JSONL to a
+private local file. HTTPS webhook delivery is a later phase behind explicit
+configuration and must remain disabled until SSRF, HMAC, timeout, redirect, and
+retry boundaries are implemented.
 
 Allowed alert payload fields:
 
 - alert ID
-- rule ID
-- status
+- dedupe key
 - severity
 - node ID
-- fixed RPC method name
-- observation ID
-- health snapshot ID
-- bounded low-sensitive message
-- opened/updated/resolved timestamps
+- fixed RPC method names
+- reason code
+- state
+- bounded low-sensitive summary
+- opened/updated/sent/resolved timestamps
 
 Forbidden hook behavior:
 
@@ -442,12 +452,10 @@ Forbidden hook behavior:
 - raw audit row delivery
 - automatic remediation
 
-Failed hook delivery must create or update `alert_events.delivery_state` and
-write controller audit metadata. It must not retry without a configured bounded
-backoff policy.
-
-The current scheduler integration stops before this delivery phase: alert
-evaluation only writes controller-local `alert_events`.
+The current JSONL delivery phase writes `alert.delivery` audit rows with bounded
+metadata: hook type, alert count, bytes written, dry-run flag, and fixed
+low-sensitive error code on failure. It does not store the output path in audit,
+does not retry, and does not add a delivery retry state machine.
 
 ## Security Rules
 
@@ -515,7 +523,8 @@ ocfleet retention set --table probe_observations --max-age 30d --max-rows 100000
 ocfleet retention apply
 
 ocfleet alert list
-ocfleet alert test --rule cert-expiring
+ocfleet alert test jsonl_file:./private-alerts/test.jsonl
+ocfleet alert deliver --hook jsonl_file:./private-alerts/alerts.jsonl --limit 100 --dry-run
 ocfleet alert silence <alert-id> --until 2026-08-01T00:00:00Z
 ocfleet alert resolve <alert-id> --reason "smoke resolved"
 

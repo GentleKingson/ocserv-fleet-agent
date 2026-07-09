@@ -24,6 +24,10 @@ pub fn open_private_create_new(path: &Path) -> Result<File, PrivateFileError> {
     open_private_create_new_impl(path)
 }
 
+pub fn open_private_append_create(path: &Path) -> Result<File, PrivateFileError> {
+    open_private_append_create_impl(path)
+}
+
 pub fn open_existing_private_read(path: &Path) -> Result<File, PrivateFileError> {
     open_existing_private_read_impl(path)
 }
@@ -46,6 +50,68 @@ fn open_private_create_new_impl(path: &Path) -> Result<File, PrivateFileError> {
         .open(path)?;
     validate_private_file_handle(&file)?;
     Ok(file)
+}
+
+#[cfg(unix)]
+fn open_private_append_create_impl(path: &Path) -> Result<File, PrivateFileError> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    ensure_private_parent(path)?;
+    validate_strict_private_parent(path)?;
+    let file = match private_append_options()
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(file) => {
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+            file
+        }
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => private_append_options()
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(path)?,
+        Err(err) => return Err(PrivateFileError::Io(err)),
+    };
+    validate_private_file_handle(&file)?;
+    validate_strict_private_file_mode(&file)?;
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn private_append_options() -> fs::OpenOptions {
+    let mut options = fs::OpenOptions::new();
+    options.append(true).write(true);
+    options
+}
+
+#[cfg(unix)]
+fn validate_strict_private_parent(path: &Path) -> Result<(), PrivateFileError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    validate_private_parent(parent)?;
+    let mode = fs::metadata(parent)?.permissions().mode() & 0o777;
+    if mode != 0o700 {
+        return Err(PrivateFileError::UnsafeParent);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_strict_private_file_mode(file: &File) -> Result<(), PrivateFileError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mode = file.metadata()?.permissions().mode() & 0o777;
+    if mode != 0o600 {
+        return Err(PrivateFileError::UnsafeFile);
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -152,6 +218,12 @@ fn validate_private_file_handle(file: &File) -> Result<(), PrivateFileError> {
 
 #[cfg(not(unix))]
 fn open_private_create_new_impl(path: &Path) -> Result<File, PrivateFileError> {
+    let _ = path;
+    Err(PrivateFileError::UnsupportedPlatform)
+}
+
+#[cfg(not(unix))]
+fn open_private_append_create_impl(path: &Path) -> Result<File, PrivateFileError> {
     let _ = path;
     Err(PrivateFileError::UnsupportedPlatform)
 }

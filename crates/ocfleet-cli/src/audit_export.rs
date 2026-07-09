@@ -139,7 +139,7 @@ fn run_audit_export_inner(
     })
 }
 
-fn validate_window(from: &str, to: &str) -> anyhow::Result<(OffsetDateTime, OffsetDateTime)> {
+pub fn validate_window(from: &str, to: &str) -> anyhow::Result<(OffsetDateTime, OffsetDateTime)> {
     let from = OffsetDateTime::parse(from, &Rfc3339).context("--from must be RFC3339")?;
     let to = OffsetDateTime::parse(to, &Rfc3339).context("--to must be RFC3339")?;
     if from >= to {
@@ -172,7 +172,7 @@ fn build_jsonl_lines(rows: &[AuditRecord], redact: RedactionMode) -> anyhow::Res
     Ok(lines)
 }
 
-fn audit_record_payload(row: &AuditRecord, redact: RedactionMode) -> Value {
+pub fn audit_record_payload(row: &AuditRecord, redact: RedactionMode) -> Value {
     let strict = redact == RedactionMode::Strict;
     json!({
         "id": row.id,

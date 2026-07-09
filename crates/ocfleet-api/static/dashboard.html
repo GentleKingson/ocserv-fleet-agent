@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ocfleet</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #f7f8fb;
+      --panel: #ffffff;
+      --ink: #18202b;
+      --muted: #647084;
+      --line: #d9dee8;
+      --accent: #1967d2;
+      --warn: #9d5c00;
+      --crit: #b42318;
+      --ok: #137333;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #111418;
+        --panel: #191d23;
+        --ink: #edf1f7;
+        --muted: #aab4c3;
+        --line: #303743;
+        --accent: #8ab4f8;
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 18px 24px;
+      border-bottom: 1px solid var(--line);
+      background: var(--panel);
+    }
+    h1 { margin: 0; font-size: 20px; font-weight: 650; }
+    h2 { margin: 0 0 12px; font-size: 15px; font-weight: 650; }
+    main {
+      width: min(1280px, 100%);
+      margin: 0 auto;
+      padding: 20px 24px 32px;
+      display: grid;
+      gap: 18px;
+    }
+    .toolbar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    input {
+      min-width: 260px;
+      height: 34px;
+      padding: 0 10px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--bg);
+      color: var(--ink);
+    }
+    button {
+      height: 34px;
+      padding: 0 12px;
+      border: 1px solid var(--accent);
+      border-radius: 6px;
+      background: var(--accent);
+      color: white;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    section {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 16px;
+      overflow: hidden;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 18px;
+    }
+    @media (max-width: 880px) {
+      .grid { grid-template-columns: 1fr; }
+      header { align-items: flex-start; flex-direction: column; }
+      input { min-width: min(100%, 260px); }
+    }
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+    }
+    .stat {
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 10px;
+      min-height: 66px;
+    }
+    .stat strong { display: block; font-size: 22px; line-height: 1.1; }
+    .stat span { color: var(--muted); }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      table-layout: fixed;
+    }
+    th, td {
+      padding: 9px 8px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+      overflow-wrap: anywhere;
+    }
+    th { color: var(--muted); font-size: 12px; font-weight: 650; }
+    tr:last-child td { border-bottom: 0; }
+    .status-healthy { color: var(--ok); }
+    .status-warning, .status-degraded, .status-stale, .severity-warning { color: var(--warn); }
+    .status-critical, .status-unreachable, .severity-critical { color: var(--crit); }
+    .muted { color: var(--muted); }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>ocfleet</h1>
+    <div class="toolbar">
+      <input id="token" type="password" autocomplete="off" placeholder="Bearer token">
+      <button id="refresh" type="button">Refresh</button>
+      <span id="status" class="muted"></span>
+    </div>
+  </header>
+  <main>
+    <section>
+      <h2>Fleet Summary</h2>
+      <div id="summary" class="stats"></div>
+    </section>
+    <section>
+      <h2>Node Health</h2>
+      <div id="nodes"></div>
+    </section>
+    <div class="grid">
+      <section>
+        <h2>Open Alerts</h2>
+        <div id="alerts"></div>
+      </section>
+      <section>
+        <h2>Recent Runs</h2>
+        <div id="runs"></div>
+      </section>
+      <section>
+        <h2>Recent Observations</h2>
+        <div id="observations"></div>
+      </section>
+    </div>
+  </main>
+  <script>
+    const tokenInput = document.querySelector("#token");
+    const statusEl = document.querySelector("#status");
+    const headers = () => {
+      const token = tokenInput.value.trim();
+      return token ? { "Authorization": `Bearer ${token}` } : {};
+    };
+    const text = value => value === null || value === undefined || value === "" ? "none" : String(value);
+    const cls = value => String(value || "").replace(/[^a-z0-9_-]/gi, "-").toLowerCase();
+    async function loadJson(path) {
+      const response = await fetch(path, { headers: headers() });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new Error(body.message || `${response.status}`);
+      }
+      return response.json();
+    }
+    function table(columns, rows) {
+      if (!rows.length) return '<p class="muted">No rows</p>';
+      const head = columns.map(column => `<th>${column.label}</th>`).join("");
+      const body = rows.map(row => `<tr>${columns.map(column => `<td>${column.render(row)}</td>`).join("")}</tr>`).join("");
+      return `<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
+    }
+    async function refresh() {
+      statusEl.textContent = "Loading";
+      const [summary, nodes, alerts, runs, observations] = await Promise.all([
+        loadJson("/health/summary"),
+        loadJson("/health/nodes"),
+        loadJson("/alerts?state=open&limit=25"),
+        loadJson("/runs?limit=10"),
+        loadJson("/observations?limit=10")
+      ]);
+      document.querySelector("#summary").innerHTML = Object.entries(summary.summary)
+        .map(([key, value]) => `<div class="stat"><strong>${value}</strong><span>${key}</span></div>`)
+        .join("");
+      document.querySelector("#nodes").innerHTML = table([
+        { label: "node", render: row => text(row.node_id) },
+        { label: "role", render: row => text(row.role) },
+        { label: "region", render: row => text(row.region) },
+        { label: "status", render: row => `<span class="status-${cls(row.status)}">${text(row.status)}</span>` },
+        { label: "computed", render: row => text(row.computed_at) }
+      ], nodes.items || []);
+      document.querySelector("#alerts").innerHTML = table([
+        { label: "dedupe", render: row => text(row.dedupe_key) },
+        { label: "severity", render: row => `<span class="severity-${cls(row.severity)}">${text(row.severity)}</span>` },
+        { label: "reason", render: row => text(row.reason_code) }
+      ], alerts.items || []);
+      document.querySelector("#runs").innerHTML = table([
+        { label: "run", render: row => text(row.run_id) },
+        { label: "status", render: row => text(row.status) },
+        { label: "observations", render: row => text(row.observation_count) }
+      ], runs.items || []);
+      document.querySelector("#observations").innerHTML = table([
+        { label: "observation", render: row => text(row.observation_id) },
+        { label: "node", render: row => text(row.node_id) },
+        { label: "method", render: row => text(row.method) },
+        { label: "ok", render: row => text(row.ok) }
+      ], observations.items || []);
+      statusEl.textContent = `Updated ${new Date().toLocaleTimeString()}`;
+    }
+    document.querySelector("#refresh").addEventListener("click", () => refresh().catch(error => {
+      statusEl.textContent = error.message;
+    }));
+    refresh().catch(error => { statusEl.textContent = error.message; });
+  </script>
+</body>
+</html>

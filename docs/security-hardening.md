@@ -94,4 +94,7 @@ Endpoint lifecycle commands update only controller-local SQLite trust state and 
 - Keep controller audit exports redacted by default.
 - Keep agent audit primary log and spool on monitored storage.
 - Treat `audit_dropped` or repeated audit write failures as operational incidents, because affected RPCs should fail closed when neither primary nor spool can record the event.
-- Web/API dashboard remains planned/not implemented; do not expose SQLite or audit files through ad hoc HTTP servers.
+- Use `ocfleet-api` only as the experimental read-only API/dashboard surface.
+  Keep it on loopback by default, require `--auth-token-file` for non-loopback
+  listeners, and do not expose SQLite or audit files through ad hoc HTTP
+  servers.

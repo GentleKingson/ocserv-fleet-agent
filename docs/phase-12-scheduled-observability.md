@@ -6,7 +6,8 @@ Phase 12 evolves `ocfleet` from manual read-only CLI probes into continuous
 controller-owned observability. The controller schedules fixed read-only RPCs,
 stores typed low-sensitive observations in SQLite, computes bounded health
 summaries, evaluates alert rules, and exports audit data. A read-only Web/API
-dashboard remains planned and is not implemented in the current source tree.
+dashboard is now experimentally implemented as a SQLite read-only observation
+surface.
 
 Phase 12 does not add new agent control powers. It reuses the current trust
 model, controller registry, controller audit log, and Phase 11 ocserv read-only
@@ -22,7 +23,7 @@ RPC boundary.
 | Alerts | partially implemented / active implementation | `ocfleet alert list --state ... --severity ... --node ... --json`, `ocfleet alert test/deliver/silence/resolve`; only `jsonl_file:<path>` delivery is enabled |
 | Retention | partially implemented / active implementation | `ocfleet retention show/set/explain/apply` for observability history scopes |
 | Audit export | partially implemented / active implementation | `ocfleet audit export --from ... --to ... --format jsonl --output ...` |
-| `ocfleet-api` / Web dashboard | planned / not implemented | No API binary, routes, or Web UI are present |
+| `ocfleet-api` / Web dashboard | partially implemented / active implementation | `ocfleet-api --database controller.sqlite --read-only --listen 127.0.0.1:8080`; read-only `GET` routes and a minimal static dashboard are present |
 | Webhook hooks | planned / not implemented | `webhook:` hooks are rejected until HTTPS/HMAC/SSRF protections are designed and implemented |
 
 ## Goals
@@ -38,8 +39,8 @@ RPC boundary.
   execution.
 - Add audit export for bounded controller audit windows and scheduled
   observability events.
-- Later, add a Web/API read-only dashboard for status, health, history, alerts,
-  and audit export visibility.
+- Operate the experimental Web/API read-only dashboard for status, health,
+  history, alerts, and audit export visibility without adding mutation routes.
 
 ## Non-goals
 
@@ -74,7 +75,7 @@ controller scheduler
   -> SQLite history
   -> health summary
   -> alert evaluation
-  -> future read-only API/dashboard
+  -> read-only API/dashboard
 ```
 
 The scheduler runs inside the controller boundary and uses the same local
@@ -301,7 +302,7 @@ Rules:
 - retention apply runs must write controller audit metadata about row counts,
   scope, cutoff, and report checksum.
 
-## Current CLI Surface And Planned API
+## Current CLI And API Surface
 
 The current Phase 12 CLI commands exist without changing the Phase 11 RPC
 boundary. Examples below match the current `ocfleet` argument parser.
@@ -447,28 +448,37 @@ endpoint, and request identifiers. The `audit.export` audit row is written after
 the file is produced, so it is not included in that export window snapshot. See
 `docs/audit-export.md` for redaction mode and private output path details.
 
-### Planned Read-only Web/API Dashboard
+### Experimental Read-only Web/API Dashboard
 
 ```bash
 ocfleet-api --database controller.sqlite --read-only --listen 127.0.0.1:8080
 ```
 
-The command above is a planned interface, not a current binary. No Web/API
-dashboard is implemented in the current source tree. Draft read-only routes:
+The command above is implemented as an experimental read-only observation
+surface. It opens controller SQLite with `SQLITE_OPEN_READ_ONLY`, does not write
+startup audit rows, does not run scheduler jobs, and does not trigger agent
+RPCs. Non-loopback listeners require `--auth-token-file`.
 
+Implemented read-only routes:
+
+- `GET /healthz`
 - `GET /health/summary`
+- `GET /health/nodes`
 - `GET /health/nodes/{node_id}`
 - `GET /observations`
 - `GET /observations/{observation_id}`
 - `GET /jobs`
+- `GET /jobs/{job_id}`
 - `GET /runs`
+- `GET /runs/{run_id}`
 - `GET /alerts`
+- `GET /alerts/{dedupe_key_or_alert_id}`
 - `GET /audit/export`
 
-The API must not define `POST /rpc`, `POST /jobs/{id}/run`, or any equivalent
-endpoint that triggers agent RPCs. Mutating alert and retention commands remain
-local CLI operations unless a later phase explicitly designs authenticated,
-audited, non-RPC-triggering API mutations.
+The API does not define `POST /rpc`, `POST /jobs/{id}/run`, alert resolve or
+silence endpoints, or any `PUT`/`PATCH`/`DELETE` mutation surface. Mutating
+alert and retention commands remain local CLI operations unless a later phase
+explicitly designs authenticated, audited, non-RPC-triggering API mutations.
 
 ## Alert Hook Model
 
@@ -525,8 +535,8 @@ Phase 12 keeps the project security posture:
 - all scheduler job creation, enable/disable, one-shot runs, retention apply,
   alert silence, alert resolve, and audit export operations write controller
   audit entries.
-- future dashboard/API reads must use a read-only SQLite connection where
-  practical and must not mutate scheduler state.
+- dashboard/API reads use a read-only SQLite connection and must not mutate
+  scheduler state.
 
 ## Health Summary Semantics
 
@@ -606,8 +616,9 @@ Additional acceptance requirements:
 - scheduler jobs are limited to current fixed job kinds.
 - `probe.path.echo` jobs require explicit source and target node IDs.
 - scheduler never enumerates mesh pairs.
-- dashboard/API remains unimplemented until a separate read-only API design is
-  approved.
+- dashboard/API remains read-only and must not trigger agent RPC, scheduler
+  runs, alert mutations, retention changes, trust changes, or node registry
+  changes.
 - alert hooks cannot execute local scripts or commands.
 - history, health, alerts, dashboard, API, and audit export contain no raw
   response bodies.

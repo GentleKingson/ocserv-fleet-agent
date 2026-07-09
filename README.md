@@ -11,7 +11,7 @@ production-complete.
 - Phase 10 enrollment/trust is implemented.
 - Phase 11 ocserv low-sensitive read-only RPCs are implemented.
 - Phase 12 CLI observability is partially implemented / active implementation.
-- Web/API dashboard is planned / not implemented yet.
+- Web/API dashboard is experimentally implemented as a read-only observation surface.
 - The project is not production-complete.
 
 ## What It Does
@@ -50,6 +50,9 @@ production-complete.
   - `ocfleet retention` policy, dry-run explanation, and pruning for
     observability history tables
   - `ocfleet audit export` for bounded redacted JSONL controller audit windows
+- Supports experimental read-only `ocfleet-api` / Web dashboard access for
+  health snapshots, jobs, runs, observations, alerts, and bounded redacted audit
+  export views.
 - Supports fixed RPC methods:
   - `node.ping`
   - `node.info`
@@ -72,8 +75,8 @@ The current implementation is intentionally narrow. It does not provide:
 - `systemctl`, `occtl`, or `journalctl` passthrough adapters
 - certificate or config content output
 - automatic active trust on first contact or TOFU registration
-- Web/API dashboard or HTTP API access; that surface is planned but not
-  implemented yet
+- Web/API endpoints that trigger agent RPCs, run scheduler jobs, resolve or
+  silence alerts, mutate retention policy, modify trust, or change node state
 
 All local capabilities must be exposed through fixed RPC methods. There is no `shell.exec`, `command.run`, `occtl.raw`, `journalctl.raw`, or equivalent generic execution interface.
 
@@ -108,6 +111,19 @@ Run read-only diagnostics:
 target/debug/ocfleet doctor
 target/debug/ocfleet doctor --json
 ```
+
+Optionally start the experimental read-only API/dashboard against an existing
+controller database:
+
+```bash
+target/debug/ocfleet-api \
+  --database controller.sqlite \
+  --read-only \
+  --listen 127.0.0.1:8080
+```
+
+The API opens SQLite in read-only mode and serves only `GET` observation routes.
+Non-loopback listeners require `--auth-token-file`.
 
 Create an agent config:
 
@@ -380,7 +396,9 @@ Networking must allow the controller to reach the agent through iroh using the r
 - `docs/roadmap.md`: forward roadmap from the current documentation baseline.
 - `docs/phase-10-enrollment-trust.md`: Phase 10 onboarding and trust lifecycle guide.
 - `docs/ocserv-readonly-spec.md`: Phase 11 ocserv read-only RPC contract.
-- `docs/phase-12-scheduled-observability.md`: Phase 12 CLI observability status and remaining dashboard/API design.
+- `docs/phase-12-scheduled-observability.md`: Phase 12 CLI observability and read-only API/dashboard status.
+- `docs/api.md`: experimental read-only HTTP API routes, auth, and redaction rules.
+- `docs/dashboard.md`: experimental static dashboard behavior and limits.
 
 ## Security Notes
 

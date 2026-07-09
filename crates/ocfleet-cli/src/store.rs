@@ -17,6 +17,7 @@ use crate::input_validation::{
     validate_description, validate_endpoint_id, validate_hostname, validate_label_json,
     validate_reason,
 };
+use crate::migrations;
 use crate::private_file::{self, PrivateFileError};
 
 pub const CURRENT_SCHEMA_VERSION: i64 = 6;
@@ -29,6 +30,14 @@ pub enum StoreError {
     Io(#[from] std::io::Error),
     #[error("controller state file permissions are unsafe")]
     UnsafePermissions,
+    #[error(
+        "unsupported future controller database schema {found}; this binary supports up to {supported}"
+    )]
+    UnsupportedFutureSchema { found: i64, supported: i64 },
+    #[error("database migration backup failed: {0}")]
+    MigrationBackup(String),
+    #[error("database integrity check failed ({check}): {detail}")]
+    DatabaseIntegrityCheckFailed { check: &'static str, detail: String },
     #[error("node not found: {0}")]
     NodeNotFound(String),
     #[error("enrollment rejected: {0}")]
@@ -285,208 +294,33 @@ pub struct StoreOpenResult {
 
 impl Store {
     pub fn open(path: &Path) -> Result<Self, StoreError> {
-        let _created_database = create_database_file_if_missing(path)?;
-        Self::open_existing_or_create(path)
+        let created_database = create_database_file_if_missing(path)?;
+        Self::open_existing_or_create(path, created_database)
     }
 
     pub fn open_with_status(path: &Path) -> Result<StoreOpenResult, StoreError> {
         let created_database = create_database_file_if_missing(path)?;
-        let store = Self::open_existing_or_create(path)?;
+        let store = Self::open_existing_or_create(path, created_database)?;
         Ok(StoreOpenResult {
             store,
             created_database,
         })
     }
 
-    fn open_existing_or_create(path: &Path) -> Result<Self, StoreError> {
+    fn open_existing_or_create(path: &Path, created_database: bool) -> Result<Self, StoreError> {
         validate_database_files(path)?;
-        let conn = Connection::open(path)?;
+        let mut conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "busy_timeout", 5_000)?;
 
-        let store = Self { conn };
-        store.migrate()?;
+        migrations::migrate_to_current(&mut conn, path, created_database)?;
         validate_database_files(path)?;
-        Ok(store)
-    }
-
-    fn migrate(&self) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
-        tx.execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS schema_migrations (
-              version INTEGER PRIMARY KEY,
-              applied_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS nodes (
-              node_id TEXT PRIMARY KEY,
-              endpoint_id TEXT NOT NULL UNIQUE,
-              name TEXT NOT NULL,
-              region TEXT,
-              role TEXT NOT NULL DEFAULT 'ocserv',
-              enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
-              created_at TEXT NOT NULL,
-              updated_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS controller_audit_log (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              ts TEXT NOT NULL,
-              actor TEXT NOT NULL,
-              event TEXT NOT NULL,
-              node_id TEXT,
-              endpoint_id TEXT,
-              method TEXT,
-              request_id TEXT,
-              params_hash TEXT,
-              ok INTEGER,
-              error_code TEXT,
-              duration_ms INTEGER,
-              detail_json TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS enrollment_tokens (
-              token_id TEXT PRIMARY KEY,
-              token_hash TEXT NOT NULL UNIQUE,
-              created_at TEXT NOT NULL,
-              created_by TEXT NOT NULL,
-              expires_at TEXT NOT NULL,
-              max_uses INTEGER NOT NULL,
-              used_count INTEGER NOT NULL DEFAULT 0,
-              status TEXT NOT NULL,
-              description TEXT,
-              labels_json TEXT NOT NULL,
-              scope_json TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS join_requests (
-              request_id TEXT PRIMARY KEY,
-              token_id TEXT NOT NULL,
-              status TEXT NOT NULL,
-              agent_public_key TEXT NOT NULL,
-              fingerprint TEXT NOT NULL,
-              requested_endpoint_id TEXT,
-              assigned_endpoint_id TEXT,
-              hostname TEXT NOT NULL,
-              agent_version TEXT NOT NULL,
-              requested_labels_json TEXT NOT NULL,
-              approved_labels_json TEXT NOT NULL,
-              created_at TEXT NOT NULL,
-              approved_at TEXT,
-              approved_by TEXT,
-              rejection_reason TEXT,
-              audit_correlation_id TEXT NOT NULL,
-              FOREIGN KEY(token_id) REFERENCES enrollment_tokens(token_id)
-            );
-
-            CREATE TABLE IF NOT EXISTS endpoint_trust (
-              endpoint_id TEXT PRIMARY KEY,
-              node_id TEXT,
-              fingerprint TEXT,
-              status TEXT NOT NULL,
-              generation INTEGER NOT NULL,
-              previous_endpoint_id TEXT,
-              rotated_to TEXT,
-              trust_bundle_json TEXT NOT NULL,
-              created_at TEXT NOT NULL,
-              updated_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS observability_jobs (
-              job_id TEXT PRIMARY KEY,
-              kind TEXT NOT NULL CHECK (kind IN ('controller-ping', 'ocserv-status', 'ocserv-cert', 'ocserv-sessions', 'path-probe')),
-              selector_json TEXT NOT NULL CHECK (json_valid(selector_json)),
-              pair_selector_json TEXT CHECK (pair_selector_json IS NULL OR json_valid(pair_selector_json)),
-              interval_seconds INTEGER NOT NULL CHECK (interval_seconds BETWEEN 60 AND 86400),
-              jitter_seconds INTEGER NOT NULL DEFAULT 0 CHECK (jitter_seconds BETWEEN 0 AND 3600),
-              timeout_ms INTEGER NOT NULL CHECK (timeout_ms BETWEEN 1000 AND 30000),
-              enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
-              next_run_at TEXT,
-              last_run_at TEXT,
-              created_at TEXT NOT NULL,
-              updated_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS observability_runs (
-              run_id TEXT PRIMARY KEY,
-              job_id TEXT,
-              started_at TEXT NOT NULL,
-              finished_at TEXT,
-              status TEXT NOT NULL CHECK (status IN ('running', 'succeeded', 'failed', 'skipped')),
-              triggered_by TEXT NOT NULL CHECK (triggered_by IN ('manual', 'scheduler.run.once')),
-              summary_json TEXT NOT NULL CHECK (json_valid(summary_json)),
-              FOREIGN KEY(job_id) REFERENCES observability_jobs(job_id) ON DELETE SET NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS probe_observations (
-              observation_id TEXT PRIMARY KEY,
-              run_id TEXT,
-              node_id TEXT,
-              endpoint_id TEXT,
-              method TEXT NOT NULL CHECK (method IN ('probe.controller.ping', 'probe.path.echo', 'ocserv.service.summary', 'ocserv.version', 'ocserv.sessions.summary', 'ocserv.cert.expiry', 'ocserv.config.fingerprint')),
-              ok INTEGER CHECK (ok IS NULL OR ok IN (0, 1)),
-              error_code TEXT,
-              duration_ms INTEGER CHECK (duration_ms IS NULL OR duration_ms >= 0),
-              observed_at TEXT NOT NULL,
-              expires_at TEXT,
-              result_class TEXT NOT NULL CHECK (result_class IN ('controller_rpc_summary', 'low_sensitive_summary', 'scheduler_summary')),
-              summary_json TEXT NOT NULL CHECK (json_valid(summary_json)),
-              FOREIGN KEY(run_id) REFERENCES observability_runs(run_id) ON DELETE SET NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS health_snapshots (
-              node_id TEXT PRIMARY KEY,
-              endpoint_id TEXT,
-              computed_at TEXT NOT NULL,
-              status TEXT NOT NULL CHECK (status IN ('healthy', 'degraded', 'unreachable', 'stale', 'disabled', 'unknown')),
-              freshness_seconds INTEGER CHECK (freshness_seconds IS NULL OR freshness_seconds >= 0),
-              last_success_at TEXT,
-              last_failure_at TEXT,
-              last_error_code TEXT,
-              degraded_methods_json TEXT NOT NULL CHECK (json_valid(degraded_methods_json)),
-              summary_json TEXT NOT NULL CHECK (json_valid(summary_json))
-            );
-
-            CREATE TABLE IF NOT EXISTS alert_events (
-              alert_id TEXT PRIMARY KEY,
-              dedupe_key TEXT NOT NULL UNIQUE,
-              node_id TEXT,
-              severity TEXT NOT NULL CHECK (severity IN ('warning', 'critical')),
-              state TEXT NOT NULL CHECK (state IN ('open', 'resolved', 'silenced')),
-              reason_code TEXT NOT NULL CHECK (reason_code IN ('NODE_UNREACHABLE', 'NODE_STALE', 'OCSERV_DEGRADED', 'CERT_EXPIRING_CRITICAL', 'CERT_EXPIRING_WARNING', 'ENDPOINT_INACTIVE')),
-              first_seen_at TEXT NOT NULL,
-              last_seen_at TEXT NOT NULL,
-              last_sent_at TEXT,
-              resolved_at TEXT,
-              detail_json TEXT NOT NULL CHECK (json_valid(detail_json))
-            );
-
-            CREATE TABLE IF NOT EXISTS retention_policies (
-              scope TEXT PRIMARY KEY CHECK (scope IN ('observations', 'observability-runs', 'health-snapshots', 'alert-events')),
-              max_age_days INTEGER CHECK (max_age_days IS NULL OR max_age_days >= 1),
-              max_rows INTEGER CHECK (max_rows IS NULL OR max_rows >= 1),
-              updated_at TEXT NOT NULL
-            );
-            "#,
-        )?;
-        rebuild_observability_v4_tables_if_needed(&tx)?;
-        tx.execute_batch(OBSERVABILITY_INDEX_SQL)?;
-        tx.execute(
-            "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, strftime('%Y-%m-%dT%H:%M:%SZ','now'))",
-            [CURRENT_SCHEMA_VERSION],
-        )?;
-        tx.commit()?;
-        Ok(())
+        Ok(Self { conn })
     }
 
     pub fn current_schema_version(&self) -> Result<i64, StoreError> {
-        Ok(self
-            .conn
-            .query_row("SELECT max(version) FROM schema_migrations", [], |row| {
-                row.get(0)
-            })?)
+        migrations::read_schema_version(&self.conn)
     }
 
     pub fn add_node(&self, node: &NodeInsert) -> Result<(), StoreError> {
@@ -1539,217 +1373,6 @@ impl Store {
         Ok(after)
     }
 }
-
-fn rebuild_observability_v4_tables_if_needed(tx: &Transaction<'_>) -> Result<(), StoreError> {
-    let checks = [
-        (
-            "observability_jobs",
-            "kind TEXT NOT NULL CHECK",
-            "kind constraint",
-        ),
-        (
-            "observability_runs",
-            "triggered_by TEXT NOT NULL CHECK",
-            "run status",
-        ),
-        ("probe_observations", "FOREIGN KEY(run_id)", "result class"),
-        (
-            "health_snapshots",
-            "status TEXT NOT NULL CHECK",
-            "health status",
-        ),
-        (
-            "alert_events",
-            "reason_code TEXT NOT NULL CHECK",
-            "alert severity",
-        ),
-        (
-            "retention_policies",
-            "observability-runs",
-            "retention scope",
-        ),
-    ];
-    let mut needs_rebuild = false;
-    for (table, marker, _label) in checks {
-        let sql = table_sql(tx, table)?;
-        if !sql.contains(marker) {
-            needs_rebuild = true;
-            break;
-        }
-    }
-    if needs_rebuild {
-        tx.execute_batch(OBSERVABILITY_V4_REBUILD_SQL)?;
-    }
-    Ok(())
-}
-
-fn table_sql(tx: &Transaction<'_>, table: &str) -> Result<String, StoreError> {
-    Ok(tx
-        .query_row(
-            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
-            [table],
-            |row| row.get(0),
-        )
-        .optional()?
-        .unwrap_or_default())
-}
-
-const OBSERVABILITY_INDEX_SQL: &str = r#"
-CREATE INDEX IF NOT EXISTS idx_observability_jobs_enabled_next_run_at
-  ON observability_jobs(enabled, next_run_at);
-CREATE INDEX IF NOT EXISTS idx_probe_observations_node_observed_at
-  ON probe_observations(node_id, observed_at);
-CREATE INDEX IF NOT EXISTS idx_probe_observations_run_id
-  ON probe_observations(run_id);
-CREATE INDEX IF NOT EXISTS idx_alert_events_state_last_seen_at
-  ON alert_events(state, last_seen_at);
-"#;
-
-const OBSERVABILITY_V4_REBUILD_SQL: &str = r#"
-ALTER TABLE observability_jobs RENAME TO observability_jobs_legacy_v3;
-CREATE TABLE observability_jobs (
-  job_id TEXT PRIMARY KEY,
-  kind TEXT NOT NULL CHECK (kind IN ('controller-ping', 'ocserv-status', 'ocserv-cert', 'ocserv-sessions', 'path-probe')),
-  selector_json TEXT NOT NULL CHECK (json_valid(selector_json)),
-  pair_selector_json TEXT CHECK (pair_selector_json IS NULL OR json_valid(pair_selector_json)),
-  interval_seconds INTEGER NOT NULL CHECK (interval_seconds BETWEEN 60 AND 86400),
-  jitter_seconds INTEGER NOT NULL DEFAULT 0 CHECK (jitter_seconds BETWEEN 0 AND 3600),
-  timeout_ms INTEGER NOT NULL CHECK (timeout_ms BETWEEN 1000 AND 30000),
-  enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
-  next_run_at TEXT,
-  last_run_at TEXT,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
-);
-INSERT INTO observability_jobs
-  (job_id, kind, selector_json, pair_selector_json, interval_seconds, jitter_seconds, timeout_ms, enabled, next_run_at, last_run_at, created_at, updated_at)
-SELECT job_id, kind, selector_json, pair_selector_json, interval_seconds, jitter_seconds, timeout_ms, enabled, next_run_at, last_run_at, created_at, updated_at
-FROM observability_jobs_legacy_v3
-WHERE kind IN ('controller-ping', 'ocserv-status', 'ocserv-cert', 'ocserv-sessions', 'path-probe')
-  AND json_valid(selector_json)
-  AND (pair_selector_json IS NULL OR json_valid(pair_selector_json))
-  AND interval_seconds BETWEEN 60 AND 86400
-  AND jitter_seconds BETWEEN 0 AND 3600
-  AND timeout_ms BETWEEN 1000 AND 30000
-  AND enabled IN (0, 1);
-DROP TABLE observability_jobs_legacy_v3;
-
-ALTER TABLE observability_runs RENAME TO observability_runs_legacy_v3;
-CREATE TABLE observability_runs (
-  run_id TEXT PRIMARY KEY,
-  job_id TEXT,
-  started_at TEXT NOT NULL,
-  finished_at TEXT,
-  status TEXT NOT NULL CHECK (status IN ('running', 'succeeded', 'failed', 'skipped')),
-  triggered_by TEXT NOT NULL CHECK (triggered_by IN ('manual', 'scheduler.run.once')),
-  summary_json TEXT NOT NULL CHECK (json_valid(summary_json)),
-  FOREIGN KEY(job_id) REFERENCES observability_jobs(job_id) ON DELETE SET NULL
-);
-INSERT INTO observability_runs
-  (run_id, job_id, started_at, finished_at, status, triggered_by, summary_json)
-SELECT run_id, job_id, started_at, finished_at, status, triggered_by, summary_json
-FROM observability_runs_legacy_v3
-WHERE status IN ('running', 'succeeded', 'failed', 'skipped')
-  AND triggered_by IN ('manual', 'scheduler.run.once')
-  AND (job_id IS NULL OR EXISTS (
-    SELECT 1 FROM observability_jobs WHERE observability_jobs.job_id = observability_runs_legacy_v3.job_id
-  ))
-  AND json_valid(summary_json);
-DROP TABLE observability_runs_legacy_v3;
-
-ALTER TABLE probe_observations RENAME TO probe_observations_legacy_v3;
-CREATE TABLE probe_observations (
-  observation_id TEXT PRIMARY KEY,
-  run_id TEXT,
-  node_id TEXT,
-  endpoint_id TEXT,
-  method TEXT NOT NULL CHECK (method IN ('probe.controller.ping', 'probe.path.echo', 'ocserv.service.summary', 'ocserv.version', 'ocserv.sessions.summary', 'ocserv.cert.expiry', 'ocserv.config.fingerprint')),
-  ok INTEGER CHECK (ok IS NULL OR ok IN (0, 1)),
-  error_code TEXT,
-  duration_ms INTEGER CHECK (duration_ms IS NULL OR duration_ms >= 0),
-  observed_at TEXT NOT NULL,
-  expires_at TEXT,
-  result_class TEXT NOT NULL CHECK (result_class IN ('controller_rpc_summary', 'low_sensitive_summary', 'scheduler_summary')),
-  summary_json TEXT NOT NULL CHECK (json_valid(summary_json)),
-  FOREIGN KEY(run_id) REFERENCES observability_runs(run_id) ON DELETE SET NULL
-);
-INSERT INTO probe_observations
-  (observation_id, run_id, node_id, endpoint_id, method, ok, error_code, duration_ms, observed_at, expires_at, result_class, summary_json)
-SELECT observation_id, run_id, node_id, endpoint_id, method, ok, error_code, duration_ms, observed_at, expires_at, result_class, summary_json
-FROM probe_observations_legacy_v3
-WHERE method IN ('probe.controller.ping', 'probe.path.echo', 'ocserv.service.summary', 'ocserv.version', 'ocserv.sessions.summary', 'ocserv.cert.expiry', 'ocserv.config.fingerprint')
-  AND (ok IS NULL OR ok IN (0, 1))
-  AND (duration_ms IS NULL OR duration_ms >= 0)
-  AND result_class IN ('controller_rpc_summary', 'low_sensitive_summary', 'scheduler_summary')
-  AND (run_id IS NULL OR EXISTS (
-    SELECT 1 FROM observability_runs WHERE observability_runs.run_id = probe_observations_legacy_v3.run_id
-  ))
-  AND json_valid(summary_json);
-DROP TABLE probe_observations_legacy_v3;
-
-ALTER TABLE health_snapshots RENAME TO health_snapshots_legacy_v3;
-CREATE TABLE health_snapshots (
-  node_id TEXT PRIMARY KEY,
-  endpoint_id TEXT,
-  computed_at TEXT NOT NULL,
-  status TEXT NOT NULL CHECK (status IN ('healthy', 'degraded', 'unreachable', 'stale', 'disabled', 'unknown')),
-  freshness_seconds INTEGER CHECK (freshness_seconds IS NULL OR freshness_seconds >= 0),
-  last_success_at TEXT,
-  last_failure_at TEXT,
-  last_error_code TEXT,
-  degraded_methods_json TEXT NOT NULL CHECK (json_valid(degraded_methods_json)),
-  summary_json TEXT NOT NULL CHECK (json_valid(summary_json))
-);
-INSERT INTO health_snapshots
-  (node_id, endpoint_id, computed_at, status, freshness_seconds, last_success_at, last_failure_at, last_error_code, degraded_methods_json, summary_json)
-SELECT node_id, endpoint_id, computed_at, status, freshness_seconds, last_success_at, last_failure_at, last_error_code, degraded_methods_json, summary_json
-FROM health_snapshots_legacy_v3
-WHERE status IN ('healthy', 'degraded', 'unreachable', 'stale', 'disabled', 'unknown')
-  AND (freshness_seconds IS NULL OR freshness_seconds >= 0)
-  AND json_valid(degraded_methods_json)
-  AND json_valid(summary_json);
-DROP TABLE health_snapshots_legacy_v3;
-
-ALTER TABLE alert_events RENAME TO alert_events_legacy_v3;
-CREATE TABLE alert_events (
-  alert_id TEXT PRIMARY KEY,
-  dedupe_key TEXT NOT NULL UNIQUE,
-  node_id TEXT,
-  severity TEXT NOT NULL CHECK (severity IN ('warning', 'critical')),
-  state TEXT NOT NULL CHECK (state IN ('open', 'resolved', 'silenced')),
-  reason_code TEXT NOT NULL CHECK (reason_code IN ('NODE_UNREACHABLE', 'NODE_STALE', 'OCSERV_DEGRADED', 'CERT_EXPIRING_CRITICAL', 'CERT_EXPIRING_WARNING', 'ENDPOINT_INACTIVE')),
-  first_seen_at TEXT NOT NULL,
-  last_seen_at TEXT NOT NULL,
-  last_sent_at TEXT,
-  resolved_at TEXT,
-  detail_json TEXT NOT NULL CHECK (json_valid(detail_json))
-);
-INSERT INTO alert_events
-  (alert_id, dedupe_key, node_id, severity, state, reason_code, first_seen_at, last_seen_at, last_sent_at, resolved_at, detail_json)
-SELECT alert_id, dedupe_key, node_id, severity, state, reason_code, first_seen_at, last_seen_at, last_sent_at, resolved_at, detail_json
-FROM alert_events_legacy_v3
-WHERE severity IN ('warning', 'critical')
-  AND state IN ('open', 'resolved', 'silenced')
-  AND reason_code IN ('NODE_UNREACHABLE', 'NODE_STALE', 'OCSERV_DEGRADED', 'CERT_EXPIRING_CRITICAL', 'CERT_EXPIRING_WARNING', 'ENDPOINT_INACTIVE')
-  AND json_valid(detail_json);
-DROP TABLE alert_events_legacy_v3;
-
-ALTER TABLE retention_policies RENAME TO retention_policies_legacy_v3;
-CREATE TABLE retention_policies (
-  scope TEXT PRIMARY KEY CHECK (scope IN ('observations', 'observability-runs', 'health-snapshots', 'alert-events')),
-  max_age_days INTEGER CHECK (max_age_days IS NULL OR max_age_days >= 1),
-  max_rows INTEGER CHECK (max_rows IS NULL OR max_rows >= 1),
-  updated_at TEXT NOT NULL
-);
-INSERT INTO retention_policies
-  (scope, max_age_days, max_rows, updated_at)
-SELECT scope, max_age_days, max_rows, updated_at
-FROM retention_policies_legacy_v3
-WHERE scope IN ('observations', 'observability-runs', 'health-snapshots', 'alert-events')
-  AND (max_age_days IS NULL OR max_age_days >= 1)
-  AND (max_rows IS NULL OR max_rows >= 1);
-DROP TABLE retention_policies_legacy_v3;
-"#;
 
 fn create_database_file_if_missing(path: &Path) -> Result<bool, StoreError> {
     match private_file::open_private_create_new(path) {

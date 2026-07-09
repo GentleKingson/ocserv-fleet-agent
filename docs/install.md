@@ -229,7 +229,17 @@ journalctl -u ocfleet-agent -n 20 --no-pager | grep 'agent_endpoint_id='
 
 ## Database Upgrade And Backup
 
-`v0.1.0` uses schema version `1`. Before upgrades:
+The controller database uses versioned SQLite migrations. On startup, `ocfleet`
+refuses to open a database that records a schema version newer than the binary
+supports. When an older non-empty schema is upgraded, the controller first
+creates a private SQLite backup under `.ocfleet-migration-backups/` next to the
+database. Backup names include the database filename, source schema version,
+target schema version, and UTC timestamp; the backup directory is kept at
+`0700`, backup files are created with mode `0600`, and a private `.sha256`
+checksum sidecar is written next to each backup. Migration continues only after
+the backup and checksum are complete.
+
+Before upgrades, keep an operator-managed backup as well:
 
 ```bash
 ocfleet --database /var/lib/ocfleet-controller/controller.sqlite --secret-key /var/lib/ocfleet-controller/controller.secret doctor

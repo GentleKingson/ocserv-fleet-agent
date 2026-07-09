@@ -1,8 +1,8 @@
 use clap::{CommandFactory, Parser};
 use ocfleet_cli::args::{
-    Cli, Command, EndpointCommand, EnrollCommand, EnrollRequestCommand, EnrollTokenCommand,
-    HealthCommand, HealthPolicyCommand, NodeCommand, OcservCommand, OcservSessionsCommand,
-    ProbeCommand, TrustCommand, TrustDiffFormat,
+    AlertCommand, Cli, Command, EndpointCommand, EnrollCommand, EnrollRequestCommand,
+    EnrollTokenCommand, HealthCommand, HealthPolicyCommand, NodeCommand, OcservCommand,
+    OcservSessionsCommand, ProbeCommand, TrustCommand, TrustDiffFormat,
 };
 use std::path::PathBuf;
 
@@ -151,6 +151,36 @@ fn parses_health_policy_commands() {
     assert_eq!(unreachable_failures, Some(3));
     assert_eq!(cert_warning_days, Some(30));
     assert_eq!(cert_critical_days, Some(7));
+}
+
+#[test]
+fn parses_alert_deliver_command() {
+    let cli = Cli::parse_from([
+        "ocfleet",
+        "alert",
+        "deliver",
+        "--hook",
+        "jsonl_file:state/alerts.jsonl",
+        "--limit",
+        "25",
+        "--dry-run",
+    ]);
+
+    let Command::Alert {
+        command:
+            AlertCommand::Deliver {
+                hook,
+                limit,
+                dry_run,
+            },
+    } = cli.command
+    else {
+        panic!("expected alert deliver command");
+    };
+
+    assert_eq!(hook, "jsonl_file:state/alerts.jsonl");
+    assert_eq!(limit, 25);
+    assert!(dry_run);
 }
 
 #[test]

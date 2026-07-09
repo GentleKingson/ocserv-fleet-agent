@@ -1,3 +1,4 @@
+pub mod alert_delivery;
 pub mod alerts;
 pub mod args;
 pub mod audit;

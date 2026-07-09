@@ -1,4 +1,4 @@
-use anyhow::{Context, bail};
+use anyhow::Context;
 use ocfleet_protocol::enrollment::EndpointStatus;
 use ocfleet_protocol::method::{OCSERV_CERT_EXPIRY, OCSERV_SERVICE_SUMMARY, PROBE_CONTROLLER_PING};
 use serde_json::{Map, Value, json};
@@ -6,6 +6,9 @@ use std::collections::BTreeMap;
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
+use crate::alert_delivery::{
+    deliver_jsonl_alerts, parse_alert_hook, validate_delivery_limit, write_jsonl_test_event,
+};
 use crate::args::AlertCommand;
 use crate::audit::AuditEvent;
 use crate::duration_args::parse_duration_seconds;
@@ -13,6 +16,7 @@ use crate::input_validation::{local_actor, validate_reason};
 use crate::store::{AlertEventRecord, HealthPolicyRecord, ProbeObservationRecord, Store};
 
 const OBSERVATION_READ_LIMIT: u64 = 1_000;
+const ALERT_DELIVERY_ERROR_CODE: &str = "ALERT_DELIVERY_FAILED";
 
 #[derive(Debug, Clone)]
 struct AlertCandidate {
@@ -37,6 +41,11 @@ pub fn run_alert_command(store: &Store, command: AlertCommand) -> anyhow::Result
     match command {
         AlertCommand::List { json } => run_alert_list(store, json),
         AlertCommand::Test { hook } => run_alert_test(store, &hook),
+        AlertCommand::Deliver {
+            hook,
+            limit,
+            dry_run,
+        } => run_alert_deliver(store, &hook, limit, dry_run),
         AlertCommand::Silence {
             dedupe_key,
             for_duration,
@@ -113,10 +122,93 @@ fn run_alert_list(store: &Store, json_output: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_alert_test(store: &Store, hook: &str) -> anyhow::Result<()> {
-    reject_disabled_alert_hook(hook)?;
+fn run_alert_test(_store: &Store, hook: &str) -> anyhow::Result<()> {
+    let hook = parse_alert_hook(hook)?;
+    let summary = write_jsonl_test_event(&hook)?;
+    println!("status=ok");
+    println!("hook_type={}", hook.hook_type());
+    println!("test_event=true");
+    println!("bytes_written={}", summary.bytes_written);
+    Ok(())
+}
+
+fn run_alert_deliver(store: &Store, hook: &str, limit: u64, dry_run: bool) -> anyhow::Result<()> {
+    let hook = match parse_alert_hook(hook) {
+        Ok(hook) => hook,
+        Err(err) => {
+            write_alert_delivery_audit(
+                store,
+                "rejected",
+                false,
+                0,
+                0,
+                dry_run,
+                Some(ALERT_DELIVERY_ERROR_CODE),
+            )?;
+            return Err(err);
+        }
+    };
+    let limit = match validate_delivery_limit(limit) {
+        Ok(limit) => limit,
+        Err(err) => {
+            write_alert_delivery_audit(
+                store,
+                hook.hook_type(),
+                false,
+                0,
+                0,
+                dry_run,
+                Some(ALERT_DELIVERY_ERROR_CODE),
+            )?;
+            return Err(err);
+        }
+    };
     evaluate_alerts(store)?;
-    unreachable!("disabled alert hooks always return an error")
+    let alerts = store
+        .list_alert_events()?
+        .into_iter()
+        .filter(|alert| alert.state == "open")
+        .take(limit)
+        .collect::<Vec<_>>();
+
+    let summary = match deliver_jsonl_alerts(&hook, &alerts, dry_run) {
+        Ok(summary) => summary,
+        Err(err) => {
+            write_alert_delivery_audit(
+                store,
+                hook.hook_type(),
+                false,
+                alerts.len(),
+                0,
+                dry_run,
+                Some(ALERT_DELIVERY_ERROR_CODE),
+            )?;
+            return Err(err);
+        }
+    };
+
+    if !dry_run {
+        let sent_at = now_rfc3339();
+        for mut alert in alerts {
+            alert.last_sent_at = Some(sent_at.clone());
+            store.upsert_alert_event(&alert)?;
+        }
+    }
+    write_alert_delivery_audit(
+        store,
+        hook.hook_type(),
+        true,
+        summary.record_count,
+        summary.bytes_written,
+        dry_run,
+        None,
+    )?;
+    println!("status=ok");
+    println!("hook_type={}", hook.hook_type());
+    println!("alert_count={}", summary.record_count);
+    println!("bytes_written={}", summary.bytes_written);
+    println!("dry_run={dry_run}");
+    Ok(())
 }
 
 fn run_alert_silence(
@@ -443,33 +535,6 @@ fn timestamp_after(left: &str, right: &str) -> anyhow::Result<bool> {
     Ok(left > right)
 }
 
-fn reject_disabled_alert_hook(value: &str) -> anyhow::Result<()> {
-    let (kind, rest) = value
-        .split_once(':')
-        .with_context(|| "alert hook must use kind:value syntax")?;
-    let kind = kind.trim().to_ascii_lowercase();
-    if matches!(kind.as_str(), "exec" | "command" | "script" | "shell") {
-        bail!("forbidden alert hook type: {kind}");
-    }
-    match kind.as_str() {
-        "jsonl_file" => {
-            if rest.trim().is_empty() {
-                bail!("jsonl_file hook requires a path");
-            }
-            bail!(
-                "jsonl_file hooks are disabled until private alert directory support is implemented"
-            );
-        }
-        "webhook" => {
-            if rest.trim().is_empty() {
-                bail!("webhook hook requires a url");
-            }
-            bail!("webhook hooks are disabled until HTTPS/HMAC/SSRF protections are implemented");
-        }
-        _ => bail!("unsupported alert hook type: {kind}"),
-    }
-}
-
 fn find_alert(store: &Store, dedupe_key: &str) -> anyhow::Result<AlertEventRecord> {
     store
         .list_alert_events()?
@@ -630,6 +695,31 @@ fn write_alert_audit(store: &Store, event_name: &str, detail_json: Value) -> any
     let mut event = AuditEvent::new(local_actor(), event_name);
     event.ok = Some(true);
     event.detail_json = detail_json;
+    store.insert_audit(&event)?;
+    Ok(())
+}
+
+fn write_alert_delivery_audit(
+    store: &Store,
+    hook_type: &str,
+    ok: bool,
+    alert_count: usize,
+    bytes_written: usize,
+    dry_run: bool,
+    error_code: Option<&str>,
+) -> anyhow::Result<()> {
+    let mut event = AuditEvent::new(local_actor(), "alert.delivery");
+    event.ok = Some(ok);
+    let mut detail = Map::new();
+    detail.insert("ok".to_string(), json!(ok));
+    detail.insert("hook_type".to_string(), json!(hook_type));
+    detail.insert("alert_count".to_string(), json!(alert_count));
+    detail.insert("bytes_written".to_string(), json!(bytes_written));
+    detail.insert("dry_run".to_string(), json!(dry_run));
+    if let Some(error_code) = error_code {
+        detail.insert("error_code".to_string(), json!(error_code));
+    }
+    event.detail_json = Value::Object(detail);
     store.insert_audit(&event)?;
     Ok(())
 }

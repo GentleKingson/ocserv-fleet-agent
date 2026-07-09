@@ -2,8 +2,9 @@
 
 `ocfleet` currently implements one controller backend: local SQLite. Postgres is
 planned as an optional backend for larger fleets, longer history windows, and
-centralized audit queries, but it is not required and is not implemented in this
-slice.
+centralized audit queries, but it is not required. The optional feature in this
+slice is intentionally a compile-only scaffold whose `connect` function always
+returns unavailable.
 
 ## Current SQLite Contract
 
@@ -34,7 +35,7 @@ tables, or ocserv write operations.
 
 ## Store Abstraction Assessment
 
-The current `Store` API mixes:
+The current controller `Store` API still mixes:
 
 - schema migration and backup
 - SQLite-specific queries
@@ -50,9 +51,31 @@ A future abstraction should split these concerns:
 | `MigrationManager` | Backend-specific schema lifecycle, backup, and integrity checks. |
 | `AuditWriter` | Append audited mutation events with redaction guarantees. |
 
-The API should depend only on read interfaces where possible. Scheduler,
-retention, alert silence/resolve, enrollment, and endpoint lifecycle flows need
-writer interfaces and must keep audit mandatory.
+`ocfleet_cli::backend` now defines backend-neutral `StoreReader`, `StoreWriter`,
+`MigrationManager`, and `AuditWriter` contracts. The SQLite implementation uses
+SQL-level limits for bounded history reads and fails closed when dynamic JSON in
+legacy rows does not satisfy the bounded low-sensitive validator. The returned
+records are internal store records, not presentation DTOs; every CLI/API output
+consumer must still use its typed projection. `StoreWriter` deliberately
+exposes only mutation methods that already bind actor and audit in one transaction.
+
+The API retains a narrower `ApiReadStore` adapter for API projections;
+`ReadOnlyStore` opens SQLite with read-only/query-only flags, validates private
+database/sidecar files, checks schema version/tables/integrity, and never exposes
+a writer to routes. Consolidating this adapter with the neutral reader remains
+future work; SQLite is the only runtime backend.
+
+Scheduler, retention, alert silence/resolve, enrollment, and endpoint lifecycle
+flows are not all migrated to the writer trait. Future writer interfaces must
+keep actor/audit input mandatory and must not loosen private file checks or
+redaction.
+
+## Postgres Scaffold
+
+The `postgres-backend` feature is default-off. It defines only redacted
+connection-source configuration and an always-unavailable connection stub. It
+does not add a client dependency, SQL schema, migration, import, secret logging,
+or runtime selection. SQLite remains required for all current commands.
 
 ## SQLite-only Assumptions To Isolate
 

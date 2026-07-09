@@ -15,6 +15,41 @@ Exit codes are stable:
 
 JSON fields `status`, `exit_code`, `schema_version_expected`, `schema_version_actual`, `checks[].id`, `checks[].status`, and `checks[].details` are stable for scripts.
 
+## Doctor Common Failures
+
+### Symptoms
+
+`doctor` exits `1`, or `doctor --json` reports one or more checks with `status="error"`.
+
+### Common Causes
+
+- Controller SQLite file is missing, unreadable, not private, or has unsafe WAL/SHM sidecars.
+- Controller SecretKey is missing, invalid, symlinked, hardlinked, or group/world accessible.
+- The recorded schema version is newer than this binary supports.
+- A previous migration could not create its private backup or checksum.
+- Registry rows contain invalid or duplicated EndpointIDs.
+
+### Verification Commands
+
+```bash
+ocfleet --database /var/lib/ocfleet-controller/controller.sqlite --secret-key /var/lib/ocfleet-controller/controller.secret doctor --json
+ls -ld /var/lib/ocfleet-controller
+ls -l /var/lib/ocfleet-controller/controller.sqlite /var/lib/ocfleet-controller/controller.secret
+sqlite3 /var/lib/ocfleet-controller/controller.sqlite 'PRAGMA integrity_check;'
+```
+
+### Fix Steps
+
+Fix permissions first; do not delete or rewrite state to make `doctor` pass:
+
+```bash
+chmod 0700 /var/lib/ocfleet-controller
+chmod 0600 /var/lib/ocfleet-controller/controller.sqlite /var/lib/ocfleet-controller/controller.secret
+ocfleet --database /var/lib/ocfleet-controller/controller.sqlite --secret-key /var/lib/ocfleet-controller/controller.secret doctor
+```
+
+If a migration backup failed, inspect disk space and parent directory permissions, then rerun the same binary. Restore from a verified backup only if the database itself is damaged.
+
 ## EndpointID Mismatch
 
 ### Symptoms
@@ -47,6 +82,40 @@ ocfleet --database /var/lib/ocfleet-controller/controller.sqlite --secret-key /v
 - Controller audit: `event=rpc.completed`, `error_code=ENDPOINT_MISMATCH`.
 - Error details: `expected_endpoint_id`, `actual_remote_endpoint_id`.
 - Doctor checks: `registry.endpoint_id.parse`, `registry.peer_relationships`.
+
+## Node Disabled Or `NODE_DISABLED`
+
+### Symptoms
+
+`ocfleet ping <node>`, ocserv read-only commands, or scheduled jobs skip a registry entry with `NODE_DISABLED`.
+
+### Common Causes
+
+- The node was intentionally disabled with `ocfleet node disable <node-id>`.
+- A restored controller database contains older disabled state.
+- The wrong node ID was selected by a scheduler selector.
+
+### Verification Commands
+
+```bash
+ocfleet --database /var/lib/ocfleet-controller/controller.sqlite --secret-key /var/lib/ocfleet-controller/controller.secret node list
+ocfleet --database /var/lib/ocfleet-controller/controller.sqlite --secret-key /var/lib/ocfleet-controller/controller.secret node info hk-ocserv-01
+ocfleet --database /var/lib/ocfleet-controller/controller.sqlite --secret-key /var/lib/ocfleet-controller/controller.secret schedule job list
+```
+
+### Fix Steps
+
+Re-enable only after confirming the EndpointID is still trusted and expected:
+
+```bash
+ocfleet --database /var/lib/ocfleet-controller/controller.sqlite --secret-key /var/lib/ocfleet-controller/controller.secret trust diff --format json
+ocfleet --database /var/lib/ocfleet-controller/controller.sqlite --secret-key /var/lib/ocfleet-controller/controller.secret node enable hk-ocserv-01
+```
+
+### Logs And Metrics
+
+- Controller audit: `event=node.enable`, `event=node.disable`, or `error_code=NODE_DISABLED`.
+- Scheduler observations: skipped jobs retain low-sensitive node/method summaries only.
 
 ## Nonce Replay
 
@@ -138,7 +207,7 @@ ocfleet --database /var/lib/ocfleet-controller/controller.sqlite --secret-key /v
 - Agent audit: `error_code=REQUEST_EXPIRED`, `CLOCK_SKEW_EXCEEDED`, `INVALID_DEADLINE`, or `RPC_TIMEOUT`.
 - Timeout rejection audit: `event=rpc_rejected`, `stage=handshake_timeout` or `connection_idle_timeout`.
 
-## Unknown Peer
+## Unknown Peer Or `ENDPOINT_NOT_ALLOWED`
 
 ### Symptoms
 
@@ -188,6 +257,48 @@ sudo systemctl restart ocfleet-agent
 
 - Agent audit: `event=rpc_rejected`, `stage=connection_admission`, `error_code=ENDPOINT_NOT_ALLOWED`.
 - Fields: `remote_endpoint_id`, `reason`, `resource=connection`.
+
+## Endpoint Revoked, Quarantined, Or Rotated
+
+### Symptoms
+
+`trust diff` or controller RPC preflight reports `ENDPOINT_REVOKED`, `ENDPOINT_QUARANTINED`, `ENDPOINT_ROTATED`, or a generic inactive endpoint status.
+
+### Common Causes
+
+- The EndpointID was explicitly revoked or quarantined during incident response.
+- A node SecretKey was rotated and the registry still points to the old EndpointID.
+- A restored controller database contains stale lifecycle state.
+- An agent config still allows an old controller or peer EndpointID.
+
+### Verification Commands
+
+```bash
+ocfleet --database /var/lib/ocfleet-controller/controller.sqlite --secret-key /var/lib/ocfleet-controller/controller.secret trust diff --format json
+ocfleet --database /var/lib/ocfleet-controller/controller.sqlite --secret-key /var/lib/ocfleet-controller/controller.secret node list
+grep -n 'endpoint_id' /etc/ocfleet-agent/agent.toml
+```
+
+### Fix Steps
+
+Use explicit lifecycle commands; never rely on first contact to trust a new key:
+
+```bash
+ocfleet --database /var/lib/ocfleet-controller/controller.sqlite --secret-key /var/lib/ocfleet-controller/controller.secret endpoint rotate "$OLD_ENDPOINT_ID" --new-endpoint-id "$NEW_ENDPOINT_ID" --reason "planned key rotation"
+ocfleet --database /var/lib/ocfleet-controller/controller.sqlite --secret-key /var/lib/ocfleet-controller/controller.secret trust diff --format json
+```
+
+For compromise or investigation:
+
+```bash
+ocfleet --database /var/lib/ocfleet-controller/controller.sqlite --secret-key /var/lib/ocfleet-controller/controller.secret endpoint revoke "$ENDPOINT_ID" --reason "retired or compromised"
+ocfleet --database /var/lib/ocfleet-controller/controller.sqlite --secret-key /var/lib/ocfleet-controller/controller.secret endpoint quarantine "$ENDPOINT_ID" --reason "investigation"
+```
+
+### Logs And Metrics
+
+- Controller audit: `event=endpoint.rotate`, `event=endpoint.revoke`, or `event=endpoint.quarantine`.
+- Trust diff codes are low-sensitive and should not expose raw certificates, usernames, client IPs, or session IDs.
 
 ## Missing Path Authorization
 
@@ -245,7 +356,7 @@ sudo systemctl restart ocfleet-agent
 - Path fields: `root_request_id`, `path_target_endpoint_id`.
 - Controller audit: `method=probe.path.echo`, `ok=false`, `error_code=ENDPOINT_NOT_ALLOWED`.
 
-## Audit Durability Fallback
+## Audit Durability Fallback Or Audit Write Failed
 
 ### Symptoms
 
@@ -288,3 +399,81 @@ Replay is automatic. New RPCs and the periodic writer wakeup try to flush the sp
 - `audit_replayed`: spooled events flushed to primary.
 - `audit_flush_failures`: failed replay attempts.
 - `audit_oldest_age_seconds`: age of the oldest queued event, or `null`.
+
+## Scheduler No Matching Node
+
+### Symptoms
+
+`schedule run --once` completes with no RPCs executed, or a scheduled job repeatedly produces no observations for the expected nodes.
+
+### Common Causes
+
+- The job selector does not match any current registry row.
+- Matching nodes are disabled.
+- A `path-probe` job is missing `--source-node-id` or `--target-node-id`, or one of those nodes no longer exists.
+- The interval has not elapsed yet, so the job is not due.
+
+### Verification Commands
+
+```bash
+ocfleet --database /var/lib/ocfleet-controller/controller.sqlite --secret-key /var/lib/ocfleet-controller/controller.secret schedule status
+ocfleet --database /var/lib/ocfleet-controller/controller.sqlite --secret-key /var/lib/ocfleet-controller/controller.secret schedule job list
+ocfleet --database /var/lib/ocfleet-controller/controller.sqlite --secret-key /var/lib/ocfleet-controller/controller.secret node list
+```
+
+### Fix Steps
+
+Create selectors that match fixed registry fields only:
+
+```bash
+ocfleet --database /var/lib/ocfleet-controller/controller.sqlite --secret-key /var/lib/ocfleet-controller/controller.secret schedule job add --kind controller-ping --interval 5m --selector role=ocserv
+ocfleet --database /var/lib/ocfleet-controller/controller.sqlite --secret-key /var/lib/ocfleet-controller/controller.secret schedule run --once
+```
+
+For a path probe, use explicit source and target node IDs:
+
+```bash
+ocfleet --database /var/lib/ocfleet-controller/controller.sqlite --secret-key /var/lib/ocfleet-controller/controller.secret schedule job add --kind path-probe --interval 5m --source-node-id source-ocserv-01 --target-node-id target-ocserv-01
+```
+
+### Logs And Metrics
+
+- Controller audit: `event=scheduler.run.once`, `event=scheduler.job.add`.
+- Observation history stays low-sensitive: method, node ID, endpoint status/error code, duration, and summarized result class.
+
+## Alert Delivery Failed
+
+### Symptoms
+
+`alert deliver --hook <hook>` exits non-zero, or `alert test <hook>` reports a rejected hook.
+
+### Common Causes
+
+- The hook type is forbidden, such as `exec:`, `command:`, `shell:`, or `script:`.
+- Webhook hooks are planned but currently disabled.
+- A `jsonl_file:` hook points to an unsafe path, symlink, hardlink, or group/world-writable parent.
+- There are no open alert events to deliver.
+
+### Verification Commands
+
+```bash
+ocfleet --database /var/lib/ocfleet-controller/controller.sqlite --secret-key /var/lib/ocfleet-controller/controller.secret alert list --json
+ocfleet --database /var/lib/ocfleet-controller/controller.sqlite --secret-key /var/lib/ocfleet-controller/controller.secret alert test jsonl_file:/var/lib/ocfleet-controller/alerts.jsonl
+ocfleet --database /var/lib/ocfleet-controller/controller.sqlite --secret-key /var/lib/ocfleet-controller/controller.secret alert deliver --hook jsonl_file:/var/lib/ocfleet-controller/alerts.jsonl --dry-run
+```
+
+### Fix Steps
+
+Use only supported read-only alert delivery hooks:
+
+```bash
+sudo install -d -o "$USER" -g "$USER" -m 0700 /var/lib/ocfleet-controller
+ocfleet --database /var/lib/ocfleet-controller/controller.sqlite --secret-key /var/lib/ocfleet-controller/controller.secret alert deliver --hook jsonl_file:/var/lib/ocfleet-controller/alerts.jsonl
+```
+
+Do not replace a rejected hook with a shell/script wrapper. Keep webhook delivery disabled until a future signed, audited design explicitly enables it.
+
+### Logs And Metrics
+
+- Controller audit: `event=alert.deliver`, `event=alert.test`, `event=alert.silence`, or `event=alert.resolve`.
+- Alert payloads are redacted summaries and must not include usernames, client IPs, session IDs, certificate subjects, raw logs, or raw RPC bodies.

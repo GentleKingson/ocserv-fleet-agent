@@ -1,21 +1,39 @@
 # Install Guide
 
-This guide installs the `v0.1.0` read-only MVP on Linux with systemd. Commands assume two hosts:
+This guide installs the `v0.2.x` read-only MVP baseline on Linux with systemd. Commands assume two hosts:
 
 - controller host: runs the `ocfleet` CLI and stores controller SQLite state.
 - agent host: runs `ocfleet-agent` on an ocserv node.
 
 Replace placeholder EndpointIDs before running RPC smoke tests.
 
+For backup and hardening details, keep these guides next to this install runbook:
+
+- [Backup And Restore](backup-restore.md)
+- [Security Hardening](security-hardening.md)
+- [Troubleshooting](troubleshooting.md)
+
+## Local CLI/State Smoke
+
+Before packaging or upgrading a host, run the local smoke test from a clean checkout:
+
+```bash
+./scripts/smoke-local.sh
+```
+
+The script builds the workspace, creates a private temp controller state, generates a minimal agent config, and exercises controller-local CLI/state commands. It does not start a long-running agent, contact a real ocserv instance, or require a public iroh relay. Set `OCFLEET_SMOKE_KEEP_TEMP=1` only when you need to inspect the temporary files after a failure.
+
 ## Build And Verify Release Artifacts
 
 ```bash
 git clone https://github.com/GentleKingson/ocserv-fleet-agent.git
 cd ocserv-fleet-agent
-./scripts/build-release.sh v0.1.0
-./scripts/verify-checksums.sh dist/v0.1.0/SHA256SUMS
-cat dist/v0.1.0/SHA256SUMS
+./scripts/build-release.sh v0.2.0
+./scripts/verify-checksums.sh dist/v0.2.0/SHA256SUMS
+cat dist/v0.2.0/SHA256SUMS
 ```
+
+The manual `Release Draft` GitHub Actions workflow builds the same Linux `x86_64` and `aarch64` binary artifacts and uploads them with `SHA256SUMS` as workflow artifacts. It does not publish crates.io packages or create a GitHub Release.
 
 Install binaries:
 
@@ -23,8 +41,8 @@ Install binaries:
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
 ARCH="$(uname -m)"
 case "$ARCH" in arm64) ARCH="aarch64";; amd64) ARCH="x86_64";; esac
-sudo install -m 0755 "dist/v0.1.0/ocfleet-v0.1.0-$OS-$ARCH" /usr/local/bin/ocfleet
-sudo install -m 0755 "dist/v0.1.0/ocfleet-agent-v0.1.0-$OS-$ARCH" /usr/local/bin/ocfleet-agent
+sudo install -m 0755 "dist/v0.2.0/ocfleet-v0.2.0-$OS-$ARCH" /usr/local/bin/ocfleet
+sudo install -m 0755 "dist/v0.2.0/ocfleet-agent-v0.2.0-$OS-$ARCH" /usr/local/bin/ocfleet-agent
 ocfleet --help
 ocfleet-agent --help
 ```
@@ -253,6 +271,23 @@ After installing a new binary:
 ocfleet --database /var/lib/ocfleet-controller/controller.sqlite --secret-key /var/lib/ocfleet-controller/controller.secret doctor --json
 ```
 
+## Upgrade Flow
+
+Use this order for routine binary upgrades, with `OS` and `ARCH` set as in the install step above:
+
+```bash
+sudo systemctl stop ocfleet-agent
+sudo install -d -m 0700 /var/backups/ocfleet
+sqlite3 /var/lib/ocfleet-controller/controller.sqlite 'PRAGMA integrity_check;'
+sudo cp -a /var/lib/ocfleet-controller/controller.sqlite /var/backups/ocfleet/controller.sqlite.pre-upgrade.$(date -u +%Y%m%dT%H%M%SZ)
+sudo install -m 0755 "dist/v0.2.0/ocfleet-v0.2.0-$OS-$ARCH" /usr/local/bin/ocfleet
+sudo install -m 0755 "dist/v0.2.0/ocfleet-agent-v0.2.0-$OS-$ARCH" /usr/local/bin/ocfleet-agent
+ocfleet --database /var/lib/ocfleet-controller/controller.sqlite --secret-key /var/lib/ocfleet-controller/controller.secret doctor
+sudo systemctl start ocfleet-agent
+```
+
+Keep the controller SQLite backup until the new binary has passed `doctor`, expected controller-local smoke commands, and at least one low-sensitive read-only RPC smoke in your deployment.
+
 ## Smoke Tests
 
 Controller-only smoke:
@@ -279,7 +314,7 @@ ocfleet --database /var/lib/ocfleet-controller/controller.sqlite --secret-key /v
 ocfleet --database /var/lib/ocfleet-controller/controller.sqlite --secret-key /var/lib/ocfleet-controller/controller.secret probe ping hk-ocserv-01
 ```
 
-The production CLI intentionally does not accept host, port, relay, or arbitrary address flags in `v0.1.0`.
+The production CLI intentionally does not accept host, port, relay, or arbitrary address flags in `v0.2.x`.
 
 ## Uninstall And Cleanup
 

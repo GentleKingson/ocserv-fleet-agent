@@ -260,11 +260,19 @@ pub enum ScheduleCommand {
     Run {
         #[arg(long)]
         once: bool,
-        #[arg(long, default_value_t = 1)]
+        #[arg(
+            long,
+            default_value_t = 1,
+            help = "Maximum concurrent scheduler RPCs (1-32)"
+        )]
         max_concurrency: usize,
     },
     Daemon {
-        #[arg(long, default_value_t = 1)]
+        #[arg(
+            long,
+            default_value_t = 1,
+            help = "Maximum concurrent scheduler RPCs (1-32)"
+        )]
         max_concurrency: usize,
         #[arg(long, default_value_t = 60)]
         tick_seconds: u64,

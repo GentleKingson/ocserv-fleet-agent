@@ -1,28 +1,39 @@
 use anyhow::{Context, bail};
 use ocfleet_config::validation::validate_node_id;
 use ocfleet_protocol::DEFAULT_DEADLINE_MS;
+use ocfleet_protocol::error::ErrorCode;
 use ocfleet_protocol::method::{
     OCSERV_CERT_EXPIRY, OCSERV_CONFIG_FINGERPRINT, OCSERV_SERVICE_SUMMARY, OCSERV_SESSIONS_SUMMARY,
     OCSERV_VERSION, PROBE_CONTROLLER_PING, PROBE_PATH_ECHO,
 };
+use ocfleet_protocol::ocserv::{
+    OcservCertExpiryResponse, OcservConfigFingerprintResponse, OcservServiceSummaryResponse,
+    OcservSessionsSummaryResponse, OcservVersionResponse,
+};
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
-use std::path::Path;
+use std::collections::HashMap;
+use std::future::Future;
+use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Instant;
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
+use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 use crate::args::{ScheduleCommand, ScheduleJobCommand, ScheduleJobKind};
 use crate::audit::AuditEvent;
 use crate::controller_rpc::{
-    CONTROLLER_RPC_RESULT_CLASS, ControllerRpcOutcome, ControllerRpcRunner, FixedControllerRpc,
-    OCSERV_RESULT_CLASS, OcservRpcOutcome, elapsed_ms, error_code_name, execute_fixed_node_rpc,
-    hash_json_value, inactive_endpoint_status, low_sensitive_ocserv_observation_summary,
-    write_rpc_audit,
+    CONTROLLER_RPC_RESULT_CLASS, FixedControllerRpc, OCSERV_RESULT_CLASS, OcservRpcOutcome,
+    RpcAuditRecord, RpcCommandFailure, elapsed_ms, error_code_name, execute_fixed_node_rpc,
+    hash_json_value, inactive_endpoint_status, low_sensitive_fixed_rpc_summary,
+    low_sensitive_ocserv_observation_summary, ocserv_failure_detail, write_rpc_audit,
 };
 use crate::input_validation::{local_actor, validate_selector};
 use crate::store::{
-    InvalidObservabilityJobRecord, ObservabilityJobLoadResult, ObservabilityJobRecord,
+    InvalidObservabilityJobRecord, NodeRecord, ObservabilityJobLoadResult, ObservabilityJobRecord,
     ObservabilityRunInsert, ProbeObservationInsert, Store,
 };
 
@@ -33,7 +44,9 @@ const MIN_INTERVAL_SECONDS: u64 = 60;
 const MAX_INTERVAL_SECONDS: u64 = 24 * 60 * 60;
 const MIN_TICK_SECONDS: u64 = 10;
 const MAX_TICK_SECONDS: u64 = 60 * 60;
-const MAX_SUPPORTED_CONCURRENCY: usize = 1;
+pub const MAX_ALLOWED_CONCURRENCY: usize = 32;
+const DEFAULT_PER_NODE_CONCURRENCY: usize = 1;
+const DEFAULT_RPC_BUDGET_PER_TICK: usize = MAX_ALLOWED_CONCURRENCY * MAX_TARGETS_PER_JOB;
 const MAX_TARGETS_PER_JOB: usize = 50;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,17 +67,126 @@ struct RunStats {
     failed_observations: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SchedulerLimits {
+    max_concurrency: usize,
+    per_node_concurrency: usize,
+    per_method_concurrency: usize,
+    rpc_budget_per_tick: usize,
+}
+
+impl SchedulerLimits {
+    fn from_max_concurrency(max_concurrency: usize) -> anyhow::Result<Self> {
+        validate_scheduler_concurrency(max_concurrency)?;
+        Ok(Self {
+            max_concurrency,
+            per_node_concurrency: DEFAULT_PER_NODE_CONCURRENCY,
+            per_method_concurrency: max_concurrency,
+            rpc_budget_per_tick: DEFAULT_RPC_BUDGET_PER_TICK,
+        })
+    }
+}
+
+struct SchedulerTickContext<'a> {
+    store: &'a Store,
+    secret_key_path: &'a Path,
+    limits: SchedulerLimits,
+    rpc_budget_remaining: &'a mut usize,
+}
+
 #[derive(Debug, Clone)]
 struct TargetNode {
     node_id: String,
 }
 
-struct OcservObservationContext<'a> {
-    store: &'a Store,
-    run_id: &'a str,
-    node_id: &'a str,
-    endpoint_id: Option<&'a str>,
+#[derive(Debug, Clone)]
+struct ResolvedSchedulerTask {
+    job_id: String,
+    run_id: String,
+    kind: StoredJobKind,
+    node: NodeRecord,
+    rpc: SchedulerTaskRpc,
+    method_key: String,
+    ordinal: usize,
+}
+
+#[derive(Debug, Clone)]
+enum SchedulerTaskRpc {
+    Fixed(FixedControllerRpc),
+    OcservStatusBundle,
+    PathProbe {
+        target_node_id: String,
+        target_endpoint_id: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct SchedulerObservationOutcome {
+    node_id: Option<String>,
+    endpoint_id: Option<String>,
+    method: String,
+    ok: bool,
+    error_code: Option<String>,
     duration_ms: u64,
+    result_class: String,
+    summary_json: Value,
+}
+
+#[derive(Debug, Clone)]
+struct SchedulerTaskOutcome {
+    task: ResolvedSchedulerTask,
+    observations: Vec<SchedulerObservationOutcome>,
+    rpc_audits: Vec<RpcAuditRecord>,
+}
+
+impl SchedulerTaskOutcome {
+    fn from_observations(
+        task: ResolvedSchedulerTask,
+        observations: Vec<SchedulerObservationOutcome>,
+        rpc_audits: Vec<RpcAuditRecord>,
+    ) -> Self {
+        Self {
+            task,
+            observations,
+            rpc_audits,
+        }
+    }
+
+    #[cfg(test)]
+    fn all_observations_ok(&self) -> bool {
+        self.observations.iter().all(|observation| observation.ok)
+    }
+
+    fn sort_key(&self) -> (&str, &str, &str, usize) {
+        (
+            self.task.job_id.as_str(),
+            self.task.node.node_id.as_str(),
+            self.task.method_key.as_str(),
+            self.task.ordinal,
+        )
+    }
+}
+
+trait SchedulerTaskExecutor: Clone + Send + Sync + 'static {
+    fn execute(
+        &self,
+        task: ResolvedSchedulerTask,
+    ) -> Pin<Box<dyn Future<Output = SchedulerTaskOutcome> + Send>>;
+}
+
+#[derive(Clone)]
+struct ProductionSchedulerTaskExecutor {
+    secret_key_path: Arc<PathBuf>,
+}
+
+impl SchedulerTaskExecutor for ProductionSchedulerTaskExecutor {
+    fn execute(
+        &self,
+        task: ResolvedSchedulerTask,
+    ) -> Pin<Box<dyn Future<Output = SchedulerTaskOutcome> + Send>> {
+        let secret_key_path = Arc::clone(&self.secret_key_path);
+        Box::pin(async move { execute_production_scheduler_task(secret_key_path, task).await })
+    }
 }
 
 pub fn parse_interval_seconds(value: &str) -> anyhow::Result<u64> {
@@ -104,8 +226,8 @@ fn validate_scheduler_concurrency(max_concurrency: usize) -> anyhow::Result<()> 
     if max_concurrency == 0 {
         bail!("--max-concurrency must be greater than zero");
     }
-    if max_concurrency > MAX_SUPPORTED_CONCURRENCY {
-        bail!("scheduler currently supports --max-concurrency=1");
+    if max_concurrency > MAX_ALLOWED_CONCURRENCY {
+        bail!("--max-concurrency must be between 1 and {MAX_ALLOWED_CONCURRENCY}");
     }
     Ok(())
 }
@@ -367,7 +489,14 @@ async fn run_due_jobs_once(
     secret_key_path: &Path,
     max_concurrency: usize,
 ) -> anyhow::Result<RunStats> {
-    validate_scheduler_concurrency(max_concurrency)?;
+    let limits = SchedulerLimits::from_max_concurrency(max_concurrency)?;
+    let mut rpc_budget_remaining = limits.rpc_budget_per_tick;
+    let mut tick_context = SchedulerTickContext {
+        store,
+        secret_key_path,
+        limits,
+        rpc_budget_remaining: &mut rpc_budget_remaining,
+    };
     let jobs = store.list_observability_jobs_tolerant()?;
     let now = OffsetDateTime::now_utc();
     let mut stats = RunStats {
@@ -417,7 +546,7 @@ async fn run_due_jobs_once(
             continue;
         }
         stats.due_jobs += 1;
-        let job_stats = match run_job(store, secret_key_path, &job).await {
+        let job_stats = match run_job(&mut tick_context, &job).await {
             Ok(job_stats) => job_stats,
             Err(_) => {
                 record_invalid_scheduler_job_observation(store, &job, "INVALID_JOB_CONFIGURATION")?;
@@ -460,8 +589,7 @@ fn update_job_after_tick(store: &Store, job: &ObservabilityJobRecord) -> anyhow:
 }
 
 async fn run_job(
-    store: &Store,
-    secret_key_path: &Path,
+    tick_context: &mut SchedulerTickContext<'_>,
     job: &ObservabilityJobRecord,
 ) -> anyhow::Result<RunStats> {
     let kind = stored_job_kind(&job.kind)?;
@@ -477,28 +605,34 @@ async fn run_job(
     };
     let started_at = now_rfc3339();
     let run_id = format!("run-{}", Uuid::new_v4().simple());
-    store.insert_observability_run(&ObservabilityRunInsert {
-        run_id: run_id.clone(),
-        job_id: Some(job.job_id.clone()),
-        started_at: started_at.clone(),
-        finished_at: None,
-        status: "running".to_string(),
-        triggered_by: "scheduler.run.once".to_string(),
-        summary_json: json!({
-            "job_id": job.job_id,
-            "kind": job.kind,
-            "result_class": SCHEDULER_RESULT_CLASS,
-        }),
-    })?;
+    tick_context
+        .store
+        .insert_observability_run(&ObservabilityRunInsert {
+            run_id: run_id.clone(),
+            job_id: Some(job.job_id.clone()),
+            started_at: started_at.clone(),
+            finished_at: None,
+            status: "running".to_string(),
+            triggered_by: "scheduler.run.once".to_string(),
+            summary_json: json!({
+                "job_id": job.job_id,
+                "kind": job.kind,
+                "result_class": SCHEDULER_RESULT_CLASS,
+            }),
+        })?;
 
-    let stats =
-        match run_job_after_start(store, secret_key_path, job, kind, selector, &run_id).await {
-            Ok(stats) => stats,
-            Err(err) => {
-                finish_failed_observability_run(store, &run_id, job, "SCHEDULER_JOB_INVALID")?;
-                return Err(err);
-            }
-        };
+    let stats = match run_job_after_start(tick_context, job, kind, selector, &run_id).await {
+        Ok(stats) => stats,
+        Err(err) => {
+            finish_failed_observability_run(
+                tick_context.store,
+                &run_id,
+                job,
+                "SCHEDULER_JOB_INVALID",
+            )?;
+            return Err(err);
+        }
+    };
 
     let finished_at = now_rfc3339();
     let status = if stats.observations == 0 {
@@ -508,7 +642,7 @@ async fn run_job(
     } else {
         "failed"
     };
-    store.finish_observability_run(
+    tick_context.store.finish_observability_run(
         &run_id,
         &finished_at,
         status,
@@ -525,8 +659,7 @@ async fn run_job(
 }
 
 async fn run_job_after_start(
-    store: &Store,
-    secret_key_path: &Path,
+    tick_context: &mut SchedulerTickContext<'_>,
     job: &ObservabilityJobRecord,
     kind: StoredJobKind,
     selector: Option<String>,
@@ -535,29 +668,985 @@ async fn run_job_after_start(
     let mut stats = RunStats::default();
     match kind {
         StoredJobKind::PathProbe => {
-            run_path_probe_job(store, secret_key_path, job, run_id, &mut stats).await?
+            run_path_probe_job(tick_context, job, run_id, &mut stats).await?
         }
         StoredJobKind::ControllerPing
         | StoredJobKind::OcservStatus
         | StoredJobKind::OcservCert
         | StoredJobKind::OcservSessions => {
             let targets = resolve_node_targets(
-                store,
+                tick_context.store,
                 selector.as_deref().context("validated selector missing")?,
             )?;
             if targets.is_empty() {
-                record_missing_target_observation(store, run_id, job, "NODE_NOT_FOUND")?;
+                record_missing_target_observation(
+                    tick_context.store,
+                    run_id,
+                    job,
+                    "NODE_NOT_FOUND",
+                )?;
                 stats.observations += 1;
                 stats.failed_observations += 1;
             } else {
-                for target in targets {
-                    run_node_target_job(store, secret_key_path, kind, run_id, target, &mut stats)
-                        .await?;
+                let mut tasks = Vec::new();
+                let mut outcomes = Vec::new();
+                for (ordinal, target) in targets.into_iter().enumerate() {
+                    match prepare_node_target_task(
+                        tick_context.store,
+                        job,
+                        kind,
+                        run_id,
+                        target,
+                        ordinal,
+                    ) {
+                        PreparedSchedulerTask::Task(task) => tasks.push(task),
+                        PreparedSchedulerTask::Outcome(outcome) => outcomes.push(outcome),
+                    }
                 }
+                outcomes.extend(limit_tasks_by_rpc_budget(
+                    job,
+                    run_id,
+                    kind,
+                    &mut tasks,
+                    tick_context.rpc_budget_remaining,
+                ));
+                let executor = ProductionSchedulerTaskExecutor {
+                    secret_key_path: Arc::new(tick_context.secret_key_path.to_path_buf()),
+                };
+                outcomes.extend(
+                    execute_resolved_scheduler_tasks(tasks, tick_context.limits, executor).await,
+                );
+                write_scheduler_task_outcomes(tick_context.store, outcomes, &mut stats)?;
             }
         }
     }
     Ok(stats)
+}
+
+enum PreparedSchedulerTask {
+    Task(ResolvedSchedulerTask),
+    Outcome(SchedulerTaskOutcome),
+}
+
+fn prepare_node_target_task(
+    store: &Store,
+    job: &ObservabilityJobRecord,
+    kind: StoredJobKind,
+    run_id: &str,
+    target: TargetNode,
+    ordinal: usize,
+) -> PreparedSchedulerTask {
+    let method_key = scheduler_method_key(kind).to_string();
+    let rpc = scheduler_rpc_for_kind(kind);
+    match load_scheduler_task_node(store, &target.node_id, kind) {
+        Ok(node) => PreparedSchedulerTask::Task(ResolvedSchedulerTask {
+            job_id: job.job_id.clone(),
+            run_id: run_id.to_string(),
+            kind,
+            node,
+            rpc,
+            method_key,
+            ordinal,
+        }),
+        Err(failure) => PreparedSchedulerTask::Outcome(preflight_failure_outcome(
+            job,
+            run_id,
+            kind,
+            &target.node_id,
+            ordinal,
+            method_key,
+            failure,
+        )),
+    }
+}
+
+fn scheduler_rpc_for_kind(kind: StoredJobKind) -> SchedulerTaskRpc {
+    match kind {
+        StoredJobKind::ControllerPing => {
+            SchedulerTaskRpc::Fixed(FixedControllerRpc::ProbeControllerPing)
+        }
+        StoredJobKind::OcservStatus => SchedulerTaskRpc::OcservStatusBundle,
+        StoredJobKind::OcservCert => SchedulerTaskRpc::Fixed(FixedControllerRpc::OcservCertExpiry),
+        StoredJobKind::OcservSessions => {
+            SchedulerTaskRpc::Fixed(FixedControllerRpc::OcservSessionsSummary)
+        }
+        StoredJobKind::PathProbe => unreachable!("path probe tasks carry an explicit target"),
+    }
+}
+
+fn scheduler_method_key(kind: StoredJobKind) -> &'static str {
+    match kind {
+        StoredJobKind::ControllerPing => PROBE_CONTROLLER_PING,
+        StoredJobKind::OcservStatus => "ocserv.status.bundle",
+        StoredJobKind::OcservCert => OCSERV_CERT_EXPIRY,
+        StoredJobKind::OcservSessions => OCSERV_SESSIONS_SUMMARY,
+        StoredJobKind::PathProbe => PROBE_PATH_ECHO,
+    }
+}
+
+struct SchedulerPreflightFailure {
+    code: ErrorCode,
+    endpoint_id: Option<String>,
+    detail_json: Value,
+}
+
+fn load_scheduler_task_node(
+    store: &Store,
+    node_id: &str,
+    kind: StoredJobKind,
+) -> Result<NodeRecord, SchedulerPreflightFailure> {
+    validate_node_id(node_id).map_err(|err| SchedulerPreflightFailure {
+        code: ErrorCode::ParamsInvalid,
+        endpoint_id: None,
+        detail_json: scheduler_preflight_detail(kind, &err.to_string(), None),
+    })?;
+    let node = store
+        .get_node(node_id)
+        .map_err(|_| SchedulerPreflightFailure {
+            code: ErrorCode::SqliteError,
+            endpoint_id: None,
+            detail_json: scheduler_preflight_detail(kind, "controller registry read failed", None),
+        })?;
+    let Some(node) = node else {
+        let message = format!("node not found: {node_id}");
+        return Err(SchedulerPreflightFailure {
+            code: ErrorCode::NodeNotFound,
+            endpoint_id: None,
+            detail_json: scheduler_preflight_detail(kind, &message, None),
+        });
+    };
+    if !node.enabled {
+        let message = format!("node disabled: {node_id}");
+        return Err(SchedulerPreflightFailure {
+            code: ErrorCode::NodeDisabled,
+            endpoint_id: Some(node.endpoint_id),
+            detail_json: scheduler_preflight_detail(kind, &message, None),
+        });
+    }
+    if let Some(status) = inactive_endpoint_status(store, &node.endpoint_id).map_err(|_| {
+        SchedulerPreflightFailure {
+            code: ErrorCode::SqliteError,
+            endpoint_id: Some(node.endpoint_id.clone()),
+            detail_json: scheduler_preflight_detail(
+                kind,
+                "controller endpoint trust read failed",
+                None,
+            ),
+        }
+    })? {
+        let message = format!("endpoint is not active: status={}", status.as_str());
+        return Err(SchedulerPreflightFailure {
+            code: ErrorCode::EndpointNotAllowed,
+            endpoint_id: Some(node.endpoint_id),
+            detail_json: scheduler_preflight_detail(kind, &message, Some(status.as_str())),
+        });
+    }
+    Ok(node)
+}
+
+fn scheduler_preflight_detail(
+    kind: StoredJobKind,
+    message: &str,
+    endpoint_status: Option<&str>,
+) -> Value {
+    let mut detail = json!({
+        "message": message,
+        "result_class": scheduler_result_class_for_stored_kind(kind),
+    });
+    if let Some(status) = endpoint_status {
+        detail["endpoint_status"] = json!(status);
+    }
+    detail
+}
+
+fn preflight_failure_outcome(
+    job: &ObservabilityJobRecord,
+    run_id: &str,
+    kind: StoredJobKind,
+    node_id: &str,
+    ordinal: usize,
+    method_key: String,
+    failure: SchedulerPreflightFailure,
+) -> SchedulerTaskOutcome {
+    let task = ResolvedSchedulerTask {
+        job_id: job.job_id.clone(),
+        run_id: run_id.to_string(),
+        kind,
+        node: NodeRecord {
+            node_id: node_id.to_string(),
+            endpoint_id: failure.endpoint_id.clone().unwrap_or_default(),
+            name: node_id.to_string(),
+            region: String::new(),
+            role: String::new(),
+            enabled: false,
+        },
+        rpc: scheduler_rpc_for_preflight_failure(kind),
+        method_key,
+        ordinal,
+    };
+    let error_code = error_code_name(&failure.code);
+    let observations = preflight_failure_observations(&task, &failure.detail_json, &error_code);
+    let rpc_audits = match kind {
+        StoredJobKind::ControllerPing => vec![RpcAuditRecord {
+            actor: local_actor(),
+            node_id: node_id.to_string(),
+            endpoint_id: failure.endpoint_id,
+            method: PROBE_CONTROLLER_PING.to_string(),
+            request_id: None,
+            params_hash: hash_json_value(&json!({})),
+            ok: false,
+            error_code: Some(failure.code),
+            duration_ms: 0,
+            detail_json: failure.detail_json,
+        }],
+        StoredJobKind::OcservStatus
+        | StoredJobKind::OcservCert
+        | StoredJobKind::OcservSessions
+        | StoredJobKind::PathProbe => Vec::new(),
+    };
+    SchedulerTaskOutcome::from_observations(task, observations, rpc_audits)
+}
+
+fn scheduler_rpc_for_preflight_failure(kind: StoredJobKind) -> SchedulerTaskRpc {
+    match kind {
+        StoredJobKind::PathProbe => SchedulerTaskRpc::PathProbe {
+            target_node_id: String::new(),
+            target_endpoint_id: String::new(),
+        },
+        _ => scheduler_rpc_for_kind(kind),
+    }
+}
+
+fn preflight_failure_observations(
+    task: &ResolvedSchedulerTask,
+    detail_json: &Value,
+    error_code: &str,
+) -> Vec<SchedulerObservationOutcome> {
+    let methods = match task.kind {
+        StoredJobKind::OcservStatus => vec![
+            OCSERV_SERVICE_SUMMARY,
+            OCSERV_VERSION,
+            OCSERV_SESSIONS_SUMMARY,
+            OCSERV_CONFIG_FINGERPRINT,
+        ],
+        StoredJobKind::ControllerPing
+        | StoredJobKind::OcservCert
+        | StoredJobKind::OcservSessions
+        | StoredJobKind::PathProbe => vec![first_method_for_stored_kind(task.kind)],
+    };
+    methods
+        .into_iter()
+        .map(|method| SchedulerObservationOutcome {
+            node_id: Some(task.node.node_id.clone()),
+            endpoint_id: (!task.node.endpoint_id.is_empty()).then(|| task.node.endpoint_id.clone()),
+            method: method.to_string(),
+            ok: false,
+            error_code: Some(error_code.to_string()),
+            duration_ms: 0,
+            result_class: scheduler_result_class_for_stored_kind(task.kind).to_string(),
+            summary_json: detail_json.clone(),
+        })
+        .collect()
+}
+
+fn limit_tasks_by_rpc_budget(
+    job: &ObservabilityJobRecord,
+    run_id: &str,
+    kind: StoredJobKind,
+    tasks: &mut Vec<ResolvedSchedulerTask>,
+    rpc_budget_remaining: &mut usize,
+) -> Vec<SchedulerTaskOutcome> {
+    if tasks.len() <= *rpc_budget_remaining {
+        *rpc_budget_remaining -= tasks.len();
+        return Vec::new();
+    }
+
+    let skipped_tasks = tasks.len() - *rpc_budget_remaining;
+    tasks.truncate(*rpc_budget_remaining);
+    *rpc_budget_remaining = 0;
+    vec![budget_exceeded_outcome(job, run_id, kind, skipped_tasks)]
+}
+
+fn budget_exceeded_outcome(
+    job: &ObservabilityJobRecord,
+    run_id: &str,
+    kind: StoredJobKind,
+    skipped_tasks: usize,
+) -> SchedulerTaskOutcome {
+    let method = first_method_for_stored_kind(kind);
+    let task = ResolvedSchedulerTask {
+        job_id: job.job_id.clone(),
+        run_id: run_id.to_string(),
+        kind,
+        node: NodeRecord {
+            node_id: "<scheduler-budget>".to_string(),
+            endpoint_id: String::new(),
+            name: "<scheduler-budget>".to_string(),
+            region: String::new(),
+            role: String::new(),
+            enabled: false,
+        },
+        rpc: scheduler_rpc_for_preflight_failure(kind),
+        method_key: method.to_string(),
+        ordinal: usize::MAX,
+    };
+    SchedulerTaskOutcome::from_observations(
+        task,
+        vec![SchedulerObservationOutcome {
+            node_id: None,
+            endpoint_id: None,
+            method: method.to_string(),
+            ok: false,
+            error_code: Some("SCHEDULER_RPC_BUDGET_EXCEEDED".to_string()),
+            duration_ms: 0,
+            result_class: SCHEDULER_RESULT_CLASS.to_string(),
+            summary_json: json!({
+                "message": "scheduler rpc budget exceeded",
+                "job_id": job.job_id,
+                "kind": job.kind,
+                "skipped_tasks": skipped_tasks,
+                "result_class": SCHEDULER_RESULT_CLASS,
+            }),
+        }],
+        Vec::new(),
+    )
+}
+
+async fn execute_resolved_scheduler_tasks<E>(
+    tasks: Vec<ResolvedSchedulerTask>,
+    limits: SchedulerLimits,
+    executor: E,
+) -> Vec<SchedulerTaskOutcome>
+where
+    E: SchedulerTaskExecutor,
+{
+    if tasks.is_empty() {
+        return Vec::new();
+    }
+
+    let global = Arc::new(Semaphore::new(limits.max_concurrency));
+    let mut node_semaphores = HashMap::new();
+    let mut method_semaphores = HashMap::new();
+    for task in &tasks {
+        node_semaphores
+            .entry(task.node.node_id.clone())
+            .or_insert_with(|| Arc::new(Semaphore::new(limits.per_node_concurrency)));
+        method_semaphores
+            .entry(task.method_key.clone())
+            .or_insert_with(|| Arc::new(Semaphore::new(limits.per_method_concurrency)));
+    }
+
+    let mut handles = Vec::with_capacity(tasks.len());
+    for task in tasks {
+        let task_for_join = task.clone();
+        let executor = executor.clone();
+        let global = Arc::clone(&global);
+        let node = Arc::clone(
+            node_semaphores
+                .get(&task.node.node_id)
+                .expect("node semaphore exists"),
+        );
+        let method = Arc::clone(
+            method_semaphores
+                .get(&task.method_key)
+                .expect("method semaphore exists"),
+        );
+        let handle = tokio::spawn(async move {
+            let node_permit = match node.acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => {
+                    return scheduler_task_runtime_failure(task, "SCHEDULER_NODE_LIMIT_CLOSED");
+                }
+            };
+            let method_permit = match method.acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => {
+                    drop(node_permit);
+                    return scheduler_task_runtime_failure(task, "SCHEDULER_METHOD_LIMIT_CLOSED");
+                }
+            };
+            let global_permit = match global.acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => {
+                    drop(method_permit);
+                    drop(node_permit);
+                    return scheduler_task_runtime_failure(task, "SCHEDULER_GLOBAL_LIMIT_CLOSED");
+                }
+            };
+            let outcome = executor.execute(task).await;
+            drop(global_permit);
+            drop(method_permit);
+            drop(node_permit);
+            outcome
+        });
+        handles.push((task_for_join, handle));
+    }
+
+    let mut outcomes = Vec::with_capacity(handles.len());
+    for (task, handle) in handles {
+        match handle.await {
+            Ok(outcome) => outcomes.push(outcome),
+            Err(_) => outcomes.push(scheduler_task_runtime_failure(
+                task,
+                "SCHEDULER_TASK_JOIN_FAILED",
+            )),
+        }
+    }
+    outcomes.sort_by(|left, right| left.sort_key().cmp(&right.sort_key()));
+    outcomes
+}
+
+fn scheduler_task_runtime_failure(
+    task: ResolvedSchedulerTask,
+    error_code: &str,
+) -> SchedulerTaskOutcome {
+    SchedulerTaskOutcome::from_observations(
+        task.clone(),
+        vec![SchedulerObservationOutcome {
+            node_id: Some(task.node.node_id.clone()),
+            endpoint_id: Some(task.node.endpoint_id.clone()),
+            method: first_method_for_stored_kind(task.kind).to_string(),
+            ok: false,
+            error_code: Some(error_code.to_string()),
+            duration_ms: 0,
+            result_class: SCHEDULER_RESULT_CLASS.to_string(),
+            summary_json: json!({
+                "message": "scheduler task runtime failed",
+                "result_class": SCHEDULER_RESULT_CLASS,
+                "error_code": error_code,
+            }),
+        }],
+        Vec::new(),
+    )
+}
+
+fn write_scheduler_task_outcomes(
+    store: &Store,
+    outcomes: Vec<SchedulerTaskOutcome>,
+    stats: &mut RunStats,
+) -> anyhow::Result<()> {
+    for outcome in outcomes {
+        for audit in outcome.rpc_audits {
+            write_rpc_audit(store, audit)?;
+        }
+        for observation in outcome.observations {
+            store.insert_probe_observation(&ProbeObservationInsert {
+                observation_id: observation_id(),
+                run_id: Some(outcome.task.run_id.clone()),
+                node_id: observation.node_id,
+                endpoint_id: observation.endpoint_id,
+                method: observation.method,
+                ok: Some(observation.ok),
+                error_code: observation.error_code,
+                duration_ms: Some(observation.duration_ms),
+                observed_at: now_rfc3339(),
+                expires_at: None,
+                result_class: observation.result_class,
+                summary_json: observation.summary_json,
+            })?;
+            update_observation_stats(stats, observation.ok);
+        }
+    }
+    Ok(())
+}
+
+async fn execute_production_scheduler_task(
+    secret_key_path: Arc<PathBuf>,
+    task: ResolvedSchedulerTask,
+) -> SchedulerTaskOutcome {
+    match task.rpc.clone() {
+        SchedulerTaskRpc::Fixed(rpc) => {
+            execute_scheduler_fixed_rpc(secret_key_path, task, rpc).await
+        }
+        SchedulerTaskRpc::OcservStatusBundle => {
+            execute_scheduler_ocserv_status_bundle(secret_key_path, task).await
+        }
+        SchedulerTaskRpc::PathProbe {
+            target_node_id,
+            target_endpoint_id,
+        } => {
+            execute_scheduler_path_probe(secret_key_path, task, target_node_id, target_endpoint_id)
+                .await
+        }
+    }
+}
+
+async fn execute_scheduler_fixed_rpc(
+    secret_key_path: Arc<PathBuf>,
+    task: ResolvedSchedulerTask,
+    rpc: FixedControllerRpc,
+) -> SchedulerTaskOutcome {
+    let started = Instant::now();
+    let method = rpc.method();
+    let params_hash = hash_json_value(&rpc.params());
+    let result_class = result_class_for_method(method);
+    match execute_fixed_node_rpc(&secret_key_path, &task.node, rpc).await {
+        Ok(success) => fixed_rpc_success_outcome(task, method, success, params_hash, started),
+        Err(failure) => fixed_rpc_failure_outcome(
+            task,
+            method,
+            failure,
+            params_hash,
+            elapsed_ms(started),
+            result_class,
+        ),
+    }
+}
+
+fn fixed_rpc_success_outcome(
+    task: ResolvedSchedulerTask,
+    method: &'static str,
+    success: crate::controller_rpc::RpcCommandSuccess,
+    params_hash: String,
+    started: Instant,
+) -> SchedulerTaskOutcome {
+    let duration_ms = elapsed_ms(started);
+    let result_class = result_class_for_method(method);
+    match scheduler_success_summary(method, &success.result) {
+        Ok(summary_json) => {
+            let audit_detail = if result_class == OCSERV_RESULT_CLASS {
+                json!({"result_class": OCSERV_RESULT_CLASS})
+            } else {
+                summary_json.clone()
+            };
+            SchedulerTaskOutcome::from_observations(
+                task.clone(),
+                vec![SchedulerObservationOutcome {
+                    node_id: Some(task.node.node_id.clone()),
+                    endpoint_id: Some(task.node.endpoint_id.clone()),
+                    method: method.to_string(),
+                    ok: true,
+                    error_code: None,
+                    duration_ms,
+                    result_class: result_class.to_string(),
+                    summary_json,
+                }],
+                vec![RpcAuditRecord {
+                    actor: local_actor(),
+                    node_id: task.node.node_id.clone(),
+                    endpoint_id: Some(task.node.endpoint_id.clone()),
+                    method: method.to_string(),
+                    request_id: Some(success.request_id),
+                    params_hash,
+                    ok: true,
+                    error_code: None,
+                    duration_ms,
+                    detail_json: audit_detail,
+                }],
+            )
+        }
+        Err(_) => {
+            let failure = RpcCommandFailure::new(
+                ErrorCode::InvalidResponse,
+                "fixed RPC response summary is invalid",
+                Some(success.request_id),
+                json!({
+                    "message": "fixed RPC response summary is invalid",
+                    "result_class": result_class,
+                    "error_code": "INVALID_RESPONSE",
+                }),
+            );
+            fixed_rpc_failure_outcome(
+                task,
+                method,
+                failure,
+                params_hash,
+                duration_ms,
+                result_class,
+            )
+        }
+    }
+}
+
+fn fixed_rpc_failure_outcome(
+    task: ResolvedSchedulerTask,
+    method: &'static str,
+    failure: RpcCommandFailure,
+    params_hash: String,
+    duration_ms: u64,
+    result_class: &'static str,
+) -> SchedulerTaskOutcome {
+    let detail_json = if result_class == OCSERV_RESULT_CLASS {
+        ocserv_failure_detail(&failure)
+    } else {
+        failure.detail_json.clone()
+    };
+    SchedulerTaskOutcome::from_observations(
+        task.clone(),
+        vec![SchedulerObservationOutcome {
+            node_id: Some(task.node.node_id.clone()),
+            endpoint_id: Some(task.node.endpoint_id.clone()),
+            method: method.to_string(),
+            ok: false,
+            error_code: Some(error_code_name(&failure.code)),
+            duration_ms,
+            result_class: result_class.to_string(),
+            summary_json: detail_json.clone(),
+        }],
+        vec![RpcAuditRecord {
+            actor: local_actor(),
+            node_id: task.node.node_id.clone(),
+            endpoint_id: Some(task.node.endpoint_id.clone()),
+            method: method.to_string(),
+            request_id: failure.request_id,
+            params_hash,
+            ok: false,
+            error_code: Some(failure.code),
+            duration_ms,
+            detail_json,
+        }],
+    )
+}
+
+async fn execute_scheduler_ocserv_status_bundle(
+    secret_key_path: Arc<PathBuf>,
+    task: ResolvedSchedulerTask,
+) -> SchedulerTaskOutcome {
+    let started = Instant::now();
+    let service = execute_scheduler_ocserv_subrpc::<OcservServiceSummaryResponse>(
+        &secret_key_path,
+        &task.node,
+        OCSERV_SERVICE_SUMMARY,
+    )
+    .await;
+    let version = execute_scheduler_ocserv_subrpc::<OcservVersionResponse>(
+        &secret_key_path,
+        &task.node,
+        OCSERV_VERSION,
+    )
+    .await;
+    let sessions = execute_scheduler_ocserv_subrpc::<OcservSessionsSummaryResponse>(
+        &secret_key_path,
+        &task.node,
+        OCSERV_SESSIONS_SUMMARY,
+    )
+    .await;
+    let config_fingerprint = execute_scheduler_ocserv_subrpc::<OcservConfigFingerprintResponse>(
+        &secret_key_path,
+        &task.node,
+        OCSERV_CONFIG_FINGERPRINT,
+    )
+    .await;
+    let duration_ms = elapsed_ms(started);
+    let mut audits = Vec::new();
+    let mut observations = Vec::new();
+    append_ocserv_subrpc_outcome(
+        &task,
+        OCSERV_SERVICE_SUMMARY,
+        service,
+        duration_ms,
+        &mut audits,
+        &mut observations,
+    );
+    append_ocserv_subrpc_outcome(
+        &task,
+        OCSERV_VERSION,
+        version,
+        duration_ms,
+        &mut audits,
+        &mut observations,
+    );
+    append_ocserv_subrpc_outcome(
+        &task,
+        OCSERV_SESSIONS_SUMMARY,
+        sessions,
+        duration_ms,
+        &mut audits,
+        &mut observations,
+    );
+    append_ocserv_subrpc_outcome(
+        &task,
+        OCSERV_CONFIG_FINGERPRINT,
+        config_fingerprint,
+        duration_ms,
+        &mut audits,
+        &mut observations,
+    );
+    SchedulerTaskOutcome::from_observations(task, observations, audits)
+}
+
+struct SchedulerOcservSubrpcOutcome<T> {
+    rpc_outcome: OcservRpcOutcome<T>,
+    audit: Option<RpcAuditRecord>,
+}
+
+fn append_ocserv_subrpc_outcome<T>(
+    task: &ResolvedSchedulerTask,
+    method: &'static str,
+    outcome: SchedulerOcservSubrpcOutcome<T>,
+    duration_ms: u64,
+    audits: &mut Vec<RpcAuditRecord>,
+    observations: &mut Vec<SchedulerObservationOutcome>,
+) where
+    T: Serialize,
+{
+    if let Some(audit) = outcome.audit {
+        audits.push(audit);
+    }
+    observations.push(ocserv_subrpc_observation(
+        task,
+        method,
+        outcome.rpc_outcome,
+        duration_ms,
+    ));
+}
+
+async fn execute_scheduler_ocserv_subrpc<T>(
+    secret_key_path: &Path,
+    node: &NodeRecord,
+    method: &'static str,
+) -> SchedulerOcservSubrpcOutcome<T>
+where
+    T: DeserializeOwned,
+{
+    let started = Instant::now();
+    let rpc = FixedControllerRpc::from_method_without_params(method)
+        .expect("scheduler ocserv method is fixed");
+    let params_hash = hash_json_value(&rpc.params());
+    match execute_fixed_node_rpc(secret_key_path, node, rpc).await {
+        Ok(success) => match serde_json::from_value::<T>(success.result) {
+            Ok(value) => SchedulerOcservSubrpcOutcome {
+                rpc_outcome: OcservRpcOutcome::Available(value),
+                audit: Some(RpcAuditRecord {
+                    actor: local_actor(),
+                    node_id: node.node_id.clone(),
+                    endpoint_id: Some(node.endpoint_id.clone()),
+                    method: method.to_string(),
+                    request_id: Some(success.request_id),
+                    params_hash,
+                    ok: true,
+                    error_code: None,
+                    duration_ms: elapsed_ms(started),
+                    detail_json: json!({"result_class": OCSERV_RESULT_CLASS}),
+                }),
+            },
+            Err(_) => {
+                let failure = RpcCommandFailure::new(
+                    ErrorCode::InvalidResponse,
+                    "ocserv readonly response schema is invalid",
+                    Some(success.request_id),
+                    json!({
+                        "message": "ocserv readonly response schema is invalid",
+                        "result_class": OCSERV_RESULT_CLASS,
+                        "error_code": "INVALID_RESPONSE",
+                    }),
+                );
+                let detail_json = ocserv_failure_detail(&failure);
+                SchedulerOcservSubrpcOutcome {
+                    rpc_outcome: OcservRpcOutcome::Unavailable {
+                        method,
+                        code: failure.code.clone(),
+                    },
+                    audit: Some(RpcAuditRecord {
+                        actor: local_actor(),
+                        node_id: node.node_id.clone(),
+                        endpoint_id: Some(node.endpoint_id.clone()),
+                        method: method.to_string(),
+                        request_id: failure.request_id,
+                        params_hash,
+                        ok: false,
+                        error_code: Some(failure.code),
+                        duration_ms: elapsed_ms(started),
+                        detail_json,
+                    }),
+                }
+            }
+        },
+        Err(failure) => {
+            let detail_json = ocserv_failure_detail(&failure);
+            SchedulerOcservSubrpcOutcome {
+                rpc_outcome: OcservRpcOutcome::Unavailable {
+                    method,
+                    code: failure.code.clone(),
+                },
+                audit: Some(RpcAuditRecord {
+                    actor: local_actor(),
+                    node_id: node.node_id.clone(),
+                    endpoint_id: Some(node.endpoint_id.clone()),
+                    method: method.to_string(),
+                    request_id: failure.request_id,
+                    params_hash,
+                    ok: false,
+                    error_code: Some(failure.code),
+                    duration_ms: elapsed_ms(started),
+                    detail_json,
+                }),
+            }
+        }
+    }
+}
+
+fn ocserv_subrpc_observation<T>(
+    task: &ResolvedSchedulerTask,
+    method: &'static str,
+    outcome: OcservRpcOutcome<T>,
+    duration_ms: u64,
+) -> SchedulerObservationOutcome
+where
+    T: Serialize,
+{
+    let (ok, error_code, summary_json) = match outcome {
+        OcservRpcOutcome::Available(value) => {
+            let value = serde_json::to_value(value).unwrap_or_else(|_| json!({}));
+            (
+                true,
+                None,
+                low_sensitive_ocserv_observation_summary(method, &value).unwrap_or_else(|_| {
+                    json!({
+                        "message": "ocserv observation summary is invalid",
+                        "method": method,
+                        "result_class": OCSERV_RESULT_CLASS,
+                    })
+                }),
+            )
+        }
+        OcservRpcOutcome::Unavailable { code, .. } => (
+            false,
+            Some(error_code_name(&code)),
+            json!({
+                "message": "ocserv status sub-rpc unavailable",
+                "method": method,
+                "result_class": OCSERV_RESULT_CLASS,
+            }),
+        ),
+    };
+    SchedulerObservationOutcome {
+        node_id: Some(task.node.node_id.clone()),
+        endpoint_id: Some(task.node.endpoint_id.clone()),
+        method: method.to_string(),
+        ok,
+        error_code,
+        duration_ms,
+        result_class: OCSERV_RESULT_CLASS.to_string(),
+        summary_json,
+    }
+}
+
+async fn execute_scheduler_path_probe(
+    secret_key_path: Arc<PathBuf>,
+    task: ResolvedSchedulerTask,
+    target_node_id: String,
+    target_endpoint_id: String,
+) -> SchedulerTaskOutcome {
+    let started = Instant::now();
+    let rpc = FixedControllerRpc::ProbePathEcho {
+        target_agent_endpoint_id: target_endpoint_id.clone(),
+    };
+    let params_hash = hash_json_value(&rpc.params());
+    match execute_fixed_node_rpc(&secret_key_path, &task.node, rpc).await {
+        Ok(success) => {
+            let duration_ms = elapsed_ms(started);
+            SchedulerTaskOutcome::from_observations(
+                task.clone(),
+                vec![SchedulerObservationOutcome {
+                    node_id: Some(task.node.node_id.clone()),
+                    endpoint_id: Some(task.node.endpoint_id.clone()),
+                    method: PROBE_PATH_ECHO.to_string(),
+                    ok: true,
+                    error_code: None,
+                    duration_ms,
+                    result_class: CONTROLLER_RPC_RESULT_CLASS.to_string(),
+                    summary_json: json!({
+                        "request_id": success.request_id,
+                        "target_node_id": target_node_id,
+                        "target_endpoint_id": target_endpoint_id,
+                        "result_class": CONTROLLER_RPC_RESULT_CLASS,
+                    }),
+                }],
+                vec![RpcAuditRecord {
+                    actor: local_actor(),
+                    node_id: task.node.node_id.clone(),
+                    endpoint_id: Some(task.node.endpoint_id.clone()),
+                    method: PROBE_PATH_ECHO.to_string(),
+                    request_id: Some(success.request_id),
+                    params_hash,
+                    ok: true,
+                    error_code: None,
+                    duration_ms,
+                    detail_json: json!({
+                        "result_class": CONTROLLER_RPC_RESULT_CLASS,
+                        "target_node_id": target_node_id,
+                        "target_endpoint_id": target_endpoint_id,
+                    }),
+                }],
+            )
+        }
+        Err(failure) => {
+            let duration_ms = elapsed_ms(started);
+            SchedulerTaskOutcome::from_observations(
+                task.clone(),
+                vec![SchedulerObservationOutcome {
+                    node_id: Some(task.node.node_id.clone()),
+                    endpoint_id: Some(task.node.endpoint_id.clone()),
+                    method: PROBE_PATH_ECHO.to_string(),
+                    ok: false,
+                    error_code: Some(error_code_name(&failure.code)),
+                    duration_ms,
+                    result_class: CONTROLLER_RPC_RESULT_CLASS.to_string(),
+                    summary_json: json!({
+                        "message": "path probe failed",
+                        "result_class": CONTROLLER_RPC_RESULT_CLASS,
+                    }),
+                }],
+                vec![RpcAuditRecord {
+                    actor: local_actor(),
+                    node_id: task.node.node_id.clone(),
+                    endpoint_id: Some(task.node.endpoint_id.clone()),
+                    method: PROBE_PATH_ECHO.to_string(),
+                    request_id: failure.request_id,
+                    params_hash,
+                    ok: false,
+                    error_code: Some(failure.code),
+                    duration_ms,
+                    detail_json: failure.detail_json,
+                }],
+            )
+        }
+    }
+}
+
+fn scheduler_success_summary(method: &str, result: &Value) -> anyhow::Result<Value> {
+    match method {
+        OCSERV_CERT_EXPIRY => {
+            let response: OcservCertExpiryResponse = serde_json::from_value(result.clone())?;
+            Ok(json!({ "cert_count": response.certs.len() }))
+        }
+        OCSERV_SESSIONS_SUMMARY => {
+            let response: OcservSessionsSummaryResponse = serde_json::from_value(result.clone())?;
+            Ok(json!({ "sessions": response.sessions }))
+        }
+        _ => low_sensitive_fixed_rpc_summary(method, result),
+    }
+}
+
+fn result_class_for_method(method: &str) -> &'static str {
+    match method {
+        OCSERV_SERVICE_SUMMARY
+        | OCSERV_VERSION
+        | OCSERV_SESSIONS_SUMMARY
+        | OCSERV_CERT_EXPIRY
+        | OCSERV_CONFIG_FINGERPRINT => OCSERV_RESULT_CLASS,
+        _ => CONTROLLER_RPC_RESULT_CLASS,
+    }
+}
+
+fn first_method_for_stored_kind(kind: StoredJobKind) -> &'static str {
+    match kind {
+        StoredJobKind::ControllerPing => PROBE_CONTROLLER_PING,
+        StoredJobKind::OcservStatus => OCSERV_SERVICE_SUMMARY,
+        StoredJobKind::OcservCert => OCSERV_CERT_EXPIRY,
+        StoredJobKind::OcservSessions => OCSERV_SESSIONS_SUMMARY,
+        StoredJobKind::PathProbe => PROBE_PATH_ECHO,
+    }
+}
+
+fn scheduler_result_class_for_stored_kind(kind: StoredJobKind) -> &'static str {
+    match kind {
+        StoredJobKind::OcservStatus | StoredJobKind::OcservCert | StoredJobKind::OcservSessions => {
+            OCSERV_RESULT_CLASS
+        }
+        StoredJobKind::ControllerPing | StoredJobKind::PathProbe => CONTROLLER_RPC_RESULT_CLASS,
+    }
 }
 
 fn finish_failed_observability_run(
@@ -581,70 +1670,18 @@ fn finish_failed_observability_run(
     Ok(())
 }
 
-async fn run_node_target_job(
-    store: &Store,
-    secret_key_path: &Path,
-    kind: StoredJobKind,
-    run_id: &str,
-    target: TargetNode,
-    stats: &mut RunStats,
-) -> anyhow::Result<()> {
-    let runner = ControllerRpcRunner::new(store, secret_key_path);
-    match kind {
-        StoredJobKind::ControllerPing => {
-            let outcome = runner
-                .run_fixed_node_rpc(&target.node_id, PROBE_CONTROLLER_PING)
-                .await;
-            record_controller_outcome(store, run_id, &outcome)?;
-            update_observation_stats(stats, outcome.ok);
-        }
-        StoredJobKind::OcservStatus => {
-            let outcome = runner.run_ocserv_status_bundle(&target.node_id).await;
-            let context = OcservObservationContext {
-                store,
-                run_id,
-                node_id: &outcome.node_id,
-                endpoint_id: outcome.endpoint_id.as_deref(),
-                duration_ms: outcome.duration_ms,
-            };
-            record_ocserv_suboutcome(&context, OCSERV_SERVICE_SUMMARY, &outcome.service, stats)?;
-            record_ocserv_suboutcome(&context, OCSERV_VERSION, &outcome.version, stats)?;
-            record_ocserv_suboutcome(&context, OCSERV_SESSIONS_SUMMARY, &outcome.sessions, stats)?;
-            record_ocserv_suboutcome(
-                &context,
-                OCSERV_CONFIG_FINGERPRINT,
-                &outcome.config_fingerprint,
-                stats,
-            )?;
-        }
-        StoredJobKind::OcservCert => {
-            let outcome = runner.run_ocserv_cert(&target.node_id).await;
-            record_controller_outcome(store, run_id, &outcome)?;
-            update_observation_stats(stats, outcome.ok);
-        }
-        StoredJobKind::OcservSessions => {
-            let outcome = runner.run_ocserv_sessions_summary(&target.node_id).await;
-            record_controller_outcome(store, run_id, &outcome)?;
-            update_observation_stats(stats, outcome.ok);
-        }
-        StoredJobKind::PathProbe => unreachable!("path probes use explicit source and target pair"),
-    }
-    Ok(())
-}
-
 async fn run_path_probe_job(
-    store: &Store,
-    secret_key_path: &Path,
+    tick_context: &mut SchedulerTickContext<'_>,
     job: &ObservabilityJobRecord,
     run_id: &str,
     stats: &mut RunStats,
 ) -> anyhow::Result<()> {
     let (source_node_id, target_node_id) = explicit_pair(job)?;
-    let source = store.get_node(&source_node_id)?;
-    let target = store.get_node(&target_node_id)?;
+    let source = tick_context.store.get_node(&source_node_id)?;
+    let target = tick_context.store.get_node(&target_node_id)?;
     let Some(source) = source else {
         record_path_probe_preflight_observation(
-            store,
+            tick_context.store,
             run_id,
             &source_node_id,
             None,
@@ -655,7 +1692,7 @@ async fn run_path_probe_job(
     };
     if !source.enabled {
         record_path_probe_preflight_observation(
-            store,
+            tick_context.store,
             run_id,
             &source.node_id,
             Some(&source.endpoint_id),
@@ -664,9 +1701,9 @@ async fn run_path_probe_job(
         update_observation_stats(stats, false);
         return Ok(());
     }
-    if let Some(status) = inactive_endpoint_status(store, &source.endpoint_id)? {
+    if let Some(status) = inactive_endpoint_status(tick_context.store, &source.endpoint_id)? {
         record_path_probe_preflight_observation(
-            store,
+            tick_context.store,
             run_id,
             &source.node_id,
             Some(&source.endpoint_id),
@@ -677,7 +1714,7 @@ async fn run_path_probe_job(
     }
     let Some(target) = target else {
         record_path_probe_preflight_observation(
-            store,
+            tick_context.store,
             run_id,
             &source.node_id,
             Some(&source.endpoint_id),
@@ -688,7 +1725,7 @@ async fn run_path_probe_job(
     };
     if !target.enabled {
         record_path_probe_preflight_observation(
-            store,
+            tick_context.store,
             run_id,
             &source.node_id,
             Some(&source.endpoint_id),
@@ -697,9 +1734,9 @@ async fn run_path_probe_job(
         update_observation_stats(stats, false);
         return Ok(());
     }
-    if let Some(status) = inactive_endpoint_status(store, &target.endpoint_id)? {
+    if let Some(status) = inactive_endpoint_status(tick_context.store, &target.endpoint_id)? {
         record_path_probe_target_preflight_observation(
-            store,
+            tick_context.store,
             run_id,
             &source.node_id,
             &source.endpoint_id,
@@ -711,97 +1748,30 @@ async fn run_path_probe_job(
         return Ok(());
     }
 
-    let started = Instant::now();
-    let params = json!({ "target_agent_endpoint_id": target.endpoint_id.clone() });
-    let params_hash = hash_json_value(&params);
-    let result = execute_fixed_node_rpc(
-        secret_key_path,
-        &source,
-        FixedControllerRpc::ProbePathEcho {
-            target_agent_endpoint_id: target.endpoint_id.clone(),
+    let mut tasks = vec![ResolvedSchedulerTask {
+        job_id: job.job_id.clone(),
+        run_id: run_id.to_string(),
+        kind: StoredJobKind::PathProbe,
+        node: source,
+        rpc: SchedulerTaskRpc::PathProbe {
+            target_node_id: target.node_id,
+            target_endpoint_id: target.endpoint_id,
         },
-    )
-    .await;
-    match result {
-        Ok(success) => {
-            let duration_ms = elapsed_ms(started);
-            write_rpc_audit(
-                store,
-                crate::controller_rpc::RpcAuditRecord {
-                    actor: local_actor(),
-                    node_id: source.node_id.clone(),
-                    endpoint_id: Some(source.endpoint_id.clone()),
-                    method: PROBE_PATH_ECHO.to_string(),
-                    request_id: Some(success.request_id.clone()),
-                    params_hash,
-                    ok: true,
-                    error_code: None,
-                    duration_ms,
-                    detail_json: json!({
-                        "result_class": CONTROLLER_RPC_RESULT_CLASS,
-                        "target_node_id": target.node_id,
-                        "target_endpoint_id": target.endpoint_id,
-                    }),
-                },
-            )?;
-            store.insert_probe_observation(&ProbeObservationInsert {
-                observation_id: observation_id(),
-                run_id: Some(run_id.to_string()),
-                node_id: Some(source.node_id),
-                endpoint_id: Some(source.endpoint_id),
-                method: PROBE_PATH_ECHO.to_string(),
-                ok: Some(true),
-                error_code: None,
-                duration_ms: Some(duration_ms),
-                observed_at: now_rfc3339(),
-                expires_at: None,
-                result_class: CONTROLLER_RPC_RESULT_CLASS.to_string(),
-                summary_json: json!({
-                    "request_id": success.request_id,
-                    "target_node_id": target.node_id,
-                    "target_endpoint_id": target.endpoint_id,
-                    "result_class": CONTROLLER_RPC_RESULT_CLASS,
-                }),
-            })?;
-            update_observation_stats(stats, true);
-        }
-        Err(failure) => {
-            let duration_ms = elapsed_ms(started);
-            write_rpc_audit(
-                store,
-                crate::controller_rpc::RpcAuditRecord {
-                    actor: local_actor(),
-                    node_id: source.node_id.clone(),
-                    endpoint_id: Some(source.endpoint_id.clone()),
-                    method: PROBE_PATH_ECHO.to_string(),
-                    request_id: failure.request_id.clone(),
-                    params_hash,
-                    ok: false,
-                    error_code: Some(failure.code.clone()),
-                    duration_ms,
-                    detail_json: failure.detail_json.clone(),
-                },
-            )?;
-            store.insert_probe_observation(&ProbeObservationInsert {
-                observation_id: observation_id(),
-                run_id: Some(run_id.to_string()),
-                node_id: Some(source.node_id),
-                endpoint_id: Some(source.endpoint_id),
-                method: PROBE_PATH_ECHO.to_string(),
-                ok: Some(false),
-                error_code: Some(error_code_name(&failure.code)),
-                duration_ms: Some(duration_ms),
-                observed_at: now_rfc3339(),
-                expires_at: None,
-                result_class: CONTROLLER_RPC_RESULT_CLASS.to_string(),
-                summary_json: json!({
-                    "message": "path probe failed",
-                    "result_class": CONTROLLER_RPC_RESULT_CLASS,
-                }),
-            })?;
-            update_observation_stats(stats, false);
-        }
-    }
+        method_key: PROBE_PATH_ECHO.to_string(),
+        ordinal: 0,
+    }];
+    let mut outcomes = limit_tasks_by_rpc_budget(
+        job,
+        run_id,
+        StoredJobKind::PathProbe,
+        &mut tasks,
+        tick_context.rpc_budget_remaining,
+    );
+    let executor = ProductionSchedulerTaskExecutor {
+        secret_key_path: Arc::new(tick_context.secret_key_path.to_path_buf()),
+    };
+    outcomes.extend(execute_resolved_scheduler_tasks(tasks, tick_context.limits, executor).await);
+    write_scheduler_task_outcomes(tick_context.store, outcomes, stats)?;
     Ok(())
 }
 
@@ -871,76 +1841,6 @@ fn resolve_node_targets(store: &Store, selector: &str) -> anyhow::Result<Vec<Tar
         return Ok(targets);
     }
     bail!("selector must use role=<role> or node_id=<node-id>")
-}
-
-fn record_controller_outcome(
-    store: &Store,
-    run_id: &str,
-    outcome: &ControllerRpcOutcome,
-) -> anyhow::Result<()> {
-    store.insert_probe_observation(&ProbeObservationInsert {
-        observation_id: observation_id(),
-        run_id: Some(run_id.to_string()),
-        node_id: Some(outcome.node_id.clone()),
-        endpoint_id: outcome.endpoint_id.clone(),
-        method: outcome.method.clone(),
-        ok: Some(outcome.ok),
-        error_code: outcome.error_code.clone(),
-        duration_ms: Some(outcome.duration_ms),
-        observed_at: now_rfc3339(),
-        expires_at: None,
-        result_class: outcome.result_class.clone(),
-        summary_json: outcome.summary_json.clone(),
-    })?;
-    Ok(())
-}
-
-fn record_ocserv_suboutcome<T>(
-    context: &OcservObservationContext<'_>,
-    method: &'static str,
-    outcome: &OcservRpcOutcome<T>,
-    stats: &mut RunStats,
-) -> anyhow::Result<()>
-where
-    T: Serialize,
-{
-    let (ok, error_code, summary_json) = match outcome {
-        OcservRpcOutcome::Available(value) => {
-            let value = serde_json::to_value(value)?;
-            (
-                true,
-                None,
-                low_sensitive_ocserv_observation_summary(method, &value)?,
-            )
-        }
-        OcservRpcOutcome::Unavailable { code, .. } => (
-            false,
-            Some(error_code_name(code)),
-            json!({
-                "message": "ocserv status sub-rpc unavailable",
-                "method": method,
-                "result_class": OCSERV_RESULT_CLASS,
-            }),
-        ),
-    };
-    context
-        .store
-        .insert_probe_observation(&ProbeObservationInsert {
-            observation_id: observation_id(),
-            run_id: Some(context.run_id.to_string()),
-            node_id: Some(context.node_id.to_string()),
-            endpoint_id: context.endpoint_id.map(ToOwned::to_owned),
-            method: method.to_string(),
-            ok: Some(ok),
-            error_code,
-            duration_ms: Some(context.duration_ms),
-            observed_at: now_rfc3339(),
-            expires_at: None,
-            result_class: OCSERV_RESULT_CLASS.to_string(),
-            summary_json,
-        })?;
-    update_observation_stats(stats, ok);
-    Ok(())
 }
 
 fn record_missing_target_observation(
@@ -1202,5 +2102,348 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::{HashMap, HashSet};
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration as StdDuration;
+
+    #[derive(Clone, Default)]
+    struct TrackingExecutor {
+        state: Arc<Mutex<TrackingState>>,
+        delay: StdDuration,
+        fail_nodes: Arc<HashSet<String>>,
+    }
+
+    #[derive(Default)]
+    struct TrackingState {
+        in_flight: usize,
+        global_peak: usize,
+        active_by_node: HashMap<String, usize>,
+        peak_by_node: HashMap<String, usize>,
+        active_by_method: HashMap<String, usize>,
+        peak_by_method: HashMap<String, usize>,
+    }
+
+    impl TrackingExecutor {
+        fn with_delay(delay: StdDuration) -> Self {
+            Self {
+                delay,
+                ..Self::default()
+            }
+        }
+
+        fn failing_node(delay: StdDuration, node_id: &str) -> Self {
+            Self {
+                delay,
+                fail_nodes: Arc::new(HashSet::from([node_id.to_string()])),
+                ..Self::default()
+            }
+        }
+
+        fn global_peak(&self) -> usize {
+            self.state.lock().expect("tracking state").global_peak
+        }
+
+        fn node_peak(&self, node_id: &str) -> usize {
+            self.state
+                .lock()
+                .expect("tracking state")
+                .peak_by_node
+                .get(node_id)
+                .copied()
+                .unwrap_or(0)
+        }
+
+        fn method_peak(&self, method: &str) -> usize {
+            self.state
+                .lock()
+                .expect("tracking state")
+                .peak_by_method
+                .get(method)
+                .copied()
+                .unwrap_or(0)
+        }
+    }
+
+    impl SchedulerTaskExecutor for TrackingExecutor {
+        fn execute(
+            &self,
+            task: ResolvedSchedulerTask,
+        ) -> Pin<Box<dyn Future<Output = SchedulerTaskOutcome> + Send>> {
+            let state = Arc::clone(&self.state);
+            let delay = self.delay;
+            let fail_nodes = Arc::clone(&self.fail_nodes);
+            Box::pin(async move {
+                {
+                    let mut state = state.lock().expect("tracking state");
+                    state.in_flight += 1;
+                    state.global_peak = state.global_peak.max(state.in_flight);
+
+                    let node_active = {
+                        let active = state
+                            .active_by_node
+                            .entry(task.node.node_id.clone())
+                            .or_insert(0);
+                        *active += 1;
+                        *active
+                    };
+                    let node_peak = state
+                        .peak_by_node
+                        .entry(task.node.node_id.clone())
+                        .or_insert(0);
+                    *node_peak = (*node_peak).max(node_active);
+
+                    let method_active = {
+                        let active = state
+                            .active_by_method
+                            .entry(task.method_key.clone())
+                            .or_insert(0);
+                        *active += 1;
+                        *active
+                    };
+                    let method_peak = state
+                        .peak_by_method
+                        .entry(task.method_key.clone())
+                        .or_insert(0);
+                    *method_peak = (*method_peak).max(method_active);
+                }
+
+                tokio::time::sleep(delay).await;
+
+                {
+                    let mut state = state.lock().expect("tracking state");
+                    state.in_flight -= 1;
+                    *state
+                        .active_by_node
+                        .get_mut(&task.node.node_id)
+                        .expect("active node") -= 1;
+                    *state
+                        .active_by_method
+                        .get_mut(&task.method_key)
+                        .expect("active method") -= 1;
+                }
+
+                let ok = !fail_nodes.contains(&task.node.node_id);
+                SchedulerTaskOutcome::from_observations(
+                    task.clone(),
+                    vec![SchedulerObservationOutcome {
+                        node_id: Some(task.node.node_id.clone()),
+                        endpoint_id: Some(task.node.endpoint_id.clone()),
+                        method: task.method_key.clone(),
+                        ok,
+                        error_code: (!ok).then(|| "FAKE_RPC_FAILED".to_string()),
+                        duration_ms: 1,
+                        result_class: CONTROLLER_RPC_RESULT_CLASS.to_string(),
+                        summary_json: json!({"result_class": CONTROLLER_RPC_RESULT_CLASS}),
+                    }],
+                    Vec::new(),
+                )
+            })
+        }
+    }
+
+    fn test_task(job_id: &str, node_id: &str, method: &'static str) -> ResolvedSchedulerTask {
+        ResolvedSchedulerTask {
+            job_id: job_id.to_string(),
+            run_id: format!("run-{job_id}"),
+            kind: StoredJobKind::ControllerPing,
+            node: NodeRecord {
+                node_id: node_id.to_string(),
+                endpoint_id: format!("{node_id}-endpoint"),
+                name: node_id.to_string(),
+                region: "hk".to_string(),
+                role: "ocserv".to_string(),
+                enabled: true,
+            },
+            rpc: SchedulerTaskRpc::Fixed(FixedControllerRpc::ProbeControllerPing),
+            method_key: method.to_string(),
+            ordinal: 0,
+        }
+    }
+
+    fn test_job(job_id: &str) -> ObservabilityJobRecord {
+        ObservabilityJobRecord {
+            job_id: job_id.to_string(),
+            kind: "controller-ping".to_string(),
+            selector_json: json!({"selector": "role=ocserv"}),
+            pair_selector_json: None,
+            interval_seconds: 60,
+            jitter_seconds: 0,
+            timeout_ms: DEFAULT_DEADLINE_MS,
+            enabled: true,
+            next_run_at: None,
+            last_run_at: None,
+            created_at: "2026-07-09T00:00:00Z".to_string(),
+            updated_at: "2026-07-09T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn scheduler_rpc_budget_truncates_tasks_and_reports_skipped_work() {
+        let job = test_job("job-a");
+        let mut tasks = (0..3)
+            .map(|index| test_task("job-a", &format!("node-{index}"), PROBE_CONTROLLER_PING))
+            .collect::<Vec<_>>();
+        let mut budget = 1;
+
+        let outcomes = limit_tasks_by_rpc_budget(
+            &job,
+            "run-job-a",
+            StoredJobKind::ControllerPing,
+            &mut tasks,
+            &mut budget,
+        );
+
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(budget, 0);
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(
+            outcomes[0].observations[0].error_code.as_deref(),
+            Some("SCHEDULER_RPC_BUDGET_EXCEEDED")
+        );
+        assert_eq!(outcomes[0].observations[0].summary_json["skipped_tasks"], 2);
+    }
+
+    #[tokio::test]
+    async fn scheduler_executor_enforces_global_max_concurrency() {
+        let tasks = (0..8)
+            .map(|index| test_task("job-a", &format!("node-{index}"), PROBE_CONTROLLER_PING))
+            .collect::<Vec<_>>();
+        let executor = TrackingExecutor::with_delay(StdDuration::from_millis(20));
+        let limits = SchedulerLimits {
+            max_concurrency: 3,
+            per_node_concurrency: 1,
+            per_method_concurrency: 3,
+            rpc_budget_per_tick: 100,
+        };
+
+        let outcomes = execute_resolved_scheduler_tasks(tasks, limits, executor.clone()).await;
+
+        assert_eq!(outcomes.len(), 8);
+        assert!(
+            outcomes
+                .iter()
+                .all(SchedulerTaskOutcome::all_observations_ok)
+        );
+        assert!(executor.global_peak() <= 3);
+    }
+
+    #[tokio::test]
+    async fn scheduler_executor_enforces_per_node_concurrency_one() {
+        let tasks = (0..5)
+            .map(|index| {
+                let mut task = test_task("job-a", "same-node", PROBE_CONTROLLER_PING);
+                task.ordinal = index;
+                task
+            })
+            .collect::<Vec<_>>();
+        let executor = TrackingExecutor::with_delay(StdDuration::from_millis(20));
+        let limits = SchedulerLimits {
+            max_concurrency: 5,
+            per_node_concurrency: 1,
+            per_method_concurrency: 5,
+            rpc_budget_per_tick: 100,
+        };
+
+        let outcomes = execute_resolved_scheduler_tasks(tasks, limits, executor.clone()).await;
+
+        assert_eq!(outcomes.len(), 5);
+        assert_eq!(executor.node_peak("same-node"), 1);
+    }
+
+    #[tokio::test]
+    async fn scheduler_executor_enforces_per_method_cap() {
+        let tasks = (0..6)
+            .map(|index| test_task("job-a", &format!("node-{index}"), PROBE_CONTROLLER_PING))
+            .collect::<Vec<_>>();
+        let executor = TrackingExecutor::with_delay(StdDuration::from_millis(20));
+        let limits = SchedulerLimits {
+            max_concurrency: 6,
+            per_node_concurrency: 1,
+            per_method_concurrency: 2,
+            rpc_budget_per_tick: 100,
+        };
+
+        let outcomes = execute_resolved_scheduler_tasks(tasks, limits, executor.clone()).await;
+
+        assert_eq!(outcomes.len(), 6);
+        assert!(executor.method_peak(PROBE_CONTROLLER_PING) <= 2);
+    }
+
+    #[tokio::test]
+    async fn scheduler_executor_keeps_partial_failures_and_stable_order() {
+        let tasks = vec![
+            test_task("job-b", "node-2", PROBE_CONTROLLER_PING),
+            test_task("job-a", "node-1", PROBE_CONTROLLER_PING),
+            test_task("job-a", "node-0", PROBE_CONTROLLER_PING),
+        ];
+        let executor = TrackingExecutor::failing_node(StdDuration::from_millis(5), "node-1");
+        let limits = SchedulerLimits {
+            max_concurrency: 3,
+            per_node_concurrency: 1,
+            per_method_concurrency: 3,
+            rpc_budget_per_tick: 100,
+        };
+
+        let outcomes = execute_resolved_scheduler_tasks(tasks, limits, executor).await;
+
+        let ordered_nodes = outcomes
+            .iter()
+            .map(|outcome| outcome.task.node.node_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ordered_nodes, ["node-0", "node-1", "node-2"]);
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| !outcome.all_observations_ok())
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduler_executor_parallel_wall_clock_is_lower_than_serial() {
+        let tasks = (0..8)
+            .map(|index| test_task("job-a", &format!("node-{index}"), PROBE_CONTROLLER_PING))
+            .collect::<Vec<_>>();
+        let executor = TrackingExecutor::with_delay(StdDuration::from_millis(35));
+        let serial_limits = SchedulerLimits {
+            max_concurrency: 1,
+            per_node_concurrency: 1,
+            per_method_concurrency: 1,
+            rpc_budget_per_tick: 100,
+        };
+        let parallel_limits = SchedulerLimits {
+            max_concurrency: 4,
+            per_node_concurrency: 1,
+            per_method_concurrency: 4,
+            rpc_budget_per_tick: 100,
+        };
+
+        let serial_started = std::time::Instant::now();
+        let serial = execute_resolved_scheduler_tasks(
+            tasks.clone(),
+            serial_limits,
+            TrackingExecutor::with_delay(StdDuration::from_millis(35)),
+        )
+        .await;
+        let serial_elapsed = serial_started.elapsed();
+
+        let parallel_started = std::time::Instant::now();
+        let parallel = execute_resolved_scheduler_tasks(tasks, parallel_limits, executor).await;
+        let parallel_elapsed = parallel_started.elapsed();
+
+        assert_eq!(serial.len(), parallel.len());
+        assert!(
+            parallel_elapsed * 2 < serial_elapsed,
+            "parallel={parallel_elapsed:?} serial={serial_elapsed:?}"
+        );
     }
 }

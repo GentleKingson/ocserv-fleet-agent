@@ -131,12 +131,24 @@ fn scheduler_tests_too_frequent_interval_rejected() {
 }
 
 #[test]
-fn scheduler_tests_max_concurrency_above_one_rejected() {
+fn scheduler_tests_max_concurrency_validation_accepts_bounded_parallelism() {
     let dir = tempfile::tempdir().expect("temp dir");
     let database = dir.path().join("controller.sqlite");
     let database_arg = database.to_string_lossy().into_owned();
 
-    let output = run_ocfleet_failure(&[
+    let zero = run_ocfleet_failure(&[
+        "--database",
+        &database_arg,
+        "schedule",
+        "run",
+        "--once",
+        "--max-concurrency",
+        "0",
+    ]);
+    let stderr = String::from_utf8_lossy(&zero.stderr);
+    assert!(stderr.contains("greater than zero"));
+
+    let two = run_ocfleet(&[
         "--database",
         &database_arg,
         "schedule",
@@ -145,8 +157,37 @@ fn scheduler_tests_max_concurrency_above_one_rejected() {
         "--max-concurrency",
         "2",
     ]);
+    let stdout = String::from_utf8_lossy(&two.stdout);
+    assert!(stdout.contains("status=ok"));
+
+    let four = run_ocfleet(&[
+        "--database",
+        &database_arg,
+        "schedule",
+        "run",
+        "--once",
+        "--max-concurrency",
+        "4",
+    ]);
+    let stdout = String::from_utf8_lossy(&four.stdout);
+    assert!(stdout.contains("status=ok"));
+    let (event, ok, detail) = latest_audit(&database);
+    assert_eq!(event, "scheduler.run.once");
+    assert_eq!(ok, 1);
+    assert_eq!(detail["max_concurrency"], 4);
+
+    let above_limit = (ocfleet_cli::scheduler::MAX_ALLOWED_CONCURRENCY + 1).to_string();
+    let output = run_ocfleet_failure(&[
+        "--database",
+        &database_arg,
+        "schedule",
+        "run",
+        "--once",
+        "--max-concurrency",
+        &above_limit,
+    ]);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("max-concurrency=1"));
+    assert!(stderr.contains("must be between 1 and"));
 }
 
 #[test]

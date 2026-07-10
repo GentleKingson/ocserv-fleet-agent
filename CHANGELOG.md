@@ -39,6 +39,12 @@
 
 ### Security
 
+- Controller and scheduler RPC preflight now reject a node whose EndpointID has
+  no `endpoint_trust` row before loading controller key material or attempting
+  network I/O. Scheduler tasks recheck source and path-target trust after
+  concurrency waits at the dispatch boundary. Missing trust is distinct from
+  active trust, produces fixed low-sensitive failure codes and rejection
+  audits, and is reported by `ocfleet doctor`.
 - Added audit-insert failure and pre-commit transaction-drop coverage proving
   node registry and endpoint-trust mutations roll back instead of committing
   without audit, plus a CI guard for controller mutation SQL placement.

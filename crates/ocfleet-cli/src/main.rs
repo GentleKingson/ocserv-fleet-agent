@@ -11,8 +11,8 @@ use ocfleet_cli::audit_export::run_audit_command;
 use ocfleet_cli::backend::StoreWriter;
 use ocfleet_cli::controller_rpc::{
     FixedControllerRpc, OcservCommandAudit, RpcAuditRecord, RpcCommandFailure, elapsed_ms,
-    error_code_from_name, execute_fixed_node_rpc, execute_ocserv_rpc, execute_optional_ocserv_rpc,
-    hash_json_value, inactive_endpoint_status, known_endpoint_id, load_ocserv_rpc_node,
+    endpoint_trust_rejection, error_code_from_name, execute_fixed_node_rpc, execute_ocserv_rpc,
+    execute_optional_ocserv_rpc, hash_json_value, known_endpoint_id, load_ocserv_rpc_node,
     low_sensitive_detail, low_sensitive_fixed_rpc_summary, ocserv_failure_detail,
     write_ocserv_command_audit, write_rpc_audit,
 };
@@ -1254,13 +1254,29 @@ async fn run_path_probe_command(
         )?;
         bail!(message);
     }
-    if let Some(status) = inactive_endpoint_status(store, &source.endpoint_id)? {
-        let message = format!(
-            "endpoint not active: node_id={} endpoint_id={} status={}",
-            source.node_id,
-            source.endpoint_id,
-            status.as_str()
-        );
+    if let Some(rejection) = endpoint_trust_rejection(store, &source.endpoint_id)? {
+        let message = if rejection.is_missing() {
+            format!(
+                "endpoint trust missing: node_id={} endpoint_id={}",
+                source.node_id, source.endpoint_id
+            )
+        } else {
+            format!(
+                "endpoint not active: node_id={} endpoint_id={} status={}",
+                source.node_id,
+                source.endpoint_id,
+                rejection.as_str()
+            )
+        };
+        let mut detail = json!({
+            "message": message,
+            "source_node_id": source_node_id,
+            "target_node_id": target_node_id,
+            "endpoint_trust_state": if rejection.is_missing() { "missing" } else { "inactive" },
+        });
+        if !rejection.is_missing() {
+            detail["endpoint_status"] = Value::String(rejection.as_str().to_string());
+        }
         write_rpc_audit(
             store,
             RpcAuditRecord {
@@ -1273,7 +1289,7 @@ async fn run_path_probe_command(
                 ok: false,
                 error_code: Some(ErrorCode::EndpointNotAllowed),
                 duration_ms: elapsed_ms(started),
-                detail_json: json!({"message": message, "source_node_id": source_node_id, "target_node_id": target_node_id, "endpoint_status": status.as_str()}),
+                detail_json: detail,
             },
         )?;
         bail!(message);
@@ -1319,13 +1335,29 @@ async fn run_path_probe_command(
         )?;
         bail!(message);
     }
-    if let Some(status) = inactive_endpoint_status(store, &target.endpoint_id)? {
-        let message = format!(
-            "endpoint not active: node_id={} endpoint_id={} status={}",
-            target.node_id,
-            target.endpoint_id,
-            status.as_str()
-        );
+    if let Some(rejection) = endpoint_trust_rejection(store, &target.endpoint_id)? {
+        let message = if rejection.is_missing() {
+            format!(
+                "endpoint trust missing: node_id={} endpoint_id={}",
+                target.node_id, target.endpoint_id
+            )
+        } else {
+            format!(
+                "endpoint not active: node_id={} endpoint_id={} status={}",
+                target.node_id,
+                target.endpoint_id,
+                rejection.as_str()
+            )
+        };
+        let mut detail = json!({
+            "message": message,
+            "source_node_id": source_node_id,
+            "target_node_id": target_node_id,
+            "target_endpoint_trust_state": if rejection.is_missing() { "missing" } else { "inactive" },
+        });
+        if !rejection.is_missing() {
+            detail["target_endpoint_status"] = Value::String(rejection.as_str().to_string());
+        }
         write_rpc_audit(
             store,
             RpcAuditRecord {
@@ -1338,7 +1370,7 @@ async fn run_path_probe_command(
                 ok: false,
                 error_code: Some(ErrorCode::EndpointNotAllowed),
                 duration_ms: elapsed_ms(started),
-                detail_json: json!({"message": message, "source_node_id": source_node_id, "target_node_id": target_node_id, "target_endpoint_status": status.as_str()}),
+                detail_json: detail,
             },
         )?;
         bail!(message);
@@ -1349,7 +1381,7 @@ async fn run_path_probe_command(
     };
     let params = rpc.params();
     let params_hash = hash_json_value(&params);
-    match execute_fixed_node_rpc(secret_key_path, &source, rpc).await {
+    match execute_fixed_node_rpc(store, secret_key_path, &source, rpc).await {
         Ok(success) => {
             let mut summary = low_sensitive_fixed_rpc_summary(PROBE_PATH_ECHO, &success.result)?;
             let path_ok = summary.get("ok").and_then(Value::as_bool).unwrap_or(true);
@@ -1464,13 +1496,27 @@ async fn run_node_rpc_command(
         )?;
         bail!(message);
     }
-    if let Some(status) = inactive_endpoint_status(store, &node.endpoint_id)? {
-        let message = format!(
-            "endpoint not active: node_id={} endpoint_id={} status={}",
-            node.node_id,
-            node.endpoint_id,
-            status.as_str()
-        );
+    if let Some(rejection) = endpoint_trust_rejection(store, &node.endpoint_id)? {
+        let message = if rejection.is_missing() {
+            format!(
+                "endpoint trust missing: node_id={} endpoint_id={}",
+                node.node_id, node.endpoint_id
+            )
+        } else {
+            format!(
+                "endpoint not active: node_id={} endpoint_id={} status={}",
+                node.node_id,
+                node.endpoint_id,
+                rejection.as_str()
+            )
+        };
+        let mut detail = json!({
+            "message": message,
+            "endpoint_trust_state": if rejection.is_missing() { "missing" } else { "inactive" },
+        });
+        if !rejection.is_missing() {
+            detail["endpoint_status"] = Value::String(rejection.as_str().to_string());
+        }
         write_rpc_audit(
             store,
             RpcAuditRecord {
@@ -1483,13 +1529,13 @@ async fn run_node_rpc_command(
                 ok: false,
                 error_code: Some(ErrorCode::EndpointNotAllowed),
                 duration_ms: elapsed_ms(started),
-                detail_json: json!({ "message": message, "endpoint_status": status.as_str() }),
+                detail_json: detail,
             },
         )?;
         bail!(message);
     }
 
-    match execute_fixed_node_rpc(secret_key_path, &node, rpc).await {
+    match execute_fixed_node_rpc(store, secret_key_path, &node, rpc).await {
         Ok(success) => {
             let summary = low_sensitive_fixed_rpc_summary(method, &success.result)?;
             write_rpc_audit(

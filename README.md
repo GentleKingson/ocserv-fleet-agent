@@ -367,10 +367,13 @@ target/debug/ocfleet endpoint revoke <endpoint-id> --reason "lost host"
 target/debug/ocfleet endpoint quarantine <endpoint-id> --reason "suspicious traffic"
 ```
 
-Rotated, revoked, and quarantined endpoints are rejected for normal controller
-RPC and path-probe authorization. These lifecycle commands are registry/trust
-operations only; they do not add diagnostic shell or service-control entry
-points.
+Missing, rotated, revoked, and quarantined endpoint-trust records are rejected
+before normal controller RPC or path-probe network I/O. Only an explicit active
+trust row authorizes the controller to contact the registered EndpointID.
+Scheduler workers recheck source and path-target trust after concurrency waits,
+and rejected methods write bounded RPC audits. `ocfleet doctor` reports any
+node without a trust row. These lifecycle commands are registry/trust operations
+only; they do not add diagnostic shell or service-control entry points.
 
 Use the Phase 12 CLI observability surface:
 

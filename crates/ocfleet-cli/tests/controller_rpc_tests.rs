@@ -1,13 +1,68 @@
 use ocfleet_cli::controller_rpc::{
-    CONTROLLER_RPC_RESULT_CLASS, ControllerRpcRunner, FixedControllerRpc,
-    low_sensitive_fixed_rpc_summary, low_sensitive_ocserv_observation_summary,
+    CONTROLLER_RPC_RESULT_CLASS, ControllerRpcRunner, EndpointTrustRejection, FixedControllerRpc,
+    endpoint_trust_rejection, low_sensitive_fixed_rpc_summary,
+    low_sensitive_ocserv_observation_summary,
 };
-use ocfleet_cli::store::Store;
+use ocfleet_cli::store::{NodeInsert, Store};
 use ocfleet_protocol::method::{
     OCSERV_CERT_EXPIRY, OCSERV_CONFIG_FINGERPRINT, OCSERV_SERVICE_SUMMARY, OCSERV_SESSIONS_SUMMARY,
     OCSERV_VERSION, PROBE_CONTROLLER_PING, PROBE_PATH_ECHO,
 };
+use rusqlite::Connection;
 use serde_json::json;
+
+const TEST_NODE_ID: &str = "node-a";
+const TEST_ACTOR: &str = "controller-rpc-test";
+
+fn seed_active_node(store: &Store) -> String {
+    let endpoint_id = iroh::SecretKey::generate().public().to_string();
+    store
+        .add_node(
+            &NodeInsert {
+                node_id: TEST_NODE_ID.to_string(),
+                endpoint_id: endpoint_id.clone(),
+                name: TEST_NODE_ID.to_string(),
+                region: "hk".to_string(),
+                role: "ocserv".to_string(),
+            },
+            TEST_ACTOR,
+        )
+        .expect("seed node");
+    endpoint_id
+}
+
+fn delete_endpoint_trust(database: &std::path::Path, endpoint_id: &str) {
+    Connection::open(database)
+        .expect("open sqlite")
+        .execute(
+            "DELETE FROM endpoint_trust WHERE endpoint_id = ?1",
+            [endpoint_id],
+        )
+        .expect("delete endpoint trust");
+}
+
+fn rpc_rejection_audits(database: &std::path::Path) -> Vec<(String, String, serde_json::Value)> {
+    let conn = Connection::open(database).expect("open sqlite");
+    let mut stmt = conn
+        .prepare(
+            "SELECT method, error_code, detail_json
+             FROM controller_audit_log
+             WHERE event = 'rpc.completed' AND ok = 0
+             ORDER BY id",
+        )
+        .expect("prepare audit query");
+    stmt.query_map([], |row| {
+        let detail: String = row.get(2)?;
+        Ok((
+            row.get(0)?,
+            row.get(1)?,
+            serde_json::from_str(&detail).expect("parse audit detail"),
+        ))
+    })
+    .expect("query rejection audits")
+    .collect::<rusqlite::Result<Vec<_>>>()
+    .expect("collect rejection audits")
+}
 
 #[tokio::test]
 async fn controller_rpc_missing_node_returns_node_not_found_outcome() {
@@ -32,6 +87,151 @@ async fn controller_rpc_missing_node_returns_node_not_found_outcome() {
         outcome.summary_json["message"],
         "node not found: missing-node"
     );
+}
+
+#[tokio::test]
+async fn controller_rpc_missing_endpoint_trust_fails_closed_before_secret_io() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("controller.sqlite");
+    let missing_secret_key = dir.path().join("does-not-exist.secret");
+    let store = Store::open(&db).expect("store opens");
+    let endpoint_id = seed_active_node(&store);
+    delete_endpoint_trust(&db, &endpoint_id);
+    let runner = ControllerRpcRunner::new(&store, &missing_secret_key);
+
+    let outcome = runner
+        .run_fixed_node_rpc(TEST_NODE_ID, PROBE_CONTROLLER_PING)
+        .await;
+
+    assert_eq!(outcome.endpoint_id.as_deref(), Some(endpoint_id.as_str()));
+    assert_eq!(outcome.error_code.as_deref(), Some("ENDPOINT_NOT_ALLOWED"));
+    assert_eq!(outcome.summary_json["endpoint_trust_state"], "missing");
+    assert!(outcome.summary_json.get("endpoint_status").is_none());
+    assert!(
+        outcome
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("endpoint trust missing"))
+    );
+    assert!(!missing_secret_key.exists());
+    let audits = rpc_rejection_audits(&db);
+    assert_eq!(audits.len(), 1);
+    assert_eq!(audits[0].0, PROBE_CONTROLLER_PING);
+    assert_eq!(audits[0].1, "ENDPOINT_NOT_ALLOWED");
+    assert_eq!(audits[0].2["endpoint_trust_state"], "missing");
+}
+
+#[tokio::test]
+async fn ocserv_rpc_missing_endpoint_trust_fails_closed_before_secret_io() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("controller.sqlite");
+    let missing_secret_key = dir.path().join("does-not-exist.secret");
+    let store = Store::open(&db).expect("store opens");
+    let endpoint_id = seed_active_node(&store);
+    delete_endpoint_trust(&db, &endpoint_id);
+    let runner = ControllerRpcRunner::new(&store, &missing_secret_key);
+
+    let outcome = runner.run_ocserv_cert(TEST_NODE_ID).await;
+
+    assert_eq!(outcome.endpoint_id.as_deref(), Some(endpoint_id.as_str()));
+    assert_eq!(outcome.error_code.as_deref(), Some("ENDPOINT_NOT_ALLOWED"));
+    assert_eq!(outcome.summary_json["endpoint_trust_state"], "missing");
+    assert!(outcome.summary_json.get("endpoint_status").is_none());
+    assert!(!missing_secret_key.exists());
+    let audits = rpc_rejection_audits(&db);
+    assert_eq!(audits.len(), 1);
+    assert_eq!(audits[0].0, OCSERV_CERT_EXPIRY);
+    assert_eq!(audits[0].1, "ENDPOINT_NOT_ALLOWED");
+    assert_eq!(audits[0].2["endpoint_trust_state"], "missing");
+}
+
+#[tokio::test]
+async fn ocserv_status_missing_endpoint_trust_audits_every_rejected_subrpc() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("controller.sqlite");
+    let missing_secret_key = dir.path().join("does-not-exist.secret");
+    let store = Store::open(&db).expect("store opens");
+    let endpoint_id = seed_active_node(&store);
+    delete_endpoint_trust(&db, &endpoint_id);
+
+    let outcome = ControllerRpcRunner::new(&store, &missing_secret_key)
+        .run_ocserv_status_bundle(TEST_NODE_ID)
+        .await;
+
+    assert!(!outcome.ok);
+    assert_eq!(outcome.error_code.as_deref(), Some("ENDPOINT_NOT_ALLOWED"));
+    assert!(!missing_secret_key.exists());
+    let audits = rpc_rejection_audits(&db);
+    assert_eq!(audits.len(), 4);
+    assert_eq!(
+        audits
+            .iter()
+            .map(|audit| audit.0.as_str())
+            .collect::<Vec<_>>(),
+        [
+            OCSERV_SERVICE_SUMMARY,
+            OCSERV_VERSION,
+            OCSERV_SESSIONS_SUMMARY,
+            OCSERV_CONFIG_FINGERPRINT,
+        ]
+    );
+    assert!(audits.iter().all(|audit| audit.1 == "ENDPOINT_NOT_ALLOWED"));
+    assert!(
+        audits
+            .iter()
+            .all(|audit| audit.2["endpoint_trust_state"] == "missing")
+    );
+}
+
+#[tokio::test]
+async fn controller_rpc_preserves_active_and_inactive_endpoint_behavior() {
+    let active_dir = tempfile::tempdir().expect("active temp dir");
+    let active_db = active_dir.path().join("controller.sqlite");
+    let active_secret_key = active_dir.path().join("does-not-exist.secret");
+    let active_store = Store::open(&active_db).expect("active store opens");
+    let active_endpoint_id = seed_active_node(&active_store);
+    assert_eq!(
+        endpoint_trust_rejection(&active_store, &active_endpoint_id).expect("read active trust"),
+        None
+    );
+
+    let active_outcome = ControllerRpcRunner::new(&active_store, &active_secret_key)
+        .run_fixed_node_rpc(TEST_NODE_ID, PROBE_CONTROLLER_PING)
+        .await;
+    assert_eq!(
+        active_outcome.error_code.as_deref(),
+        Some("SECRET_KEY_LOAD_FAILED")
+    );
+
+    let inactive_dir = tempfile::tempdir().expect("inactive temp dir");
+    let inactive_db = inactive_dir.path().join("controller.sqlite");
+    let inactive_secret_key = inactive_dir.path().join("does-not-exist.secret");
+    let inactive_store = Store::open(&inactive_db).expect("inactive store opens");
+    let inactive_endpoint_id = seed_active_node(&inactive_store);
+    inactive_store
+        .revoke_endpoint(&inactive_endpoint_id, TEST_ACTOR, "test revoke")
+        .expect("revoke endpoint");
+    assert_eq!(
+        endpoint_trust_rejection(&inactive_store, &inactive_endpoint_id)
+            .expect("read inactive trust"),
+        Some(EndpointTrustRejection::Inactive(
+            ocfleet_protocol::enrollment::EndpointStatus::Revoked
+        ))
+    );
+
+    let inactive_outcome = ControllerRpcRunner::new(&inactive_store, &inactive_secret_key)
+        .run_fixed_node_rpc(TEST_NODE_ID, PROBE_CONTROLLER_PING)
+        .await;
+    assert_eq!(
+        inactive_outcome.error_code.as_deref(),
+        Some("ENDPOINT_NOT_ALLOWED")
+    );
+    assert_eq!(
+        inactive_outcome.summary_json["endpoint_trust_state"],
+        "inactive"
+    );
+    assert_eq!(inactive_outcome.summary_json["endpoint_status"], "revoked");
+    assert!(!inactive_secret_key.exists());
 }
 
 #[test]

@@ -28,10 +28,11 @@ use crate::args::{ScheduleCommand, ScheduleJobCommand, ScheduleJobKind, Schedule
 use crate::audit::AuditEvent;
 use crate::backend::StoreWriter;
 use crate::controller_rpc::{
-    CONTROLLER_RPC_RESULT_CLASS, FixedControllerRpc, OCSERV_RESULT_CLASS, OcservRpcOutcome,
-    RpcAuditRecord, RpcCommandFailure, elapsed_ms, error_code_name, execute_fixed_node_rpc,
-    hash_json_value, inactive_endpoint_status, low_sensitive_fixed_rpc_summary,
-    low_sensitive_ocserv_observation_summary, ocserv_failure_detail, write_rpc_audit,
+    CONTROLLER_RPC_RESULT_CLASS, EndpointTrustRejection, FixedControllerRpc, OCSERV_RESULT_CLASS,
+    OcservRpcOutcome, RpcAuditRecord, RpcCommandFailure, elapsed_ms, endpoint_trust_rejection,
+    error_code_name, execute_fixed_node_rpc_from_database, hash_json_value,
+    low_sensitive_fixed_rpc_summary, low_sensitive_ocserv_observation_summary,
+    ocserv_failure_detail, write_rpc_audit,
 };
 use crate::input_validation::{local_actor, validate_description, validate_selector};
 use crate::store::{
@@ -139,6 +140,7 @@ impl SchedulerLimits {
 
 struct SchedulerTickContext<'a> {
     store: &'a Store,
+    database_path: &'a Path,
     secret_key_path: &'a Path,
     limits: SchedulerLimits,
     rpc_budget_remaining: &'a mut usize,
@@ -226,6 +228,7 @@ trait SchedulerTaskExecutor: Clone + Send + Sync + 'static {
 
 #[derive(Clone)]
 struct ProductionSchedulerTaskExecutor {
+    database_path: Arc<PathBuf>,
     secret_key_path: Arc<PathBuf>,
 }
 
@@ -234,8 +237,11 @@ impl SchedulerTaskExecutor for ProductionSchedulerTaskExecutor {
         &self,
         task: ResolvedSchedulerTask,
     ) -> Pin<Box<dyn Future<Output = SchedulerTaskOutcome> + Send>> {
+        let database_path = Arc::clone(&self.database_path);
         let secret_key_path = Arc::clone(&self.secret_key_path);
-        Box::pin(async move { execute_production_scheduler_task(secret_key_path, task).await })
+        Box::pin(async move {
+            execute_production_scheduler_task(database_path, secret_key_path, task).await
+        })
     }
 }
 
@@ -820,6 +826,7 @@ async fn run_due_jobs_once(
     let mut rpc_budget_remaining = limits.rpc_budget_per_tick;
     let mut tick_context = SchedulerTickContext {
         store,
+        database_path: store.database_path(),
         secret_key_path,
         limits,
         rpc_budget_remaining: &mut rpc_budget_remaining,
@@ -924,6 +931,7 @@ async fn run_target_job_once(
     let mut rpc_budget_remaining = limits.rpc_budget_per_tick;
     let mut tick_context = SchedulerTickContext {
         store,
+        database_path: store.database_path(),
         secret_key_path,
         limits,
         rpc_budget_remaining: &mut rpc_budget_remaining,
@@ -1162,6 +1170,7 @@ async fn run_job_after_start(
                     tick_context.rpc_budget_remaining,
                 ));
                 let executor = ProductionSchedulerTaskExecutor {
+                    database_path: Arc::new(tick_context.database_path.to_path_buf()),
                     secret_key_path: Arc::new(tick_context.secret_key_path.to_path_buf()),
                 };
                 outcomes.extend(
@@ -1237,6 +1246,7 @@ fn scheduler_method_key(kind: StoredJobKind) -> &'static str {
 
 struct SchedulerPreflightFailure {
     code: ErrorCode,
+    observation_error_code: Option<&'static str>,
     endpoint_id: Option<String>,
     detail_json: Value,
 }
@@ -1248,6 +1258,7 @@ fn load_scheduler_task_node(
 ) -> Result<NodeRecord, SchedulerPreflightFailure> {
     validate_node_id(node_id).map_err(|err| SchedulerPreflightFailure {
         code: ErrorCode::ParamsInvalid,
+        observation_error_code: None,
         endpoint_id: None,
         detail_json: scheduler_preflight_detail(kind, &err.to_string(), None),
     })?;
@@ -1255,6 +1266,7 @@ fn load_scheduler_task_node(
         .get_node(node_id)
         .map_err(|_| SchedulerPreflightFailure {
             code: ErrorCode::SqliteError,
+            observation_error_code: None,
             endpoint_id: None,
             detail_json: scheduler_preflight_detail(kind, "controller registry read failed", None),
         })?;
@@ -1262,6 +1274,7 @@ fn load_scheduler_task_node(
         let message = format!("node not found: {node_id}");
         return Err(SchedulerPreflightFailure {
             code: ErrorCode::NodeNotFound,
+            observation_error_code: None,
             endpoint_id: None,
             detail_json: scheduler_preflight_detail(kind, &message, None),
         });
@@ -1270,13 +1283,15 @@ fn load_scheduler_task_node(
         let message = format!("node disabled: {node_id}");
         return Err(SchedulerPreflightFailure {
             code: ErrorCode::NodeDisabled,
+            observation_error_code: None,
             endpoint_id: Some(node.endpoint_id),
             detail_json: scheduler_preflight_detail(kind, &message, None),
         });
     }
-    if let Some(status) = inactive_endpoint_status(store, &node.endpoint_id).map_err(|_| {
+    if let Some(rejection) = endpoint_trust_rejection(store, &node.endpoint_id).map_err(|_| {
         SchedulerPreflightFailure {
             code: ErrorCode::SqliteError,
+            observation_error_code: None,
             endpoint_id: Some(node.endpoint_id.clone()),
             detail_json: scheduler_preflight_detail(
                 kind,
@@ -1285,11 +1300,16 @@ fn load_scheduler_task_node(
             ),
         }
     })? {
-        let message = format!("endpoint is not active: status={}", status.as_str());
+        let message = if rejection.is_missing() {
+            "endpoint trust record is missing".to_string()
+        } else {
+            format!("endpoint is not active: status={}", rejection.as_str())
+        };
         return Err(SchedulerPreflightFailure {
             code: ErrorCode::EndpointNotAllowed,
+            observation_error_code: rejection.is_missing().then_some("ENDPOINT_TRUST_MISSING"),
             endpoint_id: Some(node.endpoint_id),
-            detail_json: scheduler_preflight_detail(kind, &message, Some(status.as_str())),
+            detail_json: scheduler_preflight_detail(kind, &message, Some(rejection)),
         });
     }
     Ok(node)
@@ -1298,14 +1318,21 @@ fn load_scheduler_task_node(
 fn scheduler_preflight_detail(
     kind: StoredJobKind,
     message: &str,
-    endpoint_status: Option<&str>,
+    endpoint_rejection: Option<EndpointTrustRejection>,
 ) -> Value {
     let mut detail = json!({
         "message": message,
         "result_class": scheduler_result_class_for_stored_kind(kind),
     });
-    if let Some(status) = endpoint_status {
-        detail["endpoint_status"] = json!(status);
+    if let Some(rejection) = endpoint_rejection {
+        detail["endpoint_trust_state"] = json!(if rejection.is_missing() {
+            "missing"
+        } else {
+            "inactive"
+        });
+        if !rejection.is_missing() {
+            detail["endpoint_status"] = json!(rejection.as_str());
+        }
     }
     detail
 }
@@ -1335,26 +1362,26 @@ fn preflight_failure_outcome(
         method_key,
         ordinal,
     };
-    let error_code = error_code_name(&failure.code);
+    let error_code = failure
+        .observation_error_code
+        .map(str::to_string)
+        .unwrap_or_else(|| error_code_name(&failure.code));
     let observations = preflight_failure_observations(&task, &failure.detail_json, &error_code);
-    let rpc_audits = match kind {
-        StoredJobKind::ControllerPing => vec![RpcAuditRecord {
+    let rpc_audits = preflight_methods_for_kind(kind)
+        .into_iter()
+        .map(|method| RpcAuditRecord {
             actor: local_actor(),
             node_id: node_id.to_string(),
-            endpoint_id: failure.endpoint_id,
-            method: PROBE_CONTROLLER_PING.to_string(),
+            endpoint_id: failure.endpoint_id.clone(),
+            method: method.to_string(),
             request_id: None,
             params_hash: hash_json_value(&json!({})),
             ok: false,
-            error_code: Some(failure.code),
+            error_code: Some(failure.code.clone()),
             duration_ms: 0,
-            detail_json: failure.detail_json,
-        }],
-        StoredJobKind::OcservStatus
-        | StoredJobKind::OcservCert
-        | StoredJobKind::OcservSessions
-        | StoredJobKind::PathProbe => Vec::new(),
-    };
+            detail_json: failure.detail_json.clone(),
+        })
+        .collect();
     SchedulerTaskOutcome::from_observations(task, observations, rpc_audits)
 }
 
@@ -1373,18 +1400,7 @@ fn preflight_failure_observations(
     detail_json: &Value,
     error_code: &str,
 ) -> Vec<SchedulerObservationOutcome> {
-    let methods = match task.kind {
-        StoredJobKind::OcservStatus => vec![
-            OCSERV_SERVICE_SUMMARY,
-            OCSERV_VERSION,
-            OCSERV_SESSIONS_SUMMARY,
-            OCSERV_CONFIG_FINGERPRINT,
-        ],
-        StoredJobKind::ControllerPing
-        | StoredJobKind::OcservCert
-        | StoredJobKind::OcservSessions
-        | StoredJobKind::PathProbe => vec![first_method_for_stored_kind(task.kind)],
-    };
+    let methods = preflight_methods_for_kind(task.kind);
     methods
         .into_iter()
         .map(|method| SchedulerObservationOutcome {
@@ -1398,6 +1414,21 @@ fn preflight_failure_observations(
             summary_json: detail_json.clone(),
         })
         .collect()
+}
+
+fn preflight_methods_for_kind(kind: StoredJobKind) -> Vec<&'static str> {
+    match kind {
+        StoredJobKind::OcservStatus => vec![
+            OCSERV_SERVICE_SUMMARY,
+            OCSERV_VERSION,
+            OCSERV_SESSIONS_SUMMARY,
+            OCSERV_CONFIG_FINGERPRINT,
+        ],
+        StoredJobKind::ControllerPing
+        | StoredJobKind::OcservCert
+        | StoredJobKind::OcservSessions
+        | StoredJobKind::PathProbe => vec![first_method_for_stored_kind(kind)],
+    }
 }
 
 fn limit_tasks_by_rpc_budget(
@@ -1602,27 +1633,35 @@ fn write_scheduler_task_outcomes(
 }
 
 async fn execute_production_scheduler_task(
+    database_path: Arc<PathBuf>,
     secret_key_path: Arc<PathBuf>,
     task: ResolvedSchedulerTask,
 ) -> SchedulerTaskOutcome {
     match task.rpc.clone() {
         SchedulerTaskRpc::Fixed(rpc) => {
-            execute_scheduler_fixed_rpc(secret_key_path, task, rpc).await
+            execute_scheduler_fixed_rpc(database_path, secret_key_path, task, rpc).await
         }
         SchedulerTaskRpc::OcservStatusBundle => {
-            execute_scheduler_ocserv_status_bundle(secret_key_path, task).await
+            execute_scheduler_ocserv_status_bundle(database_path, secret_key_path, task).await
         }
         SchedulerTaskRpc::PathProbe {
             target_node_id,
             target_endpoint_id,
         } => {
-            execute_scheduler_path_probe(secret_key_path, task, target_node_id, target_endpoint_id)
-                .await
+            execute_scheduler_path_probe(
+                database_path,
+                secret_key_path,
+                task,
+                target_node_id,
+                target_endpoint_id,
+            )
+            .await
         }
     }
 }
 
 async fn execute_scheduler_fixed_rpc(
+    database_path: Arc<PathBuf>,
     secret_key_path: Arc<PathBuf>,
     task: ResolvedSchedulerTask,
     rpc: FixedControllerRpc,
@@ -1631,7 +1670,9 @@ async fn execute_scheduler_fixed_rpc(
     let method = rpc.method();
     let params_hash = hash_json_value(&rpc.params());
     let result_class = result_class_for_method(method);
-    match execute_fixed_node_rpc(&secret_key_path, &task.node, rpc).await {
+    match execute_fixed_node_rpc_from_database(&database_path, &secret_key_path, &task.node, rpc)
+        .await
+    {
         Ok(success) => fixed_rpc_success_outcome(task, method, success, params_hash, started),
         Err(failure) => fixed_rpc_failure_outcome(
             task,
@@ -1717,6 +1758,7 @@ fn fixed_rpc_failure_outcome(
     duration_ms: u64,
     result_class: &'static str,
 ) -> SchedulerTaskOutcome {
+    let observation_error_code = scheduler_failure_error_code(&failure);
     let detail_json = if result_class == OCSERV_RESULT_CLASS {
         ocserv_failure_detail(&failure)
     } else {
@@ -1729,7 +1771,7 @@ fn fixed_rpc_failure_outcome(
             endpoint_id: Some(task.node.endpoint_id.clone()),
             method: method.to_string(),
             ok: false,
-            error_code: Some(error_code_name(&failure.code)),
+            error_code: Some(observation_error_code),
             duration_ms,
             result_class: result_class.to_string(),
             summary_json: detail_json.clone(),
@@ -1750,29 +1792,34 @@ fn fixed_rpc_failure_outcome(
 }
 
 async fn execute_scheduler_ocserv_status_bundle(
+    database_path: Arc<PathBuf>,
     secret_key_path: Arc<PathBuf>,
     task: ResolvedSchedulerTask,
 ) -> SchedulerTaskOutcome {
     let started = Instant::now();
     let service = execute_scheduler_ocserv_subrpc::<OcservServiceSummaryResponse>(
+        &database_path,
         &secret_key_path,
         &task.node,
         OCSERV_SERVICE_SUMMARY,
     )
     .await;
     let version = execute_scheduler_ocserv_subrpc::<OcservVersionResponse>(
+        &database_path,
         &secret_key_path,
         &task.node,
         OCSERV_VERSION,
     )
     .await;
     let sessions = execute_scheduler_ocserv_subrpc::<OcservSessionsSummaryResponse>(
+        &database_path,
         &secret_key_path,
         &task.node,
         OCSERV_SESSIONS_SUMMARY,
     )
     .await;
     let config_fingerprint = execute_scheduler_ocserv_subrpc::<OcservConfigFingerprintResponse>(
+        &database_path,
         &secret_key_path,
         &task.node,
         OCSERV_CONFIG_FINGERPRINT,
@@ -1819,6 +1866,7 @@ async fn execute_scheduler_ocserv_status_bundle(
 struct SchedulerOcservSubrpcOutcome<T> {
     rpc_outcome: OcservRpcOutcome<T>,
     audit: Option<RpcAuditRecord>,
+    observation_error_code: Option<String>,
 }
 
 fn append_ocserv_subrpc_outcome<T>(
@@ -1838,11 +1886,13 @@ fn append_ocserv_subrpc_outcome<T>(
         task,
         method,
         outcome.rpc_outcome,
+        outcome.observation_error_code,
         duration_ms,
     ));
 }
 
 async fn execute_scheduler_ocserv_subrpc<T>(
+    database_path: &Path,
     secret_key_path: &Path,
     node: &NodeRecord,
     method: &'static str,
@@ -1854,7 +1904,7 @@ where
     let rpc = FixedControllerRpc::from_method_without_params(method)
         .expect("scheduler ocserv method is fixed");
     let params_hash = hash_json_value(&rpc.params());
-    match execute_fixed_node_rpc(secret_key_path, node, rpc).await {
+    match execute_fixed_node_rpc_from_database(database_path, secret_key_path, node, rpc).await {
         Ok(success) => match serde_json::from_value::<T>(success.result) {
             Ok(value) => SchedulerOcservSubrpcOutcome {
                 rpc_outcome: OcservRpcOutcome::Available(value),
@@ -1870,6 +1920,7 @@ where
                     duration_ms: elapsed_ms(started),
                     detail_json: json!({"result_class": OCSERV_RESULT_CLASS}),
                 }),
+                observation_error_code: None,
             },
             Err(_) => {
                 let failure = RpcCommandFailure::new(
@@ -1896,14 +1947,16 @@ where
                         request_id: failure.request_id,
                         params_hash,
                         ok: false,
-                        error_code: Some(failure.code),
+                        error_code: Some(failure.code.clone()),
                         duration_ms: elapsed_ms(started),
                         detail_json,
                     }),
+                    observation_error_code: Some(error_code_name(&failure.code)),
                 }
             }
         },
         Err(failure) => {
+            let observation_error_code = scheduler_failure_error_code(&failure);
             let detail_json = ocserv_failure_detail(&failure);
             SchedulerOcservSubrpcOutcome {
                 rpc_outcome: OcservRpcOutcome::Unavailable {
@@ -1922,6 +1975,7 @@ where
                     duration_ms: elapsed_ms(started),
                     detail_json,
                 }),
+                observation_error_code: Some(observation_error_code),
             }
         }
     }
@@ -1931,6 +1985,7 @@ fn ocserv_subrpc_observation<T>(
     task: &ResolvedSchedulerTask,
     method: &'static str,
     outcome: OcservRpcOutcome<T>,
+    error_code_override: Option<String>,
     duration_ms: u64,
 ) -> SchedulerObservationOutcome
 where
@@ -1953,7 +2008,7 @@ where
         }
         OcservRpcOutcome::Unavailable { code, .. } => (
             false,
-            Some(error_code_name(&code)),
+            Some(error_code_override.unwrap_or_else(|| error_code_name(&code))),
             json!({
                 "message": "ocserv status sub-rpc unavailable",
                 "method": method,
@@ -1974,6 +2029,7 @@ where
 }
 
 async fn execute_scheduler_path_probe(
+    database_path: Arc<PathBuf>,
     secret_key_path: Arc<PathBuf>,
     task: ResolvedSchedulerTask,
     target_node_id: String,
@@ -1984,7 +2040,9 @@ async fn execute_scheduler_path_probe(
         target_agent_endpoint_id: target_endpoint_id.clone(),
     };
     let params_hash = hash_json_value(&rpc.params());
-    match execute_fixed_node_rpc(&secret_key_path, &task.node, rpc).await {
+    match execute_fixed_node_rpc_from_database(&database_path, &secret_key_path, &task.node, rpc)
+        .await
+    {
         Ok(success) => {
             let duration_ms = elapsed_ms(started);
             SchedulerTaskOutcome::from_observations(
@@ -2024,6 +2082,10 @@ async fn execute_scheduler_path_probe(
         }
         Err(failure) => {
             let duration_ms = elapsed_ms(started);
+            let observation_error_code = scheduler_failure_error_code(&failure);
+            let mut audit_detail = failure.detail_json.clone();
+            audit_detail["target_node_id"] = Value::String(target_node_id.clone());
+            audit_detail["target_endpoint_id"] = Value::String(target_endpoint_id.clone());
             SchedulerTaskOutcome::from_observations(
                 task.clone(),
                 vec![SchedulerObservationOutcome {
@@ -2031,11 +2093,13 @@ async fn execute_scheduler_path_probe(
                     endpoint_id: Some(task.node.endpoint_id.clone()),
                     method: PROBE_PATH_ECHO.to_string(),
                     ok: false,
-                    error_code: Some(error_code_name(&failure.code)),
+                    error_code: Some(observation_error_code),
                     duration_ms,
                     result_class: CONTROLLER_RPC_RESULT_CLASS.to_string(),
                     summary_json: json!({
                         "message": "path probe failed",
+                        "target_node_id": target_node_id,
+                        "target_endpoint_id": target_endpoint_id,
                         "result_class": CONTROLLER_RPC_RESULT_CLASS,
                     }),
                 }],
@@ -2049,7 +2113,7 @@ async fn execute_scheduler_path_probe(
                     ok: false,
                     error_code: Some(failure.code),
                     duration_ms,
-                    detail_json: failure.detail_json,
+                    detail_json: audit_detail,
                 }],
             )
         }
@@ -2078,6 +2142,22 @@ fn result_class_for_method(method: &str) -> &'static str {
         | OCSERV_CERT_EXPIRY
         | OCSERV_CONFIG_FINGERPRINT => OCSERV_RESULT_CLASS,
         _ => CONTROLLER_RPC_RESULT_CLASS,
+    }
+}
+
+fn scheduler_failure_error_code(failure: &RpcCommandFailure) -> String {
+    match failure.endpoint_trust_rejection() {
+        Some(EndpointTrustRejection::Missing) if failure.endpoint_trust_target() => {
+            "TARGET_ENDPOINT_TRUST_MISSING".to_string()
+        }
+        Some(EndpointTrustRejection::Missing) => "ENDPOINT_TRUST_MISSING".to_string(),
+        Some(EndpointTrustRejection::Inactive(status)) if failure.endpoint_trust_target() => {
+            format!("TARGET_ENDPOINT_{}", status.as_str().to_ascii_uppercase())
+        }
+        Some(EndpointTrustRejection::Inactive(status)) => {
+            format!("ENDPOINT_{}", status.as_str().to_ascii_uppercase())
+        }
+        None => error_code_name(&failure.code),
     }
 }
 
@@ -2152,13 +2232,18 @@ async fn run_path_probe_job(
         update_observation_stats(stats, false);
         return Ok(());
     }
-    if let Some(status) = inactive_endpoint_status(tick_context.store, &source.endpoint_id)? {
+    if let Some(rejection) = endpoint_trust_rejection(tick_context.store, &source.endpoint_id)? {
+        let error_code = if rejection.is_missing() {
+            "ENDPOINT_TRUST_MISSING".to_string()
+        } else {
+            format!("ENDPOINT_{}", rejection.as_str().to_ascii_uppercase())
+        };
         record_path_probe_preflight_observation(
             tick_context.store,
             run_id,
             &source.node_id,
             Some(&source.endpoint_id),
-            &format!("ENDPOINT_{}", status.as_str().to_ascii_uppercase()),
+            &error_code,
         )?;
         update_observation_stats(stats, false);
         return Ok(());
@@ -2185,7 +2270,15 @@ async fn run_path_probe_job(
         update_observation_stats(stats, false);
         return Ok(());
     }
-    if let Some(status) = inactive_endpoint_status(tick_context.store, &target.endpoint_id)? {
+    if let Some(rejection) = endpoint_trust_rejection(tick_context.store, &target.endpoint_id)? {
+        let error_code = if rejection.is_missing() {
+            "TARGET_ENDPOINT_TRUST_MISSING".to_string()
+        } else {
+            format!(
+                "TARGET_ENDPOINT_{}",
+                rejection.as_str().to_ascii_uppercase()
+            )
+        };
         record_path_probe_target_preflight_observation(
             tick_context.store,
             run_id,
@@ -2193,7 +2286,7 @@ async fn run_path_probe_job(
             &source.endpoint_id,
             &target.node_id,
             &target.endpoint_id,
-            &format!("TARGET_ENDPOINT_{}", status.as_str().to_ascii_uppercase()),
+            &error_code,
         )?;
         update_observation_stats(stats, false);
         return Ok(());
@@ -2219,6 +2312,7 @@ async fn run_path_probe_job(
         tick_context.rpc_budget_remaining,
     );
     let executor = ProductionSchedulerTaskExecutor {
+        database_path: Arc::new(tick_context.database_path.to_path_buf()),
         secret_key_path: Arc::new(tick_context.secret_key_path.to_path_buf()),
     };
     outcomes.extend(execute_resolved_scheduler_tasks(tasks, tick_context.limits, executor).await);
@@ -2395,6 +2489,25 @@ fn record_path_probe_preflight_observation(
             "result_class": CONTROLLER_RPC_RESULT_CLASS,
         }),
     })?;
+    write_rpc_audit(
+        store,
+        RpcAuditRecord {
+            actor: local_actor(),
+            node_id: node_id.to_string(),
+            endpoint_id: endpoint_id.map(ToOwned::to_owned),
+            method: PROBE_PATH_ECHO.to_string(),
+            request_id: None,
+            params_hash: hash_json_value(&json!({})),
+            ok: false,
+            error_code: Some(path_preflight_protocol_error(error_code)),
+            duration_ms: 0,
+            detail_json: json!({
+                "message": "path probe rejected before RPC dispatch",
+                "result_class": CONTROLLER_RPC_RESULT_CLASS,
+                "error_code": error_code,
+            }),
+        },
+    )?;
     Ok(())
 }
 
@@ -2428,7 +2541,38 @@ fn record_path_probe_target_preflight_observation(
             "result_class": CONTROLLER_RPC_RESULT_CLASS,
         }),
     })?;
+    write_rpc_audit(
+        store,
+        RpcAuditRecord {
+            actor: local_actor(),
+            node_id: source_node_id.to_string(),
+            endpoint_id: Some(source_endpoint_id.to_string()),
+            method: PROBE_PATH_ECHO.to_string(),
+            request_id: None,
+            params_hash: hash_json_value(&json!({"target_agent_endpoint_id": target_endpoint_id})),
+            ok: false,
+            error_code: Some(path_preflight_protocol_error(error_code)),
+            duration_ms: 0,
+            detail_json: json!({
+                "message": "path probe target rejected before RPC dispatch",
+                "target_node_id": target_node_id,
+                "target_endpoint_id": target_endpoint_id,
+                "result_class": CONTROLLER_RPC_RESULT_CLASS,
+                "error_code": error_code,
+            }),
+        },
+    )?;
     Ok(())
+}
+
+fn path_preflight_protocol_error(error_code: &str) -> ErrorCode {
+    if error_code.ends_with("NODE_NOT_FOUND") {
+        ErrorCode::NodeNotFound
+    } else if error_code.ends_with("NODE_DISABLED") {
+        ErrorCode::NodeDisabled
+    } else {
+        ErrorCode::EndpointNotAllowed
+    }
 }
 
 fn update_observation_stats(stats: &mut RunStats, ok: bool) {
@@ -2624,6 +2768,8 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::NodeInsert;
+    use rusqlite::Connection;
     use std::collections::{HashMap, HashSet};
     use std::future::Future;
     use std::pin::Pin;
@@ -2645,6 +2791,34 @@ mod tests {
         peak_by_node: HashMap<String, usize>,
         active_by_method: HashMap<String, usize>,
         peak_by_method: HashMap<String, usize>,
+    }
+
+    #[derive(Clone)]
+    struct DeleteTrustThenDispatchExecutor {
+        database_path: Arc<PathBuf>,
+        secret_key_path: Arc<PathBuf>,
+        endpoint_id: Arc<String>,
+    }
+
+    impl SchedulerTaskExecutor for DeleteTrustThenDispatchExecutor {
+        fn execute(
+            &self,
+            task: ResolvedSchedulerTask,
+        ) -> Pin<Box<dyn Future<Output = SchedulerTaskOutcome> + Send>> {
+            let database_path = Arc::clone(&self.database_path);
+            let secret_key_path = Arc::clone(&self.secret_key_path);
+            let endpoint_id = Arc::clone(&self.endpoint_id);
+            Box::pin(async move {
+                Connection::open(database_path.as_ref())
+                    .expect("open scheduler database")
+                    .execute(
+                        "DELETE FROM endpoint_trust WHERE endpoint_id = ?1",
+                        [endpoint_id.as_str()],
+                    )
+                    .expect("delete trust after semaphore acquisition");
+                execute_production_scheduler_task(database_path, secret_key_path, task).await
+            })
+        }
     }
 
     impl TrackingExecutor {
@@ -2799,6 +2973,133 @@ mod tests {
             created_at: "2026-07-09T00:00:00Z".to_string(),
             updated_at: "2026-07-09T00:00:00Z".to_string(),
         }
+    }
+
+    fn seed_dispatch_node(store: &Store, node_id: &str) -> NodeRecord {
+        let endpoint_id = iroh::SecretKey::generate().public().to_string();
+        store
+            .add_node(
+                &NodeInsert {
+                    node_id: node_id.to_string(),
+                    endpoint_id,
+                    name: node_id.to_string(),
+                    region: "hk".to_string(),
+                    role: "ocserv".to_string(),
+                },
+                "scheduler-dispatch-test",
+            )
+            .expect("seed scheduler node");
+        store
+            .get_node(node_id)
+            .expect("load scheduler node")
+            .expect("scheduler node exists")
+    }
+
+    #[tokio::test]
+    async fn scheduler_dispatch_rechecks_source_trust_after_semaphore_acquisition() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let database = dir.path().join("controller.sqlite");
+        let secret_key = dir.path().join("missing.secret");
+        let store = Store::open(&database).expect("open store");
+        let node = seed_dispatch_node(&store, "source-node");
+        let task = ResolvedSchedulerTask {
+            job_id: "job-source".to_string(),
+            run_id: "run-source".to_string(),
+            kind: StoredJobKind::ControllerPing,
+            node: node.clone(),
+            rpc: SchedulerTaskRpc::Fixed(FixedControllerRpc::ProbeControllerPing),
+            method_key: PROBE_CONTROLLER_PING.to_string(),
+            ordinal: 0,
+        };
+        let executor = DeleteTrustThenDispatchExecutor {
+            database_path: Arc::new(database),
+            secret_key_path: Arc::new(secret_key.clone()),
+            endpoint_id: Arc::new(node.endpoint_id),
+        };
+
+        let outcomes = execute_resolved_scheduler_tasks(
+            vec![task],
+            SchedulerLimits::from_max_concurrency(1).expect("limits"),
+            executor,
+        )
+        .await;
+
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(
+            outcomes[0].observations[0].error_code.as_deref(),
+            Some("ENDPOINT_TRUST_MISSING")
+        );
+        assert_eq!(
+            outcomes[0].rpc_audits[0].error_code,
+            Some(ErrorCode::EndpointNotAllowed)
+        );
+        assert_eq!(
+            outcomes[0].rpc_audits[0].detail_json["endpoint_trust_state"],
+            "missing"
+        );
+        assert!(!secret_key.exists());
+    }
+
+    #[tokio::test]
+    async fn scheduler_dispatch_rechecks_path_target_trust_after_semaphore_acquisition() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let database = dir.path().join("controller.sqlite");
+        let secret_key = dir.path().join("missing.secret");
+        let store = Store::open(&database).expect("open store");
+        let source = seed_dispatch_node(&store, "source-node");
+        let target = seed_dispatch_node(&store, "target-node");
+        let task = ResolvedSchedulerTask {
+            job_id: "job-path".to_string(),
+            run_id: "run-path".to_string(),
+            kind: StoredJobKind::PathProbe,
+            node: source,
+            rpc: SchedulerTaskRpc::PathProbe {
+                target_node_id: target.node_id.clone(),
+                target_endpoint_id: target.endpoint_id.clone(),
+            },
+            method_key: PROBE_PATH_ECHO.to_string(),
+            ordinal: 0,
+        };
+        let executor = DeleteTrustThenDispatchExecutor {
+            database_path: Arc::new(database),
+            secret_key_path: Arc::new(secret_key.clone()),
+            endpoint_id: Arc::new(target.endpoint_id),
+        };
+
+        let outcomes = execute_resolved_scheduler_tasks(
+            vec![task],
+            SchedulerLimits::from_max_concurrency(1).expect("limits"),
+            executor,
+        )
+        .await;
+
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(
+            outcomes[0].observations[0].error_code.as_deref(),
+            Some("TARGET_ENDPOINT_TRUST_MISSING")
+        );
+        assert_eq!(
+            outcomes[0].observations[0].summary_json["target_node_id"],
+            "target-node"
+        );
+        assert!(
+            outcomes[0].observations[0].summary_json["target_endpoint_id"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
+        assert_eq!(
+            outcomes[0].rpc_audits[0].error_code,
+            Some(ErrorCode::EndpointNotAllowed)
+        );
+        assert_eq!(
+            outcomes[0].rpc_audits[0].detail_json["target_endpoint_trust_state"],
+            "missing"
+        );
+        assert_eq!(
+            outcomes[0].rpc_audits[0].detail_json["target_node_id"],
+            "target-node"
+        );
+        assert!(!secret_key.exists());
     }
 
     #[test]

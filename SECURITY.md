@@ -136,6 +136,19 @@ Operators should monitor audit spool growth, audit flush failures, and disk
 capacity. A full or unavailable audit destination can make RPCs fail closed by
 design.
 
+## Endpoint Trust Gate
+
+Controller and scheduler RPC paths require an explicit active
+`endpoint_trust` row for the node's registered EndpointID. A missing row is not
+equivalent to active trust. Missing, revoked, quarantined, and rotated records
+are rejected with bounded error metadata before controller key loading,
+connection setup, or RPC dispatch. Scheduler workers repeat the source and
+path-target lookup after concurrency waits; the lookup uses a separate
+read-only SQLite connection and no database transaction is held across network
+I/O. Health computation uses the same missing-trust condition as an unreachable
+advisory state and never creates trust. `ocfleet doctor` reports incomplete
+node-to-trust coverage without listing identities.
+
 ## CI Security Gates
 
 GitHub Actions workflows must use least-privilege permissions. Pull request

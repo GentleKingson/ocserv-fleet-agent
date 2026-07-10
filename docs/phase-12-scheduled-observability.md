@@ -89,8 +89,12 @@ Each scheduled job resolves its target from static controller SQLite state:
   controller-local selectors.
 - path jobs resolve one explicitly configured source node and one explicitly
   configured target node.
-- jobs fail closed if the node is missing, disabled, revoked, quarantined,
+- jobs fail closed before key loading or network I/O if the node is missing or
+  disabled, or if its EndpointID trust row is missing, revoked, quarantined,
   rotated away, or otherwise not active.
+- source and explicit path-target trust are read again after scheduler
+  concurrency waits at each dispatch boundary; rejected methods write bounded
+  RPC audits and no SQLite transaction spans network I/O.
 
 Successful RPC responses are decoded into closed typed DTOs before storage.
 Failed RPCs store only error code, fixed method name, node IDs, endpoint IDs,

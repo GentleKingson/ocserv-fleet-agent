@@ -281,6 +281,58 @@ fn ping_disabled_node_writes_failure_audit() {
 }
 
 #[test]
+fn ping_missing_endpoint_trust_fails_closed_before_key_loading() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let secret_key = dir.path().join("missing-controller.secret");
+    let endpoint_id = iroh::SecretKey::generate().public().to_string();
+    let store = Store::open(&database).expect("store opens");
+    store
+        .add_node(
+            &NodeInsert {
+                node_id: "hk-ocserv-01".to_string(),
+                endpoint_id: endpoint_id.clone(),
+                name: "hk-ocserv-01".to_string(),
+                region: "hk".to_string(),
+                role: "ocserv".to_string(),
+            },
+            TEST_ACTOR,
+        )
+        .expect("insert node");
+    drop(store);
+    Connection::open(&database)
+        .expect("open db")
+        .execute(
+            "DELETE FROM endpoint_trust WHERE endpoint_id = ?1",
+            [&endpoint_id],
+        )
+        .expect("remove endpoint trust fixture");
+
+    let database_arg = database.to_string_lossy().into_owned();
+    let secret_key_arg = secret_key.to_string_lossy().into_owned();
+    let output = run_ocfleet_failure(&[
+        "--database",
+        &database_arg,
+        "--secret-key",
+        &secret_key_arg,
+        "ping",
+        "hk-ocserv-01",
+    ]);
+
+    assert!(String::from_utf8_lossy(&output.stderr).contains("endpoint trust missing"));
+    assert!(!secret_key.exists());
+    let audit = latest_rpc_audit(&database);
+    assert_eq!(audit.event, "rpc.completed");
+    assert_eq!(audit.node_id.as_deref(), Some("hk-ocserv-01"));
+    assert_eq!(audit.endpoint_id.as_deref(), Some(endpoint_id.as_str()));
+    assert_eq!(audit.method.as_deref(), Some(NODE_PING));
+    assert_eq!(audit.ok, 0);
+    assert_eq!(audit.error_code.as_deref(), Some("ENDPOINT_NOT_ALLOWED"));
+    assert_eq!(audit.detail["endpoint_trust_state"], "missing");
+    assert!(audit.detail.get("endpoint_status").is_none());
+}
+
+#[test]
 fn probe_ping_missing_node_writes_failure_audit() {
     let dir = tempfile::tempdir().expect("temp dir");
     let database = dir.path().join("controller.sqlite");
@@ -518,6 +570,69 @@ fn probe_path_missing_target_writes_failure_audit_on_source_node() {
     assert_eq!(audit.error_code.as_deref(), Some("NODE_NOT_FOUND"));
     assert_eq!(audit.detail["source_node_id"], "source-node");
     assert_eq!(audit.detail["target_node_id"], "missing-target");
+}
+
+#[test]
+fn probe_path_missing_target_trust_fails_closed_before_key_loading() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let secret_key = dir.path().join("missing-controller.secret");
+    let source_endpoint_id = iroh::SecretKey::generate().public().to_string();
+    let target_endpoint_id = iroh::SecretKey::generate().public().to_string();
+    let store = Store::open(&database).expect("store opens");
+    for (node_id, endpoint_id, region) in [
+        ("source-node", &source_endpoint_id, "hk"),
+        ("target-node", &target_endpoint_id, "sg"),
+    ] {
+        store
+            .add_node(
+                &NodeInsert {
+                    node_id: node_id.to_string(),
+                    endpoint_id: endpoint_id.clone(),
+                    name: node_id.to_string(),
+                    region: region.to_string(),
+                    role: "ocserv".to_string(),
+                },
+                TEST_ACTOR,
+            )
+            .expect("insert node");
+    }
+    drop(store);
+    Connection::open(&database)
+        .expect("open db")
+        .execute(
+            "DELETE FROM endpoint_trust WHERE endpoint_id = ?1",
+            [&target_endpoint_id],
+        )
+        .expect("remove target endpoint trust fixture");
+
+    let database_arg = database.to_string_lossy().into_owned();
+    let secret_key_arg = secret_key.to_string_lossy().into_owned();
+    let output = run_ocfleet_failure(&[
+        "--database",
+        &database_arg,
+        "--secret-key",
+        &secret_key_arg,
+        "probe",
+        "path",
+        "source-node",
+        "target-node",
+    ]);
+
+    assert!(String::from_utf8_lossy(&output.stderr).contains("endpoint trust missing"));
+    assert!(!secret_key.exists());
+    let audit = latest_rpc_audit(&database);
+    assert_eq!(audit.event, "rpc.completed");
+    assert_eq!(audit.node_id.as_deref(), Some("source-node"));
+    assert_eq!(
+        audit.endpoint_id.as_deref(),
+        Some(source_endpoint_id.as_str())
+    );
+    assert_eq!(audit.method.as_deref(), Some(PROBE_PATH_ECHO));
+    assert_eq!(audit.ok, 0);
+    assert_eq!(audit.error_code.as_deref(), Some("ENDPOINT_NOT_ALLOWED"));
+    assert_eq!(audit.detail["target_endpoint_trust_state"], "missing");
+    assert!(audit.detail.get("target_endpoint_status").is_none());
 }
 
 #[test]

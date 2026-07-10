@@ -1,16 +1,111 @@
+use ocfleet_cli::backend::StoreWriter;
 use ocfleet_cli::store::{
     AlertDeliveryAttemptRecord, AlertEventRecord, AlertWebhookHookRecord, CURRENT_SCHEMA_VERSION,
     HealthSnapshotRecord, ObservabilityJobRecord, ObservabilityRunInsert, ProbeObservationInsert,
-    RetentionPolicyRecord, Store,
+    RetentionPolicyRecord, Store, StoreError,
 };
 use rusqlite::Connection;
-use serde_json::json;
+use serde_json::{Value, json};
+
+const TEST_ACTOR: &str = "observability-store-test";
 
 fn open_temp_store() -> (tempfile::TempDir, Store, std::path::PathBuf) {
     let dir = tempfile::tempdir().expect("temp dir");
     let db = dir.path().join("controller.sqlite");
     let store = Store::open(&db).expect("store opens");
     (dir, store, db)
+}
+
+fn sample_job(job_id: &str, enabled: bool) -> ObservabilityJobRecord {
+    ObservabilityJobRecord {
+        job_id: job_id.to_string(),
+        kind: "controller-ping".to_string(),
+        selector_json: json!({
+            "selector": "node_id=hk-ocserv-01",
+            "name": "HK controller ping",
+        }),
+        pair_selector_json: None,
+        interval_seconds: 60,
+        jitter_seconds: 5,
+        timeout_ms: 2_000,
+        enabled,
+        next_run_at: Some("2026-07-08T08:00:00Z".to_string()),
+        last_run_at: None,
+        created_at: "2026-07-08T07:00:00Z".to_string(),
+        updated_at: "2026-07-08T07:00:00Z".to_string(),
+    }
+}
+
+fn latest_job_audit(database: &std::path::Path) -> (String, String, Value) {
+    let conn = Connection::open(database).expect("open db for audit query");
+    let (actor, event, detail): (String, String, String) = conn
+        .query_row(
+            "SELECT actor, event, detail_json FROM controller_audit_log ORDER BY id DESC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("latest scheduler job audit");
+    (
+        actor,
+        event,
+        serde_json::from_str(&detail).expect("parse scheduler job audit detail"),
+    )
+}
+
+fn inject_job_audit_failure(database: &std::path::Path, event: &str) {
+    let conn = Connection::open(database).expect("open db for audit failure injection");
+    conn.execute_batch(&format!(
+        "CREATE TRIGGER fail_scheduler_job_audit
+         BEFORE INSERT ON controller_audit_log
+         WHEN NEW.event = '{event}'
+         BEGIN
+           SELECT RAISE(ABORT, 'injected scheduler job audit failure');
+         END;"
+    ))
+    .expect("install scheduler job audit failure trigger");
+}
+
+fn assert_injected_job_audit_failure(result: Result<(), StoreError>) {
+    match result {
+        Err(StoreError::Sqlite(error)) => assert!(
+            error
+                .to_string()
+                .contains("injected scheduler job audit failure"),
+            "unexpected SQLite error: {error}"
+        ),
+        other => panic!("expected injected scheduler job audit failure, got {other:?}"),
+    }
+}
+
+fn assert_job_state_rolls_back_when_audit_fails(enabled_before: bool, enabled_after: bool) {
+    let (_dir, store, db) = open_temp_store();
+    let job = sample_job("job-state-rollback", enabled_before);
+    StoreWriter::write_scheduler_job_add(&store, &job, TEST_ACTOR).expect("seed job");
+    let before = store
+        .get_observability_job(&job.job_id)
+        .expect("load job before failed state change")
+        .expect("job exists before failed state change");
+    let event = if enabled_after {
+        "scheduler.job.enable"
+    } else {
+        "scheduler.job.disable"
+    };
+    inject_job_audit_failure(&db, event);
+
+    let result = if enabled_after {
+        StoreWriter::write_scheduler_job_enable(&store, &job.job_id, TEST_ACTOR)
+    } else {
+        StoreWriter::write_scheduler_job_disable(&store, &job.job_id, TEST_ACTOR)
+    };
+    assert_injected_job_audit_failure(result);
+
+    let after = store
+        .get_observability_job(&job.job_id)
+        .expect("load job after failed state change")
+        .expect("job remains after failed state change");
+    assert_eq!(after, before);
+    assert_eq!(after.updated_at, before.updated_at);
+    assert_eq!(store.audit_count().expect("audit count"), 1);
 }
 
 #[test]
@@ -119,39 +214,131 @@ fn observability_store_tests_inserts_webhook_hook_and_delivery_attempt() {
 
 #[test]
 fn observability_store_tests_inserts_and_lists_observability_job() {
-    let (_dir, store, _db) = open_temp_store();
-    let job = ObservabilityJobRecord {
-        job_id: "job-1".to_string(),
-        kind: "controller-ping".to_string(),
-        selector_json: json!({"node_id": "hk-ocserv-01", "method": "ocserv.service.summary"}),
-        pair_selector_json: None,
-        interval_seconds: 60,
-        jitter_seconds: 5,
-        timeout_ms: 2_000,
-        enabled: true,
-        next_run_at: Some("2026-07-08T08:00:00Z".to_string()),
-        last_run_at: None,
-        created_at: "2026-07-08T07:00:00Z".to_string(),
-        updated_at: "2026-07-08T07:00:00Z".to_string(),
-    };
+    let (_dir, store, db) = open_temp_store();
+    let job = sample_job("job-1", true);
 
-    store
-        .insert_observability_job(&job)
+    StoreWriter::write_scheduler_job_add(&store, &job, TEST_ACTOR)
         .expect("insert observability job");
 
     let jobs = store
         .list_observability_jobs()
         .expect("list observability jobs");
     assert_eq!(jobs, vec![job.clone()]);
+    let (actor, event, detail) = latest_job_audit(&db);
+    assert_eq!(actor, TEST_ACTOR);
+    assert_eq!(event, "scheduler.job.add");
+    assert_eq!(detail["target_type"], "observability_job");
+    assert_eq!(detail["target_id"], "job-1");
+    assert_eq!(detail["before"], Value::Null);
+    assert_eq!(detail["after"]["enabled"], true);
+    assert_eq!(detail["selector_class"], "node_id");
+    assert_eq!(detail["after"]["selector_class"], "node_id");
+    assert!(detail.get("name").is_none());
+    assert!(detail.get("selector").is_none());
+    assert!(detail["after"].get("selector_json").is_none());
+    assert!(detail["after"].get("pair_selector_json").is_none());
+    assert!(detail["after"].get("updated_at").is_none());
 
-    store
-        .set_observability_job_enabled("job-1", false)
+    StoreWriter::write_scheduler_job_disable(&store, "job-1", TEST_ACTOR)
         .expect("disable observability job");
     let jobs = store
         .list_observability_jobs()
         .expect("list observability jobs after disable");
     assert_eq!(jobs[0].job_id, job.job_id);
     assert!(!jobs[0].enabled);
+    let (actor, event, detail) = latest_job_audit(&db);
+    assert_eq!(actor, TEST_ACTOR);
+    assert_eq!(event, "scheduler.job.disable");
+    assert_eq!(detail["job_id"], "job-1");
+    assert_eq!(detail["enabled"], false);
+    assert_eq!(detail["before"]["enabled"], true);
+    assert_eq!(detail["after"]["enabled"], false);
+}
+
+#[test]
+fn observability_store_tests_scheduler_job_add_rolls_back_when_audit_fails() {
+    let (_dir, store, db) = open_temp_store();
+    let job = sample_job("job-add-rollback", true);
+    inject_job_audit_failure(&db, "scheduler.job.add");
+
+    assert_injected_job_audit_failure(StoreWriter::write_scheduler_job_add(
+        &store, &job, TEST_ACTOR,
+    ));
+    assert!(
+        store
+            .get_observability_job(&job.job_id)
+            .expect("load job after failed add")
+            .is_none()
+    );
+    assert_eq!(store.audit_count().expect("audit count"), 0);
+}
+
+#[test]
+fn observability_store_tests_scheduler_job_state_rolls_back_exact_row_when_audit_fails() {
+    assert_job_state_rolls_back_when_audit_fails(true, false);
+    assert_job_state_rolls_back_when_audit_fails(false, true);
+}
+
+#[test]
+fn observability_store_tests_scheduler_job_state_audit_uses_closed_projection() {
+    let (_dir, store, db) = open_temp_store();
+    let job = sample_job("job-closed-audit", true);
+    StoreWriter::write_scheduler_job_add(&store, &job, TEST_ACTOR).expect("seed job");
+    Connection::open(&db)
+        .expect("open contaminated fixture")
+        .execute(
+            "UPDATE observability_jobs SET selector_json = ?1 WHERE job_id = ?2",
+            [
+                r#"{"selector":"role=/etc/ops","name":"credential alpha"}"#,
+                job.job_id.as_str(),
+            ],
+        )
+        .expect("contaminate stored job selector");
+
+    StoreWriter::write_scheduler_job_disable(&store, &job.job_id, TEST_ACTOR)
+        .expect("closed audit projection permits safe disable");
+    assert!(
+        !store
+            .get_observability_job(&job.job_id)
+            .expect("load disabled job")
+            .expect("job exists")
+            .enabled
+    );
+    let (_, event, detail) = latest_job_audit(&db);
+    assert_eq!(event, "scheduler.job.disable");
+    assert_eq!(detail["before"]["selector_class"], "role");
+    assert_eq!(detail["after"]["selector_class"], "role");
+    let encoded = serde_json::to_string(&detail).expect("encode audit detail");
+    assert!(!encoded.contains("/etc/ops"));
+    assert!(!encoded.contains("credential alpha"));
+    assert!(!encoded.contains("selector_json"));
+    assert!(!encoded.contains("updated_at"));
+}
+
+#[test]
+fn observability_store_tests_scheduler_job_writer_rejects_invalid_actor_and_missing_job() {
+    let (_dir, store, _db) = open_temp_store();
+    let job = sample_job("job-invalid-actor", true);
+
+    assert!(matches!(
+        StoreWriter::write_scheduler_job_add(&store, &job, "bad\nactor"),
+        Err(StoreError::InvalidInput(_))
+    ));
+    assert!(
+        store
+            .get_observability_job(&job.job_id)
+            .expect("load rejected job")
+            .is_none()
+    );
+    assert!(matches!(
+        StoreWriter::write_scheduler_job_enable(&store, "missing-job", TEST_ACTOR),
+        Err(StoreError::ObservabilityJobNotFound(job_id)) if job_id == "missing-job"
+    ));
+    assert!(matches!(
+        StoreWriter::write_scheduler_job_disable(&store, "missing-job", TEST_ACTOR),
+        Err(StoreError::ObservabilityJobNotFound(job_id)) if job_id == "missing-job"
+    ));
+    assert_eq!(store.audit_count().expect("audit count"), 0);
 }
 
 #[test]

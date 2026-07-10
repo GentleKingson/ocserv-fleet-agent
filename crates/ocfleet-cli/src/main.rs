@@ -60,7 +60,7 @@ use uuid::Uuid;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    configure_process_actor(cli.actor.as_deref()).map_err(anyhow::Error::msg)?;
+    let actor = configure_process_actor(cli.actor.as_deref()).map_err(anyhow::Error::msg)?;
     tracing_subscriber::fmt::init();
 
     match cli.command {
@@ -326,7 +326,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Schedule { command } => {
             let store = Store::open(&cli.database).context("failed to open controller database")?;
-            run_schedule_command(&store, &cli.secret_key, command).await?;
+            run_schedule_command(&store, &cli.secret_key, &actor, command).await?;
         }
         Command::Observation { command } => {
             let store = Store::open(&cli.database).context("failed to open controller database")?;

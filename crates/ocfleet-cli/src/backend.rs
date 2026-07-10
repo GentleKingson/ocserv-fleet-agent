@@ -48,6 +48,13 @@ pub trait StoreWriter {
     fn write_node_enable(&self, node_id: &str, actor: &str) -> Result<(), Self::Error>;
     fn write_node_disable(&self, node_id: &str, actor: &str) -> Result<(), Self::Error>;
     fn write_node_remove(&self, node_id: &str, actor: &str) -> Result<(), Self::Error>;
+    fn write_scheduler_job_add(
+        &self,
+        job: &ObservabilityJobRecord,
+        actor: &str,
+    ) -> Result<(), Self::Error>;
+    fn write_scheduler_job_enable(&self, job_id: &str, actor: &str) -> Result<(), Self::Error>;
+    fn write_scheduler_job_disable(&self, job_id: &str, actor: &str) -> Result<(), Self::Error>;
     fn write_health_policy(
         &self,
         policy: &HealthPolicyRecord,
@@ -198,6 +205,22 @@ impl StoreWriter for Store {
 
     fn write_node_remove(&self, node_id: &str, actor: &str) -> Result<(), Self::Error> {
         Store::remove_node(self, node_id, actor)
+    }
+
+    fn write_scheduler_job_add(
+        &self,
+        job: &ObservabilityJobRecord,
+        actor: &str,
+    ) -> Result<(), Self::Error> {
+        Store::insert_observability_job(self, job, actor)
+    }
+
+    fn write_scheduler_job_enable(&self, job_id: &str, actor: &str) -> Result<(), Self::Error> {
+        Store::set_observability_job_enabled(self, job_id, true, actor)
+    }
+
+    fn write_scheduler_job_disable(&self, job_id: &str, actor: &str) -> Result<(), Self::Error> {
+        Store::set_observability_job_enabled(self, job_id, false, actor)
     }
 
     fn write_health_policy(

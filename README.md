@@ -14,9 +14,10 @@ production-complete.
 - Web/API dashboard is experimentally implemented as a read-only observation surface.
 - Governance foundation work has started: actor identity, trust policy
   validation/diff, and optional signed audit export are implemented.
-- Production hardening is active: node add/enable/disable/remove use one
-  actor-bound SQLite transaction for both state and audit; other legacy
-  controller mutations are still being migrated.
+- Production hardening is active: node add/enable/disable/remove and scheduler
+  job add/enable/disable use actor-bearing `StoreWriter` transactions for both
+  state and audit. Scheduler run/outcome/observation, health/alert/delivery,
+  retention, and other legacy controller mutations are still being migrated.
 - The project is not production-complete.
 
 ## What It Does
@@ -44,7 +45,8 @@ production-complete.
     kinds: `controller-ping`, `ocserv-status`, `ocserv-cert`,
     `ocserv-sessions`, and `path-probe`; current query surfaces include job
     show/validate, targeted `run --once --job-id <job-id>`, run list/show, and
-    JSON status output
+    JSON status output. Job add/enable/disable bind the resolved actor and commit
+    the job row with its success audit in one SQLite transaction.
   - `ocfleet observation` list/show queries for bounded low-sensitive stored
     observations
   - `ocfleet health` summaries, node health views, and local health policy
@@ -387,6 +389,8 @@ target/debug/ocfleet schedule job add \
 target/debug/ocfleet schedule job list
 target/debug/ocfleet schedule job show <job-id> --json
 target/debug/ocfleet schedule job validate <job-id> --json
+target/debug/ocfleet schedule job disable <job-id>
+target/debug/ocfleet schedule job enable <job-id>
 target/debug/ocfleet schedule run --once
 target/debug/ocfleet schedule run --once --job-id <job-id> --json
 target/debug/ocfleet schedule run list --limit 50 --json
@@ -426,11 +430,12 @@ target/debug/ocfleet trust policy diff ./trust-policy.toml \
 
 These commands operate inside the controller boundary. Scheduler jobs use only
 fixed job kinds; non-path jobs target `role=<role>` or `node_id=<node-id>`
-selectors, and path jobs require an explicit source/target node pair. Health,
-alerts, retention, and audit export use controller SQLite state and bounded
-low-sensitive summaries. Webhook alert hooks require explicit HTTPS endpoints,
-host allowlists, private HMAC secret files, bounded retries, and no redirect
-following.
+selectors, and path jobs require an explicit source/target node pair. Scheduler
+job add/enable/disable are actor-bound and audit-atomic; this does not yet apply
+to scheduler run/outcome/observation transitions. Health, alerts, retention, and
+audit export use controller SQLite state and bounded low-sensitive summaries.
+Webhook alert hooks require explicit HTTPS endpoints, host allowlists, private
+HMAC secret files, bounded retries, and no redirect following.
 
 The historical Phase 7 ocserv-aware read-only document remains as the
 conservative pre-Phase-11 boundary record. The implemented ocserv-aware surface is

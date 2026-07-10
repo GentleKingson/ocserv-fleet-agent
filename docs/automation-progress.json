@@ -2,11 +2,11 @@
   "baseline_commit": "b3c906a94823b4620dc1a2077a44e7160c0848b2",
   "current_phase": "A1",
   "completed_phases": [],
-  "active_branch": "codex/a1-node-audit-atomicity",
+  "active_branch": "codex/a1-scheduler-audit-atomicity",
   "active_issue": 33,
-  "active_pr": 57,
+  "active_pr": 58,
   "last_test_result": "passed",
-  "last_updated_at": "2026-07-10T15:15:42Z",
+  "last_updated_at": "2026-07-10T16:02:15Z",
   "blockers": [],
-  "next_action": "Monitor pull request 57 CI and fix any failures before the next A1 slice."
+  "next_action": "Monitor pull request 58 CI and fix failures before scheduler run transitions."
 }

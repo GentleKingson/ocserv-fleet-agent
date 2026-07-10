@@ -17,7 +17,7 @@ RPC boundary.
 
 | Surface | Current status | Current CLI or source state |
 | --- | --- | --- |
-| Scheduler | partially implemented / active implementation | `ocfleet schedule job add/list/show/validate/enable/disable`, `ocfleet schedule run --once [--job-id <job-id>]`, `ocfleet schedule run list/show`, `ocfleet schedule daemon`, `ocfleet schedule status --json` |
+| Scheduler | partially implemented / active implementation | `ocfleet schedule job add/list/show/validate/enable/disable`, `ocfleet schedule run --once [--job-id <job-id>]`, `ocfleet schedule run list/show`, `ocfleet schedule daemon`, `ocfleet schedule status --json`; job add/enable/disable are actor-bound and audit-atomic, while run/outcome/observation transitions are not included in that claim |
 | Observations | partially implemented / active implementation | `ocfleet observation list --node <node-id> --method <method> --limit <n> --json`, `ocfleet observation show <observation-id> --json` |
 | Health | partially implemented / active implementation | `ocfleet health summary`, `ocfleet health node`, `ocfleet health snapshot list`, `ocfleet health policy show/set` |
 | Alerts | partially implemented / active implementation | `ocfleet alert list --state ... --severity ... --node ... --json`, `ocfleet alert hook add-webhook/list/test`, `ocfleet alert test/deliver/silence/resolve`; `jsonl_file:<path>` and explicitly configured HTTPS `webhook:<hook-id>` delivery are enabled |
@@ -164,6 +164,9 @@ Rules:
 - `interval_seconds` must be positive and bounded.
 - no column may store command text, local file paths, shell snippets, service
   units, journal queries, or agent-side selectors.
+- job add, enable, and disable use actor-bearing `StoreWriter` methods. Each
+  method writes the job configuration change and its success audit in one
+  SQLite transaction, so audit insertion failure rolls back the job row.
 
 ### `observability_runs`
 
@@ -348,6 +351,12 @@ ocfleet schedule status --json
 `schedule daemon` runs scheduler loops only from local controller config and
 SQLite job rows. It must not expose an unauthenticated socket and must not allow
 dashboard/API callers to trigger RPCs.
+
+Scheduler job add, enable, and disable pass the resolved actor to `StoreWriter`
+and commit the `observability_jobs` change with its success audit in one SQLite
+transaction. Audit insertion failure rolls back the insert or enabled-state
+update. This slice does not make scheduler run/outcome/observation writes
+audit-atomic and changes no schema, protocol, agent RPC, or API route.
 
 After `schedule run --once` and after each daemon tick, the controller evaluates
 local alert candidates from existing observations, health snapshots, and endpoint
@@ -550,9 +559,12 @@ Phase 12 keeps the project security posture:
   journal selectors, scripts, or file selectors.
 - no automatic trust generation, no TOFU, no automatic path-probe
   authorization, and no mesh enumeration.
-- all scheduler job creation, enable/disable, one-shot runs, non-dry-run retention apply,
-  alert silence, alert resolve, and audit export operations write controller
-  audit entries.
+- scheduler job creation and enable/disable use actor-bearing `StoreWriter`
+  transactions that roll back their job changes if audit insertion fails.
+- one-shot runs, non-dry-run retention apply, alert silence, alert resolve, and
+  audit export operations write controller audit entries, but this statement
+  does not claim their business writes are all transactionally paired with
+  those audits.
 - dashboard/API reads use a read-only SQLite connection and must not mutate
   scheduler state.
 
@@ -644,4 +656,6 @@ Additional acceptance requirements:
   response bodies.
 - retention policies prune only approved history tables.
 - controller audit records exist for job mutation, run completion, retention
-  apply, alert lifecycle operations, and audit export.
+  apply, alert lifecycle operations, and audit export. Job add/enable/disable
+  are audit-atomic; run/outcome/observation and the other listed mutation
+  families are not covered by that atomicity statement.

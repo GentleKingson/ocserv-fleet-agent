@@ -916,20 +916,23 @@ fn seed_database(path: &Path) {
         )
         .expect("add node");
     store
-        .insert_observability_job(&ObservabilityJobRecord {
-            job_id: "job-a".to_string(),
-            kind: "controller-ping".to_string(),
-            selector_json: json!({"selector": "role=ocserv", "name": "daily checks"}),
-            pair_selector_json: None,
-            interval_seconds: 300,
-            jitter_seconds: 0,
-            timeout_ms: 5_000,
-            enabled: true,
-            next_run_at: Some("2026-07-09T00:00:00Z".to_string()),
-            last_run_at: Some("2026-07-09T00:01:00Z".to_string()),
-            created_at: "2026-07-09T00:00:00Z".to_string(),
-            updated_at: "2026-07-09T00:01:00Z".to_string(),
-        })
+        .insert_observability_job(
+            &ObservabilityJobRecord {
+                job_id: "job-a".to_string(),
+                kind: "controller-ping".to_string(),
+                selector_json: json!({"selector": "role=ocserv", "name": "daily checks"}),
+                pair_selector_json: None,
+                interval_seconds: 300,
+                jitter_seconds: 0,
+                timeout_ms: 5_000,
+                enabled: true,
+                next_run_at: Some("2026-07-09T00:00:00Z".to_string()),
+                last_run_at: Some("2026-07-09T00:01:00Z".to_string()),
+                created_at: "2026-07-09T00:00:00Z".to_string(),
+                updated_at: "2026-07-09T00:01:00Z".to_string(),
+            },
+            "api-test",
+        )
         .expect("insert job");
     store
         .insert_observability_run(&ObservabilityRunInsert {

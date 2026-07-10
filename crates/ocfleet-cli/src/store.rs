@@ -44,6 +44,8 @@ pub enum StoreError {
     DatabaseIntegrityCheckFailed { check: &'static str, detail: String },
     #[error("node not found: {0}")]
     NodeNotFound(String),
+    #[error("observability job not found: {0}")]
+    ObservabilityJobNotFound(String),
     #[error("enrollment rejected: {0}")]
     EnrollmentRejected(String),
     #[error("join request not found: {0}")]
@@ -562,7 +564,12 @@ impl Store {
         }
     }
 
-    pub fn insert_observability_job(&self, job: &ObservabilityJobRecord) -> Result<(), StoreError> {
+    pub fn insert_observability_job(
+        &self,
+        job: &ObservabilityJobRecord,
+        actor: &str,
+    ) -> Result<(), StoreError> {
+        validate_actor(actor).map_err(StoreError::InvalidInput)?;
         validate_low_sensitive_json(&job.selector_json, "observability job selector")?;
         if let Some(pair) = &job.pair_selector_json {
             validate_low_sensitive_json(pair, "observability job pair selector")?;
@@ -587,6 +594,12 @@ impl Store {
                 job.updated_at.as_str(),
             ],
         )?;
+        let after = get_observability_job_tx(&tx, &job.job_id)?
+            .ok_or_else(|| StoreError::ObservabilityJobNotFound(job.job_id.clone()))?;
+        let mut event = AuditEvent::new(actor, "scheduler.job.add");
+        event.ok = Some(true);
+        event.detail_json = scheduler_job_add_audit_detail(&after);
+        insert_audit_tx(&tx, &event)?;
         tx.commit()?;
         Ok(())
     }
@@ -672,15 +685,33 @@ impl Store {
         &self,
         job_id: &str,
         enabled: bool,
+        actor: &str,
     ) -> Result<(), StoreError> {
+        validate_actor(actor).map_err(StoreError::InvalidInput)?;
         let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
+        let before = get_observability_job_tx(&tx, job_id)?
+            .ok_or_else(|| StoreError::ObservabilityJobNotFound(job_id.to_string()))?;
+        let affected = tx.execute(
             "UPDATE observability_jobs
              SET enabled = ?1,
                  updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
              WHERE job_id = ?2",
             params![bool_to_i64(enabled), job_id],
         )?;
+        if affected == 0 {
+            return Err(StoreError::ObservabilityJobNotFound(job_id.to_string()));
+        }
+        let after = get_observability_job_tx(&tx, job_id)?
+            .ok_or_else(|| StoreError::ObservabilityJobNotFound(job_id.to_string()))?;
+        let event_name = if enabled {
+            "scheduler.job.enable"
+        } else {
+            "scheduler.job.disable"
+        };
+        let mut event = AuditEvent::new(actor, event_name);
+        event.ok = Some(true);
+        event.detail_json = scheduler_job_state_audit_detail(&before, &after);
+        insert_audit_tx(&tx, &event)?;
         tx.commit()?;
         Ok(())
     }
@@ -2024,6 +2055,21 @@ fn get_node_tx(tx: &Transaction<'_>, node_id: &str) -> Result<Option<NodeRecord>
     .map_err(StoreError::from)
 }
 
+fn get_observability_job_tx(
+    tx: &Transaction<'_>,
+    job_id: &str,
+) -> Result<Option<ObservabilityJobRecord>, StoreError> {
+    tx.query_row(
+        "SELECT job_id, kind, selector_json, pair_selector_json, interval_seconds, jitter_seconds, timeout_ms, enabled, next_run_at, last_run_at, created_at, updated_at
+         FROM observability_jobs
+         WHERE job_id = ?1",
+        [job_id],
+        observability_job_from_row,
+    )
+    .optional()
+    .map_err(StoreError::from)
+}
+
 fn get_join_request_tx(
     tx: &Transaction<'_>,
     request_id: &str,
@@ -2128,6 +2174,63 @@ fn node_audit_json(node: &NodeRecord) -> Value {
         "role": node.role.clone(),
         "enabled": node.enabled,
     })
+}
+
+fn scheduler_job_add_audit_detail(job: &ObservabilityJobRecord) -> Value {
+    serde_json::json!({
+        "actor_type": "user",
+        "target_type": "observability_job",
+        "target_id": job.job_id.clone(),
+        "job_id": job.job_id.clone(),
+        "kind": job.kind.clone(),
+        "interval_seconds": job.interval_seconds,
+        "selector_class": scheduler_job_selector_class(job),
+        "result_class": "scheduler_summary",
+        "before": Value::Null,
+        "after": observability_job_audit_json(job),
+        "reason": Value::Null,
+    })
+}
+
+fn scheduler_job_state_audit_detail(
+    before: &ObservabilityJobRecord,
+    after: &ObservabilityJobRecord,
+) -> Value {
+    serde_json::json!({
+        "actor_type": "user",
+        "target_type": "observability_job",
+        "target_id": after.job_id.clone(),
+        "job_id": after.job_id.clone(),
+        "enabled": after.enabled,
+        "result_class": "scheduler_summary",
+        "before": observability_job_audit_json(before),
+        "after": observability_job_audit_json(after),
+        "reason": Value::Null,
+    })
+}
+
+fn observability_job_audit_json(job: &ObservabilityJobRecord) -> Value {
+    serde_json::json!({
+        "job_id": job.job_id.clone(),
+        "kind": job.kind.clone(),
+        "selector_class": scheduler_job_selector_class(job),
+        "interval_seconds": job.interval_seconds,
+        "jitter_seconds": job.jitter_seconds,
+        "timeout_ms": job.timeout_ms,
+        "enabled": job.enabled,
+    })
+}
+
+fn scheduler_job_selector_class(job: &ObservabilityJobRecord) -> &'static str {
+    if job.pair_selector_json.is_some() {
+        return "explicit_pair";
+    }
+    match job.selector_json.get("selector").and_then(Value::as_str) {
+        Some("all") => "all",
+        Some(selector) if selector.starts_with("role=") => "role",
+        Some(selector) if selector.starts_with("node_id=") => "node_id",
+        _ => "invalid",
+    }
 }
 
 fn endpoint_audit_json(endpoint: &EndpointTrustRecord) -> Value {

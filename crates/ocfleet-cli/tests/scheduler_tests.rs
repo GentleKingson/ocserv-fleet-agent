@@ -1,6 +1,6 @@
 use ocfleet_cli::store::{NodeInsert, ProbeObservationInsert, Store};
 use ocfleet_protocol::enrollment::EndpointStatus;
-use ocfleet_protocol::method::PROBE_CONTROLLER_PING;
+use ocfleet_protocol::method::{OCSERV_CERT_EXPIRY, PROBE_CONTROLLER_PING, PROBE_PATH_ECHO};
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::Value;
 use std::path::Path;
@@ -1147,6 +1147,166 @@ fn scheduler_tests_run_once_missing_and_disabled_node_write_failed_observations(
 }
 
 #[test]
+fn scheduler_tests_missing_endpoint_trust_fails_closed_without_network_attempt() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let database_arg = database.to_string_lossy().into_owned();
+    let unused_secret = dir.path().join("unused-controller.secret");
+    let unused_secret_arg = unused_secret.to_string_lossy().into_owned();
+
+    let endpoint_id = {
+        let store = Store::open(&database).expect("open store");
+        add_node_with_generated_endpoint(&store, "missing-trust-node")
+    };
+    let conn = Connection::open(&database).expect("open db");
+    conn.execute(
+        "DELETE FROM endpoint_trust WHERE endpoint_id = ?1",
+        [&endpoint_id],
+    )
+    .expect("delete endpoint trust");
+    drop(conn);
+
+    run_ocfleet(&[
+        "--database",
+        &database_arg,
+        "schedule",
+        "job",
+        "add",
+        "--kind",
+        "controller-ping",
+        "--interval",
+        "60s",
+        "--selector",
+        "node_id=missing-trust-node",
+    ]);
+
+    let output = run_ocfleet(&[
+        "--database",
+        &database_arg,
+        "--secret-key",
+        &unused_secret_arg,
+        "schedule",
+        "run",
+        "--once",
+    ]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("due_jobs=1"));
+    assert!(stdout.contains("failed_observations=1"));
+    assert!(!unused_secret.exists());
+
+    let store = Store::open(&database).expect("open store");
+    let observations = store
+        .list_probe_observations(None, 10)
+        .expect("list observations");
+    assert_eq!(observations.len(), 1);
+    assert_eq!(
+        observations[0].node_id.as_deref(),
+        Some("missing-trust-node")
+    );
+    assert_eq!(
+        observations[0].endpoint_id.as_deref(),
+        Some(endpoint_id.as_str())
+    );
+    assert_eq!(observations[0].ok, Some(false));
+    assert_eq!(
+        observations[0].error_code.as_deref(),
+        Some("ENDPOINT_TRUST_MISSING")
+    );
+    assert_eq!(observations[0].duration_ms, Some(0));
+    assert_eq!(
+        observations[0].summary_json["result_class"],
+        "controller_rpc_summary"
+    );
+    let conn = Connection::open(&database).expect("open db");
+    let (error_code, detail): (String, String) = conn
+        .query_row(
+            "SELECT error_code, detail_json
+             FROM controller_audit_log
+             WHERE event = 'rpc.completed' AND method = ?1
+             ORDER BY id DESC LIMIT 1",
+            [PROBE_CONTROLLER_PING],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("missing-trust rejection audit");
+    let detail: Value = serde_json::from_str(&detail).expect("parse rejection audit");
+    assert_eq!(error_code, "ENDPOINT_NOT_ALLOWED");
+    assert_eq!(detail["endpoint_trust_state"], "missing");
+}
+
+#[test]
+fn scheduler_tests_ocserv_missing_trust_writes_rejection_audit() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let database_arg = database.to_string_lossy().into_owned();
+    let unused_secret = dir.path().join("unused-controller.secret");
+    let unused_secret_arg = unused_secret.to_string_lossy().into_owned();
+
+    let endpoint_id = {
+        let store = Store::open(&database).expect("open store");
+        add_node_with_generated_endpoint(&store, "missing-trust-ocserv")
+    };
+    Connection::open(&database)
+        .expect("open db")
+        .execute(
+            "DELETE FROM endpoint_trust WHERE endpoint_id = ?1",
+            [&endpoint_id],
+        )
+        .expect("delete endpoint trust");
+
+    run_ocfleet(&[
+        "--database",
+        &database_arg,
+        "schedule",
+        "job",
+        "add",
+        "--kind",
+        "ocserv-cert",
+        "--interval",
+        "60s",
+        "--selector",
+        "node_id=missing-trust-ocserv",
+    ]);
+    let output = run_ocfleet(&[
+        "--database",
+        &database_arg,
+        "--secret-key",
+        &unused_secret_arg,
+        "schedule",
+        "run",
+        "--once",
+    ]);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("failed_observations=1"));
+    assert!(!unused_secret.exists());
+
+    let store = Store::open(&database).expect("open store");
+    let observations = store
+        .list_probe_observations(None, 10)
+        .expect("list observations");
+    assert_eq!(observations.len(), 1);
+    assert_eq!(observations[0].method, OCSERV_CERT_EXPIRY);
+    assert_eq!(
+        observations[0].error_code.as_deref(),
+        Some("ENDPOINT_TRUST_MISSING")
+    );
+    drop(store);
+    let conn = Connection::open(&database).expect("open db");
+    let (error_code, detail): (String, String) = conn
+        .query_row(
+            "SELECT error_code, detail_json
+             FROM controller_audit_log
+             WHERE event = 'rpc.completed' AND method = ?1
+             ORDER BY id DESC LIMIT 1",
+            [OCSERV_CERT_EXPIRY],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("ocserv rejection audit");
+    let detail: Value = serde_json::from_str(&detail).expect("parse rejection audit");
+    assert_eq!(error_code, "ENDPOINT_NOT_ALLOWED");
+    assert_eq!(detail["endpoint_trust_state"], "missing");
+    assert_eq!(detail["result_class"], "low_sensitive_summary");
+}
+
+#[test]
 fn scheduler_tests_malformed_job_does_not_block_valid_job() {
     let dir = tempfile::tempdir().expect("temp dir");
     let database = dir.path().join("controller.sqlite");
@@ -1404,4 +1564,98 @@ fn scheduler_tests_path_probe_target_rotated_writes_failed_preflight() {
         EndpointStatus::Rotated,
         "TARGET_ENDPOINT_ROTATED",
     );
+}
+
+#[test]
+fn scheduler_tests_path_probe_missing_target_trust_fails_closed_without_network_attempt() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let database_arg = database.to_string_lossy().into_owned();
+    let unused_secret = dir.path().join("unused-controller.secret");
+    let unused_secret_arg = unused_secret.to_string_lossy().into_owned();
+
+    let (source_endpoint_id, target_endpoint_id) = {
+        let store = Store::open(&database).expect("open store");
+        (
+            add_node_with_generated_endpoint(&store, "source-node"),
+            add_node_with_generated_endpoint(&store, "target-node"),
+        )
+    };
+    let conn = Connection::open(&database).expect("open db");
+    conn.execute(
+        "DELETE FROM endpoint_trust WHERE endpoint_id = ?1",
+        [&target_endpoint_id],
+    )
+    .expect("delete target endpoint trust");
+    drop(conn);
+
+    run_ocfleet(&[
+        "--database",
+        &database_arg,
+        "schedule",
+        "job",
+        "add",
+        "--kind",
+        "path-probe",
+        "--interval",
+        "60s",
+        "--source-node-id",
+        "source-node",
+        "--target-node-id",
+        "target-node",
+    ]);
+
+    let output = run_ocfleet(&[
+        "--database",
+        &database_arg,
+        "--secret-key",
+        &unused_secret_arg,
+        "schedule",
+        "run",
+        "--once",
+    ]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("due_jobs=1"));
+    assert!(stdout.contains("failed_observations=1"));
+    assert!(!unused_secret.exists());
+
+    let store = Store::open(&database).expect("open store");
+    let observations = store
+        .list_probe_observations(None, 10)
+        .expect("list observations");
+    assert_eq!(observations.len(), 1);
+    assert_eq!(observations[0].node_id.as_deref(), Some("source-node"));
+    assert_eq!(
+        observations[0].endpoint_id.as_deref(),
+        Some(source_endpoint_id.as_str())
+    );
+    assert_eq!(observations[0].ok, Some(false));
+    assert_eq!(
+        observations[0].error_code.as_deref(),
+        Some("TARGET_ENDPOINT_TRUST_MISSING")
+    );
+    assert_eq!(observations[0].duration_ms, Some(0));
+    assert_eq!(
+        observations[0].summary_json["target_endpoint_id"],
+        target_endpoint_id
+    );
+    assert_eq!(
+        observations[0].summary_json["result_class"],
+        "controller_rpc_summary"
+    );
+    let conn = Connection::open(&database).expect("open db");
+    let (error_code, detail): (String, String) = conn
+        .query_row(
+            "SELECT error_code, detail_json
+             FROM controller_audit_log
+             WHERE event = 'rpc.completed' AND method = ?1
+             ORDER BY id DESC LIMIT 1",
+            [PROBE_PATH_ECHO],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("path rejection audit");
+    let detail: Value = serde_json::from_str(&detail).expect("parse path rejection audit");
+    assert_eq!(error_code, "ENDPOINT_NOT_ALLOWED");
+    assert_eq!(detail["error_code"], "TARGET_ENDPOINT_TRUST_MISSING");
+    assert_eq!(detail["target_endpoint_id"], target_endpoint_id);
 }

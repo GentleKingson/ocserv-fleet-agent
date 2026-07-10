@@ -313,7 +313,16 @@ ocfleet --database /var/lib/ocfleet-controller/controller.sqlite --secret-key /v
 sudo systemctl start ocfleet-agent
 ```
 
-Keep the controller SQLite backup until the new binary has passed `doctor`, expected controller-local smoke commands, and at least one low-sensitive read-only RPC smoke in your deployment.
+Do not start controller scheduler execution until
+`registry.endpoint_trust.coverage` is `ok`. Missing trust is unauthorized and
+fails before key loading or network dispatch. If the check fails, retain the
+backup and either restore a known-good database or explicitly re-register each
+affected node with its operator-verified EndpointID; there is no automatic
+trust reconstruction from registry rows.
+
+Keep the controller SQLite backup until the new binary has passed `doctor`,
+expected controller-local smoke commands, and at least one low-sensitive
+read-only RPC smoke in your deployment.
 
 ## Smoke Tests
 

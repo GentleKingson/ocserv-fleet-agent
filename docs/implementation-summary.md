@@ -68,6 +68,12 @@ their pinned GitHub Actions jobs are the verification path for this candidate.
   and other remaining mutations to the atomic `StoreWriter` actor/audit contract
   before claiming fully fail-closed controller mutation auditing. The completed
   scheduler-job configuration slice changes no schema, protocol, or API route.
+- Keep every controller and scheduler RPC gate fail closed on absent as well as
+  inactive endpoint trust. The current correction adds fixed missing-trust
+  outcomes and rejection audits before key or network access, repeats scheduler
+  source/target checks after concurrency waits, and adds an aggregate doctor
+  coverage check. It changes no schema, protocol, or API route; endpoint binding
+  and lifecycle-state invariants remain separate A1 work.
 - Consolidate the API-specific read adapter with the backend-neutral reader only
   after their projection contracts can remain equally strict.
 - Add a real Postgres client/schema/import path only as a separately reviewed,

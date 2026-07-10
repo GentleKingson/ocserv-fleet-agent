@@ -2,11 +2,11 @@
   "baseline_commit": "b3c906a94823b4620dc1a2077a44e7160c0848b2",
   "current_phase": "A1",
   "completed_phases": [],
-  "active_branch": "codex/a1-scheduler-audit-atomicity",
+  "active_branch": "codex/a1-endpoint-trust-fail-closed",
   "active_issue": 33,
-  "active_pr": 58,
+  "active_pr": null,
   "last_test_result": "passed",
-  "last_updated_at": "2026-07-10T16:02:15Z",
+  "last_updated_at": "2026-07-10T16:56:35Z",
   "blockers": [],
-  "next_action": "Monitor pull request 58 CI and fix failures before scheduler run transitions."
+  "next_action": "Open the endpoint-trust fail-closed pull request, monitor CI, and fix any failures before merge."
 }

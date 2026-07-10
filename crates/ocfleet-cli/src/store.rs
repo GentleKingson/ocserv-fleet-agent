@@ -2,7 +2,7 @@ use ocfleet_protocol::enrollment::{
     EndpointStatus, EnrollmentTokenStatus, JoinRequestStatus, TrustBundle,
 };
 use ocfleet_protocol::method::{PROBE_CONTROLLER_PING, PROBE_PATH_ECHO};
-use rusqlite::{Connection, OptionalExtension, Transaction, params, types::Type};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params, types::Type};
 use serde_json::Value;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -367,6 +367,7 @@ pub struct TrustSnapshot {
 
 pub struct Store {
     conn: Connection,
+    database_path: PathBuf,
 }
 
 pub struct StoreOpenResult {
@@ -376,29 +377,53 @@ pub struct StoreOpenResult {
 
 impl Store {
     pub fn open(path: &Path) -> Result<Self, StoreError> {
-        let created_database = create_database_file_if_missing(path)?;
-        Self::open_existing_or_create(path, created_database)
+        let database_path = absolute_database_path(path)?;
+        let created_database = create_database_file_if_missing(&database_path)?;
+        Self::open_existing_or_create(database_path, created_database)
     }
 
     pub fn open_with_status(path: &Path) -> Result<StoreOpenResult, StoreError> {
-        let created_database = create_database_file_if_missing(path)?;
-        let store = Self::open_existing_or_create(path, created_database)?;
+        let database_path = absolute_database_path(path)?;
+        let created_database = create_database_file_if_missing(&database_path)?;
+        let store = Self::open_existing_or_create(database_path, created_database)?;
         Ok(StoreOpenResult {
             store,
             created_database,
         })
     }
 
-    fn open_existing_or_create(path: &Path, created_database: bool) -> Result<Self, StoreError> {
-        validate_database_files(path)?;
-        let mut conn = Connection::open(path)?;
+    pub(crate) fn database_path(&self) -> &Path {
+        &self.database_path
+    }
+
+    pub(crate) fn read_endpoint_trust_status(
+        database_path: &Path,
+        endpoint_id: &str,
+    ) -> Result<Option<EndpointStatus>, StoreError> {
+        validate_database_files(database_path)?;
+        let conn = Connection::open_with_flags(database_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        conn.pragma_update(None, "query_only", "ON")?;
+        conn.pragma_update(None, "busy_timeout", 5_000)?;
+        validate_database_files(database_path)?;
+        get_endpoint_trust_status_conn(&conn, endpoint_id)
+    }
+
+    fn open_existing_or_create(
+        database_path: PathBuf,
+        created_database: bool,
+    ) -> Result<Self, StoreError> {
+        validate_database_files(&database_path)?;
+        let mut conn = Connection::open(&database_path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "busy_timeout", 5_000)?;
 
-        migrations::migrate_to_current(&mut conn, path, created_database)?;
-        validate_database_files(path)?;
-        Ok(Self { conn })
+        migrations::migrate_to_current(&mut conn, &database_path, created_database)?;
+        validate_database_files(&database_path)?;
+        Ok(Self {
+            conn,
+            database_path,
+        })
     }
 
     pub fn current_schema_version(&self) -> Result<i64, StoreError> {
@@ -1951,6 +1976,14 @@ impl Store {
     }
 }
 
+fn absolute_database_path(path: &Path) -> Result<PathBuf, StoreError> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()?.join(path))
+    }
+}
+
 fn create_database_file_if_missing(path: &Path) -> Result<bool, StoreError> {
     match private_file::open_private_create_new(path) {
         Ok(_) => Ok(true),
@@ -2079,6 +2112,22 @@ fn get_join_request_tx(
          FROM join_requests WHERE request_id = ?1",
         [request_id],
         join_request_from_row,
+    )
+    .optional()
+    .map_err(StoreError::from)
+}
+
+fn get_endpoint_trust_status_conn(
+    conn: &Connection,
+    endpoint_id: &str,
+) -> Result<Option<EndpointStatus>, StoreError> {
+    conn.query_row(
+        "SELECT status FROM endpoint_trust WHERE endpoint_id = ?1",
+        [endpoint_id],
+        |row| {
+            let status: String = row.get(0)?;
+            parse_status(&status, 0)
+        },
     )
     .optional()
     .map_err(StoreError::from)
@@ -3230,4 +3279,146 @@ fn i64_to_u32(value: i64) -> rusqlite::Result<u32> {
 fn i64_to_u64(value: i64) -> rusqlite::Result<u64> {
     u64::try_from(value)
         .map_err(|err| rusqlite::Error::FromSqlConversionFailure(0, Type::Integer, Box::new(err)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TEST_ACTOR: &str = "store-test";
+
+    #[test]
+    fn store_binds_relative_database_path_to_opened_file() {
+        let cwd = std::env::current_dir().expect("current directory");
+        let dir = tempfile::Builder::new()
+            .prefix("ocfleet-store-path-")
+            .tempdir_in(&cwd)
+            .expect("temp dir");
+        let relative_db = dir
+            .path()
+            .strip_prefix(&cwd)
+            .expect("temp dir below current directory")
+            .join("controller.sqlite");
+
+        let store = Store::open(&relative_db).expect("store opens");
+
+        assert_eq!(store.database_path(), cwd.join(relative_db));
+    }
+
+    #[test]
+    fn read_endpoint_trust_status_returns_active_missing_and_inactive() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = dir.path().join("controller.sqlite");
+        let store = Store::open(&db).expect("store opens");
+        let endpoint_id = iroh::SecretKey::generate().public().to_string();
+        let node = NodeInsert {
+            node_id: "readonly-node".into(),
+            endpoint_id,
+            name: "readonly-node".into(),
+            region: "test".into(),
+            role: "ocserv".into(),
+        };
+        store.add_node(&node, TEST_ACTOR).expect("insert node");
+
+        let active = Store::read_endpoint_trust_status(store.database_path(), &node.endpoint_id)
+            .expect("read active endpoint")
+            .expect("active endpoint exists");
+        assert_eq!(active, EndpointStatus::Active);
+        assert!(
+            Store::read_endpoint_trust_status(store.database_path(), "missing-endpoint")
+                .expect("read missing endpoint")
+                .is_none()
+        );
+
+        store
+            .quarantine_endpoint(&node.endpoint_id, TEST_ACTOR, "test quarantine")
+            .expect("quarantine endpoint");
+        let inactive = Store::read_endpoint_trust_status(store.database_path(), &node.endpoint_id)
+            .expect("read inactive endpoint")
+            .expect("inactive endpoint exists");
+        assert_eq!(inactive, EndpointStatus::Quarantined);
+    }
+
+    #[test]
+    fn read_endpoint_trust_status_is_query_only_and_does_not_run_migrations() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = dir.path().join("controller.sqlite");
+        let store = Store::open(&db).expect("store opens");
+        let node = NodeInsert {
+            node_id: "readonly-no-write-node".into(),
+            endpoint_id: "readonly-no-write-endpoint".into(),
+            name: "readonly-no-write-node".into(),
+            region: "test".into(),
+            role: "ocserv".into(),
+        };
+        store.add_node(&node, TEST_ACTOR).expect("insert node");
+        let database_path = store.database_path().to_path_buf();
+        drop(store);
+
+        let conn = Connection::open(&database_path).expect("open database for test setup");
+        conn.execute(
+            "DELETE FROM schema_migrations WHERE version = ?1",
+            [CURRENT_SCHEMA_VERSION],
+        )
+        .expect("mark schema as one version behind");
+        let audit_count_before: i64 = conn
+            .query_row("SELECT count(*) FROM controller_audit_log", [], |row| {
+                row.get(0)
+            })
+            .expect("count audit rows");
+        drop(conn);
+        let database_before = std::fs::read(&database_path).expect("read database before lookup");
+
+        let status = Store::read_endpoint_trust_status(&database_path, &node.endpoint_id)
+            .expect("read endpoint")
+            .expect("endpoint exists");
+
+        assert_eq!(status, EndpointStatus::Active);
+        assert_eq!(
+            std::fs::read(&database_path).expect("read database after lookup"),
+            database_before
+        );
+        let conn = Connection::open(&database_path).expect("reopen database for assertions");
+        let version: i64 = conn
+            .query_row("SELECT max(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .expect("read schema version");
+        let audit_count_after: i64 = conn
+            .query_row("SELECT count(*) FROM controller_audit_log", [], |row| {
+                row.get(0)
+            })
+            .expect("count audit rows");
+        assert_eq!(version, CURRENT_SCHEMA_VERSION - 1);
+        assert_eq!(audit_count_after, audit_count_before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_endpoint_trust_status_rejects_unsafe_database_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = dir.path().join("controller.sqlite");
+        drop(Store::open(&db).expect("store opens"));
+        std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o644))
+            .expect("make database unsafe");
+
+        assert!(matches!(
+            Store::read_endpoint_trust_status(&db, "endpoint"),
+            Err(StoreError::UnsafePermissions)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_endpoint_trust_status_rejects_missing_database() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = dir.path().join("missing.sqlite");
+
+        assert!(matches!(
+            Store::read_endpoint_trust_status(&db, "endpoint"),
+            Err(StoreError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound
+        ));
+    }
 }

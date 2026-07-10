@@ -71,6 +71,14 @@ database/sidecar files, checks schema version/tables/integrity, and never expose
 a writer to routes. Consolidating this adapter with the neutral reader remains
 future work; SQLite is the only runtime backend.
 
+The controller `Store` also retains the absolute path it actually opened. A
+crate-private scheduler dispatch gate uses that bound path to open a short-lived
+read-only/query-only SQLite connection and select only endpoint trust status
+after concurrency waits. It validates the database and WAL/SHM files, never
+runs migrations, executes through `spawn_blocking`, and closes before key
+loading or network I/O. Callers cannot substitute an unrelated authorization
+database.
+
 Scheduler run/outcome/observation, health/alert/delivery, retention, and some
 enrollment lifecycle flows are not all migrated to the writer trait. Future
 writer interfaces must keep actor/audit input mandatory and must not loosen

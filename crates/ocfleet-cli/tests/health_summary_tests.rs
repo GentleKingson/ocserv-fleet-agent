@@ -226,6 +226,64 @@ fn health_summary_tests_inactive_endpoint_overrides_recent_success() {
 }
 
 #[test]
+fn health_summary_tests_missing_endpoint_trust_fails_closed_without_network_attempt() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let database_arg = database.to_string_lossy().into_owned();
+    let missing_secret_arg = dir
+        .path()
+        .join("missing.secret")
+        .to_string_lossy()
+        .into_owned();
+    let store = Store::open(&database).expect("open store");
+    add_node(&store, "hk-ocserv-01");
+    let observed_at = now_rfc3339();
+    insert_observation(
+        &store,
+        ObservationFixture {
+            observation_id: "obs-ping-ok",
+            node_id: "hk-ocserv-01",
+            method: PROBE_CONTROLLER_PING,
+            ok: true,
+            error_code: None,
+            observed_at: &observed_at,
+            summary_json: json!({"message": "pong"}),
+        },
+    );
+    drop(store);
+
+    let conn = rusqlite::Connection::open(&database).expect("open db");
+    conn.execute(
+        "DELETE FROM endpoint_trust WHERE endpoint_id = (SELECT endpoint_id FROM nodes WHERE node_id = ?1)",
+        ["hk-ocserv-01"],
+    )
+    .expect("delete endpoint trust");
+    drop(conn);
+
+    let output = run_ocfleet(&[
+        "--database",
+        &database_arg,
+        "--secret-key",
+        &missing_secret_arg,
+        "health",
+        "summary",
+        "--json",
+    ]);
+    let payload: Value = serde_json::from_slice(&output.stdout).expect("valid payload");
+    let node = payload["nodes"]
+        .as_array()
+        .expect("nodes")
+        .iter()
+        .find(|node| node["node_id"] == "hk-ocserv-01")
+        .expect("node health");
+
+    assert_eq!(node["endpoint_status"], Value::Null);
+    assert_eq!(node["status"], "unreachable");
+    assert_eq!(node["last_error_code"], "ENDPOINT_TRUST_MISSING");
+    assert_eq!(payload["summary"]["unreachable"], 1);
+}
+
+#[test]
 fn health_summary_tests_ocserv_degraded_methods_reports_degraded() {
     let dir = tempfile::tempdir().expect("temp dir");
     let database = dir.path().join("controller.sqlite");

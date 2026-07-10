@@ -340,6 +340,7 @@ fn check_registry(conn: &Connection, checks: &mut Vec<DoctorCheck>) {
         ));
     }
 
+    check_endpoint_trust_coverage(conn, checks, nodes.len());
     check_audit_relationship_references(
         conn,
         checks,
@@ -347,6 +348,42 @@ fn check_registry(conn: &Connection, checks: &mut Vec<DoctorCheck>) {
         &endpoint_to_node,
         &node_to_endpoint,
     );
+}
+
+fn check_endpoint_trust_coverage(
+    conn: &Connection,
+    checks: &mut Vec<DoctorCheck>,
+    node_count: usize,
+) {
+    let missing_count = conn.query_row(
+        "SELECT count(*)
+         FROM nodes AS node
+         WHERE NOT EXISTS (
+           SELECT 1
+           FROM endpoint_trust AS trust
+           WHERE trust.endpoint_id = node.endpoint_id
+         )",
+        [],
+        |row| row.get::<_, i64>(0),
+    );
+
+    match missing_count {
+        Ok(0) => checks.push(ok(
+            "registry.endpoint_trust.coverage",
+            "every registry EndpointID has endpoint trust state",
+            json!({"node_count": node_count}),
+        )),
+        Ok(missing_count) => checks.push(error(
+            "registry.endpoint_trust.coverage",
+            "registry EndpointIDs are missing endpoint trust state",
+            json!({"node_count": node_count, "missing_count": missing_count}),
+        )),
+        Err(err) => checks.push(error(
+            "registry.endpoint_trust.coverage",
+            "failed to inspect endpoint trust coverage",
+            json!({"error": err.to_string()}),
+        )),
+    }
 }
 
 fn check_audit_relationship_references(

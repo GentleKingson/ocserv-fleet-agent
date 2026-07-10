@@ -32,6 +32,32 @@ use crate::store::{NodeRecord, Store};
 pub const CONTROLLER_RPC_RESULT_CLASS: &str = "controller_rpc_summary";
 pub const OCSERV_RESULT_CLASS: &str = "low_sensitive_summary";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndpointTrustRejection {
+    Missing,
+    Inactive(EndpointStatus),
+}
+
+impl EndpointTrustRejection {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::Inactive(status) => status.as_str(),
+        }
+    }
+
+    pub fn is_missing(self) -> bool {
+        matches!(self, Self::Missing)
+    }
+
+    fn endpoint_status(self) -> Option<EndpointStatus> {
+        match self {
+            Self::Missing => None,
+            Self::Inactive(status) => Some(status),
+        }
+    }
+}
+
 const FIXED_CONTROLLER_RPC_METHODS: &[&str] = &[
     NODE_PING,
     NODE_INFO,
@@ -208,7 +234,7 @@ impl<'a> ControllerRpcRunner<'a> {
             }
         };
 
-        match execute_fixed_node_rpc(self.secret_key_path, &node, rpc).await {
+        match execute_fixed_node_rpc(self.store, self.secret_key_path, &node, rpc).await {
             Ok(success) => {
                 let duration_ms = elapsed_ms(started);
                 let summary_json = match low_sensitive_fixed_rpc_summary(method, &success.result) {
@@ -306,6 +332,19 @@ impl<'a> ControllerRpcRunner<'a> {
             Ok(node) => node,
             Err(failure) => {
                 let duration_ms = elapsed_ms(started);
+                write_rpc_rejection_audits(
+                    self.store,
+                    node_id,
+                    known_endpoint_id(self.store, node_id),
+                    &[
+                        OCSERV_SERVICE_SUMMARY,
+                        OCSERV_VERSION,
+                        OCSERV_SESSIONS_SUMMARY,
+                        OCSERV_CONFIG_FINGERPRINT,
+                    ],
+                    &failure,
+                    duration_ms,
+                );
                 return OcservStatusBundleOutcome {
                     node_id: node_id.to_string(),
                     endpoint_id: known_endpoint_id(self.store, node_id),
@@ -458,12 +497,21 @@ impl<'a> ControllerRpcRunner<'a> {
         let node = match load_ocserv_rpc_node(self.store, node_id) {
             Ok(node) => node,
             Err(failure) => {
+                let duration_ms = elapsed_ms(started);
+                write_rpc_rejection_audits(
+                    self.store,
+                    node_id,
+                    known_endpoint_id(self.store, node_id),
+                    &[method],
+                    &failure,
+                    duration_ms,
+                );
                 return failure_to_outcome(
                     node_id.to_string(),
                     known_endpoint_id(self.store, node_id),
                     method.to_string(),
                     failure,
-                    elapsed_ms(started),
+                    duration_ms,
                     OCSERV_RESULT_CLASS,
                 );
             }
@@ -493,14 +541,145 @@ impl<'a> ControllerRpcRunner<'a> {
     }
 }
 
-pub fn inactive_endpoint_status(
+fn write_rpc_rejection_audits(
+    store: &Store,
+    node_id: &str,
+    endpoint_id: Option<String>,
+    methods: &[&str],
+    failure: &RpcCommandFailure,
+    duration_ms: u64,
+) {
+    for method in methods {
+        let _ = write_rpc_audit(
+            store,
+            RpcAuditRecord {
+                actor: local_actor(),
+                node_id: node_id.to_string(),
+                endpoint_id: endpoint_id.clone(),
+                method: (*method).to_string(),
+                request_id: None,
+                params_hash: hash_json_value(&json!({})),
+                ok: false,
+                error_code: Some(failure.code.clone()),
+                duration_ms,
+                detail_json: failure.detail_json.clone(),
+            },
+        );
+    }
+}
+
+pub fn endpoint_trust_rejection(
     store: &Store,
     endpoint_id: &str,
-) -> Result<Option<EndpointStatus>> {
-    Ok(store
-        .get_endpoint_trust(endpoint_id)?
-        .map(|endpoint| endpoint.status)
-        .filter(|status| *status != EndpointStatus::Active))
+) -> Result<Option<EndpointTrustRejection>> {
+    Ok(classify_endpoint_trust(
+        store
+            .get_endpoint_trust(endpoint_id)?
+            .map(|endpoint| endpoint.status),
+    ))
+}
+
+fn classify_endpoint_trust(status: Option<EndpointStatus>) -> Option<EndpointTrustRejection> {
+    match status {
+        None => Some(EndpointTrustRejection::Missing),
+        Some(EndpointStatus::Active) => None,
+        Some(status) => Some(EndpointTrustRejection::Inactive(status)),
+    }
+}
+
+fn ensure_fixed_rpc_trust(
+    node: &NodeRecord,
+    rpc: &FixedControllerRpc,
+    mut lookup: impl FnMut(&str) -> Result<Option<EndpointTrustRejection>>,
+) -> Result<(), RpcCommandFailure> {
+    let result_class = rpc_result_class(rpc.method());
+    if let Some(rejection) =
+        lookup(&node.endpoint_id).map_err(|_| trust_read_failure(result_class))?
+    {
+        return Err(endpoint_trust_failure(node, rejection, result_class, None));
+    }
+    if let FixedControllerRpc::ProbePathEcho {
+        target_agent_endpoint_id,
+    } = rpc
+        && let Some(rejection) =
+            lookup(target_agent_endpoint_id).map_err(|_| trust_read_failure(result_class))?
+    {
+        return Err(endpoint_trust_failure(
+            node,
+            rejection,
+            result_class,
+            Some(target_agent_endpoint_id),
+        ));
+    }
+    Ok(())
+}
+
+fn trust_read_failure(result_class: &str) -> RpcCommandFailure {
+    RpcCommandFailure::new(
+        ErrorCode::SqliteError,
+        "controller endpoint trust read failed",
+        None,
+        json!({
+            "message": "controller endpoint trust read failed",
+            "result_class": result_class,
+        }),
+    )
+}
+
+fn endpoint_trust_failure(
+    node: &NodeRecord,
+    rejection: EndpointTrustRejection,
+    result_class: &str,
+    target_endpoint_id: Option<&str>,
+) -> RpcCommandFailure {
+    let target = target_endpoint_id.is_some();
+    let message = match target_endpoint_id {
+        Some(endpoint_id) if rejection.is_missing() => {
+            format!("target endpoint trust missing: endpoint_id={endpoint_id}")
+        }
+        Some(endpoint_id) => format!(
+            "target endpoint not active: endpoint_id={} status={}",
+            endpoint_id,
+            rejection.as_str()
+        ),
+        None => endpoint_trust_rejection_message(node, rejection),
+    };
+    let trust_state_field = if target {
+        "target_endpoint_trust_state"
+    } else {
+        "endpoint_trust_state"
+    };
+    let endpoint_status_field = if target {
+        "target_endpoint_status"
+    } else {
+        "endpoint_status"
+    };
+    let mut detail = json!({
+        "message": message,
+        "result_class": result_class,
+    });
+    detail[trust_state_field] = Value::String(
+        if rejection.is_missing() {
+            "missing"
+        } else {
+            "inactive"
+        }
+        .to_string(),
+    );
+    if let Some(status) = rejection.endpoint_status() {
+        detail[endpoint_status_field] = Value::String(status.as_str().to_string());
+    }
+    RpcCommandFailure::new(ErrorCode::EndpointNotAllowed, message, None, detail)
+        .with_endpoint_id(Some(node.endpoint_id.clone()))
+        .with_endpoint_trust_rejection(rejection, target)
+}
+
+fn rpc_result_class(method: &str) -> &'static str {
+    if method.starts_with("ocserv.") {
+        OCSERV_RESULT_CLASS
+    } else {
+        CONTROLLER_RPC_RESULT_CLASS
+    }
 }
 
 pub fn load_ocserv_rpc_node(store: &Store, node_id: &str) -> Result<NodeRecord, RpcCommandFailure> {
@@ -538,7 +717,7 @@ pub fn load_ocserv_rpc_node(store: &Store, node_id: &str) -> Result<NodeRecord, 
             low_sensitive_detail(&message),
         ));
     }
-    if let Some(status) = inactive_endpoint_status(store, &node.endpoint_id).map_err(|err| {
+    if let Some(rejection) = endpoint_trust_rejection(store, &node.endpoint_id).map_err(|err| {
         RpcCommandFailure::new(
             ErrorCode::SqliteError,
             err.to_string(),
@@ -546,21 +725,11 @@ pub fn load_ocserv_rpc_node(store: &Store, node_id: &str) -> Result<NodeRecord, 
             low_sensitive_detail("controller endpoint trust read failed"),
         )
     })? {
-        let message = format!(
-            "endpoint not active: node_id={} endpoint_id={} status={}",
-            node.node_id,
-            node.endpoint_id,
-            status.as_str()
-        );
-        return Err(RpcCommandFailure::new(
-            ErrorCode::EndpointNotAllowed,
-            message.clone(),
+        return Err(endpoint_trust_failure(
+            &node,
+            rejection,
+            OCSERV_RESULT_CLASS,
             None,
-            json!({
-                "message": "endpoint is not active",
-                "result_class": OCSERV_RESULT_CLASS,
-                "endpoint_status": status.as_str(),
-            }),
         ));
     }
     Ok(node)
@@ -581,7 +750,7 @@ where
     };
     let params = rpc.params();
     let params_hash = hash_json_value(&params);
-    let result = execute_fixed_node_rpc(secret_key_path, node, rpc).await;
+    let result = execute_fixed_node_rpc(store, secret_key_path, node, rpc).await;
     match result {
         Ok(success) => {
             let typed = match serde_json::from_value::<T>(success.result.clone()) {
@@ -765,6 +934,8 @@ pub struct RpcCommandFailure {
     pub request_id: Option<String>,
     pub detail_json: Value,
     endpoint_id: Option<String>,
+    endpoint_trust_rejection: Option<EndpointTrustRejection>,
+    endpoint_trust_target: bool,
 }
 
 impl RpcCommandFailure {
@@ -780,6 +951,8 @@ impl RpcCommandFailure {
             request_id,
             detail_json,
             endpoint_id: None,
+            endpoint_trust_rejection: None,
+            endpoint_trust_target: false,
         }
     }
 
@@ -787,9 +960,60 @@ impl RpcCommandFailure {
         self.endpoint_id = endpoint_id;
         self
     }
+
+    fn with_endpoint_trust_rejection(
+        mut self,
+        rejection: EndpointTrustRejection,
+        target: bool,
+    ) -> Self {
+        self.endpoint_trust_rejection = Some(rejection);
+        self.endpoint_trust_target = target;
+        self
+    }
+
+    pub fn endpoint_trust_rejection(&self) -> Option<EndpointTrustRejection> {
+        self.endpoint_trust_rejection
+    }
+
+    pub fn endpoint_trust_target(&self) -> bool {
+        self.endpoint_trust_target
+    }
 }
 
 pub async fn execute_fixed_node_rpc(
+    store: &Store,
+    secret_key_path: &Path,
+    node: &NodeRecord,
+    rpc: FixedControllerRpc,
+) -> Result<RpcCommandSuccess, RpcCommandFailure> {
+    ensure_fixed_rpc_trust(node, &rpc, |endpoint_id| {
+        endpoint_trust_rejection(store, endpoint_id)
+    })?;
+    execute_fixed_node_rpc_unchecked(secret_key_path, node, rpc).await
+}
+
+pub(crate) async fn execute_fixed_node_rpc_from_database(
+    database_path: &Path,
+    secret_key_path: &Path,
+    node: &NodeRecord,
+    rpc: FixedControllerRpc,
+) -> Result<RpcCommandSuccess, RpcCommandFailure> {
+    let gate_database_path = database_path.to_path_buf();
+    let gate_node = node.clone();
+    let gate_rpc = rpc.clone();
+    let result_class = rpc_result_class(rpc.method());
+    tokio::task::spawn_blocking(move || {
+        ensure_fixed_rpc_trust(&gate_node, &gate_rpc, |endpoint_id| {
+            let status = Store::read_endpoint_trust_status(&gate_database_path, endpoint_id)?;
+            Ok(classify_endpoint_trust(status))
+        })
+    })
+    .await
+    .map_err(|_| trust_read_failure(result_class))??;
+    execute_fixed_node_rpc_unchecked(secret_key_path, node, rpc).await
+}
+
+async fn execute_fixed_node_rpc_unchecked(
     secret_key_path: &Path,
     node: &NodeRecord,
     rpc: FixedControllerRpc,
@@ -1183,7 +1407,7 @@ fn load_fixed_rpc_node(store: &Store, node_id: &str) -> Result<NodeRecord, RpcCo
         )
         .with_endpoint_id(Some(node.endpoint_id)));
     }
-    if let Some(status) = inactive_endpoint_status(store, &node.endpoint_id).map_err(|err| {
+    if let Some(rejection) = endpoint_trust_rejection(store, &node.endpoint_id).map_err(|err| {
         RpcCommandFailure::new(
             ErrorCode::SqliteError,
             err.to_string(),
@@ -1191,21 +1415,32 @@ fn load_fixed_rpc_node(store: &Store, node_id: &str) -> Result<NodeRecord, RpcCo
             json!({ "message": "controller endpoint trust read failed" }),
         )
     })? {
-        let message = format!(
+        return Err(endpoint_trust_failure(
+            &node,
+            rejection,
+            CONTROLLER_RPC_RESULT_CLASS,
+            None,
+        ));
+    }
+    Ok(node)
+}
+
+fn endpoint_trust_rejection_message(
+    node: &NodeRecord,
+    rejection: EndpointTrustRejection,
+) -> String {
+    match rejection {
+        EndpointTrustRejection::Missing => format!(
+            "endpoint trust missing: node_id={} endpoint_id={}",
+            node.node_id, node.endpoint_id
+        ),
+        EndpointTrustRejection::Inactive(status) => format!(
             "endpoint not active: node_id={} endpoint_id={} status={}",
             node.node_id,
             node.endpoint_id,
             status.as_str()
-        );
-        return Err(RpcCommandFailure::new(
-            ErrorCode::EndpointNotAllowed,
-            message.clone(),
-            None,
-            json!({ "message": message, "endpoint_status": status.as_str() }),
-        )
-        .with_endpoint_id(Some(node.endpoint_id)));
+        ),
     }
-    Ok(node)
 }
 
 fn validate_response_for_method(

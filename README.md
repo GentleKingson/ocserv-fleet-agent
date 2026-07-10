@@ -14,10 +14,12 @@ production-complete.
 - Web/API dashboard is experimentally implemented as a read-only observation surface.
 - Governance foundation work has started: actor identity, trust policy
   validation/diff, and optional signed audit export are implemented.
-- Production hardening is active: node lifecycle, scheduler job configuration,
-  and scheduler run/outcome/observation/job-clock writes use actor-bearing
-  `StoreWriter` transactions for state and audit. Health/alert/delivery,
-  retention, and other legacy controller mutations are still being migrated.
+- Production hardening is active: enrollment approval/legacy claim, node
+  lifecycle, scheduler job configuration, and scheduler
+  run/outcome/observation/job-clock writes use actor-bearing `StoreWriter`
+  transactions for state and audit. Enrollment token/request transitions,
+  health/alert/delivery, retention, and other legacy controller mutations are
+  still being migrated.
 - Controller dispatch requires an enabled node and one Active trust row bound
   bidirectionally to that node. Active status by itself is not authorization;
   scheduler workers repeat the same binding check after concurrency waits.
@@ -34,7 +36,8 @@ production-complete.
   - the agent allowlists trusted controller EndpointIDs.
 - Supports Phase 10 enrollment and trust management:
   - one-time enrollment tokens stored as hashes.
-  - pending join requests with manual approval.
+  - pending join requests with manual, operator-owned node binding at approval.
+  - explicit strict repair for legacy approved-unbound enrollment rows.
   - EndpointID rotate, revoke, and quarantine lifecycle states.
   - closed lifecycle transitions that keep the node registry and its unique
     Active EndpointID binding consistent.
@@ -215,8 +218,7 @@ target/debug/ocfleet node add hk-ocserv-01 \
   --role ocserv
 ```
 
-The Phase 10 approval records enrollment state, but it is not yet a replacement
-for the manual bound `node add` path:
+Phase 10 approval is an alternative to the manual bound `node add` path:
 
 ```bash
 target/debug/ocfleet enroll token create \
@@ -236,16 +238,31 @@ target/debug/ocfleet enroll request create \
 
 target/debug/ocfleet enroll approve <join-request-id> \
   --endpoint-id <agent_endpoint_id> \
+  --node-id hk-ocserv-01 \
+  --region hk \
+  --role ocserv \
   --reason "ticket-123"
 ```
 
-Enrollment tokens only create pending join requests. The current approval flow
-creates a legacy Active trust row without an operator-selected node binding.
-That row is rejected by controller and scheduler dispatch even after approval;
-there is no automatic hostname-based binding or startup repair. Use the manual
-bound `node add` path for dispatch until an explicit reconciliation workflow is
-implemented. Avoid approving and then trying to add the same EndpointID, because
-the existing trust row is retained rather than overwritten.
+Enrollment tokens only create pending join requests. Approval uses the resolved
+operator actor and explicit node metadata to insert the registry node, bound
+generation-1 trust row, request decision, and audit event in one transaction.
+It never derives controller identity from the submitted hostname or labels.
+
+Rows approved by older binaries remain unbound and rejected for dispatch. Repair
+one only by naming its exact approved request and assigned EndpointID:
+
+```bash
+target/debug/ocfleet enroll claim <join-request-id> \
+  --endpoint-id <agent_endpoint_id> \
+  --node-id hk-ocserv-01 \
+  --region hk \
+  --role ocserv \
+  --reason "ticket-123 legacy binding"
+```
+
+Claim rejects ambiguous, modified, advanced, or already differently bound state;
+there is no hostname-based adoption, startup repair, or trust-on-first-use path.
 Avoid passing enrollment tokens as command-line arguments; use `--token-file` or
 `--token-stdin` so the token is less likely to leak through shell history,
 process listings, or audit collection.

@@ -71,8 +71,9 @@ counted as Active orphans. Do not edit SQLite directly or bind from
 agent-reported hostname to clear these counts. Preserve the database and audit
 log, identify the last audited node/endpoint lifecycle operation, and use only
 an allowed explicit transition. Legacy enrollment approvals can account for
-`active_unbound`; there is currently no safe reconciliation command, and those
-rows remain rejected for dispatch.
+`active_unbound`; those rows remain rejected for dispatch until an operator runs
+`ocfleet enroll claim` with the exact approved request and assigned EndpointID.
+Claim refuses contaminated, ambiguous, advanced, or differently bound state.
 
 ## EndpointID Mismatch
 
@@ -111,8 +112,11 @@ or ambiguous bindings, preserve state and investigate the audit trail rather
 than selecting a row manually.
 
 An EndpointID already inserted by the legacy enrollment approval flow cannot be
-used as a rotation destination because it already exists as Active unbound trust.
-It remains rejected and awaits the explicit reconciliation follow-up.
+used as a rotation destination because it already exists as Active unbound
+trust. Use `ocfleet enroll claim <join-request-id> --endpoint-id
+<endpoint-id> --node-id <node-id> --region <region> --reason <ticket>` only
+after verifying the original approval. Do not remove, rewrite, or adopt the row
+with `node add`.
 
 ### Logs And Metrics
 

@@ -114,9 +114,11 @@ Run `ocfleet doctor --json` after lifecycle changes. The
 `inactive_current`, and `active_extra_for_node`; it does not expose raw node or
 EndpointID values. `inactive_current` counts only enabled nodes, so disabled
 revoked or quarantined lifecycle state and historical inactive tombstones are
-valid. A legacy enrollment approval may leave Active unbound trust, which
-remains rejected until an explicit operator reconciliation workflow exists.
-Never bind it from agent hostname or repair it automatically at startup.
+valid. A legacy enrollment approval may leave Active unbound trust. It remains
+rejected until `ocfleet enroll claim` verifies the exact approved request,
+EndpointID, fingerprint, generation, lineage, trust bundle, and approval audit,
+then binds explicit operator-owned node metadata in one transaction. Never bind
+from agent hostname or labels, scan for candidates, or repair at startup.
 
 ## Audit And Observability
 

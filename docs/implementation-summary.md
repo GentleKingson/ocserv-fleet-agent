@@ -66,7 +66,8 @@ their pinned GitHub Actions jobs are the verification path for this candidate.
 - Convert every dynamic controller JSON column to a closed typed storage schema;
   current writes are bounded and reject forbidden content, and outputs apply
   typed projections, but some internal records still use `serde_json::Value`.
-- Migrate health/alert/delivery, retention, and other remaining mutations to the
+- Migrate enrollment token/request transitions, health/alert/delivery,
+  retention, and other remaining mutations to the
   atomic `StoreWriter` actor/audit contract before claiming fully fail-closed
   controller mutation auditing. Scheduler job and run/outcome/finish writers
   now use short atomic boundaries without holding a transaction across RPC;
@@ -79,10 +80,11 @@ their pinned GitHub Actions jobs are the verification path for this candidate.
   after concurrency waits. Lifecycle transitions keep the node pointer and trust
   state together, while doctor reports aggregate binding counts. This changes no
   schema, protocol, or API route.
-- Add an explicit operator-controlled reconciliation path for legacy enrollment
-  approvals that created Active unbound trust. Those rows remain rejected for
-  dispatch; the controller must not infer node identity from agent hostname or
-  repair them automatically at startup.
+- Enrollment approval now atomically creates the explicit operator-owned node,
+  bound generation-1 trust, request decision, and low-sensitive audit. `enroll
+  claim` reconciles only the strict legacy approved-unbound shape. Hostname and
+  labels never select node identity, and there is no startup or dispatch repair.
+  Exact retries are no-ops and divergent or contaminated state fails closed.
 - Consolidate the API-specific read adapter with the backend-neutral reader only
   after their projection contracts can remain equally strict.
 - Add a real Postgres client/schema/import path only as a separately reviewed,

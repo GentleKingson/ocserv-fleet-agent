@@ -4,9 +4,9 @@
   "completed_phases": [],
   "active_branch": "codex/a1-endpoint-trust-fail-closed",
   "active_issue": 33,
-  "active_pr": null,
+  "active_pr": 59,
   "last_test_result": "passed",
-  "last_updated_at": "2026-07-10T16:56:35Z",
+  "last_updated_at": "2026-07-10T16:58:47Z",
   "blockers": [],
-  "next_action": "Open the endpoint-trust fail-closed pull request, monitor CI, and fix any failures before merge."
+  "next_action": "Monitor pull request 59 CI, fix any failures, and merge only after all required checks pass."
 }

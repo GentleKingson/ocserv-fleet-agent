@@ -38,13 +38,16 @@ fn run_ocfleet_failure(args: &[&str]) -> Output {
 
 fn add_node(store: &Store, node_id: &str) {
     store
-        .add_node(&NodeInsert {
-            node_id: node_id.to_string(),
-            endpoint_id: iroh::SecretKey::generate().public().to_string(),
-            name: node_id.to_string(),
-            region: "hk".to_string(),
-            role: "ocserv".to_string(),
-        })
+        .add_node(
+            &NodeInsert {
+                node_id: node_id.to_string(),
+                endpoint_id: iroh::SecretKey::generate().public().to_string(),
+                name: node_id.to_string(),
+                region: "hk".to_string(),
+                role: "ocserv".to_string(),
+            },
+            "health-policy-test",
+        )
         .expect("add node");
 }
 

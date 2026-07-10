@@ -1,5 +1,11 @@
 # Forward Roadmap
 
+> Historical Phase 12 roadmap. The audited cross-release dependency graph and
+> current execution state now live in [next-roadmap.md](next-roadmap.md). This
+> page describes how the existing read-only slices were originally staged; it
+> is not the authority for milestone maturity or ordering after commit
+> `b3c906a`.
+
 This roadmap starts from the current source tree and keeps `ocfleet` inside the
 read-only ocserv fleet observability/control-plane boundary. It is an
 implementation guide, not a production-complete claim.

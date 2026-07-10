@@ -8,6 +8,7 @@ use ocfleet_cli::args::{
 };
 use ocfleet_cli::audit::AuditEvent;
 use ocfleet_cli::audit_export::run_audit_command;
+use ocfleet_cli::backend::StoreWriter;
 use ocfleet_cli::controller_rpc::{
     FixedControllerRpc, OcservCommandAudit, RpcAuditRecord, RpcCommandFailure, elapsed_ms,
     error_code_from_name, execute_fixed_node_rpc, execute_ocserv_rpc, execute_optional_ocserv_rpc,
@@ -162,12 +163,7 @@ async fn main() -> anyhow::Result<()> {
                         region,
                         role,
                     };
-                    store.add_node(&node)?;
-                    let mut event = AuditEvent::new(local_actor(), "node.add");
-                    event.node_id = Some(node_id);
-                    event.endpoint_id = Some(endpoint_id);
-                    event.ok = Some(true);
-                    store.insert_audit(&event)?;
+                    StoreWriter::write_node_add(&store, &node, &local_actor())?;
                 }
                 NodeCommand::List => {
                     let nodes = store.list_nodes()?;
@@ -186,30 +182,18 @@ async fn main() -> anyhow::Result<()> {
                 }
                 NodeCommand::Disable { node_id } => {
                     validate_node_id(&node_id)?;
-                    store.disable_node(&node_id)?;
-                    let mut event = AuditEvent::new(local_actor(), "node.disable");
-                    event.node_id = Some(node_id);
-                    event.ok = Some(true);
-                    store.insert_audit(&event)?;
+                    StoreWriter::write_node_disable(&store, &node_id, &local_actor())?;
                 }
                 NodeCommand::Enable { node_id } => {
                     validate_node_id(&node_id)?;
-                    store.enable_node(&node_id)?;
-                    let mut event = AuditEvent::new(local_actor(), "node.enable");
-                    event.node_id = Some(node_id);
-                    event.ok = Some(true);
-                    store.insert_audit(&event)?;
+                    StoreWriter::write_node_enable(&store, &node_id, &local_actor())?;
                 }
                 NodeCommand::Remove { node_id, yes } => {
                     validate_node_id(&node_id)?;
                     if !yes {
                         bail!("node remove requires --yes");
                     }
-                    store.remove_node(&node_id)?;
-                    let mut event = AuditEvent::new(local_actor(), "node.remove");
-                    event.node_id = Some(node_id);
-                    event.ok = Some(true);
-                    store.insert_audit(&event)?;
+                    StoreWriter::write_node_remove(&store, &node_id, &local_actor())?;
                 }
             }
         }

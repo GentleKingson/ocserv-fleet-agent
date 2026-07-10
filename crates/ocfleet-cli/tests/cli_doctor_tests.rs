@@ -13,13 +13,16 @@ fn doctor_reports_ok_for_initialized_controller_state() {
     let store = Store::open(&db).expect("store opens");
     let node_key = SecretKey::generate();
     store
-        .add_node(&NodeInsert {
-            node_id: "hk-ocserv-01".to_string(),
-            endpoint_id: node_key.public().to_string(),
-            name: "hk-ocserv-01".to_string(),
-            region: "hk".to_string(),
-            role: "ocserv".to_string(),
-        })
+        .add_node(
+            &NodeInsert {
+                node_id: "hk-ocserv-01".to_string(),
+                endpoint_id: node_key.public().to_string(),
+                name: "hk-ocserv-01".to_string(),
+                region: "hk".to_string(),
+                role: "ocserv".to_string(),
+            },
+            "doctor-test",
+        )
         .expect("insert node");
     load_or_create_secret_key_with_status(&secret, false).expect("controller secret");
 
@@ -70,13 +73,16 @@ fn doctor_detects_invalid_registry_endpoint_ids() {
     let secret = dir.path().join("controller.secret");
     let store = Store::open(&db).expect("store opens");
     store
-        .add_node(&NodeInsert {
-            node_id: "hk-ocserv-01".to_string(),
-            endpoint_id: "not-an-endpoint-id".to_string(),
-            name: "hk-ocserv-01".to_string(),
-            region: "hk".to_string(),
-            role: "ocserv".to_string(),
-        })
+        .add_node(
+            &NodeInsert {
+                node_id: "hk-ocserv-01".to_string(),
+                endpoint_id: "not-an-endpoint-id".to_string(),
+                name: "hk-ocserv-01".to_string(),
+                region: "hk".to_string(),
+                role: "ocserv".to_string(),
+            },
+            "doctor-test",
+        )
         .expect("insert malformed node");
     load_or_create_secret_key_with_status(&secret, false).expect("controller secret");
 

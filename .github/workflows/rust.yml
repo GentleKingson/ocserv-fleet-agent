@@ -60,6 +60,12 @@ jobs:
       - name: Check documentation claims
         run: bash scripts/check-doc-claims.sh
 
+      - name: Test controller mutation guard
+        run: ./scripts/tests/test-controller-mutation-guard.sh
+
+      - name: Check controller mutation SQL boundaries
+        run: ./scripts/check-controller-mutations.sh
+
       - name: Install Rust toolchain
         run: rustup toolchain install 1.96.1 --profile minimal --component rustfmt
 

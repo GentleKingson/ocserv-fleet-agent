@@ -489,13 +489,16 @@ fn alert_hooks_tests_rotated_endpoint_generates_inactive_alert() {
     let endpoint_id = iroh::SecretKey::generate().public().to_string();
     let new_endpoint_id = iroh::SecretKey::generate().public().to_string();
     store
-        .add_node(&NodeInsert {
-            node_id: "hk-ocserv-01".to_string(),
-            endpoint_id: endpoint_id.clone(),
-            name: "hk-ocserv-01".to_string(),
-            region: "hk".to_string(),
-            role: "ocserv".to_string(),
-        })
+        .add_node(
+            &NodeInsert {
+                node_id: "hk-ocserv-01".to_string(),
+                endpoint_id: endpoint_id.clone(),
+                name: "hk-ocserv-01".to_string(),
+                region: "hk".to_string(),
+                role: "ocserv".to_string(),
+            },
+            "alert-test",
+        )
         .expect("add node");
     store
         .rotate_endpoint(&endpoint_id, &new_endpoint_id, "operator", "test rotate")
@@ -522,13 +525,16 @@ fn alert_hooks_tests_cert_expiry_summary_fields_generate_cert_alerts() {
     let store = Store::open(&database).expect("open store");
     let endpoint_id = iroh::SecretKey::generate().public().to_string();
     store
-        .add_node(&NodeInsert {
-            node_id: "hk-ocserv-01".to_string(),
-            endpoint_id: endpoint_id.clone(),
-            name: "hk-ocserv-01".to_string(),
-            region: "hk".to_string(),
-            role: "ocserv".to_string(),
-        })
+        .add_node(
+            &NodeInsert {
+                node_id: "hk-ocserv-01".to_string(),
+                endpoint_id: endpoint_id.clone(),
+                name: "hk-ocserv-01".to_string(),
+                region: "hk".to_string(),
+                role: "ocserv".to_string(),
+            },
+            "alert-test",
+        )
         .expect("add node");
     store
         .insert_probe_observation(&ProbeObservationInsert {

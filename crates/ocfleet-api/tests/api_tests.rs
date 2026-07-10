@@ -904,13 +904,16 @@ fn sqlite_sidecar_path(database: &Path, suffix: &str) -> std::path::PathBuf {
 fn seed_database(path: &Path) {
     let store = Store::open(path).expect("open store");
     store
-        .add_node(&NodeInsert {
-            node_id: "node-a".to_string(),
-            endpoint_id: "endpoint-a".to_string(),
-            name: "node-a".to_string(),
-            region: "hk".to_string(),
-            role: "ocserv".to_string(),
-        })
+        .add_node(
+            &NodeInsert {
+                node_id: "node-a".to_string(),
+                endpoint_id: "endpoint-a".to_string(),
+                name: "node-a".to_string(),
+                region: "hk".to_string(),
+                role: "ocserv".to_string(),
+            },
+            "api-test",
+        )
         .expect("add node");
     store
         .insert_observability_job(&ObservabilityJobRecord {

@@ -57,7 +57,10 @@ SQL-level limits for bounded history reads and fails closed when dynamic JSON in
 legacy rows does not satisfy the bounded low-sensitive validator. The returned
 records are internal store records, not presentation DTOs; every CLI/API output
 consumer must still use its typed projection. `StoreWriter` deliberately
-exposes only mutation methods that already bind actor and audit in one transaction.
+exposes only mutation methods that bind actor and audit in one transaction. The
+first production-hardening slice adds node add/enable/disable/remove to this
+contract and removes the CLI's post-commit success audits. Audit-trigger failure
+tests prove both `nodes` and `endpoint_trust` changes roll back.
 
 The API retains a narrower `ApiReadStore` adapter for API projections;
 `ReadOnlyStore` opens SQLite with read-only/query-only flags, validates private
@@ -65,7 +68,7 @@ database/sidecar files, checks schema version/tables/integrity, and never expose
 a writer to routes. Consolidating this adapter with the neutral reader remains
 future work; SQLite is the only runtime backend.
 
-Scheduler, retention, alert silence/resolve, enrollment, and endpoint lifecycle
+Scheduler, retention, alert silence/resolve, and some enrollment lifecycle
 flows are not all migrated to the writer trait. Future writer interfaces must
 keep actor/audit input mandatory and must not loosen private file checks or
 redaction.

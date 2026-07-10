@@ -25,13 +25,16 @@ fn run_ocfleet(args: &[&str]) -> Output {
 
 fn add_node(store: &Store, node_id: &str) {
     store
-        .add_node(&NodeInsert {
-            node_id: node_id.to_string(),
-            endpoint_id: iroh::SecretKey::generate().public().to_string(),
-            name: node_id.to_string(),
-            region: "hk".to_string(),
-            role: "ocserv".to_string(),
-        })
+        .add_node(
+            &NodeInsert {
+                node_id: node_id.to_string(),
+                endpoint_id: iroh::SecretKey::generate().public().to_string(),
+                name: node_id.to_string(),
+                region: "hk".to_string(),
+                role: "ocserv".to_string(),
+            },
+            "health-summary-test",
+        )
         .expect("add node");
 }
 
@@ -105,7 +108,9 @@ fn health_summary_tests_disabled_node_reports_disabled() {
     let database_arg = database.to_string_lossy().into_owned();
     let store = Store::open(&database).expect("open store");
     add_node(&store, "hk-ocserv-01");
-    store.disable_node("hk-ocserv-01").expect("disable node");
+    store
+        .disable_node("hk-ocserv-01", "health-summary-test")
+        .expect("disable node");
     drop(store);
 
     let output = run_ocfleet(&["--database", &database_arg, "health", "summary"]);

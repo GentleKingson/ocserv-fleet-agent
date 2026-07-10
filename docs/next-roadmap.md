@@ -94,8 +94,9 @@ not change schema, protocol, API routes, agent capabilities, or the default
 read-only boundary. Statuses describe the milestone, not just the amount of
 supporting code already in the repository. Explicit enrollment binding and its
 actor-bearing writer migration are active on branch
-`codex/a1-enrollment-binding-writers`. The active slice makes new approval one
-atomic operator-owned node/request/trust/audit transition and adds a strict
+`codex/a1-enrollment-binding-writers` in pull request `#62`. The active slice
+makes new approval one atomic operator-owned node/request/trust/audit transition
+and adds a strict
 manual claim for legacy approved-unbound rows. It introduces no schema,
 protocol, API, agent-capability, or default read-only boundary change.
 

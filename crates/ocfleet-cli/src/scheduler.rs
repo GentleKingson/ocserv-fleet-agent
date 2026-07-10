@@ -1364,8 +1364,8 @@ fn load_scheduler_task_node(
             detail_json: scheduler_preflight_detail(kind, &message, None),
         });
     }
-    if let Some(rejection) = endpoint_trust_rejection(store, &node.endpoint_id).map_err(|_| {
-        SchedulerPreflightFailure {
+    if let Some(rejection) = endpoint_trust_rejection(store, &node.node_id, &node.endpoint_id)
+        .map_err(|_| SchedulerPreflightFailure {
             code: ErrorCode::SqliteError,
             observation_error_code: None,
             endpoint_id: Some(node.endpoint_id.clone()),
@@ -1374,16 +1374,12 @@ fn load_scheduler_task_node(
                 "controller endpoint trust read failed",
                 None,
             ),
-        }
-    })? {
-        let message = if rejection.is_missing() {
-            "endpoint trust record is missing".to_string()
-        } else {
-            format!("endpoint is not active: status={}", rejection.as_str())
-        };
+        })?
+    {
+        let message = scheduler_endpoint_rejection_message(rejection);
         return Err(SchedulerPreflightFailure {
             code: ErrorCode::EndpointNotAllowed,
-            observation_error_code: rejection.is_missing().then_some("ENDPOINT_TRUST_MISSING"),
+            observation_error_code: endpoint_trust_observation_code(rejection, false),
             endpoint_id: Some(node.endpoint_id),
             detail_json: scheduler_preflight_detail(kind, &message, Some(rejection)),
         });
@@ -1401,13 +1397,9 @@ fn scheduler_preflight_detail(
         "result_class": scheduler_result_class_for_stored_kind(kind),
     });
     if let Some(rejection) = endpoint_rejection {
-        detail["endpoint_trust_state"] = json!(if rejection.is_missing() {
-            "missing"
-        } else {
-            "inactive"
-        });
-        if !rejection.is_missing() {
-            detail["endpoint_status"] = json!(rejection.as_str());
+        detail["endpoint_trust_state"] = json!(rejection.trust_state());
+        if let Some(status) = rejection.endpoint_status() {
+            detail["endpoint_status"] = json!(status.as_str());
         }
     }
     detail
@@ -2176,6 +2168,7 @@ async fn execute_scheduler_path_probe(
 ) -> SchedulerTaskOutcome {
     let started = Instant::now();
     let rpc = FixedControllerRpc::ProbePathEcho {
+        target_node_id: target_node_id.clone(),
         target_agent_endpoint_id: target_endpoint_id.clone(),
     };
     let params_hash = hash_json_value(&rpc.params());
@@ -2286,17 +2279,58 @@ fn result_class_for_method(method: &str) -> &'static str {
 
 fn scheduler_failure_error_code(failure: &RpcCommandFailure) -> String {
     match failure.endpoint_trust_rejection() {
-        Some(EndpointTrustRejection::Missing) if failure.endpoint_trust_target() => {
-            "TARGET_ENDPOINT_TRUST_MISSING".to_string()
-        }
-        Some(EndpointTrustRejection::Missing) => "ENDPOINT_TRUST_MISSING".to_string(),
-        Some(EndpointTrustRejection::Inactive(status)) if failure.endpoint_trust_target() => {
-            format!("TARGET_ENDPOINT_{}", status.as_str().to_ascii_uppercase())
-        }
-        Some(EndpointTrustRejection::Inactive(status)) => {
-            format!("ENDPOINT_{}", status.as_str().to_ascii_uppercase())
+        Some(rejection) => {
+            scheduler_preflight_endpoint_error_code(rejection, failure.endpoint_trust_target())
         }
         None => error_code_name(&failure.code),
+    }
+}
+
+fn endpoint_trust_observation_code(
+    rejection: EndpointTrustRejection,
+    target: bool,
+) -> Option<&'static str> {
+    match (rejection, target) {
+        (EndpointTrustRejection::Missing, false) => Some("ENDPOINT_TRUST_MISSING"),
+        (EndpointTrustRejection::Missing, true) => Some("TARGET_ENDPOINT_TRUST_MISSING"),
+        (EndpointTrustRejection::Unbound, false) => Some("ENDPOINT_TRUST_UNBOUND"),
+        (EndpointTrustRejection::Unbound, true) => Some("TARGET_ENDPOINT_TRUST_UNBOUND"),
+        (EndpointTrustRejection::BindingMismatch, false) => Some("ENDPOINT_TRUST_BINDING_MISMATCH"),
+        (EndpointTrustRejection::BindingMismatch, true) => {
+            Some("TARGET_ENDPOINT_TRUST_BINDING_MISMATCH")
+        }
+        (EndpointTrustRejection::Inactive(_), _) => None,
+    }
+}
+
+fn scheduler_preflight_endpoint_error_code(
+    rejection: EndpointTrustRejection,
+    target: bool,
+) -> String {
+    endpoint_trust_observation_code(rejection, target)
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            let EndpointTrustRejection::Inactive(status) = rejection else {
+                unreachable!("non-inactive trust rejection has a fixed observation code")
+            };
+            if target {
+                format!("TARGET_ENDPOINT_{}", status.as_str().to_ascii_uppercase())
+            } else {
+                format!("ENDPOINT_{}", status.as_str().to_ascii_uppercase())
+            }
+        })
+}
+
+fn scheduler_endpoint_rejection_message(rejection: EndpointTrustRejection) -> String {
+    match rejection {
+        EndpointTrustRejection::Missing => "endpoint trust record is missing".to_string(),
+        EndpointTrustRejection::Inactive(status) => {
+            format!("endpoint is not active: status={}", status.as_str())
+        }
+        EndpointTrustRejection::Unbound => "endpoint trust is unbound".to_string(),
+        EndpointTrustRejection::BindingMismatch => {
+            "endpoint trust binding does not match registry node".to_string()
+        }
     }
 }
 
@@ -2358,12 +2392,10 @@ async fn run_path_probe_job(
         )?;
         return Ok(());
     }
-    if let Some(rejection) = endpoint_trust_rejection(tick_context.store, &source.endpoint_id)? {
-        let error_code = if rejection.is_missing() {
-            "ENDPOINT_TRUST_MISSING".to_string()
-        } else {
-            format!("ENDPOINT_{}", rejection.as_str().to_ascii_uppercase())
-        };
+    if let Some(rejection) =
+        endpoint_trust_rejection(tick_context.store, &source.node_id, &source.endpoint_id)?
+    {
+        let error_code = scheduler_preflight_endpoint_error_code(rejection, false);
         record_path_probe_preflight_observation(
             tick_context.store,
             tick_context.actor,
@@ -2408,15 +2440,10 @@ async fn run_path_probe_job(
         )?;
         return Ok(());
     }
-    if let Some(rejection) = endpoint_trust_rejection(tick_context.store, &target.endpoint_id)? {
-        let error_code = if rejection.is_missing() {
-            "TARGET_ENDPOINT_TRUST_MISSING".to_string()
-        } else {
-            format!(
-                "TARGET_ENDPOINT_{}",
-                rejection.as_str().to_ascii_uppercase()
-            )
-        };
+    if let Some(rejection) =
+        endpoint_trust_rejection(tick_context.store, &target.node_id, &target.endpoint_id)?
+    {
+        let error_code = scheduler_preflight_endpoint_error_code(rejection, true);
         record_path_probe_target_preflight_observation(
             tick_context.store,
             tick_context.actor,
@@ -3042,13 +3069,21 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct DeleteTrustThenDispatchExecutor {
+    struct MutateTrustThenDispatchExecutor {
         database_path: Arc<PathBuf>,
         secret_key_path: Arc<PathBuf>,
         endpoint_id: Arc<String>,
+        mutation: DispatchTrustMutation,
     }
 
-    impl SchedulerTaskExecutor for DeleteTrustThenDispatchExecutor {
+    #[derive(Clone)]
+    enum DispatchTrustMutation {
+        Delete,
+        SetNode(Option<String>),
+        SetRegistryEnabled(i64),
+    }
+
+    impl SchedulerTaskExecutor for MutateTrustThenDispatchExecutor {
         fn execute(
             &self,
             task: ResolvedSchedulerTask,
@@ -3056,14 +3091,40 @@ mod tests {
             let database_path = Arc::clone(&self.database_path);
             let secret_key_path = Arc::clone(&self.secret_key_path);
             let endpoint_id = Arc::clone(&self.endpoint_id);
+            let mutation = self.mutation.clone();
             Box::pin(async move {
-                Connection::open(database_path.as_ref())
-                    .expect("open scheduler database")
-                    .execute(
-                        "DELETE FROM endpoint_trust WHERE endpoint_id = ?1",
-                        [endpoint_id.as_str()],
-                    )
-                    .expect("delete trust after semaphore acquisition");
+                let connection =
+                    Connection::open(database_path.as_ref()).expect("open scheduler database");
+                match mutation {
+                    DispatchTrustMutation::Delete => {
+                        connection
+                            .execute(
+                                "DELETE FROM endpoint_trust WHERE endpoint_id = ?1",
+                                [endpoint_id.as_str()],
+                            )
+                            .expect("delete trust after semaphore acquisition");
+                    }
+                    DispatchTrustMutation::SetNode(node_id) => {
+                        connection
+                            .execute(
+                                "UPDATE endpoint_trust SET node_id = ?1 WHERE endpoint_id = ?2",
+                                rusqlite::params![node_id, endpoint_id.as_str()],
+                            )
+                            .expect("change trust binding after semaphore acquisition");
+                    }
+                    DispatchTrustMutation::SetRegistryEnabled(enabled) => {
+                        connection
+                            .pragma_update(None, "ignore_check_constraints", true)
+                            .expect("allow malformed registry fixture");
+                        let affected = connection
+                            .execute(
+                                "UPDATE nodes SET enabled = ?1 WHERE node_id = ?2",
+                                rusqlite::params![enabled, task.node.node_id.as_str()],
+                            )
+                            .expect("change registry enabled after semaphore acquisition");
+                        assert_eq!(affected, 1, "scheduler node fixture exists");
+                    }
+                }
                 execute_production_scheduler_task(database_path, secret_key_path, task).await
             })
         }
@@ -3261,10 +3322,11 @@ mod tests {
             method_key: PROBE_CONTROLLER_PING.to_string(),
             ordinal: 0,
         };
-        let executor = DeleteTrustThenDispatchExecutor {
+        let executor = MutateTrustThenDispatchExecutor {
             database_path: Arc::new(database),
             secret_key_path: Arc::new(secret_key.clone()),
             endpoint_id: Arc::new(node.endpoint_id),
+            mutation: DispatchTrustMutation::Delete,
         };
 
         let outcomes = execute_resolved_scheduler_tasks(
@@ -3291,6 +3353,158 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scheduler_dispatch_rechecks_unbound_source_after_semaphore_acquisition() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let database = dir.path().join("controller.sqlite");
+        let secret_key = dir.path().join("missing.secret");
+        let store = Store::open(&database).expect("open store");
+        let node = seed_dispatch_node(&store, "unbound-source-node");
+        let task = ResolvedSchedulerTask {
+            job_id: "job-unbound-source".to_string(),
+            run_id: "run-unbound-source".to_string(),
+            actor: "scheduler-dispatch-test".to_string(),
+            kind: StoredJobKind::ControllerPing,
+            node: node.clone(),
+            rpc: SchedulerTaskRpc::Fixed(FixedControllerRpc::ProbeControllerPing),
+            method_key: PROBE_CONTROLLER_PING.to_string(),
+            ordinal: 0,
+        };
+        let executor = MutateTrustThenDispatchExecutor {
+            database_path: Arc::new(database),
+            secret_key_path: Arc::new(secret_key.clone()),
+            endpoint_id: Arc::new(node.endpoint_id),
+            mutation: DispatchTrustMutation::SetNode(None),
+        };
+
+        let outcomes = execute_resolved_scheduler_tasks(
+            vec![task],
+            SchedulerLimits::from_max_concurrency(1).expect("limits"),
+            executor,
+        )
+        .await;
+
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(
+            outcomes[0].observations[0].error_code.as_deref(),
+            Some("ENDPOINT_TRUST_UNBOUND")
+        );
+        assert_eq!(
+            outcomes[0].rpc_audits[0].error_code,
+            Some(ErrorCode::EndpointNotAllowed)
+        );
+        assert_eq!(
+            outcomes[0].rpc_audits[0].detail_json["endpoint_trust_state"],
+            "unbound"
+        );
+        assert!(!secret_key.exists());
+    }
+
+    #[tokio::test]
+    async fn scheduler_dispatch_rechecks_source_binding_after_semaphore_acquisition() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let database = dir.path().join("controller.sqlite");
+        let secret_key = dir.path().join("missing.secret");
+        let store = Store::open(&database).expect("open store");
+        let node = seed_dispatch_node(&store, "binding-source-node");
+        let wrong = seed_dispatch_node(&store, "different-source-binding-node");
+        let task = ResolvedSchedulerTask {
+            job_id: "job-source-binding".to_string(),
+            run_id: "run-source-binding".to_string(),
+            actor: "scheduler-dispatch-test".to_string(),
+            kind: StoredJobKind::ControllerPing,
+            node: node.clone(),
+            rpc: SchedulerTaskRpc::Fixed(FixedControllerRpc::ProbeControllerPing),
+            method_key: PROBE_CONTROLLER_PING.to_string(),
+            ordinal: 0,
+        };
+        let executor = MutateTrustThenDispatchExecutor {
+            database_path: Arc::new(database),
+            secret_key_path: Arc::new(secret_key.clone()),
+            endpoint_id: Arc::new(node.endpoint_id),
+            mutation: DispatchTrustMutation::SetNode(Some(wrong.node_id)),
+        };
+
+        let outcomes = execute_resolved_scheduler_tasks(
+            vec![task],
+            SchedulerLimits::from_max_concurrency(1).expect("limits"),
+            executor,
+        )
+        .await;
+
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(
+            outcomes[0].observations[0].error_code.as_deref(),
+            Some("ENDPOINT_TRUST_BINDING_MISMATCH")
+        );
+        assert_eq!(
+            outcomes[0].rpc_audits[0].error_code,
+            Some(ErrorCode::EndpointNotAllowed)
+        );
+        assert_eq!(
+            outcomes[0].rpc_audits[0].detail_json["endpoint_trust_state"],
+            "binding_mismatch"
+        );
+        assert!(!secret_key.exists());
+    }
+
+    #[tokio::test]
+    async fn scheduler_dispatch_rejects_malformed_enabled_after_semaphore_acquisition() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let database = dir.path().join("controller.sqlite");
+        let secret_key = dir.path().join("missing.secret");
+        let store = Store::open(&database).expect("open store");
+        let node = seed_dispatch_node(&store, "malformed-enabled-node");
+        let task = ResolvedSchedulerTask {
+            job_id: "job-malformed-enabled".to_string(),
+            run_id: "run-malformed-enabled".to_string(),
+            actor: "scheduler-dispatch-test".to_string(),
+            kind: StoredJobKind::ControllerPing,
+            node: node.clone(),
+            rpc: SchedulerTaskRpc::Fixed(FixedControllerRpc::ProbeControllerPing),
+            method_key: PROBE_CONTROLLER_PING.to_string(),
+            ordinal: 0,
+        };
+        let executor = MutateTrustThenDispatchExecutor {
+            database_path: Arc::new(database),
+            secret_key_path: Arc::new(secret_key.clone()),
+            endpoint_id: Arc::new(node.endpoint_id),
+            mutation: DispatchTrustMutation::SetRegistryEnabled(2),
+        };
+
+        let outcomes = execute_resolved_scheduler_tasks(
+            vec![task],
+            SchedulerLimits::from_max_concurrency(1).expect("limits"),
+            executor,
+        )
+        .await;
+
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(
+            outcomes[0].observations[0].error_code.as_deref(),
+            Some("SQLITE_ERROR")
+        );
+        assert_eq!(
+            outcomes[0].observations[0].summary_json["message"],
+            "controller endpoint trust read failed"
+        );
+        assert_eq!(
+            outcomes[0].rpc_audits[0].error_code,
+            Some(ErrorCode::SqliteError)
+        );
+        assert_eq!(
+            outcomes[0].rpc_audits[0].detail_json["message"],
+            "controller endpoint trust read failed"
+        );
+        assert!(
+            outcomes[0].rpc_audits[0]
+                .detail_json
+                .get("endpoint_trust_state")
+                .is_none()
+        );
+        assert!(!secret_key.exists());
+    }
+
+    #[tokio::test]
     async fn scheduler_dispatch_rechecks_path_target_trust_after_semaphore_acquisition() {
         let dir = tempfile::tempdir().expect("temp dir");
         let database = dir.path().join("controller.sqlite");
@@ -3311,10 +3525,11 @@ mod tests {
             method_key: PROBE_PATH_ECHO.to_string(),
             ordinal: 0,
         };
-        let executor = DeleteTrustThenDispatchExecutor {
+        let executor = MutateTrustThenDispatchExecutor {
             database_path: Arc::new(database),
             secret_key_path: Arc::new(secret_key.clone()),
             endpoint_id: Arc::new(target.endpoint_id),
+            mutation: DispatchTrustMutation::Delete,
         };
 
         let outcomes = execute_resolved_scheduler_tasks(
@@ -3349,6 +3564,118 @@ mod tests {
         assert_eq!(
             outcomes[0].rpc_audits[0].detail_json["target_node_id"],
             "target-node"
+        );
+        assert!(!secret_key.exists());
+    }
+
+    #[tokio::test]
+    async fn scheduler_dispatch_rechecks_unbound_target_after_semaphore_acquisition() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let database = dir.path().join("controller.sqlite");
+        let secret_key = dir.path().join("missing.secret");
+        let store = Store::open(&database).expect("open store");
+        let source = seed_dispatch_node(&store, "unbound-target-source-node");
+        let target = seed_dispatch_node(&store, "unbound-target-node");
+        let task = ResolvedSchedulerTask {
+            job_id: "job-unbound-target".to_string(),
+            run_id: "run-unbound-target".to_string(),
+            actor: "scheduler-dispatch-test".to_string(),
+            kind: StoredJobKind::PathProbe,
+            node: source,
+            rpc: SchedulerTaskRpc::PathProbe {
+                target_node_id: target.node_id.clone(),
+                target_endpoint_id: target.endpoint_id.clone(),
+            },
+            method_key: PROBE_PATH_ECHO.to_string(),
+            ordinal: 0,
+        };
+        let executor = MutateTrustThenDispatchExecutor {
+            database_path: Arc::new(database),
+            secret_key_path: Arc::new(secret_key.clone()),
+            endpoint_id: Arc::new(target.endpoint_id),
+            mutation: DispatchTrustMutation::SetNode(None),
+        };
+
+        let outcomes = execute_resolved_scheduler_tasks(
+            vec![task],
+            SchedulerLimits::from_max_concurrency(1).expect("limits"),
+            executor,
+        )
+        .await;
+
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(
+            outcomes[0].observations[0].error_code.as_deref(),
+            Some("TARGET_ENDPOINT_TRUST_UNBOUND")
+        );
+        assert_eq!(
+            outcomes[0].rpc_audits[0].error_code,
+            Some(ErrorCode::EndpointNotAllowed)
+        );
+        assert_eq!(
+            outcomes[0].rpc_audits[0].detail_json["target_endpoint_trust_state"],
+            "unbound"
+        );
+        assert_eq!(
+            outcomes[0].rpc_audits[0].detail_json["target_node_id"],
+            "unbound-target-node"
+        );
+        assert!(!secret_key.exists());
+    }
+
+    #[tokio::test]
+    async fn scheduler_dispatch_rechecks_target_binding_after_semaphore_acquisition() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let database = dir.path().join("controller.sqlite");
+        let secret_key = dir.path().join("missing.secret");
+        let store = Store::open(&database).expect("open store");
+        let source = seed_dispatch_node(&store, "binding-source-node");
+        let target = seed_dispatch_node(&store, "binding-target-node");
+        let wrong = seed_dispatch_node(&store, "different-binding-node");
+        let wrong_node_id = wrong.node_id;
+        let task = ResolvedSchedulerTask {
+            job_id: "job-target-binding".to_string(),
+            run_id: "run-target-binding".to_string(),
+            actor: "scheduler-dispatch-test".to_string(),
+            kind: StoredJobKind::PathProbe,
+            node: source,
+            rpc: SchedulerTaskRpc::PathProbe {
+                target_node_id: target.node_id.clone(),
+                target_endpoint_id: target.endpoint_id.clone(),
+            },
+            method_key: PROBE_PATH_ECHO.to_string(),
+            ordinal: 0,
+        };
+        let executor = MutateTrustThenDispatchExecutor {
+            database_path: Arc::new(database),
+            secret_key_path: Arc::new(secret_key.clone()),
+            endpoint_id: Arc::new(target.endpoint_id),
+            mutation: DispatchTrustMutation::SetNode(Some(wrong_node_id)),
+        };
+
+        let outcomes = execute_resolved_scheduler_tasks(
+            vec![task],
+            SchedulerLimits::from_max_concurrency(1).expect("limits"),
+            executor,
+        )
+        .await;
+
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(
+            outcomes[0].observations[0].error_code.as_deref(),
+            Some("TARGET_ENDPOINT_TRUST_BINDING_MISMATCH")
+        );
+        assert_eq!(
+            outcomes[0].rpc_audits[0].error_code,
+            Some(ErrorCode::EndpointNotAllowed)
+        );
+        assert_eq!(
+            outcomes[0].rpc_audits[0].detail_json["target_endpoint_trust_state"],
+            "binding_mismatch"
+        );
+        assert_eq!(
+            outcomes[0].rpc_audits[0].detail_json["target_node_id"],
+            "binding-target-node"
         );
         assert!(!secret_key.exists());
     }

@@ -537,6 +537,15 @@ fn endpoint_lifecycle_commands_write_audit_and_update_registry() {
         "--database",
         &database_arg,
         "endpoint",
+        "quarantine",
+        &endpoint_one,
+        "--reason",
+        "suspicious traffic",
+    ]);
+    run_ocfleet(&[
+        "--database",
+        &database_arg,
+        "endpoint",
         "rotate",
         &endpoint_one,
         "--new-endpoint-id",
@@ -547,13 +556,20 @@ fn endpoint_lifecycle_commands_write_audit_and_update_registry() {
     run_ocfleet(&[
         "--database",
         &database_arg,
+        "node",
+        "enable",
+        "hk-ocserv-01",
+    ]);
+    run_ocfleet(&[
+        "--database",
+        &database_arg,
         "endpoint",
         "revoke",
         &endpoint_two,
         "--reason",
         "lost host",
     ]);
-    run_ocfleet(&[
+    let terminal_retry = run_ocfleet_failure(&[
         "--database",
         &database_arg,
         "endpoint",
@@ -562,6 +578,9 @@ fn endpoint_lifecycle_commands_write_audit_and_update_registry() {
         "--reason",
         "suspicious traffic",
     ]);
+    let terminal_stderr = String::from_utf8_lossy(&terminal_retry.stderr);
+    assert!(terminal_stderr.contains("invalid endpoint transition"));
+    assert!(terminal_stderr.contains("revoked"));
 
     let store = Store::open(&database).expect("store reopens");
     assert_eq!(
@@ -578,11 +597,19 @@ fn endpoint_lifecycle_commands_write_audit_and_update_registry() {
             .expect("load new")
             .expect("new exists")
             .status,
-        EndpointStatus::Quarantined
+        EndpointStatus::Revoked
     );
+    let node = store
+        .get_node("hk-ocserv-01")
+        .expect("load node")
+        .expect("node exists");
+    assert_eq!(node.endpoint_id, endpoint_two);
+    assert!(!node.enabled);
     let (event, detail) = latest_audit_event(&database);
-    assert_eq!(event, "endpoint.quarantine");
-    assert_eq!(detail["reason"], "suspicious traffic");
+    assert_eq!(event, "endpoint.revoke");
+    assert_eq!(detail["reason"], "lost host");
+    assert_eq!(detail["before"]["node"]["enabled"], true);
+    assert_eq!(detail["after"]["node"]["enabled"], false);
 }
 
 #[test]

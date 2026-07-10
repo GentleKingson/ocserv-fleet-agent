@@ -246,7 +246,8 @@ async fn main() -> anyhow::Result<()> {
                     new_endpoint_id,
                     reason,
                 } => {
-                    let endpoint = store.rotate_endpoint(
+                    let endpoint = StoreWriter::write_endpoint_rotation(
+                        &store,
                         &old_endpoint_id,
                         &new_endpoint_id,
                         &local_actor(),
@@ -264,7 +265,12 @@ async fn main() -> anyhow::Result<()> {
                     endpoint_id,
                     reason,
                 } => {
-                    let endpoint = store.revoke_endpoint(&endpoint_id, &local_actor(), &reason)?;
+                    let endpoint = StoreWriter::write_endpoint_revocation(
+                        &store,
+                        &endpoint_id,
+                        &local_actor(),
+                        &reason,
+                    )?;
                     println!("endpoint_id={}", endpoint.endpoint_id);
                     println!("status={}", endpoint.status.as_str());
                     println!("generation={}", endpoint.generation);
@@ -273,8 +279,12 @@ async fn main() -> anyhow::Result<()> {
                     endpoint_id,
                     reason,
                 } => {
-                    let endpoint =
-                        store.quarantine_endpoint(&endpoint_id, &local_actor(), &reason)?;
+                    let endpoint = StoreWriter::write_endpoint_quarantine(
+                        &store,
+                        &endpoint_id,
+                        &local_actor(),
+                        &reason,
+                    )?;
                     println!("endpoint_id={}", endpoint.endpoint_id);
                     println!("status={}", endpoint.status.as_str());
                     println!("generation={}", endpoint.generation);
@@ -1254,28 +1264,17 @@ async fn run_path_probe_command(
         )?;
         bail!(message);
     }
-    if let Some(rejection) = endpoint_trust_rejection(store, &source.endpoint_id)? {
-        let message = if rejection.is_missing() {
-            format!(
-                "endpoint trust missing: node_id={} endpoint_id={}",
-                source.node_id, source.endpoint_id
-            )
-        } else {
-            format!(
-                "endpoint not active: node_id={} endpoint_id={} status={}",
-                source.node_id,
-                source.endpoint_id,
-                rejection.as_str()
-            )
-        };
+    if let Some(rejection) = endpoint_trust_rejection(store, &source.node_id, &source.endpoint_id)?
+    {
+        let message = rejection.message(false, &source.node_id, &source.endpoint_id);
         let mut detail = json!({
             "message": message,
             "source_node_id": source_node_id,
             "target_node_id": target_node_id,
-            "endpoint_trust_state": if rejection.is_missing() { "missing" } else { "inactive" },
+            "endpoint_trust_state": rejection.trust_state(),
         });
-        if !rejection.is_missing() {
-            detail["endpoint_status"] = Value::String(rejection.as_str().to_string());
+        if let Some(status) = rejection.endpoint_status() {
+            detail["endpoint_status"] = Value::String(status.as_str().to_string());
         }
         write_rpc_audit(
             store,
@@ -1335,28 +1334,17 @@ async fn run_path_probe_command(
         )?;
         bail!(message);
     }
-    if let Some(rejection) = endpoint_trust_rejection(store, &target.endpoint_id)? {
-        let message = if rejection.is_missing() {
-            format!(
-                "endpoint trust missing: node_id={} endpoint_id={}",
-                target.node_id, target.endpoint_id
-            )
-        } else {
-            format!(
-                "endpoint not active: node_id={} endpoint_id={} status={}",
-                target.node_id,
-                target.endpoint_id,
-                rejection.as_str()
-            )
-        };
+    if let Some(rejection) = endpoint_trust_rejection(store, &target.node_id, &target.endpoint_id)?
+    {
+        let message = rejection.message(true, &target.node_id, &target.endpoint_id);
         let mut detail = json!({
             "message": message,
             "source_node_id": source_node_id,
             "target_node_id": target_node_id,
-            "target_endpoint_trust_state": if rejection.is_missing() { "missing" } else { "inactive" },
+            "target_endpoint_trust_state": rejection.trust_state(),
         });
-        if !rejection.is_missing() {
-            detail["target_endpoint_status"] = Value::String(rejection.as_str().to_string());
+        if let Some(status) = rejection.endpoint_status() {
+            detail["target_endpoint_status"] = Value::String(status.as_str().to_string());
         }
         write_rpc_audit(
             store,
@@ -1377,6 +1365,7 @@ async fn run_path_probe_command(
     }
 
     let rpc = FixedControllerRpc::ProbePathEcho {
+        target_node_id: target.node_id.clone(),
         target_agent_endpoint_id: target.endpoint_id.clone(),
     };
     let params = rpc.params();
@@ -1496,26 +1485,14 @@ async fn run_node_rpc_command(
         )?;
         bail!(message);
     }
-    if let Some(rejection) = endpoint_trust_rejection(store, &node.endpoint_id)? {
-        let message = if rejection.is_missing() {
-            format!(
-                "endpoint trust missing: node_id={} endpoint_id={}",
-                node.node_id, node.endpoint_id
-            )
-        } else {
-            format!(
-                "endpoint not active: node_id={} endpoint_id={} status={}",
-                node.node_id,
-                node.endpoint_id,
-                rejection.as_str()
-            )
-        };
+    if let Some(rejection) = endpoint_trust_rejection(store, &node.node_id, &node.endpoint_id)? {
+        let message = rejection.message(false, &node.node_id, &node.endpoint_id);
         let mut detail = json!({
             "message": message,
-            "endpoint_trust_state": if rejection.is_missing() { "missing" } else { "inactive" },
+            "endpoint_trust_state": rejection.trust_state(),
         });
-        if !rejection.is_missing() {
-            detail["endpoint_status"] = Value::String(rejection.as_str().to_string());
+        if let Some(status) = rejection.endpoint_status() {
+            detail["endpoint_status"] = Value::String(status.as_str().to_string());
         }
         write_rpc_audit(
             store,

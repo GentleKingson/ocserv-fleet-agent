@@ -27,6 +27,10 @@
 - Scheduler job add, enable, and disable now take the resolved actor and commit
   the job configuration change and success audit in one SQLite transaction
   through `StoreWriter`.
+- Scheduler run start, bounded outcome, and finish transitions now use explicit
+  actor-bound `StoreWriter` transactions. Each observation is paired with an
+  RPC or scheduler audit, while finish commits terminal run state and the owning
+  job clock together. No SQLite transaction spans RPC or semaphore waits.
 - Health `unreachable` now honors the configured consecutive ping-failure
   threshold; a single recent failure is degraded.
 - Retention dry-run performs no deletion and writes no audit row.
@@ -52,6 +56,10 @@
   disable roll back their `observability_jobs` changes instead of committing
   without audit. Scheduler audit before/after projections use only fixed job
   fields and a closed selector class, not free-form names or selector values.
+- Added audit, observation, and job-clock failure injection for scheduler run
+  execution. Partial outcome bundles roll back, terminal run rewrites are
+  rejected, explicit actors are preserved, and persistence errors leave an
+  incomplete `running` marker without advancing the job clock.
 - Added bounded low-sensitive storage validation and fail-closed reader checks
   for observability/audit JSON, including secret aliases, addresses, raw
   fields, excessive nesting, entry counts, and string sizes.
@@ -81,9 +89,10 @@
 - The collector normalizes operator-supplied aggregate metadata; it does not
   discover live ocserv state or call administration/log/service tools.
 - SQLite is the only runtime backend; Postgres always returns unavailable.
-- Scheduler run/outcome/observation, health/alert/delivery, retention, and other
-  remaining legacy controller mutations have not yet all moved to atomic
-  `StoreWriter` actor/audit transactions.
+- Health/alert/delivery, retention, and other remaining legacy controller
+  mutations have not yet all moved to atomic `StoreWriter` actor/audit
+  transactions. Recovery of incomplete scheduler `running` rows remains A3
+  scheduler-reliability work.
 - Controlled writes are validation-only scaffolding and have no live code path.
 - API TLS termination remains an external deployment responsibility.
 - Browser screenshot QA, cargo-deny, cargo-audit, Linux multi-architecture

@@ -32,12 +32,13 @@ use crate::controller_rpc::{
     OcservRpcOutcome, RpcAuditRecord, RpcCommandFailure, elapsed_ms, endpoint_trust_rejection,
     error_code_name, execute_fixed_node_rpc_from_database, hash_json_value,
     low_sensitive_fixed_rpc_summary, low_sensitive_ocserv_observation_summary,
-    ocserv_failure_detail, write_rpc_audit,
+    ocserv_failure_detail, rpc_audit_event,
 };
-use crate::input_validation::{local_actor, validate_description, validate_selector};
+use crate::input_validation::{validate_description, validate_selector};
 use crate::store::{
     InvalidObservabilityJobRecord, NodeRecord, ObservabilityJobLoadResult, ObservabilityJobRecord,
-    ObservabilityRunInsert, ObservabilityRunRecord, ProbeObservationInsert, Store,
+    ObservabilityRunRecord, ProbeObservationInsert, SchedulerJobClockUpdate, SchedulerOutcomeEntry,
+    SchedulerOutcomeWrite, SchedulerRunFinish, SchedulerRunStart, Store, StoreError,
 };
 
 const DEFAULT_SELECTOR: &str = "role=ocserv";
@@ -142,6 +143,7 @@ struct SchedulerTickContext<'a> {
     store: &'a Store,
     database_path: &'a Path,
     secret_key_path: &'a Path,
+    actor: &'a str,
     limits: SchedulerLimits,
     rpc_budget_remaining: &'a mut usize,
 }
@@ -155,11 +157,21 @@ struct TargetNode {
 struct ResolvedSchedulerTask {
     job_id: String,
     run_id: String,
+    actor: String,
     kind: StoredJobKind,
     node: NodeRecord,
     rpc: SchedulerTaskRpc,
     method_key: String,
     ordinal: usize,
+}
+
+#[derive(Debug)]
+enum PreparedSchedulerJob {
+    NodeTargets {
+        kind: StoredJobKind,
+        targets: Vec<TargetNode>,
+    },
+    PathProbe,
 }
 
 #[derive(Debug, Clone)]
@@ -320,6 +332,7 @@ pub async fn run_schedule_command(
                 run_schedule_run_once_command(
                     store,
                     secret_key_path,
+                    actor,
                     once,
                     job_id.as_deref(),
                     max_concurrency,
@@ -332,7 +345,14 @@ pub async fn run_schedule_command(
             max_concurrency,
             tick_seconds,
         } => {
-            run_schedule_daemon_command(store, secret_key_path, max_concurrency, tick_seconds).await
+            run_schedule_daemon_command(
+                store,
+                secret_key_path,
+                actor,
+                max_concurrency,
+                tick_seconds,
+            )
+            .await
         }
         ScheduleCommand::Status { json } => run_schedule_status_command(store, json),
     }
@@ -637,6 +657,7 @@ fn set_job_enabled(store: &Store, actor: &str, job_id: &str, enabled: bool) -> a
 async fn run_schedule_run_once_command(
     store: &Store,
     secret_key_path: &Path,
+    actor: &str,
     once: bool,
     job_id: Option<&str>,
     max_concurrency: usize,
@@ -646,13 +667,14 @@ async fn run_schedule_run_once_command(
         bail!("schedule run currently requires --once");
     }
     let stats = if let Some(job_id) = job_id {
-        run_target_job_once(store, secret_key_path, job_id, max_concurrency).await?
+        run_target_job_once(store, secret_key_path, actor, job_id, max_concurrency).await?
     } else {
-        run_due_jobs_once(store, secret_key_path, max_concurrency).await?
+        run_due_jobs_once(store, secret_key_path, actor, max_concurrency).await?
     };
     let alert_evaluation = evaluate_scheduler_alerts(store);
     write_scheduler_audit(
         store,
+        actor,
         "scheduler.run.once",
         true,
         scheduler_run_once_detail_json(&stats, job_id, max_concurrency, &alert_evaluation),
@@ -730,6 +752,7 @@ fn run_schedule_run_show(store: &Store, run_id: &str, json_output: bool) -> anyh
 async fn run_schedule_daemon_command(
     store: &Store,
     secret_key_path: &Path,
+    actor: &str,
     max_concurrency: usize,
     tick_seconds: u64,
 ) -> anyhow::Result<()> {
@@ -737,6 +760,7 @@ async fn run_schedule_daemon_command(
     validate_tick_seconds(tick_seconds)?;
     write_scheduler_audit(
         store,
+        actor,
         "scheduler.daemon.start",
         true,
         json!({
@@ -747,10 +771,11 @@ async fn run_schedule_daemon_command(
     )?;
 
     loop {
-        run_due_jobs_once(store, secret_key_path, max_concurrency).await?;
+        run_due_jobs_once(store, secret_key_path, actor, max_concurrency).await?;
         let alert_evaluation = evaluate_scheduler_alerts(store);
         write_scheduler_audit(
             store,
+            actor,
             "scheduler.alert.evaluate",
             alert_evaluation.ok,
             scheduler_alert_evaluation_detail_json(&alert_evaluation),
@@ -765,6 +790,7 @@ async fn run_schedule_daemon_command(
 
     write_scheduler_audit(
         store,
+        actor,
         "scheduler.daemon.stop",
         true,
         json!({
@@ -820,6 +846,7 @@ fn run_schedule_status_command(store: &Store, json_output: bool) -> anyhow::Resu
 async fn run_due_jobs_once(
     store: &Store,
     secret_key_path: &Path,
+    actor: &str,
     max_concurrency: usize,
 ) -> anyhow::Result<RunStats> {
     let limits = SchedulerLimits::from_max_concurrency(max_concurrency)?;
@@ -828,6 +855,7 @@ async fn run_due_jobs_once(
         store,
         database_path: store.database_path(),
         secret_key_path,
+        actor,
         limits,
         rpc_budget_remaining: &mut rpc_budget_remaining,
     };
@@ -854,7 +882,7 @@ async fn run_due_jobs_once(
                     continue;
                 }
                 stats.due_jobs += 1;
-                record_invalid_scheduler_job_record_observation(store, &job)?;
+                record_invalid_scheduler_job_record_observation(store, actor, &job)?;
                 stats.executed_jobs += 1;
                 stats.observations += 1;
                 stats.failed_observations += 1;
@@ -868,11 +896,18 @@ async fn run_due_jobs_once(
             Ok(due) => due,
             Err(_) => {
                 stats.due_jobs += 1;
-                record_invalid_scheduler_job_observation(store, &job, "INVALID_NEXT_RUN_AT")?;
+                let finished_at = now_rfc3339();
+                let clock = scheduler_job_clock(&job, &finished_at)?;
+                record_invalid_scheduler_job_observation(
+                    store,
+                    actor,
+                    &job,
+                    "INVALID_NEXT_RUN_AT",
+                    Some(clock),
+                )?;
                 stats.executed_jobs += 1;
                 stats.observations += 1;
                 stats.failed_observations += 1;
-                update_job_after_tick(store, &job)?;
                 continue;
             }
         };
@@ -880,22 +915,30 @@ async fn run_due_jobs_once(
             continue;
         }
         stats.due_jobs += 1;
-        let job_stats = match run_job(&mut tick_context, &job).await {
-            Ok(job_stats) => job_stats,
+        let prepared = match prepare_scheduler_job(store, &job) {
+            Ok(prepared) => prepared,
+            Err(err) if err.downcast_ref::<StoreError>().is_some() => return Err(err),
             Err(_) => {
-                record_invalid_scheduler_job_observation(store, &job, "INVALID_JOB_CONFIGURATION")?;
+                let finished_at = now_rfc3339();
+                let clock = scheduler_job_clock(&job, &finished_at)?;
+                record_invalid_scheduler_job_observation(
+                    store,
+                    actor,
+                    &job,
+                    "INVALID_JOB_CONFIGURATION",
+                    Some(clock),
+                )?;
                 stats.executed_jobs += 1;
                 stats.observations += 1;
                 stats.failed_observations += 1;
-                update_job_after_tick(store, &job)?;
                 continue;
             }
         };
+        let job_stats = run_job(&mut tick_context, &job, prepared).await?;
         stats.executed_jobs += 1;
         stats.observations += job_stats.observations;
         stats.failed_observations += job_stats.failed_observations;
         stats.run_ids.extend(job_stats.run_ids);
-        update_job_after_tick(store, &job)?;
     }
     Ok(stats)
 }
@@ -903,6 +946,7 @@ async fn run_due_jobs_once(
 async fn run_target_job_once(
     store: &Store,
     secret_key_path: &Path,
+    actor: &str,
     job_id: &str,
     max_concurrency: usize,
 ) -> anyhow::Result<RunStats> {
@@ -922,10 +966,8 @@ async fn run_target_job_once(
     if !job.enabled {
         bail!("observability job is disabled: {job_id}");
     }
-    let validation = validate_job_config(store, &job);
-    if !validation.valid {
-        bail!("scheduler job validation failed: {}", validation.message);
-    }
+    let prepared = prepare_scheduler_job(store, &job)?;
+    validate_prepared_scheduler_job(store, &job, &prepared)?;
 
     let limits = SchedulerLimits::from_max_concurrency(max_concurrency)?;
     let mut rpc_budget_remaining = limits.rpc_budget_per_tick;
@@ -933,11 +975,11 @@ async fn run_target_job_once(
         store,
         database_path: store.database_path(),
         secret_key_path,
+        actor,
         limits,
         rpc_budget_remaining: &mut rpc_budget_remaining,
     };
-    let job_stats = run_job(&mut tick_context, &job).await?;
-    update_job_after_tick(store, &job)?;
+    let job_stats = run_job(&mut tick_context, &job, prepared).await?;
     Ok(RunStats {
         due_jobs: 1,
         executed_jobs: 1,
@@ -1030,128 +1072,142 @@ fn append_alert_evaluation_detail(
     }
 }
 
-fn update_job_after_tick(store: &Store, job: &ObservabilityJobRecord) -> anyhow::Result<()> {
-    let finished_at = now_rfc3339();
+fn scheduler_job_clock(
+    job: &ObservabilityJobRecord,
+    finished_at: &str,
+) -> anyhow::Result<SchedulerJobClockUpdate> {
     let interval_seconds =
         i64::try_from(job.interval_seconds).context("scheduler job interval is too large")?;
     let next_run_at = offset_to_rfc3339(
-        OffsetDateTime::parse(&finished_at, &Rfc3339).expect("formatted timestamp parses")
+        OffsetDateTime::parse(finished_at, &Rfc3339)
+            .context("scheduler finished_at must be RFC3339")?
             + Duration::seconds(interval_seconds),
     );
-    store.update_observability_job_run_times(
-        &job.job_id,
-        Some(&next_run_at),
-        Some(&finished_at),
-    )?;
+    Ok(SchedulerJobClockUpdate {
+        job_id: job.job_id.clone(),
+        next_run_at,
+        last_run_at: finished_at.to_string(),
+    })
+}
+
+fn prepare_scheduler_job(
+    store: &Store,
+    job: &ObservabilityJobRecord,
+) -> anyhow::Result<PreparedSchedulerJob> {
+    let kind = stored_job_kind(&job.kind)?;
+    match kind {
+        StoredJobKind::PathProbe => {
+            let (source_node_id, target_node_id) = explicit_pair(job)?;
+            validate_node_id(&source_node_id).map_err(anyhow::Error::msg)?;
+            validate_node_id(&target_node_id).map_err(anyhow::Error::msg)?;
+            Ok(PreparedSchedulerJob::PathProbe)
+        }
+        StoredJobKind::ControllerPing
+        | StoredJobKind::OcservStatus
+        | StoredJobKind::OcservCert
+        | StoredJobKind::OcservSessions => {
+            let targets = resolve_node_targets(store, selector_label(job)?)?;
+            for target in &targets {
+                validate_node_id(&target.node_id).map_err(anyhow::Error::msg)?;
+            }
+            Ok(PreparedSchedulerJob::NodeTargets { kind, targets })
+        }
+    }
+}
+
+fn validate_prepared_scheduler_job(
+    store: &Store,
+    job: &ObservabilityJobRecord,
+    prepared: &PreparedSchedulerJob,
+) -> anyhow::Result<()> {
+    let node_ids = match prepared {
+        PreparedSchedulerJob::PathProbe => {
+            let (source_node_id, target_node_id) = explicit_pair(job)?;
+            vec![source_node_id, target_node_id]
+        }
+        PreparedSchedulerJob::NodeTargets { targets, .. } => {
+            if targets.is_empty() {
+                bail!("scheduler job validation failed: selector matched no nodes");
+            }
+            targets
+                .iter()
+                .map(|target| target.node_id.clone())
+                .collect()
+        }
+    };
+    for node_id in node_ids {
+        validate_node_id(&node_id).map_err(anyhow::Error::msg)?;
+        let node = store.get_node(&node_id)?.with_context(|| {
+            format!("scheduler job validation failed: node not found: {node_id}")
+        })?;
+        if !node.enabled {
+            bail!("scheduler job validation failed: node disabled: {node_id}");
+        }
+    }
     Ok(())
 }
 
 async fn run_job(
     tick_context: &mut SchedulerTickContext<'_>,
     job: &ObservabilityJobRecord,
+    prepared: PreparedSchedulerJob,
 ) -> anyhow::Result<RunStats> {
-    let kind = stored_job_kind(&job.kind)?;
-    let selector = match kind {
-        StoredJobKind::PathProbe => {
-            explicit_pair(job)?;
-            None
-        }
-        StoredJobKind::ControllerPing
-        | StoredJobKind::OcservStatus
-        | StoredJobKind::OcservCert
-        | StoredJobKind::OcservSessions => Some(selector_label(job)?.to_string()),
-    };
     let started_at = now_rfc3339();
     let run_id = format!("run-{}", Uuid::new_v4().simple());
-    tick_context
-        .store
-        .insert_observability_run(&ObservabilityRunInsert {
+    StoreWriter::write_scheduler_run_start(
+        tick_context.store,
+        &SchedulerRunStart {
             run_id: run_id.clone(),
-            job_id: Some(job.job_id.clone()),
-            started_at: started_at.clone(),
-            finished_at: None,
-            status: "running".to_string(),
-            triggered_by: "scheduler.run.once".to_string(),
-            summary_json: json!({
-                "job_id": job.job_id,
-                "kind": job.kind,
-                "result_class": SCHEDULER_RESULT_CLASS,
-            }),
-        })?;
+            job_id: job.job_id.clone(),
+            started_at,
+        },
+        tick_context.actor,
+    )?;
 
-    let mut stats = match run_job_after_start(tick_context, job, kind, selector, &run_id).await {
-        Ok(stats) => stats,
-        Err(err) => {
-            finish_failed_observability_run(
-                tick_context.store,
-                &run_id,
-                job,
-                "SCHEDULER_JOB_INVALID",
-            )?;
-            return Err(err);
-        }
-    };
-    stats.run_ids.push(run_id.clone());
+    let mut stats = run_job_after_start(tick_context, job, prepared, &run_id).await?;
 
     let finished_at = now_rfc3339();
-    let status = if stats.observations == 0 {
-        "skipped"
-    } else if stats.failed_observations == 0 {
-        "succeeded"
-    } else {
-        "failed"
-    };
-    tick_context.store.finish_observability_run(
-        &run_id,
-        &finished_at,
-        status,
-        &json!({
-            "job_id": job.job_id,
-            "kind": job.kind,
-            "status": status,
-            "observations": stats.observations,
-            "failed_observations": stats.failed_observations,
-            "result_class": SCHEDULER_RESULT_CLASS,
-        }),
+    StoreWriter::write_scheduler_run_finish(
+        tick_context.store,
+        &SchedulerRunFinish {
+            run_id: run_id.clone(),
+            finished_at: finished_at.clone(),
+            job_clock: scheduler_job_clock(job, &finished_at)?,
+        },
+        tick_context.actor,
     )?;
+    stats.run_ids.push(run_id);
     Ok(stats)
 }
 
 async fn run_job_after_start(
     tick_context: &mut SchedulerTickContext<'_>,
     job: &ObservabilityJobRecord,
-    kind: StoredJobKind,
-    selector: Option<String>,
+    prepared: PreparedSchedulerJob,
     run_id: &str,
 ) -> anyhow::Result<RunStats> {
     let mut stats = RunStats::default();
-    match kind {
-        StoredJobKind::PathProbe => {
+    match prepared {
+        PreparedSchedulerJob::PathProbe => {
             run_path_probe_job(tick_context, job, run_id, &mut stats).await?
         }
-        StoredJobKind::ControllerPing
-        | StoredJobKind::OcservStatus
-        | StoredJobKind::OcservCert
-        | StoredJobKind::OcservSessions => {
-            let targets = resolve_node_targets(
-                tick_context.store,
-                selector.as_deref().context("validated selector missing")?,
-            )?;
+        PreparedSchedulerJob::NodeTargets { kind, targets } => {
             if targets.is_empty() {
-                record_missing_target_observation(
+                let outcome =
+                    missing_target_outcome(tick_context.actor, run_id, job, "NODE_NOT_FOUND");
+                write_scheduler_task_outcomes(
                     tick_context.store,
-                    run_id,
-                    job,
-                    "NODE_NOT_FOUND",
+                    tick_context.actor,
+                    vec![outcome],
+                    &mut stats,
                 )?;
-                stats.observations += 1;
-                stats.failed_observations += 1;
             } else {
                 let mut tasks = Vec::new();
                 let mut outcomes = Vec::new();
                 for (ordinal, target) in targets.into_iter().enumerate() {
                     match prepare_node_target_task(
                         tick_context.store,
+                        tick_context.actor,
                         job,
                         kind,
                         run_id,
@@ -1164,6 +1220,7 @@ async fn run_job_after_start(
                 }
                 outcomes.extend(limit_tasks_by_rpc_budget(
                     job,
+                    tick_context.actor,
                     run_id,
                     kind,
                     &mut tasks,
@@ -1176,7 +1233,12 @@ async fn run_job_after_start(
                 outcomes.extend(
                     execute_resolved_scheduler_tasks(tasks, tick_context.limits, executor).await,
                 );
-                write_scheduler_task_outcomes(tick_context.store, outcomes, &mut stats)?;
+                write_scheduler_task_outcomes(
+                    tick_context.store,
+                    tick_context.actor,
+                    outcomes,
+                    &mut stats,
+                )?;
             }
         }
     }
@@ -1190,6 +1252,7 @@ enum PreparedSchedulerTask {
 
 fn prepare_node_target_task(
     store: &Store,
+    actor: &str,
     job: &ObservabilityJobRecord,
     kind: StoredJobKind,
     run_id: &str,
@@ -1202,21 +1265,34 @@ fn prepare_node_target_task(
         Ok(node) => PreparedSchedulerTask::Task(ResolvedSchedulerTask {
             job_id: job.job_id.clone(),
             run_id: run_id.to_string(),
+            actor: actor.to_string(),
             kind,
             node,
             rpc,
             method_key,
             ordinal,
         }),
-        Err(failure) => PreparedSchedulerTask::Outcome(preflight_failure_outcome(
-            job,
-            run_id,
-            kind,
-            &target.node_id,
-            ordinal,
-            method_key,
-            failure,
-        )),
+        Err(failure) => {
+            let node_id = target.node_id;
+            let task = ResolvedSchedulerTask {
+                job_id: job.job_id.clone(),
+                run_id: run_id.to_string(),
+                actor: actor.to_string(),
+                kind,
+                node: NodeRecord {
+                    node_id: node_id.clone(),
+                    endpoint_id: failure.endpoint_id.clone().unwrap_or_default(),
+                    name: node_id,
+                    region: String::new(),
+                    role: String::new(),
+                    enabled: false,
+                },
+                rpc: scheduler_rpc_for_preflight_failure(kind),
+                method_key,
+                ordinal,
+            };
+            PreparedSchedulerTask::Outcome(preflight_failure_outcome(task, failure))
+        }
     }
 }
 
@@ -1338,40 +1414,19 @@ fn scheduler_preflight_detail(
 }
 
 fn preflight_failure_outcome(
-    job: &ObservabilityJobRecord,
-    run_id: &str,
-    kind: StoredJobKind,
-    node_id: &str,
-    ordinal: usize,
-    method_key: String,
+    task: ResolvedSchedulerTask,
     failure: SchedulerPreflightFailure,
 ) -> SchedulerTaskOutcome {
-    let task = ResolvedSchedulerTask {
-        job_id: job.job_id.clone(),
-        run_id: run_id.to_string(),
-        kind,
-        node: NodeRecord {
-            node_id: node_id.to_string(),
-            endpoint_id: failure.endpoint_id.clone().unwrap_or_default(),
-            name: node_id.to_string(),
-            region: String::new(),
-            role: String::new(),
-            enabled: false,
-        },
-        rpc: scheduler_rpc_for_preflight_failure(kind),
-        method_key,
-        ordinal,
-    };
     let error_code = failure
         .observation_error_code
         .map(str::to_string)
         .unwrap_or_else(|| error_code_name(&failure.code));
     let observations = preflight_failure_observations(&task, &failure.detail_json, &error_code);
-    let rpc_audits = preflight_methods_for_kind(kind)
+    let rpc_audits = preflight_methods_for_kind(task.kind)
         .into_iter()
         .map(|method| RpcAuditRecord {
-            actor: local_actor(),
-            node_id: node_id.to_string(),
+            actor: task.actor.clone(),
+            node_id: task.node.node_id.clone(),
             endpoint_id: failure.endpoint_id.clone(),
             method: method.to_string(),
             request_id: None,
@@ -1433,6 +1488,7 @@ fn preflight_methods_for_kind(kind: StoredJobKind) -> Vec<&'static str> {
 
 fn limit_tasks_by_rpc_budget(
     job: &ObservabilityJobRecord,
+    actor: &str,
     run_id: &str,
     kind: StoredJobKind,
     tasks: &mut Vec<ResolvedSchedulerTask>,
@@ -1446,11 +1502,18 @@ fn limit_tasks_by_rpc_budget(
     let skipped_tasks = tasks.len() - *rpc_budget_remaining;
     tasks.truncate(*rpc_budget_remaining);
     *rpc_budget_remaining = 0;
-    vec![budget_exceeded_outcome(job, run_id, kind, skipped_tasks)]
+    vec![budget_exceeded_outcome(
+        job,
+        actor,
+        run_id,
+        kind,
+        skipped_tasks,
+    )]
 }
 
 fn budget_exceeded_outcome(
     job: &ObservabilityJobRecord,
+    actor: &str,
     run_id: &str,
     kind: StoredJobKind,
     skipped_tasks: usize,
@@ -1459,6 +1522,7 @@ fn budget_exceeded_outcome(
     let task = ResolvedSchedulerTask {
         job_id: job.job_id.clone(),
         run_id: run_id.to_string(),
+        actor: actor.to_string(),
         kind,
         node: NodeRecord {
             node_id: "<scheduler-budget>".to_string(),
@@ -1604,32 +1668,97 @@ fn scheduler_task_runtime_failure(
 
 fn write_scheduler_task_outcomes(
     store: &Store,
+    actor: &str,
     outcomes: Vec<SchedulerTaskOutcome>,
     stats: &mut RunStats,
 ) -> anyhow::Result<()> {
     for outcome in outcomes {
-        for audit in outcome.rpc_audits {
-            write_rpc_audit(store, audit)?;
+        if outcome.task.actor != actor {
+            bail!("scheduler task actor does not match command actor");
         }
+        let mut rpc_audits = outcome.rpc_audits;
+        let observed_at = now_rfc3339();
+        let mut entries = Vec::with_capacity(outcome.observations.len());
+        let mut failed_observations = 0_usize;
         for observation in outcome.observations {
-            store.insert_probe_observation(&ProbeObservationInsert {
-                observation_id: observation_id(),
-                run_id: Some(outcome.task.run_id.clone()),
-                node_id: observation.node_id,
-                endpoint_id: observation.endpoint_id,
-                method: observation.method,
-                ok: Some(observation.ok),
-                error_code: observation.error_code,
-                duration_ms: Some(observation.duration_ms),
-                observed_at: now_rfc3339(),
-                expires_at: None,
-                result_class: observation.result_class,
-                summary_json: observation.summary_json,
-            })?;
-            update_observation_stats(stats, observation.ok);
+            let audit = matching_rpc_audit(&observation, &mut rpc_audits)
+                .map(rpc_audit_event)
+                .unwrap_or_else(|| {
+                    scheduler_task_outcome_audit(actor, &outcome.task, &observation)
+                });
+            if !observation.ok {
+                failed_observations += 1;
+            }
+            entries.push(SchedulerOutcomeEntry {
+                observation: ProbeObservationInsert {
+                    observation_id: observation_id(),
+                    run_id: Some(outcome.task.run_id.clone()),
+                    node_id: observation.node_id,
+                    endpoint_id: observation.endpoint_id,
+                    method: observation.method,
+                    ok: Some(observation.ok),
+                    error_code: observation.error_code,
+                    duration_ms: Some(observation.duration_ms),
+                    observed_at: observed_at.clone(),
+                    expires_at: None,
+                    result_class: observation.result_class,
+                    summary_json: observation.summary_json,
+                },
+                audit,
+            });
         }
+        if !rpc_audits.is_empty() {
+            bail!("scheduler RPC audit does not match an observation");
+        }
+        let observation_count = entries.len();
+        StoreWriter::write_scheduler_outcome(
+            store,
+            &SchedulerOutcomeWrite {
+                job_id: outcome.task.job_id,
+                run_id: Some(outcome.task.run_id),
+                entries,
+                job_clock: None,
+            },
+            actor,
+        )?;
+        stats.observations += observation_count;
+        stats.failed_observations += failed_observations;
     }
     Ok(())
+}
+
+fn matching_rpc_audit(
+    observation: &SchedulerObservationOutcome,
+    audits: &mut Vec<RpcAuditRecord>,
+) -> Option<RpcAuditRecord> {
+    let position = audits.iter().position(|audit| {
+        audit.method == observation.method
+            && Some(audit.node_id.as_str()) == observation.node_id.as_deref()
+            && audit.endpoint_id.as_deref() == observation.endpoint_id.as_deref()
+            && audit.ok == observation.ok
+            && audit.duration_ms == observation.duration_ms
+    })?;
+    Some(audits.remove(position))
+}
+
+fn scheduler_task_outcome_audit(
+    actor: &str,
+    task: &ResolvedSchedulerTask,
+    observation: &SchedulerObservationOutcome,
+) -> AuditEvent {
+    let mut event = AuditEvent::new(actor, "scheduler.task.outcome");
+    event.node_id = observation.node_id.clone();
+    event.endpoint_id = observation.endpoint_id.clone();
+    event.method = Some(observation.method.clone());
+    event.ok = Some(observation.ok);
+    event.error_code = observation.error_code.clone();
+    event.duration_ms = Some(observation.duration_ms);
+    event.detail_json = json!({
+        "job_id": task.job_id,
+        "run_id": task.run_id,
+        "result_class": observation.result_class,
+    });
+    event
 }
 
 async fn execute_production_scheduler_task(
@@ -1714,7 +1843,7 @@ fn fixed_rpc_success_outcome(
                     summary_json,
                 }],
                 vec![RpcAuditRecord {
-                    actor: local_actor(),
+                    actor: task.actor.clone(),
                     node_id: task.node.node_id.clone(),
                     endpoint_id: Some(task.node.endpoint_id.clone()),
                     method: method.to_string(),
@@ -1777,7 +1906,7 @@ fn fixed_rpc_failure_outcome(
             summary_json: detail_json.clone(),
         }],
         vec![RpcAuditRecord {
-            actor: local_actor(),
+            actor: task.actor.clone(),
             node_id: task.node.node_id.clone(),
             endpoint_id: Some(task.node.endpoint_id.clone()),
             method: method.to_string(),
@@ -1800,6 +1929,7 @@ async fn execute_scheduler_ocserv_status_bundle(
     let service = execute_scheduler_ocserv_subrpc::<OcservServiceSummaryResponse>(
         &database_path,
         &secret_key_path,
+        &task.actor,
         &task.node,
         OCSERV_SERVICE_SUMMARY,
     )
@@ -1807,6 +1937,7 @@ async fn execute_scheduler_ocserv_status_bundle(
     let version = execute_scheduler_ocserv_subrpc::<OcservVersionResponse>(
         &database_path,
         &secret_key_path,
+        &task.actor,
         &task.node,
         OCSERV_VERSION,
     )
@@ -1814,6 +1945,7 @@ async fn execute_scheduler_ocserv_status_bundle(
     let sessions = execute_scheduler_ocserv_subrpc::<OcservSessionsSummaryResponse>(
         &database_path,
         &secret_key_path,
+        &task.actor,
         &task.node,
         OCSERV_SESSIONS_SUMMARY,
     )
@@ -1821,6 +1953,7 @@ async fn execute_scheduler_ocserv_status_bundle(
     let config_fingerprint = execute_scheduler_ocserv_subrpc::<OcservConfigFingerprintResponse>(
         &database_path,
         &secret_key_path,
+        &task.actor,
         &task.node,
         OCSERV_CONFIG_FINGERPRINT,
     )
@@ -1879,6 +2012,11 @@ fn append_ocserv_subrpc_outcome<T>(
 ) where
     T: Serialize,
 {
+    let observation_duration_ms = outcome
+        .audit
+        .as_ref()
+        .map(|audit| audit.duration_ms)
+        .unwrap_or(duration_ms);
     if let Some(audit) = outcome.audit {
         audits.push(audit);
     }
@@ -1887,13 +2025,14 @@ fn append_ocserv_subrpc_outcome<T>(
         method,
         outcome.rpc_outcome,
         outcome.observation_error_code,
-        duration_ms,
+        observation_duration_ms,
     ));
 }
 
 async fn execute_scheduler_ocserv_subrpc<T>(
     database_path: &Path,
     secret_key_path: &Path,
+    actor: &str,
     node: &NodeRecord,
     method: &'static str,
 ) -> SchedulerOcservSubrpcOutcome<T>
@@ -1909,7 +2048,7 @@ where
             Ok(value) => SchedulerOcservSubrpcOutcome {
                 rpc_outcome: OcservRpcOutcome::Available(value),
                 audit: Some(RpcAuditRecord {
-                    actor: local_actor(),
+                    actor: actor.to_string(),
                     node_id: node.node_id.clone(),
                     endpoint_id: Some(node.endpoint_id.clone()),
                     method: method.to_string(),
@@ -1940,7 +2079,7 @@ where
                         code: failure.code.clone(),
                     },
                     audit: Some(RpcAuditRecord {
-                        actor: local_actor(),
+                        actor: actor.to_string(),
                         node_id: node.node_id.clone(),
                         endpoint_id: Some(node.endpoint_id.clone()),
                         method: method.to_string(),
@@ -1964,7 +2103,7 @@ where
                     code: failure.code.clone(),
                 },
                 audit: Some(RpcAuditRecord {
-                    actor: local_actor(),
+                    actor: actor.to_string(),
                     node_id: node.node_id.clone(),
                     endpoint_id: Some(node.endpoint_id.clone()),
                     method: method.to_string(),
@@ -2063,7 +2202,7 @@ async fn execute_scheduler_path_probe(
                     }),
                 }],
                 vec![RpcAuditRecord {
-                    actor: local_actor(),
+                    actor: task.actor.clone(),
                     node_id: task.node.node_id.clone(),
                     endpoint_id: Some(task.node.endpoint_id.clone()),
                     method: PROBE_PATH_ECHO.to_string(),
@@ -2104,7 +2243,7 @@ async fn execute_scheduler_path_probe(
                     }),
                 }],
                 vec![RpcAuditRecord {
-                    actor: local_actor(),
+                    actor: task.actor.clone(),
                     node_id: task.node.node_id.clone(),
                     endpoint_id: Some(task.node.endpoint_id.clone()),
                     method: PROBE_PATH_ECHO.to_string(),
@@ -2180,27 +2319,6 @@ fn scheduler_result_class_for_stored_kind(kind: StoredJobKind) -> &'static str {
     }
 }
 
-fn finish_failed_observability_run(
-    store: &Store,
-    run_id: &str,
-    job: &ObservabilityJobRecord,
-    error_code: &str,
-) -> anyhow::Result<()> {
-    store.finish_observability_run(
-        run_id,
-        &now_rfc3339(),
-        "failed",
-        &json!({
-            "job_id": job.job_id,
-            "kind": job.kind,
-            "status": "failed",
-            "error_code": error_code,
-            "result_class": SCHEDULER_RESULT_CLASS,
-        }),
-    )?;
-    Ok(())
-}
-
 async fn run_path_probe_job(
     tick_context: &mut SchedulerTickContext<'_>,
     job: &ObservabilityJobRecord,
@@ -2213,23 +2331,31 @@ async fn run_path_probe_job(
     let Some(source) = source else {
         record_path_probe_preflight_observation(
             tick_context.store,
-            run_id,
-            &source_node_id,
-            None,
-            "NODE_NOT_FOUND",
+            tick_context.actor,
+            PathProbePreflight {
+                run_id,
+                job,
+                node_id: &source_node_id,
+                endpoint_id: None,
+                error_code: "NODE_NOT_FOUND",
+            },
+            stats,
         )?;
-        update_observation_stats(stats, false);
         return Ok(());
     };
     if !source.enabled {
         record_path_probe_preflight_observation(
             tick_context.store,
-            run_id,
-            &source.node_id,
-            Some(&source.endpoint_id),
-            "NODE_DISABLED",
+            tick_context.actor,
+            PathProbePreflight {
+                run_id,
+                job,
+                node_id: &source.node_id,
+                endpoint_id: Some(&source.endpoint_id),
+                error_code: "NODE_DISABLED",
+            },
+            stats,
         )?;
-        update_observation_stats(stats, false);
         return Ok(());
     }
     if let Some(rejection) = endpoint_trust_rejection(tick_context.store, &source.endpoint_id)? {
@@ -2240,34 +2366,46 @@ async fn run_path_probe_job(
         };
         record_path_probe_preflight_observation(
             tick_context.store,
-            run_id,
-            &source.node_id,
-            Some(&source.endpoint_id),
-            &error_code,
+            tick_context.actor,
+            PathProbePreflight {
+                run_id,
+                job,
+                node_id: &source.node_id,
+                endpoint_id: Some(&source.endpoint_id),
+                error_code: &error_code,
+            },
+            stats,
         )?;
-        update_observation_stats(stats, false);
         return Ok(());
     }
     let Some(target) = target else {
         record_path_probe_preflight_observation(
             tick_context.store,
-            run_id,
-            &source.node_id,
-            Some(&source.endpoint_id),
-            "TARGET_NODE_NOT_FOUND",
+            tick_context.actor,
+            PathProbePreflight {
+                run_id,
+                job,
+                node_id: &source.node_id,
+                endpoint_id: Some(&source.endpoint_id),
+                error_code: "TARGET_NODE_NOT_FOUND",
+            },
+            stats,
         )?;
-        update_observation_stats(stats, false);
         return Ok(());
     };
     if !target.enabled {
         record_path_probe_preflight_observation(
             tick_context.store,
-            run_id,
-            &source.node_id,
-            Some(&source.endpoint_id),
-            "TARGET_NODE_DISABLED",
+            tick_context.actor,
+            PathProbePreflight {
+                run_id,
+                job,
+                node_id: &source.node_id,
+                endpoint_id: Some(&source.endpoint_id),
+                error_code: "TARGET_NODE_DISABLED",
+            },
+            stats,
         )?;
-        update_observation_stats(stats, false);
         return Ok(());
     }
     if let Some(rejection) = endpoint_trust_rejection(tick_context.store, &target.endpoint_id)? {
@@ -2281,20 +2419,25 @@ async fn run_path_probe_job(
         };
         record_path_probe_target_preflight_observation(
             tick_context.store,
-            run_id,
-            &source.node_id,
-            &source.endpoint_id,
-            &target.node_id,
-            &target.endpoint_id,
-            &error_code,
+            tick_context.actor,
+            PathProbeTargetPreflight {
+                run_id,
+                job,
+                source_node_id: &source.node_id,
+                source_endpoint_id: &source.endpoint_id,
+                target_node_id: &target.node_id,
+                target_endpoint_id: &target.endpoint_id,
+                error_code: &error_code,
+            },
+            stats,
         )?;
-        update_observation_stats(stats, false);
         return Ok(());
     }
 
     let mut tasks = vec![ResolvedSchedulerTask {
         job_id: job.job_id.clone(),
         run_id: run_id.to_string(),
+        actor: tick_context.actor.to_string(),
         kind: StoredJobKind::PathProbe,
         node: source,
         rpc: SchedulerTaskRpc::PathProbe {
@@ -2306,6 +2449,7 @@ async fn run_path_probe_job(
     }];
     let mut outcomes = limit_tasks_by_rpc_budget(
         job,
+        tick_context.actor,
         run_id,
         StoredJobKind::PathProbe,
         &mut tasks,
@@ -2316,7 +2460,7 @@ async fn run_path_probe_job(
         secret_key_path: Arc::new(tick_context.secret_key_path.to_path_buf()),
     };
     outcomes.extend(execute_resolved_scheduler_tasks(tasks, tick_context.limits, executor).await);
-    write_scheduler_task_outcomes(tick_context.store, outcomes, stats)?;
+    write_scheduler_task_outcomes(tick_context.store, tick_context.actor, outcomes, stats)?;
     Ok(())
 }
 
@@ -2388,64 +2532,106 @@ fn resolve_node_targets(store: &Store, selector: &str) -> anyhow::Result<Vec<Tar
     bail!("selector must use role=<role> or node_id=<node-id>")
 }
 
-fn record_missing_target_observation(
-    store: &Store,
+fn missing_target_outcome(
+    actor: &str,
     run_id: &str,
     job: &ObservabilityJobRecord,
     error_code: &str,
-) -> anyhow::Result<()> {
-    store.insert_probe_observation(&ProbeObservationInsert {
-        observation_id: observation_id(),
-        run_id: Some(run_id.to_string()),
-        node_id: None,
-        endpoint_id: None,
-        method: first_method_for_kind(&job.kind)
-            .unwrap_or("unknown")
-            .to_string(),
-        ok: Some(false),
-        error_code: Some(error_code.to_string()),
-        duration_ms: Some(0),
-        observed_at: now_rfc3339(),
-        expires_at: None,
-        result_class: scheduler_result_class_for_job(&job.kind).to_string(),
-        summary_json: json!({
-            "message": "no matching node",
-            "selector": selector_label(job).unwrap_or("<invalid>"),
-            "result_class": scheduler_result_class_for_job(&job.kind),
-        }),
-    })?;
-    Ok(())
+) -> SchedulerTaskOutcome {
+    let kind = stored_job_kind(&job.kind).expect("prepared scheduler job kind is valid");
+    let method = first_method_for_stored_kind(kind);
+    let task = ResolvedSchedulerTask {
+        job_id: job.job_id.clone(),
+        run_id: run_id.to_string(),
+        actor: actor.to_string(),
+        kind,
+        node: NodeRecord {
+            node_id: "<scheduler-target>".to_string(),
+            endpoint_id: String::new(),
+            name: "<scheduler-target>".to_string(),
+            region: String::new(),
+            role: String::new(),
+            enabled: false,
+        },
+        rpc: scheduler_rpc_for_preflight_failure(kind),
+        method_key: method.to_string(),
+        ordinal: 0,
+    };
+    SchedulerTaskOutcome::from_observations(
+        task,
+        vec![SchedulerObservationOutcome {
+            node_id: None,
+            endpoint_id: None,
+            method: method.to_string(),
+            ok: false,
+            error_code: Some(error_code.to_string()),
+            duration_ms: 0,
+            result_class: scheduler_result_class_for_job(&job.kind).to_string(),
+            summary_json: json!({
+                "message": "no matching node",
+                "selector_class": scheduler_selector_class(job),
+                "result_class": scheduler_result_class_for_job(&job.kind),
+            }),
+        }],
+        Vec::new(),
+    )
+}
+
+fn scheduler_selector_class(job: &ObservabilityJobRecord) -> &'static str {
+    match selector_label(job) {
+        Ok(selector) if selector.starts_with("role=") => "role",
+        Ok(selector) if selector.starts_with("node_id=") => "node_id",
+        _ => "invalid",
+    }
 }
 
 fn record_invalid_scheduler_job_observation(
     store: &Store,
+    actor: &str,
     job: &ObservabilityJobRecord,
     reason_code: &str,
+    job_clock: Option<SchedulerJobClockUpdate>,
 ) -> anyhow::Result<()> {
-    record_invalid_scheduler_job_fields_observation(store, &job.job_id, &job.kind, reason_code)
+    record_invalid_scheduler_job_fields_observation(
+        store,
+        actor,
+        &job.job_id,
+        &job.kind,
+        reason_code,
+        job_clock,
+    )
 }
 
 fn record_invalid_scheduler_job_record_observation(
     store: &Store,
+    actor: &str,
     job: &InvalidObservabilityJobRecord,
 ) -> anyhow::Result<()> {
-    record_invalid_scheduler_job_fields_observation(store, &job.job_id, &job.kind, &job.reason_code)
+    record_invalid_scheduler_job_fields_observation(
+        store,
+        actor,
+        &job.job_id,
+        &job.kind,
+        &job.reason_code,
+        None,
+    )
 }
 
 fn record_invalid_scheduler_job_fields_observation(
     store: &Store,
+    actor: &str,
     job_id: &str,
     kind: &str,
     reason_code: &str,
+    job_clock: Option<SchedulerJobClockUpdate>,
 ) -> anyhow::Result<()> {
     let summary_json = json!({
         "message": "scheduler job configuration is invalid",
         "job_id": job_id,
-        "kind": kind,
         "reason_code": reason_code,
         "result_class": SCHEDULER_RESULT_CLASS,
     });
-    store.insert_probe_observation(&ProbeObservationInsert {
+    let observation = ProbeObservationInsert {
         observation_id: observation_id(),
         run_id: None,
         node_id: None,
@@ -2460,39 +2646,65 @@ fn record_invalid_scheduler_job_fields_observation(
         expires_at: None,
         result_class: SCHEDULER_RESULT_CLASS.to_string(),
         summary_json: summary_json.clone(),
-    })?;
-    write_scheduler_audit(store, "scheduler.job.invalid", false, summary_json)?;
+    };
+    let mut audit = AuditEvent::new(actor, "scheduler.job.invalid");
+    audit.method = Some(observation.method.clone());
+    audit.ok = Some(false);
+    audit.error_code = observation.error_code.clone();
+    audit.duration_ms = observation.duration_ms;
+    audit.detail_json = summary_json;
+    StoreWriter::write_scheduler_outcome(
+        store,
+        &SchedulerOutcomeWrite {
+            job_id: job_id.to_string(),
+            run_id: None,
+            entries: vec![SchedulerOutcomeEntry { observation, audit }],
+            job_clock,
+        },
+        actor,
+    )?;
     Ok(())
+}
+
+struct PathProbePreflight<'a> {
+    run_id: &'a str,
+    job: &'a ObservabilityJobRecord,
+    node_id: &'a str,
+    endpoint_id: Option<&'a str>,
+    error_code: &'a str,
 }
 
 fn record_path_probe_preflight_observation(
     store: &Store,
-    run_id: &str,
-    node_id: &str,
-    endpoint_id: Option<&str>,
-    error_code: &str,
+    actor: &str,
+    input: PathProbePreflight<'_>,
+    stats: &mut RunStats,
 ) -> anyhow::Result<()> {
-    store.insert_probe_observation(&ProbeObservationInsert {
-        observation_id: observation_id(),
-        run_id: Some(run_id.to_string()),
-        node_id: Some(node_id.to_string()),
-        endpoint_id: endpoint_id.map(ToOwned::to_owned),
-        method: PROBE_PATH_ECHO.to_string(),
-        ok: Some(false),
-        error_code: Some(error_code.to_string()),
-        duration_ms: Some(0),
-        observed_at: now_rfc3339(),
-        expires_at: None,
-        result_class: CONTROLLER_RPC_RESULT_CLASS.to_string(),
-        summary_json: json!({
-            "message": "path probe preflight failed",
-            "result_class": CONTROLLER_RPC_RESULT_CLASS,
-        }),
-    })?;
-    write_rpc_audit(
-        store,
-        RpcAuditRecord {
-            actor: local_actor(),
+    let PathProbePreflight {
+        run_id,
+        job,
+        node_id,
+        endpoint_id,
+        error_code,
+    } = input;
+    let task = path_preflight_task(actor, job, run_id, node_id, endpoint_id);
+    let outcome = SchedulerTaskOutcome::from_observations(
+        task,
+        vec![SchedulerObservationOutcome {
+            node_id: Some(node_id.to_string()),
+            endpoint_id: endpoint_id.map(ToOwned::to_owned),
+            method: PROBE_PATH_ECHO.to_string(),
+            ok: false,
+            error_code: Some(error_code.to_string()),
+            duration_ms: 0,
+            result_class: CONTROLLER_RPC_RESULT_CLASS.to_string(),
+            summary_json: json!({
+                "message": "path probe preflight failed",
+                "result_class": CONTROLLER_RPC_RESULT_CLASS,
+            }),
+        }],
+        vec![RpcAuditRecord {
+            actor: actor.to_string(),
             node_id: node_id.to_string(),
             endpoint_id: endpoint_id.map(ToOwned::to_owned),
             method: PROBE_PATH_ECHO.to_string(),
@@ -2506,45 +2718,58 @@ fn record_path_probe_preflight_observation(
                 "result_class": CONTROLLER_RPC_RESULT_CLASS,
                 "error_code": error_code,
             }),
-        },
-    )?;
-    Ok(())
+        }],
+    );
+    write_scheduler_task_outcomes(store, actor, vec![outcome], stats)
+}
+
+struct PathProbeTargetPreflight<'a> {
+    run_id: &'a str,
+    job: &'a ObservabilityJobRecord,
+    source_node_id: &'a str,
+    source_endpoint_id: &'a str,
+    target_node_id: &'a str,
+    target_endpoint_id: &'a str,
+    error_code: &'a str,
 }
 
 fn record_path_probe_target_preflight_observation(
     store: &Store,
-    run_id: &str,
-    source_node_id: &str,
-    source_endpoint_id: &str,
-    target_node_id: &str,
-    target_endpoint_id: &str,
-    error_code: &str,
+    actor: &str,
+    input: PathProbeTargetPreflight<'_>,
+    stats: &mut RunStats,
 ) -> anyhow::Result<()> {
-    store.insert_probe_observation(&ProbeObservationInsert {
-        observation_id: observation_id(),
-        run_id: Some(run_id.to_string()),
-        node_id: Some(source_node_id.to_string()),
-        endpoint_id: Some(source_endpoint_id.to_string()),
-        method: PROBE_PATH_ECHO.to_string(),
-        ok: Some(false),
-        error_code: Some(error_code.to_string()),
-        duration_ms: Some(0),
-        observed_at: now_rfc3339(),
-        expires_at: None,
-        result_class: CONTROLLER_RPC_RESULT_CLASS.to_string(),
-        summary_json: json!({
-            "message": "path probe target endpoint preflight failed",
-            "source_node_id": source_node_id,
-            "source_endpoint_id": source_endpoint_id,
-            "target_node_id": target_node_id,
-            "target_endpoint_id": target_endpoint_id,
-            "result_class": CONTROLLER_RPC_RESULT_CLASS,
-        }),
-    })?;
-    write_rpc_audit(
-        store,
-        RpcAuditRecord {
-            actor: local_actor(),
+    let PathProbeTargetPreflight {
+        run_id,
+        job,
+        source_node_id,
+        source_endpoint_id,
+        target_node_id,
+        target_endpoint_id,
+        error_code,
+    } = input;
+    let task = path_preflight_task(actor, job, run_id, source_node_id, Some(source_endpoint_id));
+    let outcome = SchedulerTaskOutcome::from_observations(
+        task,
+        vec![SchedulerObservationOutcome {
+            node_id: Some(source_node_id.to_string()),
+            endpoint_id: Some(source_endpoint_id.to_string()),
+            method: PROBE_PATH_ECHO.to_string(),
+            ok: false,
+            error_code: Some(error_code.to_string()),
+            duration_ms: 0,
+            result_class: CONTROLLER_RPC_RESULT_CLASS.to_string(),
+            summary_json: json!({
+                "message": "path probe target endpoint preflight failed",
+                "source_node_id": source_node_id,
+                "source_endpoint_id": source_endpoint_id,
+                "target_node_id": target_node_id,
+                "target_endpoint_id": target_endpoint_id,
+                "result_class": CONTROLLER_RPC_RESULT_CLASS,
+            }),
+        }],
+        vec![RpcAuditRecord {
+            actor: actor.to_string(),
             node_id: source_node_id.to_string(),
             endpoint_id: Some(source_endpoint_id.to_string()),
             method: PROBE_PATH_ECHO.to_string(),
@@ -2560,9 +2785,38 @@ fn record_path_probe_target_preflight_observation(
                 "result_class": CONTROLLER_RPC_RESULT_CLASS,
                 "error_code": error_code,
             }),
+        }],
+    );
+    write_scheduler_task_outcomes(store, actor, vec![outcome], stats)
+}
+
+fn path_preflight_task(
+    actor: &str,
+    job: &ObservabilityJobRecord,
+    run_id: &str,
+    node_id: &str,
+    endpoint_id: Option<&str>,
+) -> ResolvedSchedulerTask {
+    ResolvedSchedulerTask {
+        job_id: job.job_id.clone(),
+        run_id: run_id.to_string(),
+        actor: actor.to_string(),
+        kind: StoredJobKind::PathProbe,
+        node: NodeRecord {
+            node_id: node_id.to_string(),
+            endpoint_id: endpoint_id.unwrap_or_default().to_string(),
+            name: node_id.to_string(),
+            region: String::new(),
+            role: String::new(),
+            enabled: false,
         },
-    )?;
-    Ok(())
+        rpc: SchedulerTaskRpc::PathProbe {
+            target_node_id: String::new(),
+            target_endpoint_id: String::new(),
+        },
+        method_key: PROBE_PATH_ECHO.to_string(),
+        ordinal: 0,
+    }
 }
 
 fn path_preflight_protocol_error(error_code: &str) -> ErrorCode {
@@ -2572,13 +2826,6 @@ fn path_preflight_protocol_error(error_code: &str) -> ErrorCode {
         ErrorCode::NodeDisabled
     } else {
         ErrorCode::EndpointNotAllowed
-    }
-}
-
-fn update_observation_stats(stats: &mut RunStats, ok: bool) {
-    stats.observations += 1;
-    if !ok {
-        stats.failed_observations += 1;
     }
 }
 
@@ -2726,11 +2973,12 @@ fn job_due_at_or_before(job: &ObservabilityJobRecord, now: OffsetDateTime) -> an
 
 fn write_scheduler_audit(
     store: &Store,
+    actor: &str,
     event_name: &str,
     ok: bool,
     detail_json: Value,
 ) -> anyhow::Result<()> {
-    let mut event = AuditEvent::new(local_actor(), event_name);
+    let mut event = AuditEvent::new(actor, event_name);
     event.ok = Some(ok);
     event.detail_json = detail_json;
     store.insert_audit(&event)?;
@@ -2943,6 +3191,7 @@ mod tests {
         ResolvedSchedulerTask {
             job_id: job_id.to_string(),
             run_id: format!("run-{job_id}"),
+            actor: "scheduler-unit-test".to_string(),
             kind: StoredJobKind::ControllerPing,
             node: NodeRecord {
                 node_id: node_id.to_string(),
@@ -3005,6 +3254,7 @@ mod tests {
         let task = ResolvedSchedulerTask {
             job_id: "job-source".to_string(),
             run_id: "run-source".to_string(),
+            actor: "scheduler-dispatch-test".to_string(),
             kind: StoredJobKind::ControllerPing,
             node: node.clone(),
             rpc: SchedulerTaskRpc::Fixed(FixedControllerRpc::ProbeControllerPing),
@@ -3051,6 +3301,7 @@ mod tests {
         let task = ResolvedSchedulerTask {
             job_id: "job-path".to_string(),
             run_id: "run-path".to_string(),
+            actor: "scheduler-dispatch-test".to_string(),
             kind: StoredJobKind::PathProbe,
             node: source,
             rpc: SchedulerTaskRpc::PathProbe {
@@ -3112,6 +3363,7 @@ mod tests {
 
         let outcomes = limit_tasks_by_rpc_budget(
             &job,
+            "scheduler-unit-test",
             "run-job-a",
             StoredJobKind::ControllerPing,
             &mut tasks,

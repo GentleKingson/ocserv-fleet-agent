@@ -63,16 +63,17 @@ bodies, raw stdout/stderr, raw logs, raw config, certificate material, usernames
 client IPs, or session IDs. Retention policies do not delete
 `controller_audit_log`; long-term audit handling is export/archive based.
 
-Current enforcement is partial and must not be overstated. Node add, enable,
-disable, and remove plus scheduler job add, enable, and disable join health
-policy, enrollment approval, and endpoint lifecycle as actor-bound
-`StoreWriter` operations audited in their SQLite transaction. Audit-trigger
-failure tests prove that node, endpoint-trust, and scheduler job configuration
-state rolls back. Scheduler run/outcome/observation, health/alert/delivery,
-retention, and other call sites still include business and audit writes in
-separate transactions. Migrating those remaining families is required before
-claiming fully fail-closed controller mutation audit. The API remains read-only
-while that work is incomplete. The governing decision is recorded in
+Current enforcement is partial and must not be overstated. Node lifecycle,
+scheduler job configuration, and scheduler run start/outcome/finish transitions
+join health policy, enrollment approval, and endpoint lifecycle as actor-bound
+`StoreWriter` operations audited in their SQLite transaction. Failure-injection
+tests prove that node, endpoint-trust, scheduler job configuration, observation,
+RPC audit, run state, and job-clock changes roll back at their declared
+boundaries. Health/alert/delivery, retention, and other call sites still include
+business and audit writes in separate transactions. Migrating those remaining
+families is required before claiming fully fail-closed controller mutation
+audit. The API remains read-only while that work is incomplete. The governing
+decision is recorded in
 [ADR-atomic-audit-writes](adr/ADR-atomic-audit-writes.md).
 
 ## Trust Policy Workflow

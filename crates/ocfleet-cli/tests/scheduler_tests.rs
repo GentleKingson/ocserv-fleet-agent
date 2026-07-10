@@ -111,6 +111,74 @@ fn latest_audit_actor(database: &Path) -> String {
         .expect("latest audit actor")
 }
 
+fn install_scheduler_audit_failure(database: &Path, event: &str) {
+    Connection::open(database)
+        .expect("open database for audit failure trigger")
+        .execute_batch(&format!(
+            "CREATE TRIGGER fail_selected_scheduler_audit
+             BEFORE INSERT ON controller_audit_log
+             WHEN NEW.event = '{event}'
+             BEGIN
+               SELECT RAISE(ABORT, 'injected scheduler audit failure');
+             END;"
+        ))
+        .expect("install scheduler audit failure trigger");
+}
+
+fn scheduler_job_clocks(database: &Path, job_id: &str) -> (Option<String>, Option<String>) {
+    Connection::open(database)
+        .expect("open database for scheduler clock query")
+        .query_row(
+            "SELECT next_run_at, last_run_at FROM observability_jobs WHERE job_id = ?1",
+            [job_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("scheduler job clocks")
+}
+
+fn scheduler_audit_count(database: &Path, event: &str) -> i64 {
+    Connection::open(database)
+        .expect("open database for scheduler audit count")
+        .query_row(
+            "SELECT count(*) FROM controller_audit_log WHERE event = ?1",
+            [event],
+            |row| row.get(0),
+        )
+        .expect("scheduler audit count")
+}
+
+fn add_controller_ping_job(database_arg: &str, selector: &str) -> String {
+    let output = run_ocfleet(&[
+        "--database",
+        database_arg,
+        "schedule",
+        "job",
+        "add",
+        "--kind",
+        "controller-ping",
+        "--interval",
+        "60s",
+        "--selector",
+        selector,
+    ]);
+    parse_job_id(&output.stdout)
+}
+
+fn seed_missing_trust_job(database: &Path, database_arg: &str, node_id: &str) -> String {
+    let endpoint_id = {
+        let store = Store::open(database).expect("open store");
+        add_node_with_generated_endpoint(&store, node_id)
+    };
+    Connection::open(database)
+        .expect("open database to remove endpoint trust")
+        .execute(
+            "DELETE FROM endpoint_trust WHERE endpoint_id = ?1",
+            [&endpoint_id],
+        )
+        .expect("remove endpoint trust");
+    add_controller_ping_job(database_arg, &format!("node_id={node_id}"))
+}
+
 fn wait_for_audit_event(
     database: &Path,
     event_name: &str,
@@ -902,6 +970,8 @@ fn scheduler_tests_targeted_run_executes_only_selected_job_and_queries_run() {
     let output = run_ocfleet(&[
         "--database",
         &database_arg,
+        "--actor",
+        "scheduler-run-operator",
         "schedule",
         "run",
         "--once",
@@ -926,6 +996,28 @@ fn scheduler_tests_targeted_run_executes_only_selected_job_and_queries_run() {
     assert_eq!(runs[0].run_id, json_run_id);
     assert_eq!(runs[0].job_id.as_deref(), Some(first_job_id.as_str()));
     assert_eq!(runs[0].observation_count, 1);
+    let first_job = store
+        .get_observability_job(&first_job_id)
+        .expect("load executed job")
+        .expect("executed job exists");
+    assert_eq!(first_job.last_run_at, runs[0].finished_at);
+    let last_run_at = time::OffsetDateTime::parse(
+        first_job
+            .last_run_at
+            .as_deref()
+            .expect("last run timestamp"),
+        &time::format_description::well_known::Rfc3339,
+    )
+    .expect("last run timestamp parses");
+    let next_run_at = time::OffsetDateTime::parse(
+        first_job
+            .next_run_at
+            .as_deref()
+            .expect("next run timestamp"),
+        &time::format_description::well_known::Rfc3339,
+    )
+    .expect("next run timestamp parses");
+    assert_eq!((next_run_at - last_run_at).whole_seconds(), 60);
     let observations = store
         .list_probe_observations(None, 10)
         .expect("list observations");
@@ -971,6 +1063,22 @@ fn scheduler_tests_targeted_run_executes_only_selected_job_and_queries_run() {
     assert_eq!(event, "scheduler.run.once");
     assert_eq!(ok, 1);
     assert_eq!(detail["job_id"], first_job_id);
+    let conn = Connection::open(&database).expect("open db for scheduler actor audit");
+    for event_name in [
+        "scheduler.run.start",
+        "rpc.completed",
+        "scheduler.run.finish",
+        "scheduler.run.once",
+    ] {
+        let actor: String = conn
+            .query_row(
+                "SELECT actor FROM controller_audit_log WHERE event = ?1 ORDER BY id DESC LIMIT 1",
+                [event_name],
+                |row| row.get(0),
+            )
+            .expect("scheduler audit actor");
+        assert_eq!(actor, "scheduler-run-operator", "event={event_name}");
+    }
 }
 
 #[test]
@@ -1409,7 +1517,7 @@ fn scheduler_tests_malformed_job_json_does_not_block_valid_job() {
 }
 
 #[test]
-fn scheduler_tests_failed_after_run_insert_finishes_run_as_failed() {
+fn scheduler_tests_invalid_target_set_is_recorded_before_run_start() {
     let dir = tempfile::tempdir().expect("temp dir");
     let database = dir.path().join("controller.sqlite");
     let database_arg = database.to_string_lossy().into_owned();
@@ -1438,22 +1546,133 @@ fn scheduler_tests_failed_after_run_insert_finishes_run_as_failed() {
     run_ocfleet(&["--database", &database_arg, "schedule", "run", "--once"]);
 
     let conn = Connection::open(&database).expect("open db");
-    let (status, finished_at, summary): (String, Option<String>, String) = conn
+    let run_count: i64 = conn
         .query_row(
-            "SELECT status, finished_at, summary_json FROM observability_runs WHERE job_id = ?1",
+            "SELECT count(*) FROM observability_runs WHERE job_id = ?1",
+            [&job_id],
+            |row| row.get(0),
+        )
+        .expect("scheduler run count");
+    assert_eq!(run_count, 0);
+    let (run_id, error_code, summary): (Option<String>, String, String) = conn
+        .query_row(
+            "SELECT run_id, error_code, summary_json
+             FROM probe_observations
+             WHERE error_code = 'SCHEDULER_JOB_INVALID'
+             ORDER BY observed_at DESC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("invalid scheduler observation");
+    assert!(run_id.is_none());
+    assert_eq!(error_code, "SCHEDULER_JOB_INVALID");
+    assert!(!summary.contains("maximum scheduler targets exceeded"));
+    assert_eq!(scheduler_audit_count(&database, "scheduler.job.invalid"), 1);
+    let (next_run_at, last_run_at) = scheduler_job_clocks(&database, &job_id);
+    assert!(next_run_at.is_some());
+    assert!(last_run_at.is_some());
+}
+
+#[test]
+fn scheduler_tests_run_start_audit_failure_rolls_back_run_and_clock() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let database_arg = database.to_string_lossy().into_owned();
+    let job_id = add_controller_ping_job(&database_arg, "node_id=missing-node");
+    let clocks_before = scheduler_job_clocks(&database, &job_id);
+    install_scheduler_audit_failure(&database, "scheduler.run.start");
+
+    let output = run_ocfleet_failure(&["--database", &database_arg, "schedule", "run", "--once"]);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("injected scheduler audit failure"));
+
+    let conn = Connection::open(&database).expect("open db");
+    let run_count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM observability_runs WHERE job_id = ?1",
+            [&job_id],
+            |row| row.get(0),
+        )
+        .expect("run count");
+    let observation_count: i64 = conn
+        .query_row("SELECT count(*) FROM probe_observations", [], |row| {
+            row.get(0)
+        })
+        .expect("observation count");
+    assert_eq!(run_count, 0);
+    assert_eq!(observation_count, 0);
+    assert_eq!(scheduler_audit_count(&database, "scheduler.run.start"), 0);
+    assert_eq!(scheduler_job_clocks(&database, &job_id), clocks_before);
+}
+
+#[test]
+fn scheduler_tests_rpc_audit_failure_rolls_back_outcome_without_relabeling() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let database_arg = database.to_string_lossy().into_owned();
+    let job_id = seed_missing_trust_job(&database, &database_arg, "missing-trust-node");
+    let clocks_before = scheduler_job_clocks(&database, &job_id);
+    install_scheduler_audit_failure(&database, "rpc.completed");
+
+    let output = run_ocfleet_failure(&["--database", &database_arg, "schedule", "run", "--once"]);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("injected scheduler audit failure"));
+
+    let conn = Connection::open(&database).expect("open db");
+    let (run_id, status, finished_at): (String, String, Option<String>) = conn
+        .query_row(
+            "SELECT run_id, status, finished_at FROM observability_runs WHERE job_id = ?1",
             [&job_id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
-        .expect("scheduler run");
-    let summary: Value = serde_json::from_str(&summary).expect("run summary");
-    assert_eq!(status, "failed");
-    assert!(finished_at.is_some());
-    assert_eq!(summary["error_code"], "SCHEDULER_JOB_INVALID");
-    assert!(
-        !summary
-            .to_string()
-            .contains("maximum scheduler targets exceeded")
-    );
+        .expect("running scheduler run");
+    let observation_count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM probe_observations WHERE run_id = ?1",
+            [&run_id],
+            |row| row.get(0),
+        )
+        .expect("outcome observation count");
+    assert_eq!(status, "running");
+    assert!(finished_at.is_none());
+    assert_eq!(observation_count, 0);
+    assert_eq!(scheduler_audit_count(&database, "rpc.completed"), 0);
+    assert_eq!(scheduler_audit_count(&database, "scheduler.job.invalid"), 0);
+    assert_eq!(scheduler_audit_count(&database, "scheduler.run.finish"), 0);
+    assert_eq!(scheduler_job_clocks(&database, &job_id), clocks_before);
+}
+
+#[test]
+fn scheduler_tests_run_finish_audit_failure_keeps_committed_outcome_and_running_run() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let database_arg = database.to_string_lossy().into_owned();
+    let job_id = seed_missing_trust_job(&database, &database_arg, "finish-failure-node");
+    let clocks_before = scheduler_job_clocks(&database, &job_id);
+    install_scheduler_audit_failure(&database, "scheduler.run.finish");
+
+    let output = run_ocfleet_failure(&["--database", &database_arg, "schedule", "run", "--once"]);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("injected scheduler audit failure"));
+
+    let conn = Connection::open(&database).expect("open db");
+    let (run_id, status, finished_at): (String, String, Option<String>) = conn
+        .query_row(
+            "SELECT run_id, status, finished_at FROM observability_runs WHERE job_id = ?1",
+            [&job_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("running scheduler run");
+    let observation_count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM probe_observations WHERE run_id = ?1",
+            [&run_id],
+            |row| row.get(0),
+        )
+        .expect("outcome observation count");
+    assert_eq!(status, "running");
+    assert!(finished_at.is_none());
+    assert_eq!(observation_count, 1);
+    assert_eq!(scheduler_audit_count(&database, "rpc.completed"), 1);
+    assert_eq!(scheduler_audit_count(&database, "scheduler.run.finish"), 0);
+    assert_eq!(scheduler_job_clocks(&database, &job_id), clocks_before);
 }
 
 fn add_node_with_generated_endpoint(store: &Store, node_id: &str) -> String {

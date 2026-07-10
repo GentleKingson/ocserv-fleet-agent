@@ -80,13 +80,12 @@ scaffold, implemented slice, operational maturity, and release verification.
 ## Execution DAG
 
 The current execution node is **A1** on issue `#33`. The node-lifecycle slice
-merged through pull request `#57`, and the scheduler-job configuration slice
-merged through pull request `#58`. A security review found that a missing
-`endpoint_trust` row was treated like an active endpoint on RPC preflight. The
-fail-closed correction is active on branch
-`codex/a1-endpoint-trust-fail-closed` in pull request `#59`; scheduler
-run/outcome/observation transitions follow it. Statuses describe the milestone,
-not just the amount of supporting code already in the repository.
+merged through pull request `#57`, the scheduler-job configuration slice merged
+through pull request `#58`, and the endpoint-trust fail-closed slice merged
+through pull request `#59`. Atomic scheduler run, outcome, observation, audit,
+and job-clock transitions are active on branch
+`codex/a1-scheduler-persistence-atomicity`. Statuses describe the milestone, not
+just the amount of supporting code already in the repository.
 
 ### Baseline And Production Foundation
 

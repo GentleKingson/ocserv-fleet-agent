@@ -14,9 +14,9 @@ production-complete.
 - Web/API dashboard is experimentally implemented as a read-only observation surface.
 - Governance foundation work has started: actor identity, trust policy
   validation/diff, and optional signed audit export are implemented.
-- Production hardening is active: node add/enable/disable/remove and scheduler
-  job add/enable/disable use actor-bearing `StoreWriter` transactions for both
-  state and audit. Scheduler run/outcome/observation, health/alert/delivery,
+- Production hardening is active: node lifecycle, scheduler job configuration,
+  and scheduler run/outcome/observation/job-clock writes use actor-bearing
+  `StoreWriter` transactions for state and audit. Health/alert/delivery,
   retention, and other legacy controller mutations are still being migrated.
 - The project is not production-complete.
 
@@ -45,8 +45,10 @@ production-complete.
     kinds: `controller-ping`, `ocserv-status`, `ocserv-cert`,
     `ocserv-sessions`, and `path-probe`; current query surfaces include job
     show/validate, targeted `run --once --job-id <job-id>`, run list/show, and
-    JSON status output. Job add/enable/disable bind the resolved actor and commit
-    the job row with its success audit in one SQLite transaction.
+    JSON status output. Job configuration and each scheduler run start, bounded
+    outcome, and run finish bind the resolved actor and commit their state with
+    the matching audit in one SQLite transaction. Run finish commits the job
+    clock at the same boundary.
   - `ocfleet observation` list/show queries for bounded low-sensitive stored
     observations
   - `ocfleet health` summaries, node health views, and local health policy
@@ -434,9 +436,11 @@ target/debug/ocfleet trust policy diff ./trust-policy.toml \
 These commands operate inside the controller boundary. Scheduler jobs use only
 fixed job kinds; non-path jobs target `role=<role>` or `node_id=<node-id>`
 selectors, and path jobs require an explicit source/target node pair. Scheduler
-job add/enable/disable are actor-bound and audit-atomic; this does not yet apply
-to scheduler run/outcome/observation transitions. Health, alerts, retention, and
-audit export use controller SQLite state and bounded low-sensitive summaries.
+job configuration, run starts, bounded outcomes, observations, RPC audits, run
+finishes, and job clocks use actor-bound atomic writer boundaries. No database
+transaction remains open across an RPC or semaphore wait. Health, alerts,
+retention, and audit export use controller SQLite state and bounded
+low-sensitive summaries.
 Webhook alert hooks require explicit HTTPS endpoints, host allowlists, private
 HMAC secret files, bounded retries, and no redirect following.
 

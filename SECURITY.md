@@ -113,14 +113,18 @@ group/world-writable parent directories.
 
 Controller business mutations and their success audit rows must commit in the
 same database transaction. An audit insertion failure fails the mutation and
-rolls back its business rows. Node add, enable, disable, and remove plus
-scheduler job add, enable, and disable implement this contract through
-actor-bearing `StoreWriter` transactions. Scheduler run/outcome/observation,
-health/alert/delivery, retention, and other remaining legacy mutation families
-are tracked in [#33](https://github.com/GentleKingson/ocserv-fleet-agent/issues/33)
-and must not be described as fully atomic until migrated. Read-only command
-audits do not have a paired business mutation and may use the standalone audit
-writer.
+rolls back its business rows. Node lifecycle, scheduler job configuration, and
+scheduler run start/outcome/finish transitions implement this contract through
+actor-bearing `StoreWriter` transactions. Each bounded scheduler outcome pairs
+its observations with RPC or scheduler audits; run finish updates the owning
+job clock in the same transaction. No database transaction spans RPC or other
+network I/O. A failed outcome or finish write leaves the committed `running`
+row and unchanged job clock as an explicit incomplete-run marker rather than
+claiming success. Health/alert/delivery, retention, and other remaining legacy
+mutation families are tracked in
+[#33](https://github.com/GentleKingson/ocserv-fleet-agent/issues/33) and must not
+be described as fully atomic until migrated. Read-only command audits do not
+have a paired business mutation and may use the standalone audit writer.
 
 Agent audit records are security-relevant. The agent uses a bounded audit queue,
 a dedicated writer thread, and a bounded local durability spool so disk I/O does

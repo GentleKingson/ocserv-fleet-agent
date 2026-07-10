@@ -1328,7 +1328,7 @@ pub struct RpcAuditRecord {
     pub detail_json: Value,
 }
 
-pub fn write_rpc_audit(store: &Store, record: RpcAuditRecord) -> Result<()> {
+pub(crate) fn rpc_audit_event(record: RpcAuditRecord) -> AuditEvent {
     let mut event = AuditEvent::new(record.actor, "rpc.completed");
     event.node_id = Some(record.node_id);
     event.endpoint_id = record.endpoint_id;
@@ -1339,6 +1339,11 @@ pub fn write_rpc_audit(store: &Store, record: RpcAuditRecord) -> Result<()> {
     event.error_code = record.error_code.as_ref().map(error_code_name);
     event.duration_ms = Some(record.duration_ms);
     event.detail_json = record.detail_json;
+    event
+}
+
+pub fn write_rpc_audit(store: &Store, record: RpcAuditRecord) -> Result<()> {
+    let event = rpc_audit_event(record);
     store.insert_audit(&event)?;
     Ok(())
 }

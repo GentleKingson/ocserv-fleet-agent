@@ -2,7 +2,8 @@ use crate::audit::AuditEvent;
 use crate::store::{
     AlertEventRecord, ApprovalInput, AuditRecord, EndpointTrustRecord, HealthPolicyRecord,
     HealthSnapshotRecord, NodeInsert, NodeRecord, ObservabilityJobRecord, ObservabilityRunRecord,
-    ProbeObservationRecord, Store, StoreError,
+    ProbeObservationRecord, SchedulerOutcomeWrite, SchedulerRunFinish, SchedulerRunStart, Store,
+    StoreError,
 };
 
 pub const MAX_STORE_READER_ROWS: u64 = 1_000;
@@ -55,6 +56,21 @@ pub trait StoreWriter {
     ) -> Result<(), Self::Error>;
     fn write_scheduler_job_enable(&self, job_id: &str, actor: &str) -> Result<(), Self::Error>;
     fn write_scheduler_job_disable(&self, job_id: &str, actor: &str) -> Result<(), Self::Error>;
+    fn write_scheduler_run_start(
+        &self,
+        start: &SchedulerRunStart,
+        actor: &str,
+    ) -> Result<(), Self::Error>;
+    fn write_scheduler_outcome(
+        &self,
+        outcome: &SchedulerOutcomeWrite,
+        actor: &str,
+    ) -> Result<(), Self::Error>;
+    fn write_scheduler_run_finish(
+        &self,
+        finish: &SchedulerRunFinish,
+        actor: &str,
+    ) -> Result<(), Self::Error>;
     fn write_health_policy(
         &self,
         policy: &HealthPolicyRecord,
@@ -221,6 +237,30 @@ impl StoreWriter for Store {
 
     fn write_scheduler_job_disable(&self, job_id: &str, actor: &str) -> Result<(), Self::Error> {
         Store::set_observability_job_enabled(self, job_id, false, actor)
+    }
+
+    fn write_scheduler_run_start(
+        &self,
+        start: &SchedulerRunStart,
+        actor: &str,
+    ) -> Result<(), Self::Error> {
+        Store::write_scheduler_run_start(self, start, actor)
+    }
+
+    fn write_scheduler_outcome(
+        &self,
+        outcome: &SchedulerOutcomeWrite,
+        actor: &str,
+    ) -> Result<(), Self::Error> {
+        Store::write_scheduler_outcome(self, outcome, actor)
+    }
+
+    fn write_scheduler_run_finish(
+        &self,
+        finish: &SchedulerRunFinish,
+        actor: &str,
+    ) -> Result<(), Self::Error> {
+        Store::write_scheduler_run_finish(self, finish, actor)
     }
 
     fn write_health_policy(

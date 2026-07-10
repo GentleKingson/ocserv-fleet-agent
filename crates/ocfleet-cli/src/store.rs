@@ -1,7 +1,10 @@
 use ocfleet_protocol::enrollment::{
     EndpointStatus, EnrollmentTokenStatus, JoinRequestStatus, TrustBundle,
 };
-use ocfleet_protocol::method::{PROBE_CONTROLLER_PING, PROBE_PATH_ECHO};
+use ocfleet_protocol::method::{
+    OCSERV_CERT_EXPIRY, OCSERV_CONFIG_FINGERPRINT, OCSERV_SERVICE_SUMMARY, OCSERV_SESSIONS_SUMMARY,
+    OCSERV_VERSION, PROBE_CONTROLLER_PING, PROBE_PATH_ECHO,
+};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params, types::Type};
 use serde_json::Value;
 use std::io;
@@ -25,6 +28,7 @@ pub const DEFAULT_HEALTH_STALE_WINDOW_SECONDS: u64 = 24 * 60 * 60;
 pub const DEFAULT_HEALTH_UNREACHABLE_FAILURES: u64 = 3;
 pub const DEFAULT_HEALTH_CERT_WARNING_DAYS: u64 = 30;
 pub const DEFAULT_HEALTH_CERT_CRITICAL_DAYS: u64 = 7;
+pub const MAX_SCHEDULER_OUTCOME_ENTRIES: usize = 4;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -46,6 +50,10 @@ pub enum StoreError {
     NodeNotFound(String),
     #[error("observability job not found: {0}")]
     ObservabilityJobNotFound(String),
+    #[error("observability run not found: {0}")]
+    ObservabilityRunNotFound(String),
+    #[error("observability run is not running: {0}")]
+    ObservabilityRunNotRunning(String),
     #[error("enrollment rejected: {0}")]
     EnrollmentRejected(String),
     #[error("join request not found: {0}")]
@@ -177,6 +185,41 @@ pub struct ProbeObservationRecord {
     pub expires_at: Option<String>,
     pub result_class: String,
     pub summary_json: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchedulerRunStart {
+    pub run_id: String,
+    pub job_id: String,
+    pub started_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchedulerJobClockUpdate {
+    pub job_id: String,
+    pub next_run_at: String,
+    pub last_run_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SchedulerOutcomeEntry {
+    pub observation: ProbeObservationInsert,
+    pub audit: AuditEvent,
+}
+
+#[derive(Debug, Clone)]
+pub struct SchedulerOutcomeWrite {
+    pub job_id: String,
+    pub run_id: Option<String>,
+    pub entries: Vec<SchedulerOutcomeEntry>,
+    pub job_clock: Option<SchedulerJobClockUpdate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchedulerRunFinish {
+    pub run_id: String,
+    pub finished_at: String,
+    pub job_clock: SchedulerJobClockUpdate,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -741,6 +784,195 @@ impl Store {
         Ok(())
     }
 
+    pub fn write_scheduler_run_start(
+        &self,
+        start: &SchedulerRunStart,
+        actor: &str,
+    ) -> Result<(), StoreError> {
+        validate_actor(actor).map_err(StoreError::InvalidInput)?;
+        validate_safe_id("scheduler run_id", &start.run_id, 128)?;
+        validate_safe_id("scheduler job_id", &start.job_id, 128)?;
+        validate_bounded_rfc3339(&start.started_at, "scheduler started_at")?;
+
+        let tx = self.conn.unchecked_transaction()?;
+        let (kind, enabled) = get_observability_job_start_state_tx(&tx, &start.job_id)?
+            .ok_or_else(|| StoreError::ObservabilityJobNotFound(start.job_id.clone()))?;
+        validate_scheduler_job_kind(&kind)?;
+        if !enabled {
+            return Err(StoreError::InvalidInput(format!(
+                "scheduler job is disabled: {}",
+                start.job_id
+            )));
+        }
+        let summary_json = serde_json::json!({
+            "job_id": start.job_id,
+            "kind": kind,
+            "status": "running",
+            "result_class": "scheduler_summary",
+        });
+        insert_observability_run_tx(
+            &tx,
+            &ObservabilityRunInsert {
+                run_id: start.run_id.clone(),
+                job_id: Some(start.job_id.clone()),
+                started_at: start.started_at.clone(),
+                finished_at: None,
+                status: "running".to_string(),
+                triggered_by: "scheduler.run.once".to_string(),
+                summary_json: summary_json.clone(),
+            },
+        )?;
+
+        let mut event = AuditEvent::new(actor, "scheduler.run.start");
+        event.ok = Some(true);
+        event.detail_json = serde_json::json!({
+            "run_id": start.run_id,
+            "job_id": start.job_id,
+            "kind": kind,
+            "status": "running",
+            "result_class": "scheduler_summary",
+        });
+        insert_audit_tx(&tx, &event)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn write_scheduler_outcome(
+        &self,
+        outcome: &SchedulerOutcomeWrite,
+        actor: &str,
+    ) -> Result<(), StoreError> {
+        validate_scheduler_outcome(outcome, actor)?;
+
+        let tx = self.conn.unchecked_transaction()?;
+        if let Some(run_id) = outcome.run_id.as_deref() {
+            let run = get_observability_run_state_tx(&tx, run_id)?
+                .ok_or_else(|| StoreError::ObservabilityRunNotFound(run_id.to_string()))?;
+            ensure_running_observability_run(&run)?;
+            if run.job_id.as_deref() != Some(outcome.job_id.as_str()) {
+                return Err(StoreError::InvalidInput(
+                    "scheduler outcome job_id does not match run".to_string(),
+                ));
+            }
+            let kind = get_observability_job_kind_tx(&tx, &outcome.job_id)?
+                .ok_or_else(|| StoreError::ObservabilityJobNotFound(outcome.job_id.clone()))?;
+            validate_scheduler_job_kind(&kind)?;
+            for entry in &outcome.entries {
+                if !scheduler_job_kind_allows_method(&kind, &entry.observation.method) {
+                    return Err(StoreError::InvalidInput(
+                        "scheduler outcome method is not allowed for job kind".to_string(),
+                    ));
+                }
+            }
+        } else if !observability_job_exists_tx(&tx, &outcome.job_id)? {
+            return Err(StoreError::ObservabilityJobNotFound(outcome.job_id.clone()));
+        }
+
+        for entry in &outcome.entries {
+            insert_probe_observation_tx(&tx, &entry.observation)?;
+            insert_audit_tx(&tx, &entry.audit)?;
+        }
+        if let Some(clock) = &outcome.job_clock {
+            update_scheduler_job_clock_tx(&tx, clock)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn write_scheduler_run_finish(
+        &self,
+        finish: &SchedulerRunFinish,
+        actor: &str,
+    ) -> Result<(), StoreError> {
+        validate_actor(actor).map_err(StoreError::InvalidInput)?;
+        validate_safe_id("scheduler run_id", &finish.run_id, 128)?;
+        validate_bounded_rfc3339(&finish.finished_at, "scheduler finished_at")?;
+        validate_scheduler_job_clock(&finish.job_clock)?;
+        if finish.job_clock.last_run_at != finish.finished_at {
+            return Err(StoreError::InvalidInput(
+                "scheduler last_run_at must equal finished_at".to_string(),
+            ));
+        }
+
+        let tx = self.conn.unchecked_transaction()?;
+        let run = get_observability_run_state_tx(&tx, &finish.run_id)?
+            .ok_or_else(|| StoreError::ObservabilityRunNotFound(finish.run_id.clone()))?;
+        ensure_running_observability_run(&run)?;
+        if run.job_id.as_deref() != Some(finish.job_clock.job_id.as_str()) {
+            return Err(StoreError::InvalidInput(
+                "scheduler finish job_id does not match run".to_string(),
+            ));
+        }
+        if OffsetDateTime::parse(&finish.finished_at, &Rfc3339)
+            .expect("validated scheduler finished_at parses")
+            < OffsetDateTime::parse(&run.started_at, &Rfc3339).map_err(|_| {
+                StoreError::InvalidInput(
+                    "stored scheduler started_at is not bounded RFC3339".to_string(),
+                )
+            })?
+        {
+            return Err(StoreError::InvalidInput(
+                "scheduler finished_at must not precede started_at".to_string(),
+            ));
+        }
+
+        let kind = get_observability_job_kind_tx(&tx, &finish.job_clock.job_id)?
+            .ok_or_else(|| StoreError::ObservabilityJobNotFound(finish.job_clock.job_id.clone()))?;
+        validate_scheduler_job_kind(&kind)?;
+        let (observation_count, failed_observation_count) =
+            count_observability_run_outcomes_tx(&tx, &finish.run_id)?;
+        let status = if observation_count == 0 {
+            "skipped"
+        } else if failed_observation_count == 0 {
+            "succeeded"
+        } else {
+            "failed"
+        };
+        let summary_json = serde_json::json!({
+            "job_id": finish.job_clock.job_id,
+            "kind": kind,
+            "status": status,
+            "observations": observation_count,
+            "failed_observations": failed_observation_count,
+            "result_class": "scheduler_summary",
+        });
+        validate_low_sensitive_json(&summary_json, "observability run summary")?;
+        let affected = tx.execute(
+            "UPDATE observability_runs
+             SET finished_at = ?1,
+                 status = ?2,
+                 summary_json = ?3
+             WHERE run_id = ?4 AND status = 'running' AND finished_at IS NULL",
+            params![
+                finish.finished_at.as_str(),
+                status,
+                compact_json(&summary_json),
+                finish.run_id.as_str(),
+            ],
+        )?;
+        if affected != 1 {
+            return Err(StoreError::ObservabilityRunNotRunning(
+                finish.run_id.clone(),
+            ));
+        }
+        update_scheduler_job_clock_tx(&tx, &finish.job_clock)?;
+
+        let mut event = AuditEvent::new(actor, "scheduler.run.finish");
+        event.ok = Some(status != "failed");
+        event.detail_json = serde_json::json!({
+            "run_id": finish.run_id,
+            "job_id": finish.job_clock.job_id,
+            "kind": kind,
+            "status": status,
+            "observations": observation_count,
+            "failed_observations": failed_observation_count,
+            "result_class": "scheduler_summary",
+        });
+        insert_audit_tx(&tx, &event)?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn update_observability_job_run_times(
         &self,
         job_id: &str,
@@ -763,20 +995,7 @@ impl Store {
     pub fn insert_observability_run(&self, run: &ObservabilityRunInsert) -> Result<(), StoreError> {
         validate_low_sensitive_json(&run.summary_json, "observability run summary")?;
         let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
-            "INSERT INTO observability_runs
-             (run_id, job_id, started_at, finished_at, status, triggered_by, summary_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                run.run_id.as_str(),
-                run.job_id.as_deref(),
-                run.started_at.as_str(),
-                run.finished_at.as_deref(),
-                run.status.as_str(),
-                run.triggered_by.as_str(),
-                compact_json(&run.summary_json),
-            ],
-        )?;
+        insert_observability_run_tx(&tx, run)?;
         tx.commit()?;
         Ok(())
     }
@@ -848,25 +1067,7 @@ impl Store {
     ) -> Result<(), StoreError> {
         validate_low_sensitive_json(&observation.summary_json, "observation summary")?;
         let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
-            "INSERT INTO probe_observations
-             (observation_id, run_id, node_id, endpoint_id, method, ok, error_code, duration_ms, observed_at, expires_at, result_class, summary_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-            params![
-                observation.observation_id.as_str(),
-                observation.run_id.as_deref(),
-                observation.node_id.as_deref(),
-                observation.endpoint_id.as_deref(),
-                observation.method.as_str(),
-                observation.ok.map(bool_to_i64),
-                observation.error_code.as_deref(),
-                option_u64_to_i64(observation.duration_ms)?,
-                observation.observed_at.as_str(),
-                observation.expires_at.as_deref(),
-                observation.result_class.as_str(),
-                compact_json(&observation.summary_json),
-            ],
-        )?;
+        insert_probe_observation_tx(&tx, observation)?;
         tx.commit()?;
         Ok(())
     }
@@ -1974,6 +2175,419 @@ impl Store {
         tx.commit()?;
         Ok(after)
     }
+}
+
+#[derive(Debug)]
+struct ObservabilityRunState {
+    run_id: String,
+    job_id: Option<String>,
+    started_at: String,
+    finished_at: Option<String>,
+    status: String,
+}
+
+fn validate_scheduler_outcome(
+    outcome: &SchedulerOutcomeWrite,
+    actor: &str,
+) -> Result<(), StoreError> {
+    validate_actor(actor).map_err(StoreError::InvalidInput)?;
+    validate_safe_id("scheduler job_id", &outcome.job_id, 128)?;
+    if outcome.entries.is_empty() || outcome.entries.len() > MAX_SCHEDULER_OUTCOME_ENTRIES {
+        return Err(StoreError::InvalidInput(format!(
+            "scheduler outcome must contain 1-{MAX_SCHEDULER_OUTCOME_ENTRIES} entries"
+        )));
+    }
+
+    match outcome.run_id.as_deref() {
+        Some(run_id) => {
+            validate_safe_id("scheduler run_id", run_id, 128)?;
+            if outcome.job_clock.is_some() {
+                return Err(StoreError::InvalidInput(
+                    "run-bound scheduler outcome cannot update job clocks".to_string(),
+                ));
+            }
+            for entry in &outcome.entries {
+                if entry.observation.run_id.as_deref() != Some(run_id) {
+                    return Err(StoreError::InvalidInput(
+                        "scheduler outcome contains a mismatched run_id".to_string(),
+                    ));
+                }
+                if !matches!(
+                    entry.audit.event.as_str(),
+                    "rpc.completed" | "scheduler.task.outcome"
+                ) {
+                    return Err(StoreError::InvalidInput(
+                        "run-bound scheduler outcome audit event is invalid".to_string(),
+                    ));
+                }
+            }
+        }
+        None => {
+            if outcome.entries.len() != 1
+                || outcome.entries[0].observation.run_id.is_some()
+                || outcome.entries[0].audit.event != "scheduler.job.invalid"
+                || outcome.entries[0].observation.ok != Some(false)
+                || outcome.entries[0].observation.error_code.as_deref()
+                    != Some("SCHEDULER_JOB_INVALID")
+            {
+                return Err(StoreError::InvalidInput(
+                    "runless scheduler outcome must contain one failed scheduler.job.invalid entry"
+                        .to_string(),
+                ));
+            }
+        }
+    }
+
+    if let Some(clock) = &outcome.job_clock {
+        validate_scheduler_job_clock(clock)?;
+        if clock.job_id != outcome.job_id {
+            return Err(StoreError::InvalidInput(
+                "scheduler outcome clock job_id does not match outcome".to_string(),
+            ));
+        }
+    }
+    for entry in &outcome.entries {
+        validate_scheduler_observation(&entry.observation)?;
+        validate_scheduler_outcome_audit(&entry.audit, &entry.observation, actor)?;
+    }
+    Ok(())
+}
+
+fn validate_scheduler_observation(observation: &ProbeObservationInsert) -> Result<(), StoreError> {
+    validate_safe_id("scheduler observation_id", &observation.observation_id, 128)?;
+    if let Some(run_id) = &observation.run_id {
+        validate_safe_id("scheduler observation run_id", run_id, 128)?;
+    }
+    if let Some(node_id) = &observation.node_id {
+        validate_safe_id("scheduler observation node_id", node_id, 128)?;
+    }
+    if let Some(endpoint_id) = &observation.endpoint_id {
+        validate_safe_id("scheduler observation endpoint_id", endpoint_id, 128)?;
+    }
+    if !matches!(
+        observation.method.as_str(),
+        PROBE_CONTROLLER_PING
+            | PROBE_PATH_ECHO
+            | OCSERV_SERVICE_SUMMARY
+            | OCSERV_VERSION
+            | OCSERV_SESSIONS_SUMMARY
+            | OCSERV_CERT_EXPIRY
+            | OCSERV_CONFIG_FINGERPRINT
+    ) {
+        return Err(StoreError::InvalidInput(
+            "scheduler observation method is invalid".to_string(),
+        ));
+    }
+    if let Some(error_code) = &observation.error_code {
+        validate_safe_id("scheduler observation error_code", error_code, 64)?;
+    }
+    if observation.ok.is_none() || observation.duration_ms.is_none() {
+        return Err(StoreError::InvalidInput(
+            "scheduler observation ok and duration_ms are required".to_string(),
+        ));
+    }
+    if matches!(observation.ok, Some(true)) && observation.error_code.is_some()
+        || matches!(observation.ok, Some(false)) && observation.error_code.is_none()
+    {
+        return Err(StoreError::InvalidInput(
+            "scheduler observation result and error_code are inconsistent".to_string(),
+        ));
+    }
+    validate_bounded_rfc3339(&observation.observed_at, "scheduler observed_at")?;
+    if let Some(expires_at) = &observation.expires_at {
+        validate_bounded_rfc3339(expires_at, "scheduler expires_at")?;
+    }
+    if !matches!(
+        observation.result_class.as_str(),
+        "controller_rpc_summary" | "low_sensitive_summary" | "scheduler_summary"
+    ) {
+        return Err(StoreError::InvalidInput(
+            "scheduler observation result_class is invalid".to_string(),
+        ));
+    }
+    validate_low_sensitive_json(&observation.summary_json, "observation summary")
+}
+
+fn validate_scheduler_outcome_audit(
+    audit: &AuditEvent,
+    observation: &ProbeObservationInsert,
+    actor: &str,
+) -> Result<(), StoreError> {
+    if audit.actor != actor {
+        return Err(StoreError::InvalidInput(
+            "scheduler outcome audit actor does not match writer actor".to_string(),
+        ));
+    }
+    if audit.node_id != observation.node_id
+        || audit.endpoint_id != observation.endpoint_id
+        || audit.method.as_deref() != Some(observation.method.as_str())
+        || audit.ok != observation.ok
+        || audit.duration_ms != observation.duration_ms
+    {
+        return Err(StoreError::InvalidInput(
+            "scheduler outcome audit fields do not match observation".to_string(),
+        ));
+    }
+    if matches!(audit.ok, Some(true)) && audit.error_code.is_some()
+        || matches!(audit.ok, Some(false)) && audit.error_code.is_none()
+    {
+        return Err(StoreError::InvalidInput(
+            "scheduler outcome audit result and error_code are inconsistent".to_string(),
+        ));
+    }
+    if audit.event != "rpc.completed" && audit.error_code != observation.error_code {
+        return Err(StoreError::InvalidInput(
+            "scheduler outcome audit error_code does not match observation".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_scheduler_job_clock(clock: &SchedulerJobClockUpdate) -> Result<(), StoreError> {
+    validate_safe_id("scheduler clock job_id", &clock.job_id, 128)?;
+    let next_run_at = validate_bounded_rfc3339(&clock.next_run_at, "scheduler next_run_at")?;
+    let last_run_at = validate_bounded_rfc3339(&clock.last_run_at, "scheduler last_run_at")?;
+    if next_run_at <= last_run_at {
+        return Err(StoreError::InvalidInput(
+            "scheduler next_run_at must be later than last_run_at".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_bounded_rfc3339(
+    value: &str,
+    field: &'static str,
+) -> Result<OffsetDateTime, StoreError> {
+    if value.is_empty() || value.len() > 64 {
+        return Err(StoreError::InvalidInput(format!(
+            "{field} must be bounded RFC3339"
+        )));
+    }
+    OffsetDateTime::parse(value, &Rfc3339)
+        .map_err(|_| StoreError::InvalidInput(format!("{field} must be bounded RFC3339")))
+}
+
+fn validate_scheduler_job_kind(kind: &str) -> Result<(), StoreError> {
+    if matches!(
+        kind,
+        "controller-ping" | "ocserv-status" | "ocserv-cert" | "ocserv-sessions" | "path-probe"
+    ) {
+        Ok(())
+    } else {
+        Err(StoreError::InvalidInput(
+            "scheduler job kind is invalid".to_string(),
+        ))
+    }
+}
+
+fn scheduler_job_kind_allows_method(kind: &str, method: &str) -> bool {
+    match kind {
+        "controller-ping" => method == PROBE_CONTROLLER_PING,
+        "ocserv-status" => matches!(
+            method,
+            OCSERV_SERVICE_SUMMARY
+                | OCSERV_VERSION
+                | OCSERV_SESSIONS_SUMMARY
+                | OCSERV_CONFIG_FINGERPRINT
+        ),
+        "ocserv-cert" => method == OCSERV_CERT_EXPIRY,
+        "ocserv-sessions" => method == OCSERV_SESSIONS_SUMMARY,
+        "path-probe" => method == PROBE_PATH_ECHO,
+        _ => false,
+    }
+}
+
+fn insert_observability_run_tx(
+    tx: &Transaction<'_>,
+    run: &ObservabilityRunInsert,
+) -> Result<(), StoreError> {
+    validate_low_sensitive_json(&run.summary_json, "observability run summary")?;
+    tx.execute(
+        "INSERT INTO observability_runs
+         (run_id, job_id, started_at, finished_at, status, triggered_by, summary_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            run.run_id.as_str(),
+            run.job_id.as_deref(),
+            run.started_at.as_str(),
+            run.finished_at.as_deref(),
+            run.status.as_str(),
+            run.triggered_by.as_str(),
+            compact_json(&run.summary_json),
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_probe_observation_tx(
+    tx: &Transaction<'_>,
+    observation: &ProbeObservationInsert,
+) -> Result<(), StoreError> {
+    validate_low_sensitive_json(&observation.summary_json, "observation summary")?;
+    tx.execute(
+        "INSERT INTO probe_observations
+         (observation_id, run_id, node_id, endpoint_id, method, ok, error_code, duration_ms, observed_at, expires_at, result_class, summary_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![
+            observation.observation_id.as_str(),
+            observation.run_id.as_deref(),
+            observation.node_id.as_deref(),
+            observation.endpoint_id.as_deref(),
+            observation.method.as_str(),
+            observation.ok.map(bool_to_i64),
+            observation.error_code.as_deref(),
+            option_u64_to_i64(observation.duration_ms)?,
+            observation.observed_at.as_str(),
+            observation.expires_at.as_deref(),
+            observation.result_class.as_str(),
+            compact_json(&observation.summary_json),
+        ],
+    )?;
+    Ok(())
+}
+
+fn update_scheduler_job_clock_tx(
+    tx: &Transaction<'_>,
+    clock: &SchedulerJobClockUpdate,
+) -> Result<(), StoreError> {
+    let (existing_next_run_at, existing_last_run_at) = tx
+        .query_row(
+            "SELECT next_run_at, last_run_at FROM observability_jobs WHERE job_id = ?1",
+            [clock.job_id.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| StoreError::ObservabilityJobNotFound(clock.job_id.clone()))?;
+    let proposed_next_run_at =
+        validate_bounded_rfc3339(&clock.next_run_at, "scheduler next_run_at")?;
+    let proposed_last_run_at =
+        validate_bounded_rfc3339(&clock.last_run_at, "scheduler last_run_at")?;
+    if let Some(existing) = existing_last_run_at.as_deref() {
+        let existing = validate_bounded_rfc3339(existing, "stored scheduler last_run_at")?;
+        if existing > proposed_last_run_at {
+            return Err(StoreError::InvalidInput(
+                "scheduler job clock update would regress last_run_at".to_string(),
+            ));
+        }
+        if existing == proposed_last_run_at
+            && let Some(existing_next) = existing_next_run_at.as_deref()
+        {
+            let existing_next =
+                validate_bounded_rfc3339(existing_next, "stored scheduler next_run_at")?;
+            if existing_next > proposed_next_run_at {
+                return Err(StoreError::InvalidInput(
+                    "scheduler job clock update would regress next_run_at".to_string(),
+                ));
+            }
+        }
+    }
+    let affected = tx.execute(
+        "UPDATE observability_jobs
+         SET next_run_at = ?1,
+             last_run_at = ?2,
+             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+         WHERE job_id = ?3 AND last_run_at IS ?4 AND next_run_at IS ?5",
+        params![
+            clock.next_run_at.as_str(),
+            clock.last_run_at.as_str(),
+            clock.job_id.as_str(),
+            existing_last_run_at.as_deref(),
+            existing_next_run_at.as_deref(),
+        ],
+    )?;
+    if affected != 1 {
+        return Err(StoreError::InvalidInput(
+            "scheduler job clock changed concurrently".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn get_observability_run_state_tx(
+    tx: &Transaction<'_>,
+    run_id: &str,
+) -> Result<Option<ObservabilityRunState>, StoreError> {
+    tx.query_row(
+        "SELECT run_id, job_id, started_at, finished_at, status
+         FROM observability_runs WHERE run_id = ?1",
+        [run_id],
+        |row| {
+            Ok(ObservabilityRunState {
+                run_id: row.get(0)?,
+                job_id: row.get(1)?,
+                started_at: row.get(2)?,
+                finished_at: row.get(3)?,
+                status: row.get(4)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(StoreError::from)
+}
+
+fn ensure_running_observability_run(run: &ObservabilityRunState) -> Result<(), StoreError> {
+    if run.status != "running" || run.finished_at.is_some() {
+        return Err(StoreError::ObservabilityRunNotRunning(run.run_id.clone()));
+    }
+    Ok(())
+}
+
+fn get_observability_job_kind_tx(
+    tx: &Transaction<'_>,
+    job_id: &str,
+) -> Result<Option<String>, StoreError> {
+    tx.query_row(
+        "SELECT kind FROM observability_jobs WHERE job_id = ?1",
+        [job_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(StoreError::from)
+}
+
+fn get_observability_job_start_state_tx(
+    tx: &Transaction<'_>,
+    job_id: &str,
+) -> Result<Option<(String, bool)>, StoreError> {
+    tx.query_row(
+        "SELECT kind, enabled FROM observability_jobs WHERE job_id = ?1",
+        [job_id],
+        |row| {
+            let kind = row.get(0)?;
+            let enabled = i64_to_bool(row.get(1)?, 1)?;
+            Ok((kind, enabled))
+        },
+    )
+    .optional()
+    .map_err(StoreError::from)
+}
+
+fn observability_job_exists_tx(tx: &Transaction<'_>, job_id: &str) -> Result<bool, StoreError> {
+    let exists = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM observability_jobs WHERE job_id = ?1)",
+        [job_id],
+        |row| row.get::<_, i64>(0),
+    )?;
+    Ok(exists == 1)
+}
+
+fn count_observability_run_outcomes_tx(
+    tx: &Transaction<'_>,
+    run_id: &str,
+) -> Result<(u64, u64), StoreError> {
+    let (observations, failures): (i64, i64) = tx.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(CASE WHEN ok = 0 THEN 1 ELSE 0 END), 0)
+         FROM probe_observations WHERE run_id = ?1",
+        [run_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    Ok((i64_to_u64(observations)?, i64_to_u64(failures)?))
 }
 
 fn absolute_database_path(path: &Path) -> Result<PathBuf, StoreError> {

@@ -81,10 +81,10 @@ scaffold, implemented slice, operational maturity, and release verification.
 
 The current execution node is **A1** on issue `#33`. The node-lifecycle slice
 merged through pull request `#57`; the scheduler-job configuration slice is
-active on branch `codex/a1-scheduler-audit-atomicity` with no pull request yet.
-Run/outcome/observation transitions remain the immediately following A1 slice.
-Statuses describe the milestone, not just the amount of supporting code already
-in the repository.
+active in pull request `#58` from branch
+`codex/a1-scheduler-audit-atomicity`. Run/outcome/observation transitions remain
+the immediately following A1 slice. Statuses describe the milestone, not just
+the amount of supporting code already in the repository.
 
 ### Baseline And Production Foundation
 

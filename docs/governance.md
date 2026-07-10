@@ -76,6 +76,27 @@ audit. The API remains read-only while that work is incomplete. The governing
 decision is recorded in
 [ADR-atomic-audit-writes](adr/ADR-atomic-audit-writes.md).
 
+Endpoint lifecycle CLI calls are routed through `StoreWriter`. A static source
+guard rejects direct production calls to node add/enable/disable/remove and
+endpoint rotate/revoke/quarantine outside the reviewed SQLite store and backend
+adapter. This guard is a review backstop, not RBAC; the resolved actor and
+transactional audit remain the authority record.
+
+## Endpoint Authority
+
+An Active endpoint status is necessary but not sufficient. Dispatch authority
+requires an enabled registry node that points to the contacted EndpointID, an
+Active trust row that points back to the same node, and exactly one Active trust
+binding for that node. Scheduler workers repeat this complete source/path-target
+snapshot after concurrency waits. A mismatch retains protocol-level
+`ENDPOINT_NOT_ALLOWED`; fixed controller-local observation codes distinguish
+unbound and binding-mismatch cases.
+
+The controller never derives this binding from agent-supplied hostname or
+labels. Existing enrollment approvals can contain Active unbound trust and remain
+rejected until a separate, explicit operator reconciliation workflow is added.
+There is no startup repair or trust-on-first-use fallback.
+
 ## Trust Policy Workflow
 
 Trust policy as code is a review and drift-detection workflow:

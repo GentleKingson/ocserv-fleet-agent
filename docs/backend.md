@@ -66,7 +66,10 @@ failure rolls back the affected `observability_jobs` insert or enabled-state
 update. The scheduler-run expansion adds three closed writer boundaries: run
 start plus audit, one-to-four observation/audit pairs, and run finish plus the
 owning job clock and audit. The writer rejects mixed actors, jobs, run IDs,
-terminal runs, and unbounded batches.
+terminal runs, and unbounded batches. Endpoint rotation, revocation, and
+quarantine also route through `StoreWriter`; a source guard rejects direct
+production calls to inherent node/endpoint lifecycle mutators outside
+`store.rs` and the reviewed backend adapter.
 
 The API retains a narrower `ApiReadStore` adapter for API projections;
 `ReadOnlyStore` opens SQLite with read-only/query-only flags, validates private
@@ -76,11 +79,13 @@ future work; SQLite is the only runtime backend.
 
 The controller `Store` also retains the absolute path it actually opened. A
 crate-private scheduler dispatch gate uses that bound path to open a short-lived
-read-only/query-only SQLite connection and select only endpoint trust status
-after concurrency waits. It validates the database and WAL/SHM files, never
-runs migrations, executes through `spawn_blocking`, and closes before key
-loading or network I/O. Callers cannot substitute an unrelated authorization
-database.
+read-only/query-only SQLite connection and read one closed dispatch-binding
+snapshot after concurrency waits. The snapshot requires an enabled registry
+node, the requested node/EndpointID pair, an Active trust row pointing back to
+that node, and exactly one Active binding for the node. It validates the database
+and WAL/SHM files, never runs migrations, executes through `spawn_blocking`, and
+closes before key loading or network I/O. Callers cannot substitute an unrelated
+authorization database.
 
 Scheduler RPC work occurs outside database transactions. A committed start row
 is followed by short bounded outcome transactions and one finish transaction;
@@ -89,7 +94,8 @@ advance the job clock. Health/alert/delivery, retention, and some enrollment
 lifecycle flows are not all migrated to the writer trait. Future writer
 interfaces must keep actor/audit input mandatory and must not loosen private
 file checks or redaction. The scheduler writer expansions change no schema,
-protocol, agent capability, or API route; the API remains read-only.
+protocol, agent capability, or API route; neither does the binding/lifecycle
+hardening. The API remains read-only.
 
 ## Postgres Scaffold
 

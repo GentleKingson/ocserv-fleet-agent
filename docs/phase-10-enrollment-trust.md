@@ -1,7 +1,9 @@
 # Phase 10: Enrollment And Trust Management
 
-Phase 10 replaces the manual-only registration path with a token-gated,
-approval-based onboarding flow and explicit EndpointID lifecycle controls.
+Phase 10 adds a token-gated, approval-based enrollment record alongside the
+manual bound registration path and provides explicit EndpointID lifecycle
+controls. The current approval flow does not yet complete a dispatch-authorized
+node binding.
 
 ## Enrollment Flow
 
@@ -41,9 +43,26 @@ approval-based onboarding flow and explicit EndpointID lifecycle controls.
      --reason "ticket-123"
    ```
 
-   Approval records an active endpoint trust entry with generation `1`, stores
+   Approval records an Active endpoint trust entry with generation `1`, stores
    the agent fingerprint, records approved labels, and writes before/after audit
-   detail.
+   detail. The entry has no operator-selected `node_id`; Active status alone does
+   not authorize RPC dispatch.
+
+### Current Binding Limitation
+
+Controller and scheduler dispatch require all of the following:
+
+- an enabled controller registry node;
+- the node's current EndpointID equals the EndpointID being contacted;
+- the Active trust row points back to that exact node;
+- exactly one Active trust row is bound to the node.
+
+The current enrollment approval produces a legacy Active unbound row, so it
+fails this gate with `ENDPOINT_NOT_ALLOWED`. The controller does not infer a
+binding from agent-supplied hostname or labels and does not repair the row at
+startup. There is not yet an operator reconciliation command. Manual `node add`
+remains the usable path for creating a bound dispatch identity; an already
+approved EndpointID is retained rather than overwritten by `node add`.
 
 ## Endpoint Lifecycle
 
@@ -70,6 +89,28 @@ ocfleet endpoint quarantine <endpoint-id> --reason "suspicious traffic"
 Rotated, revoked, and quarantined endpoints are excluded from normal controller
 RPC and path-probe authorization. Quarantine does not add any diagnostic command
 or management shell.
+
+Lifecycle transitions are closed:
+
+| Current state | Rotate | Revoke | Quarantine |
+| --- | --- | --- | --- |
+| `active` | apply | apply | apply |
+| `quarantined` | apply | apply | exact no-op |
+| `revoked` | reject | exact no-op | reject |
+| `rotated` | exact linked retry only | reject | reject |
+
+Every effective transition uses checked generation arithmetic. An exact no-op
+does not change generation, trust bundle, timestamp, or audit count. Rotation
+updates the old/new trust rows and moves the bound node's EndpointID pointer in
+one SQLite transaction. Revocation and quarantine disable the currently bound
+node in that transaction. Rotation from quarantine keeps that node disabled
+until an operator explicitly enables the clean replacement binding. An exact
+linked retry that finds an already-correct pointer is a no-op; repairing the one
+deterministic legacy stale-pointer case writes a reconciliation audit without
+another generation increment. Node removal revokes its unique Active trust
+before deleting the registry row; ambiguous Active candidates are rejected
+rather than chosen implicitly. Historical inactive trust rows remain as
+lifecycle tombstones.
 
 ## Trust Diff
 
@@ -100,8 +141,16 @@ The controller audit log records:
 Audit detail includes actor type, target type/id, before and after state where
 applicable, reason, and request/correlation context.
 
+Node and endpoint lifecycle commands enter through actor-bearing `StoreWriter`
+methods. A production source guard rejects direct node/endpoint mutator calls
+outside the reviewed SQLite store/backend boundary. Exact lifecycle no-ops do
+not create misleading audit events.
+
 ## Safety Boundary
 
 Phase 10 does not add shell execution, raw command execution, `systemctl`,
 `occtl`, `journalctl`, reload/restart operations, generic RPC methods, relay
 probes, or unsafe diagnostics.
+
+This binding/lifecycle hardening changes no SQLite schema version, RPC protocol,
+read-only HTTP API route, agent capability, or default read-only behavior.

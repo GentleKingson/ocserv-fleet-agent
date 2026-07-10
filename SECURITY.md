@@ -142,16 +142,40 @@ design.
 
 ## Endpoint Trust Gate
 
-Controller and scheduler RPC paths require an explicit active
-`endpoint_trust` row for the node's registered EndpointID. A missing row is not
-equivalent to active trust. Missing, revoked, quarantined, and rotated records
-are rejected with bounded error metadata before controller key loading,
-connection setup, or RPC dispatch. Scheduler workers repeat the source and
-path-target lookup after concurrency waits; the lookup uses a separate
-read-only SQLite connection and no database transaction is held across network
-I/O. Health computation uses the same missing-trust condition as an unreachable
-advisory state and never creates trust. `ocfleet doctor` reports incomplete
-node-to-trust coverage without listing identities.
+Controller and scheduler RPC paths require more than an Active
+`endpoint_trust` row. The registry node must exist and be enabled, its current
+EndpointID must be the EndpointID being contacted, the trust row must point back
+to that node, and exactly one Active trust row may be bound to the node. Missing,
+inactive, unbound, mismatched, stale, disabled, or ambiguous state is rejected
+with bounded error metadata before controller key loading, connection setup, or
+RPC dispatch.
+
+Scheduler workers repeat the complete source and path-target binding snapshot
+after concurrency waits. That lookup uses a separate read-only/query-only SQLite
+connection, and no database transaction is held across network I/O. Protocol
+responses remain `ENDPOINT_NOT_ALLOWED`; controller-local observations use fixed
+codes including `ENDPOINT_TRUST_UNBOUND`, `ENDPOINT_TRUST_BINDING_MISMATCH`, and
+their `TARGET_` variants.
+
+Endpoint lifecycle is closed. Active trust may rotate, revoke, or quarantine;
+quarantined trust may rotate or revoke; revoked trust is terminal; and a rotated
+row accepts only an exact retry of its recorded successor. Exact no-ops do not
+change generation, timestamps, trust bundles, or audit count. Rotation moves the
+bound node pointer atomically. Revoke and quarantine disable the current bound
+node, while node removal revokes its unique Active trust before deleting the
+registry row. Contaminated or ambiguous state fails closed instead of selecting
+a row implicitly.
+
+Health computation is advisory and never creates trust. `ocfleet doctor` reports
+aggregate-only `active_unbound`, `active_orphan`, `current_binding_mismatch`,
+`inactive_current`, and `active_extra_for_node` counts. `inactive_current`
+counts enabled nodes only; a deliberately disabled revoked or quarantined node
+is valid. Historical inactive tombstones are allowed to outlive a removed node.
+The legacy enrollment approval flow can leave an Active unbound row; it remains
+rejected pending an explicit reconciliation workflow and is never bound from
+agent-supplied hostname data.
+This hardening changes no SQLite schema, RPC protocol, agent capability,
+read-only HTTP API route, or default read-only behavior.
 
 ## CI Security Gates
 
@@ -164,6 +188,12 @@ CodeQL runs separately with read-only repository permissions plus
 `security-events: write` for uploading analysis results. GitHub Actions should
 use least-privilege permissions, fixed tool versions, and full-length commit SHA
 pinning for third-party actions where practical.
+
+The controller mutation guard also rejects production calls that bypass the
+reviewed `StoreWriter` boundary for node and endpoint lifecycle methods. Only the
+SQLite store implementation and backend adapter may call those inherent
+mutators directly; test-only and integration fixtures remain outside the
+production scan.
 
 The release workflow accepts only bounded version input, requires an existing
 matching tag, verifies the compiled version of all four release binaries, and

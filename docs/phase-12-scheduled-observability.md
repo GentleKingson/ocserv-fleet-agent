@@ -85,16 +85,21 @@ configuration and never infers new trust.
 
 Each scheduled job resolves its target from static controller SQLite state:
 
-- non-path jobs resolve enabled nodes with active EndpointIDs from
-  controller-local selectors.
+- non-path jobs resolve enabled nodes with one Active EndpointID trust row bound
+  bidirectionally to the selected registry node.
 - path jobs resolve one explicitly configured source node and one explicitly
   configured target node.
 - jobs fail closed before key loading or network I/O if the node is missing or
-  disabled, or if its EndpointID trust row is missing, revoked, quarantined,
-  rotated away, or otherwise not active.
-- source and explicit path-target trust are read again after scheduler
-  concurrency waits at each dispatch boundary; rejected methods write bounded
-  RPC audits and no SQLite transaction spans network I/O.
+  disabled, if its EndpointID trust row is missing or inactive, if either
+  binding pointer differs, or if more than one Active trust row is bound to the
+  node. Active status alone is insufficient.
+- the complete source and explicit path-target binding snapshots are read again
+  after scheduler concurrency waits at each dispatch boundary; rejected methods
+  write bounded RPC audits and no SQLite transaction spans network I/O.
+- unbound and mismatched observations use fixed
+  `ENDPOINT_TRUST_UNBOUND` / `ENDPOINT_TRUST_BINDING_MISMATCH` codes for a source
+  and the corresponding `TARGET_` codes for a path target. The RPC protocol
+  response remains `ENDPOINT_NOT_ALLOWED`.
 
 Successful RPC responses are decoded into closed typed DTOs before storage.
 Failed RPCs store only error code, fixed method name, node IDs, endpoint IDs,
@@ -364,6 +369,11 @@ clock, and a finish audit. Audit, observation, or clock insertion failure rolls
 back that whole boundary. No transaction spans RPC or other network I/O. This
 slice changes no schema, protocol, agent RPC, or API route.
 
+The post-wait trust gate opens a short-lived read-only/query-only connection to
+the exact database path already held by `Store`, reads only the closed registry
+and trust binding snapshot, and closes before key loading or RPC dispatch. It
+does not run migrations or hold a transaction across a semaphore wait.
+
 After `schedule run --once` and after each daemon tick, the controller evaluates
 local alert candidates from existing observations, health snapshots, and endpoint
 trust state. This phase only upserts local `alert_events`; it does not deliver
@@ -565,6 +575,9 @@ Phase 12 keeps the project security posture:
   journal selectors, scripts, or file selectors.
 - no automatic trust generation, no TOFU, no automatic path-probe
   authorization, and no mesh enumeration.
+- Active status alone is not authorization. Every source and path target must be
+  an enabled registry node with matching bidirectional EndpointID pointers and
+  exactly one Active binding, checked again after concurrency waits.
 - scheduler job creation and enable/disable use actor-bearing `StoreWriter`
   transactions that roll back their job changes if audit insertion fails.
 - one-shot runs, non-dry-run retention apply, alert silence, alert resolve, and
@@ -582,8 +595,11 @@ Health state is derived, not authoritative. Current CLI status labels are:
   indicates degradation. Alert state is reported separately and is not a health input.
 - `degraded`: at least one scheduled method is unavailable, stale, or failed,
   but enough observations remain available for useful status.
-- `unreachable`: endpoint trust is inactive or consecutive controller ping
-  failures meet the configured unreachable threshold.
+- `unreachable`: endpoint trust is missing or inactive, or consecutive
+  controller ping failures meet the configured unreachable threshold. The
+  current health evaluator reads trust status only; unbound, mismatched, and
+  ambiguous Active rows are dispatch rejections and doctor findings until a
+  later health-policy update. Health remains advisory and cannot repair trust.
 - `stale`: observations exist but are older than the configured health window.
 - `disabled`: the controller registry node is disabled.
 - `unknown`: no relevant observations exist yet.

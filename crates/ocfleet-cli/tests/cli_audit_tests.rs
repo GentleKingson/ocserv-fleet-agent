@@ -8,6 +8,8 @@ use serde_json::Value;
 use std::path::Path;
 use std::process::Command;
 
+const TEST_ACTOR: &str = "audit-test";
+
 fn run_ocfleet(args: &[&str]) {
     let output = Command::new(env!("CARGO_BIN_EXE_ocfleet"))
         .args(args)
@@ -239,15 +241,20 @@ fn ping_disabled_node_writes_failure_audit() {
     let endpoint_id = iroh::SecretKey::generate().public().to_string();
     let store = Store::open(&database).expect("store opens");
     store
-        .add_node(&NodeInsert {
-            node_id: "hk-ocserv-01".to_string(),
-            endpoint_id: endpoint_id.clone(),
-            name: "hk-ocserv-01".to_string(),
-            region: "hk".to_string(),
-            role: "ocserv".to_string(),
-        })
+        .add_node(
+            &NodeInsert {
+                node_id: "hk-ocserv-01".to_string(),
+                endpoint_id: endpoint_id.clone(),
+                name: "hk-ocserv-01".to_string(),
+                region: "hk".to_string(),
+                role: "ocserv".to_string(),
+            },
+            TEST_ACTOR,
+        )
         .expect("insert node");
-    store.disable_node("hk-ocserv-01").expect("disable node");
+    store
+        .disable_node("hk-ocserv-01", TEST_ACTOR)
+        .expect("disable node");
     drop(store);
 
     let database_arg = database.to_string_lossy().into_owned();
@@ -311,15 +318,20 @@ fn probe_ping_disabled_node_writes_failure_audit() {
     let endpoint_id = iroh::SecretKey::generate().public().to_string();
     let store = Store::open(&database).expect("store opens");
     store
-        .add_node(&NodeInsert {
-            node_id: "hk-ocserv-01".to_string(),
-            endpoint_id: endpoint_id.clone(),
-            name: "hk-ocserv-01".to_string(),
-            region: "hk".to_string(),
-            role: "ocserv".to_string(),
-        })
+        .add_node(
+            &NodeInsert {
+                node_id: "hk-ocserv-01".to_string(),
+                endpoint_id: endpoint_id.clone(),
+                name: "hk-ocserv-01".to_string(),
+                region: "hk".to_string(),
+                role: "ocserv".to_string(),
+            },
+            TEST_ACTOR,
+        )
         .expect("insert node");
-    store.disable_node("hk-ocserv-01").expect("disable node");
+    store
+        .disable_node("hk-ocserv-01", TEST_ACTOR)
+        .expect("disable node");
     drop(store);
 
     let database_arg = database.to_string_lossy().into_owned();
@@ -385,15 +397,20 @@ fn ocserv_cert_disabled_node_writes_command_audit_without_certificate_material()
     let endpoint_id = iroh::SecretKey::generate().public().to_string();
     let store = Store::open(&database).expect("store opens");
     store
-        .add_node(&NodeInsert {
-            node_id: "hk-ocserv-01".to_string(),
-            endpoint_id: endpoint_id.clone(),
-            name: "hk-ocserv-01".to_string(),
-            region: "hk".to_string(),
-            role: "ocserv".to_string(),
-        })
+        .add_node(
+            &NodeInsert {
+                node_id: "hk-ocserv-01".to_string(),
+                endpoint_id: endpoint_id.clone(),
+                name: "hk-ocserv-01".to_string(),
+                region: "hk".to_string(),
+                role: "ocserv".to_string(),
+            },
+            TEST_ACTOR,
+        )
         .expect("insert node");
-    store.disable_node("hk-ocserv-01").expect("disable node");
+    store
+        .disable_node("hk-ocserv-01", TEST_ACTOR)
+        .expect("disable node");
     drop(store);
 
     let database_arg = database.to_string_lossy().into_owned();
@@ -461,13 +478,16 @@ fn probe_path_missing_target_writes_failure_audit_on_source_node() {
     let source_endpoint_id = iroh::SecretKey::generate().public().to_string();
     let store = Store::open(&database).expect("store opens");
     store
-        .add_node(&NodeInsert {
-            node_id: "source-node".to_string(),
-            endpoint_id: source_endpoint_id.clone(),
-            name: "source-node".to_string(),
-            region: "hk".to_string(),
-            role: "ocserv".to_string(),
-        })
+        .add_node(
+            &NodeInsert {
+                node_id: "source-node".to_string(),
+                endpoint_id: source_endpoint_id.clone(),
+                name: "source-node".to_string(),
+                region: "hk".to_string(),
+                role: "ocserv".to_string(),
+            },
+            TEST_ACTOR,
+        )
         .expect("insert source node");
     drop(store);
 
@@ -509,24 +529,32 @@ fn probe_summary_reports_existing_and_disabled_nodes_without_secret_key_or_rpc()
     let target_endpoint_id = iroh::SecretKey::generate().public().to_string();
     let store = Store::open(&database).expect("store opens");
     store
-        .add_node(&NodeInsert {
-            node_id: "source-node".to_string(),
-            endpoint_id: source_endpoint_id.clone(),
-            name: "source-node".to_string(),
-            region: "hk".to_string(),
-            role: "ocserv".to_string(),
-        })
+        .add_node(
+            &NodeInsert {
+                node_id: "source-node".to_string(),
+                endpoint_id: source_endpoint_id.clone(),
+                name: "source-node".to_string(),
+                region: "hk".to_string(),
+                role: "ocserv".to_string(),
+            },
+            TEST_ACTOR,
+        )
         .expect("insert source node");
     store
-        .add_node(&NodeInsert {
-            node_id: "target-node".to_string(),
-            endpoint_id: target_endpoint_id.clone(),
-            name: "target-node".to_string(),
-            region: "sg".to_string(),
-            role: "ocserv".to_string(),
-        })
+        .add_node(
+            &NodeInsert {
+                node_id: "target-node".to_string(),
+                endpoint_id: target_endpoint_id.clone(),
+                name: "target-node".to_string(),
+                region: "sg".to_string(),
+                role: "ocserv".to_string(),
+            },
+            TEST_ACTOR,
+        )
         .expect("insert target node");
-    store.disable_node("target-node").expect("disable target");
+    store
+        .disable_node("target-node", TEST_ACTOR)
+        .expect("disable target");
     drop(store);
 
     let database_arg = database.to_string_lossy().into_owned();
@@ -602,24 +630,32 @@ fn probe_summary_reports_disabled_source_without_running_rpc() {
     let target_endpoint_id = iroh::SecretKey::generate().public().to_string();
     let store = Store::open(&database).expect("store opens");
     store
-        .add_node(&NodeInsert {
-            node_id: "source-node".to_string(),
-            endpoint_id: source_endpoint_id,
-            name: "source-node".to_string(),
-            region: "hk".to_string(),
-            role: "ocserv".to_string(),
-        })
+        .add_node(
+            &NodeInsert {
+                node_id: "source-node".to_string(),
+                endpoint_id: source_endpoint_id,
+                name: "source-node".to_string(),
+                region: "hk".to_string(),
+                role: "ocserv".to_string(),
+            },
+            TEST_ACTOR,
+        )
         .expect("insert source node");
     store
-        .add_node(&NodeInsert {
-            node_id: "target-node".to_string(),
-            endpoint_id: target_endpoint_id,
-            name: "target-node".to_string(),
-            region: "sg".to_string(),
-            role: "ocserv".to_string(),
-        })
+        .add_node(
+            &NodeInsert {
+                node_id: "target-node".to_string(),
+                endpoint_id: target_endpoint_id,
+                name: "target-node".to_string(),
+                region: "sg".to_string(),
+                role: "ocserv".to_string(),
+            },
+            TEST_ACTOR,
+        )
         .expect("insert target node");
-    store.disable_node("source-node").expect("disable source");
+    store
+        .disable_node("source-node", TEST_ACTOR)
+        .expect("disable source");
     drop(store);
 
     let database_arg = database.to_string_lossy().into_owned();
@@ -695,33 +731,44 @@ fn probe_topology_reports_region_role_groups_without_claiming_authorization() {
     let sg_endpoint_id = iroh::SecretKey::generate().public().to_string();
     let store = Store::open(&database).expect("store opens");
     store
-        .add_node(&NodeInsert {
-            node_id: "hk-source".to_string(),
-            endpoint_id: hk_source_endpoint_id,
-            name: "hk-source".to_string(),
-            region: "hk".to_string(),
-            role: "ocserv".to_string(),
-        })
+        .add_node(
+            &NodeInsert {
+                node_id: "hk-source".to_string(),
+                endpoint_id: hk_source_endpoint_id,
+                name: "hk-source".to_string(),
+                region: "hk".to_string(),
+                role: "ocserv".to_string(),
+            },
+            TEST_ACTOR,
+        )
         .expect("insert hk source");
     store
-        .add_node(&NodeInsert {
-            node_id: "hk-target".to_string(),
-            endpoint_id: hk_target_endpoint_id,
-            name: "hk-target".to_string(),
-            region: "hk".to_string(),
-            role: "ocserv".to_string(),
-        })
+        .add_node(
+            &NodeInsert {
+                node_id: "hk-target".to_string(),
+                endpoint_id: hk_target_endpoint_id,
+                name: "hk-target".to_string(),
+                region: "hk".to_string(),
+                role: "ocserv".to_string(),
+            },
+            TEST_ACTOR,
+        )
         .expect("insert hk target");
     store
-        .add_node(&NodeInsert {
-            node_id: "sg-relay-observer".to_string(),
-            endpoint_id: sg_endpoint_id,
-            name: "sg-relay-observer".to_string(),
-            region: "sg".to_string(),
-            role: "observer".to_string(),
-        })
+        .add_node(
+            &NodeInsert {
+                node_id: "sg-relay-observer".to_string(),
+                endpoint_id: sg_endpoint_id,
+                name: "sg-relay-observer".to_string(),
+                region: "sg".to_string(),
+                role: "observer".to_string(),
+            },
+            TEST_ACTOR,
+        )
         .expect("insert sg observer");
-    store.disable_node("hk-target").expect("disable target");
+    store
+        .disable_node("hk-target", TEST_ACTOR)
+        .expect("disable target");
     drop(store);
 
     let database_arg = database.to_string_lossy().into_owned();
@@ -904,22 +951,28 @@ fn probe_observe_reports_registry_status_without_history_or_rpc() {
     let target_endpoint_id = iroh::SecretKey::generate().public().to_string();
     let store = Store::open(&database).expect("store opens");
     store
-        .add_node(&NodeInsert {
-            node_id: "source-node".to_string(),
-            endpoint_id: source_endpoint_id,
-            name: "source-node".to_string(),
-            region: "hk".to_string(),
-            role: "ocserv".to_string(),
-        })
+        .add_node(
+            &NodeInsert {
+                node_id: "source-node".to_string(),
+                endpoint_id: source_endpoint_id,
+                name: "source-node".to_string(),
+                region: "hk".to_string(),
+                role: "ocserv".to_string(),
+            },
+            TEST_ACTOR,
+        )
         .expect("insert source");
     store
-        .add_node(&NodeInsert {
-            node_id: "target-node".to_string(),
-            endpoint_id: target_endpoint_id,
-            name: "target-node".to_string(),
-            region: "sg".to_string(),
-            role: "ocserv".to_string(),
-        })
+        .add_node(
+            &NodeInsert {
+                node_id: "target-node".to_string(),
+                endpoint_id: target_endpoint_id,
+                name: "target-node".to_string(),
+                region: "sg".to_string(),
+                role: "ocserv".to_string(),
+            },
+            TEST_ACTOR,
+        )
         .expect("insert target");
     drop(store);
 
@@ -964,22 +1017,28 @@ fn probe_observe_reports_latest_matching_path_result_only() {
     let other_target_endpoint_id = iroh::SecretKey::generate().public().to_string();
     let store = Store::open(&database).expect("store opens");
     store
-        .add_node(&NodeInsert {
-            node_id: "source-node".to_string(),
-            endpoint_id: source_endpoint_id,
-            name: "source-node".to_string(),
-            region: "hk".to_string(),
-            role: "ocserv".to_string(),
-        })
+        .add_node(
+            &NodeInsert {
+                node_id: "source-node".to_string(),
+                endpoint_id: source_endpoint_id,
+                name: "source-node".to_string(),
+                region: "hk".to_string(),
+                role: "ocserv".to_string(),
+            },
+            TEST_ACTOR,
+        )
         .expect("insert source");
     store
-        .add_node(&NodeInsert {
-            node_id: "target-node".to_string(),
-            endpoint_id: target_endpoint_id.clone(),
-            name: "target-node".to_string(),
-            region: "sg".to_string(),
-            role: "ocserv".to_string(),
-        })
+        .add_node(
+            &NodeInsert {
+                node_id: "target-node".to_string(),
+                endpoint_id: target_endpoint_id.clone(),
+                name: "target-node".to_string(),
+                region: "sg".to_string(),
+                role: "ocserv".to_string(),
+            },
+            TEST_ACTOR,
+        )
         .expect("insert target");
 
     let mut other_target = AuditEvent::new("seed", "rpc.completed");
@@ -1060,13 +1119,16 @@ fn ping_with_unsafe_controller_secret_key_writes_permission_error_audit() {
     let endpoint_id = iroh::SecretKey::generate().public().to_string();
     let store = Store::open(&database).expect("store opens");
     store
-        .add_node(&NodeInsert {
-            node_id: "hk-ocserv-01".to_string(),
-            endpoint_id: endpoint_id.clone(),
-            name: "hk-ocserv-01".to_string(),
-            region: "hk".to_string(),
-            role: "ocserv".to_string(),
-        })
+        .add_node(
+            &NodeInsert {
+                node_id: "hk-ocserv-01".to_string(),
+                endpoint_id: endpoint_id.clone(),
+                name: "hk-ocserv-01".to_string(),
+                region: "hk".to_string(),
+                role: "ocserv".to_string(),
+            },
+            TEST_ACTOR,
+        )
         .expect("insert node");
     drop(store);
 

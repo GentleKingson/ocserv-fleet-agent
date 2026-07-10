@@ -403,7 +403,8 @@ impl Store {
         migrations::read_schema_version(&self.conn)
     }
 
-    pub fn add_node(&self, node: &NodeInsert) -> Result<(), StoreError> {
+    pub fn add_node(&self, node: &NodeInsert, actor: &str) -> Result<(), StoreError> {
+        validate_actor(actor).map_err(StoreError::InvalidInput)?;
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
             "INSERT INTO nodes (node_id, endpoint_id, name, region, role, enabled, created_at, updated_at)
@@ -431,6 +432,20 @@ impl Store {
                 updated_at: String::new(),
             },
         )?;
+        let after = get_node_tx(&tx, &node.node_id)?
+            .ok_or_else(|| StoreError::NodeNotFound(node.node_id.clone()))?;
+        let mut event = AuditEvent::new(actor, "node.add");
+        event.node_id = Some(after.node_id.clone());
+        event.endpoint_id = Some(after.endpoint_id.clone());
+        event.ok = Some(true);
+        event.detail_json = json_detail(
+            "node",
+            &after.node_id,
+            None,
+            Some(node_audit_json(&after)),
+            None,
+        );
+        insert_audit_tx(&tx, &event)?;
         tx.commit()?;
         Ok(())
     }
@@ -1341,38 +1356,71 @@ impl Store {
         Ok(deleted)
     }
 
-    pub fn disable_node(&self, node_id: &str) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
-        let affected = tx.execute(
-            "UPDATE nodes SET enabled = 0, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE node_id = ?1",
-            [node_id],
-        )?;
-        if affected == 0 {
-            return Err(StoreError::NodeNotFound(node_id.to_string()));
-        }
-        tx.commit()?;
-        Ok(())
+    pub fn disable_node(&self, node_id: &str, actor: &str) -> Result<(), StoreError> {
+        self.set_node_enabled(node_id, false, actor, "node.disable")
     }
 
-    pub fn enable_node(&self, node_id: &str) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
-        let affected = tx.execute(
-            "UPDATE nodes SET enabled = 1, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE node_id = ?1",
-            [node_id],
-        )?;
-        if affected == 0 {
-            return Err(StoreError::NodeNotFound(node_id.to_string()));
-        }
-        tx.commit()?;
-        Ok(())
+    pub fn enable_node(&self, node_id: &str, actor: &str) -> Result<(), StoreError> {
+        self.set_node_enabled(node_id, true, actor, "node.enable")
     }
 
-    pub fn remove_node(&self, node_id: &str) -> Result<(), StoreError> {
+    pub fn remove_node(&self, node_id: &str, actor: &str) -> Result<(), StoreError> {
+        validate_actor(actor).map_err(StoreError::InvalidInput)?;
         let tx = self.conn.unchecked_transaction()?;
+        let before = get_node_tx(&tx, node_id)?
+            .ok_or_else(|| StoreError::NodeNotFound(node_id.to_string()))?;
         let affected = tx.execute("DELETE FROM nodes WHERE node_id = ?1", [node_id])?;
         if affected == 0 {
             return Err(StoreError::NodeNotFound(node_id.to_string()));
         }
+        let mut event = AuditEvent::new(actor, "node.remove");
+        event.node_id = Some(before.node_id.clone());
+        event.endpoint_id = Some(before.endpoint_id.clone());
+        event.ok = Some(true);
+        event.detail_json = json_detail(
+            "node",
+            &before.node_id,
+            Some(node_audit_json(&before)),
+            None,
+            None,
+        );
+        insert_audit_tx(&tx, &event)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn set_node_enabled(
+        &self,
+        node_id: &str,
+        enabled: bool,
+        actor: &str,
+        event_name: &str,
+    ) -> Result<(), StoreError> {
+        validate_actor(actor).map_err(StoreError::InvalidInput)?;
+        let tx = self.conn.unchecked_transaction()?;
+        let before = get_node_tx(&tx, node_id)?
+            .ok_or_else(|| StoreError::NodeNotFound(node_id.to_string()))?;
+        let affected = tx.execute(
+            "UPDATE nodes SET enabled = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE node_id = ?2",
+            params![bool_to_i64(enabled), node_id],
+        )?;
+        if affected == 0 {
+            return Err(StoreError::NodeNotFound(node_id.to_string()));
+        }
+        let after = get_node_tx(&tx, node_id)?
+            .ok_or_else(|| StoreError::NodeNotFound(node_id.to_string()))?;
+        let mut event = AuditEvent::new(actor, event_name);
+        event.node_id = Some(after.node_id.clone());
+        event.endpoint_id = Some(after.endpoint_id.clone());
+        event.ok = Some(true);
+        event.detail_json = json_detail(
+            "node",
+            &after.node_id,
+            Some(node_audit_json(&before)),
+            Some(node_audit_json(&after)),
+            None,
+        );
+        insert_audit_tx(&tx, &event)?;
         tx.commit()?;
         Ok(())
     }
@@ -1966,6 +2014,16 @@ fn insert_endpoint_trust_tx(
     Ok(())
 }
 
+fn get_node_tx(tx: &Transaction<'_>, node_id: &str) -> Result<Option<NodeRecord>, StoreError> {
+    tx.query_row(
+        "SELECT node_id, endpoint_id, name, region, role, enabled FROM nodes WHERE node_id = ?1",
+        [node_id],
+        node_from_row,
+    )
+    .optional()
+    .map_err(StoreError::from)
+}
+
 fn get_join_request_tx(
     tx: &Transaction<'_>,
     request_id: &str,
@@ -2059,6 +2117,16 @@ fn join_request_audit_json(join: &JoinRequestRecord) -> Value {
         "requested_labels": join.requested_labels_json.clone(),
         "approved_labels": join.approved_labels_json.clone(),
         "approved_by": join.approved_by.clone(),
+    })
+}
+
+fn node_audit_json(node: &NodeRecord) -> Value {
+    serde_json::json!({
+        "node_id": node.node_id.clone(),
+        "endpoint_id": node.endpoint_id.clone(),
+        "region": node.region.clone(),
+        "role": node.role.clone(),
+        "enabled": node.enabled,
     })
 }
 

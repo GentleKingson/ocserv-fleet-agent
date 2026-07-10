@@ -520,13 +520,16 @@ fn endpoint_lifecycle_commands_write_audit_and_update_registry() {
     let endpoint_one = iroh::SecretKey::generate().public().to_string();
     let endpoint_two = iroh::SecretKey::generate().public().to_string();
     store
-        .add_node(&NodeInsert {
-            node_id: "hk-ocserv-01".to_string(),
-            endpoint_id: endpoint_one.clone(),
-            name: "hk-ocserv-01".to_string(),
-            region: "hk".to_string(),
-            role: "ocserv".to_string(),
-        })
+        .add_node(
+            &NodeInsert {
+                node_id: "hk-ocserv-01".to_string(),
+                endpoint_id: endpoint_one.clone(),
+                name: "hk-ocserv-01".to_string(),
+                region: "hk".to_string(),
+                role: "ocserv".to_string(),
+            },
+            "phase10-test",
+        )
         .expect("node added");
     drop(store);
 
@@ -590,13 +593,16 @@ fn trust_diff_reports_registry_status_and_strict_fails_on_high_severity_diff() {
     let store = Store::open(&database).expect("store opens");
     let endpoint_id = iroh::SecretKey::generate().public().to_string();
     store
-        .add_node(&NodeInsert {
-            node_id: "hk-ocserv-01".to_string(),
-            endpoint_id: endpoint_id.clone(),
-            name: "hk-ocserv-01".to_string(),
-            region: "hk".to_string(),
-            role: "ocserv".to_string(),
-        })
+        .add_node(
+            &NodeInsert {
+                node_id: "hk-ocserv-01".to_string(),
+                endpoint_id: endpoint_id.clone(),
+                name: "hk-ocserv-01".to_string(),
+                region: "hk".to_string(),
+                role: "ocserv".to_string(),
+            },
+            "phase10-test",
+        )
         .expect("node added");
     store
         .revoke_endpoint(&endpoint_id, "operator", "lost host")

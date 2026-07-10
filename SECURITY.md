@@ -111,6 +111,14 @@ group/world-writable parent directories.
 
 ## Audit Policy
 
+Controller business mutations and their success audit rows must commit in the
+same database transaction. An audit insertion failure fails the mutation and
+rolls back its business rows. Node add, enable, disable, and remove implement
+this contract; remaining legacy mutation families are tracked in
+[#33](https://github.com/GentleKingson/ocserv-fleet-agent/issues/33) and must not
+be described as fully atomic until migrated. Read-only command audits do not
+have a paired business mutation and may use the standalone audit writer.
+
 Agent audit records are security-relevant. The agent uses a bounded audit queue,
 a dedicated writer thread, and a bounded local durability spool so disk I/O does
 not block async RPC handling and temporary primary audit sink failures do not

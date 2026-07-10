@@ -1033,15 +1033,20 @@ fn scheduler_tests_run_once_missing_and_disabled_node_write_failed_observations(
     {
         let store = Store::open(&database).expect("open store");
         store
-            .add_node(&NodeInsert {
-                node_id: "disabled-node".to_string(),
-                endpoint_id: iroh::SecretKey::generate().public().to_string(),
-                name: "disabled-node".to_string(),
-                region: "hk".to_string(),
-                role: "ocserv".to_string(),
-            })
+            .add_node(
+                &NodeInsert {
+                    node_id: "disabled-node".to_string(),
+                    endpoint_id: iroh::SecretKey::generate().public().to_string(),
+                    name: "disabled-node".to_string(),
+                    region: "hk".to_string(),
+                    role: "ocserv".to_string(),
+                },
+                "scheduler-test",
+            )
             .expect("add node");
-        store.disable_node("disabled-node").expect("disable node");
+        store
+            .disable_node("disabled-node", "scheduler-test")
+            .expect("disable node");
     }
 
     run_ocfleet(&[
@@ -1247,13 +1252,16 @@ fn scheduler_tests_failed_after_run_insert_finishes_run_as_failed() {
 fn add_node_with_generated_endpoint(store: &Store, node_id: &str) -> String {
     let endpoint_id = iroh::SecretKey::generate().public().to_string();
     store
-        .add_node(&NodeInsert {
-            node_id: node_id.to_string(),
-            endpoint_id: endpoint_id.clone(),
-            name: node_id.to_string(),
-            region: "hk".to_string(),
-            role: "ocserv".to_string(),
-        })
+        .add_node(
+            &NodeInsert {
+                node_id: node_id.to_string(),
+                endpoint_id: endpoint_id.clone(),
+                name: node_id.to_string(),
+                region: "hk".to_string(),
+                role: "ocserv".to_string(),
+            },
+            "scheduler-test",
+        )
         .expect("add node");
     endpoint_id
 }

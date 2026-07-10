@@ -1,7 +1,7 @@
 use crate::audit::AuditEvent;
 use crate::store::{
     AlertEventRecord, ApprovalInput, AuditRecord, EndpointTrustRecord, HealthPolicyRecord,
-    HealthSnapshotRecord, NodeRecord, ObservabilityJobRecord, ObservabilityRunRecord,
+    HealthSnapshotRecord, NodeInsert, NodeRecord, ObservabilityJobRecord, ObservabilityRunRecord,
     ProbeObservationRecord, Store, StoreError,
 };
 
@@ -44,6 +44,10 @@ pub trait StoreReader {
 pub trait StoreWriter {
     type Error;
 
+    fn write_node_add(&self, node: &NodeInsert, actor: &str) -> Result<(), Self::Error>;
+    fn write_node_enable(&self, node_id: &str, actor: &str) -> Result<(), Self::Error>;
+    fn write_node_disable(&self, node_id: &str, actor: &str) -> Result<(), Self::Error>;
+    fn write_node_remove(&self, node_id: &str, actor: &str) -> Result<(), Self::Error>;
     fn write_health_policy(
         &self,
         policy: &HealthPolicyRecord,
@@ -179,6 +183,22 @@ impl StoreReader for Store {
 
 impl StoreWriter for Store {
     type Error = StoreError;
+
+    fn write_node_add(&self, node: &NodeInsert, actor: &str) -> Result<(), Self::Error> {
+        Store::add_node(self, node, actor)
+    }
+
+    fn write_node_enable(&self, node_id: &str, actor: &str) -> Result<(), Self::Error> {
+        Store::enable_node(self, node_id, actor)
+    }
+
+    fn write_node_disable(&self, node_id: &str, actor: &str) -> Result<(), Self::Error> {
+        Store::disable_node(self, node_id, actor)
+    }
+
+    fn write_node_remove(&self, node_id: &str, actor: &str) -> Result<(), Self::Error> {
+        Store::remove_node(self, node_id, actor)
+    }
 
     fn write_health_policy(
         &self,

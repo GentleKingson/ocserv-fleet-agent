@@ -14,6 +14,9 @@ production-complete.
 - Web/API dashboard is experimentally implemented as a read-only observation surface.
 - Governance foundation work has started: actor identity, trust policy
   validation/diff, and optional signed audit export are implemented.
+- Production hardening is active: node add/enable/disable/remove use one
+  actor-bound SQLite transaction for both state and audit; other legacy
+  controller mutations are still being migrated.
 - The project is not production-complete.
 
 ## What It Does
@@ -219,7 +222,7 @@ target/debug/ocfleet enroll request create \
   --fingerprint <agent-fingerprint> \
   --requested-endpoint-id <agent_endpoint_id> \
   --hostname hk-ocserv-01 \
-  --agent-version 0.1.0
+  --agent-version 0.2.0
 
 target/debug/ocfleet enroll approve <join-request-id> \
   --endpoint-id <agent_endpoint_id> \
@@ -448,7 +451,7 @@ Networking must allow the controller to reach the agent through iroh using the r
 - `docs/release-notes/v0.2.0.md`: v0.2.0 read-only release-candidate notes and known limitations.
 - `docs/release-notes/v0.1.0.md`: v0.1.0 release notes and known limitations.
 - `docs/status.md`: implementation status by feature and CLI surface.
-- `docs/roadmap.md`: forward roadmap from the current documentation baseline.
+- `docs/roadmap.md`: historical Phase 12 staging roadmap.
 - `docs/alert-webhook.md`: HTTPS webhook alert delivery security model and HMAC contract.
 - `docs/phase-10-enrollment-trust.md`: Phase 10 onboarding and trust lifecycle guide.
 - `docs/ocserv-readonly-spec.md`: Phase 11 ocserv read-only RPC contract.
@@ -456,6 +459,10 @@ Networking must allow the controller to reach the agent through iroh using the r
 - `docs/api.md`: experimental read-only HTTP API routes, auth, and redaction rules.
 - `docs/dashboard.md`: experimental static dashboard behavior and limits.
 - `docs/governance.md`: operator identity, RBAC roles, audit model, and trust policy workflow.
+- `docs/next-roadmap.md`: authoritative implementation DAG, milestone issues,
+  dependencies, acceptance gates, and completion evidence.
+- `docs/adr/ADR-atomic-audit-writes.md`: fail-closed controller mutation and
+  audit transaction decision.
 - `docs/trust-policy.md`: trust policy as code schema, validation, and diff behavior.
 - `docs/backend.md`: SQLite contract and optional Postgres backend plan.
 - `docs/archive-export.md`: long-term history archive and signed audit export guidance.
@@ -476,7 +483,14 @@ Run the standard checks:
 ```bash
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace -j1 -- --test-threads=1
+cargo test --workspace --all-features -j1 -- --test-threads=1
+bash scripts/check-doc-claims.sh
+./scripts/tests/test-controller-mutation-guard.sh
+./scripts/check-controller-mutations.sh
+./scripts/check-github-actions-pinning.sh
+./scripts/test-release-version-validation.sh
 ```
 
 Docker can be used when the local Rust toolchain is unavailable:
@@ -485,7 +499,7 @@ Docker can be used when the local Rust toolchain is unavailable:
 docker run --rm \
   -v "$PWD:/workspace" \
   -w /workspace \
-  rust:1.96 \
+  rust:1.96.1 \
   cargo test --workspace -j1 -- --test-threads=1
 ```
 

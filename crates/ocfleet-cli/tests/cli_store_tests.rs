@@ -1,4 +1,5 @@
 use ocfleet_cli::audit::AuditEvent;
+use ocfleet_cli::backend::StoreWriter;
 use ocfleet_cli::store::{
     ApprovalInput, CURRENT_SCHEMA_VERSION, EnrollmentTokenInsert, JoinRequestInsert, NodeInsert,
     Store, StoreError,
@@ -7,6 +8,8 @@ use ocfleet_protocol::enrollment::{EndpointStatus, EnrollmentTokenStatus, JoinRe
 use rusqlite::Connection;
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
+
+const TEST_ACTOR: &str = "store-test";
 
 fn cwd_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -249,8 +252,8 @@ fn node_endpoint_id_must_be_unique() {
         region: "hk".into(),
         role: "ocserv".into(),
     };
-    store.add_node(&first).expect("first insert");
-    assert!(store.add_node(&second).is_err());
+    store.add_node(&first, TEST_ACTOR).expect("first insert");
+    assert!(store.add_node(&second, TEST_ACTOR).is_err());
 }
 
 #[test]
@@ -265,8 +268,10 @@ fn disabled_node_is_visible_but_not_enabled() {
         region: "hk".into(),
         role: "ocserv".into(),
     };
-    store.add_node(&node).expect("insert");
-    store.disable_node("hk-ocserv-01").expect("disable");
+    store.add_node(&node, TEST_ACTOR).expect("insert");
+    store
+        .disable_node("hk-ocserv-01", TEST_ACTOR)
+        .expect("disable");
     let loaded = store
         .get_node("hk-ocserv-01")
         .expect("load")
@@ -280,9 +285,136 @@ fn missing_node_mutations_return_node_not_found() {
     let db = dir.path().join("controller.sqlite");
     let store = Store::open(&db).expect("store opens");
 
-    assert_node_not_found(store.disable_node("missing-disable"), "missing-disable");
-    assert_node_not_found(store.enable_node("missing-enable"), "missing-enable");
-    assert_node_not_found(store.remove_node("missing-remove"), "missing-remove");
+    assert_node_not_found(
+        store.disable_node("missing-disable", TEST_ACTOR),
+        "missing-disable",
+    );
+    assert_node_not_found(
+        store.enable_node("missing-enable", TEST_ACTOR),
+        "missing-enable",
+    );
+    assert_node_not_found(
+        store.remove_node("missing-remove", TEST_ACTOR),
+        "missing-remove",
+    );
+}
+
+#[test]
+fn node_lifecycle_writes_actor_bound_before_after_audit() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("controller.sqlite");
+    let store = Store::open(&db).expect("store opens");
+    let node = NodeInsert {
+        node_id: "hk-ocserv-01".into(),
+        endpoint_id: "endpoint-one".into(),
+        name: "hk-ocserv-01".into(),
+        region: "hk".into(),
+        role: "ocserv".into(),
+    };
+
+    StoreWriter::write_node_add(&store, &node, "alice").expect("add node");
+    let (actor, event, node_id, endpoint_id, detail) = latest_node_audit(&db);
+    assert_eq!(actor, "alice");
+    assert_eq!(event, "node.add");
+    assert_eq!(node_id.as_deref(), Some("hk-ocserv-01"));
+    assert_eq!(endpoint_id.as_deref(), Some("endpoint-one"));
+    assert_eq!(detail["actor_type"], "user");
+    assert_eq!(detail["target_type"], "node");
+    assert_eq!(detail["target_id"], "hk-ocserv-01");
+    assert_eq!(detail["before"], serde_json::Value::Null);
+    assert_eq!(detail["after"]["enabled"], true);
+    assert_eq!(detail["reason"], serde_json::Value::Null);
+    assert!(detail["after"].get("name").is_none());
+
+    StoreWriter::write_node_disable(&store, "hk-ocserv-01", "bob").expect("disable node");
+    let (actor, event, _, _, detail) = latest_node_audit(&db);
+    assert_eq!(actor, "bob");
+    assert_eq!(event, "node.disable");
+    assert_eq!(detail["before"]["enabled"], true);
+    assert_eq!(detail["after"]["enabled"], false);
+
+    StoreWriter::write_node_enable(&store, "hk-ocserv-01", "carol").expect("enable node");
+    let (actor, event, _, _, detail) = latest_node_audit(&db);
+    assert_eq!(actor, "carol");
+    assert_eq!(event, "node.enable");
+    assert_eq!(detail["before"]["enabled"], false);
+    assert_eq!(detail["after"]["enabled"], true);
+
+    StoreWriter::write_node_remove(&store, "hk-ocserv-01", "dave").expect("remove node");
+    let (actor, event, _, _, detail) = latest_node_audit(&db);
+    assert_eq!(actor, "dave");
+    assert_eq!(event, "node.remove");
+    assert_eq!(detail["before"]["node_id"], "hk-ocserv-01");
+    assert_eq!(detail["after"], serde_json::Value::Null);
+}
+
+#[test]
+fn node_add_rolls_back_registry_and_trust_when_audit_insert_fails() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("controller.sqlite");
+    let store = Store::open(&db).expect("store opens");
+    inject_audit_insert_failure(&db);
+    let node = NodeInsert {
+        node_id: "hk-ocserv-01".into(),
+        endpoint_id: "endpoint-one".into(),
+        name: "hk-ocserv-01".into(),
+        region: "hk".into(),
+        role: "ocserv".into(),
+    };
+
+    assert!(matches!(
+        StoreWriter::write_node_add(&store, &node, TEST_ACTOR),
+        Err(StoreError::Sqlite(_))
+    ));
+    assert!(store.get_node(&node.node_id).expect("load node").is_none());
+    assert!(
+        store
+            .get_endpoint_trust(&node.endpoint_id)
+            .expect("load endpoint trust")
+            .is_none()
+    );
+    assert_eq!(store.audit_count().expect("audit count"), 0);
+}
+
+#[test]
+fn node_state_and_remove_drop_transaction_when_audit_insert_fails() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("controller.sqlite");
+    let store = Store::open(&db).expect("store opens");
+    let node = NodeInsert {
+        node_id: "hk-ocserv-01".into(),
+        endpoint_id: "endpoint-one".into(),
+        name: "hk-ocserv-01".into(),
+        region: "hk".into(),
+        role: "ocserv".into(),
+    };
+    StoreWriter::write_node_add(&store, &node, TEST_ACTOR).expect("seed node");
+    inject_audit_insert_failure(&db);
+
+    assert!(matches!(
+        StoreWriter::write_node_disable(&store, &node.node_id, TEST_ACTOR),
+        Err(StoreError::Sqlite(_))
+    ));
+    assert!(
+        store
+            .get_node(&node.node_id)
+            .expect("load node")
+            .expect("node exists")
+            .enabled
+    );
+
+    assert!(matches!(
+        StoreWriter::write_node_remove(&store, &node.node_id, TEST_ACTOR),
+        Err(StoreError::Sqlite(_))
+    ));
+    assert!(store.get_node(&node.node_id).expect("load node").is_some());
+    assert!(
+        store
+            .get_endpoint_trust(&node.endpoint_id)
+            .expect("load endpoint trust")
+            .is_some()
+    );
+    assert_eq!(store.audit_count().expect("audit count"), 1);
 }
 
 #[test]
@@ -307,15 +439,12 @@ fn removed_node_does_not_remove_audit_rows() {
         region: "hk".into(),
         role: "ocserv".into(),
     };
-    store.add_node(&node).expect("insert");
-    let mut event = AuditEvent::new("local-cli", "node.add");
-    event.node_id = Some("hk-ocserv-01".into());
-    event.endpoint_id = Some("endpoint-one".into());
-    event.ok = Some(true);
-    store.insert_audit(&event).expect("audit insert");
-    store.remove_node("hk-ocserv-01").expect("remove");
+    store.add_node(&node, TEST_ACTOR).expect("insert");
+    store
+        .remove_node("hk-ocserv-01", TEST_ACTOR)
+        .expect("remove");
     assert!(store.get_node("hk-ocserv-01").expect("load").is_none());
-    assert_eq!(store.audit_count().expect("count"), 1);
+    assert_eq!(store.audit_count().expect("count"), 2);
 }
 
 fn future_time() -> String {
@@ -339,6 +468,51 @@ fn latest_audit_event(database: &Path) -> (String, serde_json::Value) {
         event,
         serde_json::from_str(&detail).expect("parse audit detail"),
     )
+}
+
+fn latest_node_audit(
+    database: &Path,
+) -> (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    serde_json::Value,
+) {
+    let conn = Connection::open(database).expect("open db");
+    let (actor, event, node_id, endpoint_id, detail): (
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        String,
+    ) = conn
+        .query_row(
+            "SELECT actor, event, node_id, endpoint_id, detail_json FROM controller_audit_log ORDER BY id DESC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )
+        .expect("latest node audit");
+    (
+        actor,
+        event,
+        node_id,
+        endpoint_id,
+        serde_json::from_str(&detail).expect("parse audit detail"),
+    )
+}
+
+fn inject_audit_insert_failure(database: &Path) {
+    let conn = Connection::open(database).expect("open db for audit failure injection");
+    // ABORT fails only the audit statement; the writer transaction must roll back on drop.
+    conn.execute_batch(
+        "CREATE TRIGGER fail_controller_audit_insert
+         BEFORE INSERT ON controller_audit_log
+         BEGIN
+           SELECT RAISE(ABORT, 'injected audit insert failure');
+         END;",
+    )
+    .expect("install audit failure trigger");
 }
 
 #[test]
@@ -751,7 +925,7 @@ fn endpoint_lifecycle_rotate_revoke_and_quarantine_update_status_and_generation(
         role: "ocserv".into(),
     };
     store
-        .add_node(&node)
+        .add_node(&node, TEST_ACTOR)
         .expect("insert node and endpoint trust");
 
     let rotated = store
@@ -802,7 +976,7 @@ fn endpoint_rotate_rejects_non_canonical_new_endpoint_id() {
         role: "ocserv".into(),
     };
     store
-        .add_node(&node)
+        .add_node(&node, TEST_ACTOR)
         .expect("insert node and endpoint trust");
 
     let err = store

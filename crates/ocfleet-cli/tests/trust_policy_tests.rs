@@ -251,22 +251,28 @@ fn trust_policy_diff_does_not_mutate_controller_state() {
     let endpoint_b = iroh::SecretKey::generate().public().to_string();
     let store = Store::open(&database).expect("open store");
     store
-        .add_node(&NodeInsert {
-            node_id: "node-a".to_string(),
-            endpoint_id: endpoint_a.clone(),
-            name: "node-a".to_string(),
-            region: "hk".to_string(),
-            role: "ocserv".to_string(),
-        })
+        .add_node(
+            &NodeInsert {
+                node_id: "node-a".to_string(),
+                endpoint_id: endpoint_a.clone(),
+                name: "node-a".to_string(),
+                region: "hk".to_string(),
+                role: "ocserv".to_string(),
+            },
+            "trust-policy-test",
+        )
         .expect("add node a");
     store
-        .add_node(&NodeInsert {
-            node_id: "node-b".to_string(),
-            endpoint_id: endpoint_b.clone(),
-            name: "node-b".to_string(),
-            region: "sg".to_string(),
-            role: "ocserv".to_string(),
-        })
+        .add_node(
+            &NodeInsert {
+                node_id: "node-b".to_string(),
+                endpoint_id: endpoint_b.clone(),
+                name: "node-b".to_string(),
+                region: "sg".to_string(),
+                role: "ocserv".to_string(),
+            },
+            "trust-policy-test",
+        )
         .expect("add node b");
     drop(store);
     write_basic_policy(&policy, &endpoint_a, &endpoint_b);
@@ -302,13 +308,16 @@ fn trust_policy_diff_writes_markdown_review_summary() {
     let endpoint_b = iroh::SecretKey::generate().public().to_string();
     let store = Store::open(&database).expect("open store");
     store
-        .add_node(&NodeInsert {
-            node_id: "node-a".to_string(),
-            endpoint_id: endpoint_a.clone(),
-            name: "node-a".to_string(),
-            region: "hk".to_string(),
-            role: "ocserv".to_string(),
-        })
+        .add_node(
+            &NodeInsert {
+                node_id: "node-a".to_string(),
+                endpoint_id: endpoint_a.clone(),
+                name: "node-a".to_string(),
+                region: "hk".to_string(),
+                role: "ocserv".to_string(),
+            },
+            "trust-policy-test",
+        )
         .expect("add node a");
     drop(store);
     write_basic_policy(&policy, &endpoint_a, &endpoint_b);
@@ -584,13 +593,16 @@ fn trust_policy_diff_reports_controller_peer_and_path_probe_allowlist_drift() {
         ("node-b", endpoint_b.as_str(), "sg"),
     ] {
         store
-            .add_node(&NodeInsert {
-                node_id: node_id.to_string(),
-                endpoint_id: endpoint_id.to_string(),
-                name: node_id.to_string(),
-                region: region.to_string(),
-                role: "ocserv".to_string(),
-            })
+            .add_node(
+                &NodeInsert {
+                    node_id: node_id.to_string(),
+                    endpoint_id: endpoint_id.to_string(),
+                    name: node_id.to_string(),
+                    region: region.to_string(),
+                    role: "ocserv".to_string(),
+                },
+                "trust-policy-test",
+            )
             .expect("add node");
     }
     drop(store);
@@ -652,13 +664,16 @@ fn trust_policy_diff_output_is_bounded_and_reports_truncation() {
         ("node-b", endpoint_b.as_str(), "sg"),
     ] {
         store
-            .add_node(&NodeInsert {
-                node_id: node_id.to_string(),
-                endpoint_id: endpoint_id.to_string(),
-                name: node_id.to_string(),
-                region: region.to_string(),
-                role: "ocserv".to_string(),
-            })
+            .add_node(
+                &NodeInsert {
+                    node_id: node_id.to_string(),
+                    endpoint_id: endpoint_id.to_string(),
+                    name: node_id.to_string(),
+                    region: region.to_string(),
+                    role: "ocserv".to_string(),
+                },
+                "trust-policy-test",
+            )
             .expect("add node");
     }
     drop(store);
@@ -706,13 +721,16 @@ fn trust_policy_diff_flags_active_state_for_quarantined_policy_endpoint() {
     let endpoint = iroh::SecretKey::generate().public().to_string();
     let store = Store::open(&database).expect("open store");
     store
-        .add_node(&NodeInsert {
-            node_id: "node-a".to_string(),
-            endpoint_id: endpoint.clone(),
-            name: "node-a".to_string(),
-            region: "hk".to_string(),
-            role: "ocserv".to_string(),
-        })
+        .add_node(
+            &NodeInsert {
+                node_id: "node-a".to_string(),
+                endpoint_id: endpoint.clone(),
+                name: "node-a".to_string(),
+                region: "hk".to_string(),
+                role: "ocserv".to_string(),
+            },
+            "trust-policy-test",
+        )
         .expect("add node");
     drop(store);
     let policy = dir.path().join("trust-policy.toml");
@@ -759,13 +777,16 @@ fn trust_policy_diff_does_not_echo_malformed_stored_projection_values() {
     let endpoint = iroh::SecretKey::generate().public().to_string();
     let store = Store::open(&database).expect("open store");
     store
-        .add_node(&NodeInsert {
-            node_id: "node-a".to_string(),
-            endpoint_id: endpoint.clone(),
-            name: "node-a".to_string(),
-            region: "hk".to_string(),
-            role: "ocserv".to_string(),
-        })
+        .add_node(
+            &NodeInsert {
+                node_id: "node-a".to_string(),
+                endpoint_id: endpoint.clone(),
+                name: "node-a".to_string(),
+                region: "hk".to_string(),
+                role: "ocserv".to_string(),
+            },
+            "trust-policy-test",
+        )
         .expect("add node");
     drop(store);
     Connection::open(&database)

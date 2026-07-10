@@ -79,9 +79,10 @@ scaffold, implemented slice, operational maturity, and release verification.
 
 ## Execution DAG
 
-The current execution node is **A1** on issue `#33`. Statuses describe the
-milestone at this baseline, not just the amount of supporting code already in
-the repository.
+The current execution node is **A1** on issue `#33`; the node-lifecycle slice is
+active in pull request `#57` from branch `codex/a1-node-audit-atomicity`.
+Statuses describe the milestone, not just the amount of supporting code already
+in the repository.
 
 ### Baseline And Production Foundation
 

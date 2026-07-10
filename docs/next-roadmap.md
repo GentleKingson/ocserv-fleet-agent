@@ -84,8 +84,9 @@ merged through pull request `#57`, the scheduler-job configuration slice merged
 through pull request `#58`, and the endpoint-trust fail-closed slice merged
 through pull request `#59`. Atomic scheduler run, outcome, observation, audit,
 and job-clock transitions are active on branch
-`codex/a1-scheduler-persistence-atomicity`. Statuses describe the milestone, not
-just the amount of supporting code already in the repository.
+`codex/a1-scheduler-persistence-atomicity` in pull request `#60`. Statuses
+describe the milestone, not just the amount of supporting code already in the
+repository.
 
 ### Baseline And Production Foundation
 

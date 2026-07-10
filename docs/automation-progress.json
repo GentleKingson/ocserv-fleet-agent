@@ -4,9 +4,9 @@
   "completed_phases": [],
   "active_branch": "codex/a1-scheduler-persistence-atomicity",
   "active_issue": 33,
-  "active_pr": null,
+  "active_pr": 60,
   "last_test_result": "passed",
-  "last_updated_at": "2026-07-10T17:48:54Z",
+  "last_updated_at": "2026-07-10T17:50:53Z",
   "blockers": [],
-  "next_action": "Commit and push the verified scheduler persistence slice, open its A1 pull request, and merge only after all required checks pass."
+  "next_action": "Monitor pull request 60, fix any failures, and merge only after all required checks pass."
 }

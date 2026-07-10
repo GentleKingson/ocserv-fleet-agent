@@ -100,6 +100,17 @@ fn latest_audit(database: &Path) -> (String, i64, Value) {
     )
 }
 
+fn latest_audit_actor(database: &Path) -> String {
+    Connection::open(database)
+        .expect("open db")
+        .query_row(
+            "SELECT actor FROM controller_audit_log ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("latest audit actor")
+}
+
 fn wait_for_audit_event(
     database: &Path,
     event_name: &str,
@@ -532,6 +543,8 @@ fn scheduler_tests_enable_disable_writes_audit() {
     let database_arg = database.to_string_lossy().into_owned();
 
     let add = run_ocfleet(&[
+        "--actor",
+        "scheduler-operator",
         "--database",
         &database_arg,
         "schedule",
@@ -543,8 +556,17 @@ fn scheduler_tests_enable_disable_writes_audit() {
         "60s",
     ]);
     let job_id = parse_job_id(&add.stdout);
+    let (event, ok, detail) = latest_audit(&database);
+    assert_eq!(latest_audit_actor(&database), "scheduler-operator");
+    assert_eq!(event, "scheduler.job.add");
+    assert_eq!(ok, 1);
+    assert_eq!(detail["job_id"], job_id);
+    assert_eq!(detail["before"], Value::Null);
+    assert_eq!(detail["after"]["enabled"], true);
 
     run_ocfleet(&[
+        "--actor",
+        "scheduler-operator",
         "--database",
         &database_arg,
         "schedule",
@@ -553,12 +575,17 @@ fn scheduler_tests_enable_disable_writes_audit() {
         &job_id,
     ]);
     let (event, ok, detail) = latest_audit(&database);
+    assert_eq!(latest_audit_actor(&database), "scheduler-operator");
     assert_eq!(event, "scheduler.job.disable");
     assert_eq!(ok, 1);
     assert_eq!(detail["job_id"], job_id);
     assert_eq!(detail["enabled"], false);
+    assert_eq!(detail["before"]["enabled"], true);
+    assert_eq!(detail["after"]["enabled"], false);
 
     run_ocfleet(&[
+        "--actor",
+        "scheduler-operator",
         "--database",
         &database_arg,
         "schedule",
@@ -567,10 +594,13 @@ fn scheduler_tests_enable_disable_writes_audit() {
         &job_id,
     ]);
     let (event, ok, detail) = latest_audit(&database);
+    assert_eq!(latest_audit_actor(&database), "scheduler-operator");
     assert_eq!(event, "scheduler.job.enable");
     assert_eq!(ok, 1);
     assert_eq!(detail["job_id"], job_id);
     assert_eq!(detail["enabled"], true);
+    assert_eq!(detail["before"]["enabled"], false);
+    assert_eq!(detail["after"]["enabled"], true);
 }
 
 #[test]
@@ -995,6 +1025,22 @@ fn scheduler_tests_invalid_job_and_run_ids_return_clear_errors() {
             "schedule",
             "job",
             "show",
+            "missing-job",
+        ],
+        vec![
+            "--database",
+            &database_arg,
+            "schedule",
+            "job",
+            "enable",
+            "missing-job",
+        ],
+        vec![
+            "--database",
+            &database_arg,
+            "schedule",
+            "job",
+            "disable",
             "missing-job",
         ],
         vec![

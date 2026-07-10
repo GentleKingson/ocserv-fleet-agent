@@ -26,6 +26,7 @@ use uuid::Uuid;
 use crate::alerts::{AlertEvaluationSummary, evaluate_alerts_with_summary};
 use crate::args::{ScheduleCommand, ScheduleJobCommand, ScheduleJobKind, ScheduleRunCommand};
 use crate::audit::AuditEvent;
+use crate::backend::StoreWriter;
 use crate::controller_rpc::{
     CONTROLLER_RPC_RESULT_CLASS, FixedControllerRpc, OCSERV_RESULT_CLASS, OcservRpcOutcome,
     RpcAuditRecord, RpcCommandFailure, elapsed_ms, error_code_name, execute_fixed_node_rpc,
@@ -291,10 +292,11 @@ fn validate_tick_seconds(tick_seconds: u64) -> anyhow::Result<()> {
 pub async fn run_schedule_command(
     store: &Store,
     secret_key_path: &Path,
+    actor: &str,
     command: ScheduleCommand,
 ) -> anyhow::Result<()> {
     match command {
-        ScheduleCommand::Job { command } => run_schedule_job_command(store, command),
+        ScheduleCommand::Job { command } => run_schedule_job_command(store, actor, command),
         ScheduleCommand::Run {
             command,
             once,
@@ -330,7 +332,11 @@ pub async fn run_schedule_command(
     }
 }
 
-fn run_schedule_job_command(store: &Store, command: ScheduleJobCommand) -> anyhow::Result<()> {
+fn run_schedule_job_command(
+    store: &Store,
+    actor: &str,
+    command: ScheduleJobCommand,
+) -> anyhow::Result<()> {
     match command {
         ScheduleJobCommand::Add {
             name,
@@ -341,43 +347,51 @@ fn run_schedule_job_command(store: &Store, command: ScheduleJobCommand) -> anyho
             target_node_id,
         } => add_job(
             store,
-            name,
-            kind,
-            &interval,
-            selector,
-            source_node_id,
-            target_node_id,
+            actor,
+            AddJobInput {
+                name,
+                kind,
+                interval,
+                selector,
+                source_node_id,
+                target_node_id,
+            },
         ),
         ScheduleJobCommand::List { json } => list_jobs(store, json),
         ScheduleJobCommand::Show { job_id, json } => show_job(store, &job_id, json),
         ScheduleJobCommand::Validate { job_id, json } => validate_job(store, &job_id, json),
-        ScheduleJobCommand::Enable { job_id } => set_job_enabled(store, &job_id, true),
-        ScheduleJobCommand::Disable { job_id } => set_job_enabled(store, &job_id, false),
+        ScheduleJobCommand::Enable { job_id } => set_job_enabled(store, actor, &job_id, true),
+        ScheduleJobCommand::Disable { job_id } => set_job_enabled(store, actor, &job_id, false),
     }
 }
 
-fn add_job(
-    store: &Store,
+struct AddJobInput {
     name: Option<String>,
     kind: ScheduleJobKind,
-    interval: &str,
+    interval: String,
     selector: Option<String>,
     source_node_id: Option<String>,
     target_node_id: Option<String>,
-) -> anyhow::Result<()> {
-    if let Some(name) = &name {
+}
+
+fn add_job(store: &Store, actor: &str, input: AddJobInput) -> anyhow::Result<()> {
+    if let Some(name) = &input.name {
         validate_description(name).map_err(anyhow::Error::msg)?;
     }
-    let interval_seconds = parse_interval_seconds(interval)?;
-    let (selector_value, pair_selector_json) =
-        build_selectors(kind, selector, source_node_id, target_node_id)?;
+    let interval_seconds = parse_interval_seconds(&input.interval)?;
+    let (selector_value, pair_selector_json) = build_selectors(
+        input.kind,
+        input.selector,
+        input.source_node_id,
+        input.target_node_id,
+    )?;
     let now = now_rfc3339();
     let job = ObservabilityJobRecord {
         job_id: format!("job-{}", Uuid::new_v4().simple()),
-        kind: schedule_kind_name(kind).to_string(),
+        kind: schedule_kind_name(input.kind).to_string(),
         selector_json: json!({
             "selector": selector_value,
-            "name": name,
+            "name": input.name,
         }),
         pair_selector_json,
         interval_seconds,
@@ -389,20 +403,7 @@ fn add_job(
         created_at: now.clone(),
         updated_at: now,
     };
-    store.insert_observability_job(&job)?;
-    write_scheduler_audit(
-        store,
-        "scheduler.job.add",
-        true,
-        json!({
-            "job_id": job.job_id.as_str(),
-            "name": job_name(&job),
-            "kind": job.kind.as_str(),
-            "interval_seconds": job.interval_seconds,
-            "selector": selector_value.as_str(),
-            "result_class": SCHEDULER_RESULT_CLASS,
-        }),
-    )?;
+    StoreWriter::write_scheduler_job_add(store, &job, actor)?;
     println!("job_id={}", job.job_id);
     println!("name={}", job_name(&job).unwrap_or("<none>"));
     println!("kind={}", job.kind);
@@ -616,30 +617,12 @@ fn validate_registry_node(store: &Store, node_id: &str) -> Result<(), (String, S
     Ok(())
 }
 
-fn set_job_enabled(store: &Store, job_id: &str, enabled: bool) -> anyhow::Result<()> {
-    if !store
-        .list_observability_jobs()?
-        .iter()
-        .any(|job| job.job_id == job_id)
-    {
-        bail!("observability job not found: {job_id}");
-    }
-    store.set_observability_job_enabled(job_id, enabled)?;
-    let event_name = if enabled {
-        "scheduler.job.enable"
+fn set_job_enabled(store: &Store, actor: &str, job_id: &str, enabled: bool) -> anyhow::Result<()> {
+    if enabled {
+        StoreWriter::write_scheduler_job_enable(store, job_id, actor)?;
     } else {
-        "scheduler.job.disable"
-    };
-    write_scheduler_audit(
-        store,
-        event_name,
-        true,
-        json!({
-            "job_id": job_id,
-            "enabled": enabled,
-            "result_class": SCHEDULER_RESULT_CLASS,
-        }),
-    )?;
+        StoreWriter::write_scheduler_job_disable(store, job_id, actor)?;
+    }
     println!("job_id={job_id}");
     println!("enabled={enabled}");
     Ok(())

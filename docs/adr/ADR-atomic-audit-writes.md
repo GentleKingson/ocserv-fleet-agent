@@ -32,8 +32,9 @@ An audit insertion error is a business-operation error. Dropping the transaction
 at any point before the final commit rolls back both writes. Callers must not add
 a second success audit for the same mutation.
 
-The first rollout slice covers node add, enable, disable, and remove. Later slices
-cover scheduler/run/observation, health/alert/delivery, retention, and missing
+The first rollout slice covers node add, enable, disable, and remove. The second
+slice covers scheduler job add, enable, and disable. Later slices cover
+scheduler run/outcome/observation, health/alert/delivery, retention, and missing
 enrollment lifecycle transitions. Read-only events may continue to use the
 standalone audit writer because they have no paired business mutation.
 
@@ -41,15 +42,17 @@ standalone audit writer because they have no paired business mutation.
 
 Audit events use fixed event names and bounded fields. They may contain stable
 node and endpoint identifiers already allowed by the controller audit contract,
-plus closed before/after state such as `enabled`. They do not contain secrets,
-tokens, raw RPC bodies, local paths, commands, stdout, stderr, or arbitrary
-database JSON.
+stable scheduler job identifiers and fixed job kinds, plus closed before/after
+state such as `enabled`. They do not contain secrets, tokens, raw RPC bodies,
+local paths, commands, stdout, stderr, or arbitrary database JSON.
+Scheduler job projections reduce selectors to a fixed class and omit free-form
+job names and selector values, including when legacy rows contain unsafe text.
 
 ## Enforcement
 
 - Backend contracts identify actor-bearing mutation entry points.
 - Integration tests install a failing `BEFORE INSERT` audit trigger and prove
-  that affected business tables remain unchanged.
+  that affected node, endpoint-trust, and scheduler-job tables remain unchanged.
 - Transaction-drop tests exercise the pre-commit boundary.
 - A repository check restricts controller mutation SQL to reviewed storage and
   migration modules; it is a guardrail, not a substitute for code review.
@@ -70,7 +73,8 @@ continues to open SQLite with read-only and query-only enforcement.
 
 ## Rollback
 
-The node-lifecycle slice has no schema migration. Reverting its code restores the
-previous call structure but also restores the known audit gap, so rollback is
-appropriate only as an emergency source rollback before production use. Stored
-rows and existing audits remain compatible.
+The node-lifecycle and scheduler-job slices have no schema migration. Reverting
+either slice restores its previous call structure but also restores the known
+audit gap, so rollback is appropriate only as an emergency source rollback
+before production use. Stored rows and existing audits remain compatible; no
+protocol or API contract changes are involved.

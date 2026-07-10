@@ -24,6 +24,9 @@
 - Node add, enable, disable, and remove now take an explicit resolved actor and
   commit their registry/trust change and success audit in one SQLite
   transaction through `StoreWriter`.
+- Scheduler job add, enable, and disable now take the resolved actor and commit
+  the job configuration change and success audit in one SQLite transaction
+  through `StoreWriter`.
 - Health `unreachable` now honors the configured consecutive ping-failure
   threshold; a single recent failure is degraded.
 - Retention dry-run performs no deletion and writes no audit row.
@@ -39,6 +42,10 @@
 - Added audit-insert failure and pre-commit transaction-drop coverage proving
   node registry and endpoint-trust mutations roll back instead of committing
   without audit, plus a CI guard for controller mutation SQL placement.
+- Added audit-insert failure coverage proving scheduler job add, enable, and
+  disable roll back their `observability_jobs` changes instead of committing
+  without audit. Scheduler audit before/after projections use only fixed job
+  fields and a closed selector class, not free-form names or selector values.
 - Added bounded low-sensitive storage validation and fail-closed reader checks
   for observability/audit JSON, including secret aliases, addresses, raw
   fields, excessive nesting, entry counts, and string sizes.
@@ -68,8 +75,9 @@
 - The collector normalizes operator-supplied aggregate metadata; it does not
   discover live ocserv state or call administration/log/service tools.
 - SQLite is the only runtime backend; Postgres always returns unavailable.
-- Scheduler, retention, alert, and other remaining legacy controller mutations
-  have not yet all moved to atomic StoreWriter actor/audit transactions.
+- Scheduler run/outcome/observation, health/alert/delivery, retention, and other
+  remaining legacy controller mutations have not yet all moved to atomic
+  `StoreWriter` actor/audit transactions.
 - Controlled writes are validation-only scaffolding and have no live code path.
 - API TLS termination remains an external deployment responsibility.
 - Browser screenshot QA, cargo-deny, cargo-audit, Linux multi-architecture

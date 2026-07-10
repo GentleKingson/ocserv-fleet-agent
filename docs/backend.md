@@ -60,7 +60,10 @@ consumer must still use its typed projection. `StoreWriter` deliberately
 exposes only mutation methods that bind actor and audit in one transaction. The
 first production-hardening slice adds node add/enable/disable/remove to this
 contract and removes the CLI's post-commit success audits. Audit-trigger failure
-tests prove both `nodes` and `endpoint_trust` changes roll back.
+tests prove both `nodes` and `endpoint_trust` changes roll back. The next slice
+adds scheduler job add/enable/disable to the same contract; audit-trigger
+failure rolls back the affected `observability_jobs` insert or enabled-state
+update. Scheduler run/outcome/observation writes are not part of this slice.
 
 The API retains a narrower `ApiReadStore` adapter for API projections;
 `ReadOnlyStore` opens SQLite with read-only/query-only flags, validates private
@@ -68,10 +71,11 @@ database/sidecar files, checks schema version/tables/integrity, and never expose
 a writer to routes. Consolidating this adapter with the neutral reader remains
 future work; SQLite is the only runtime backend.
 
-Scheduler, retention, alert silence/resolve, and some enrollment lifecycle
-flows are not all migrated to the writer trait. Future writer interfaces must
-keep actor/audit input mandatory and must not loosen private file checks or
-redaction.
+Scheduler run/outcome/observation, health/alert/delivery, retention, and some
+enrollment lifecycle flows are not all migrated to the writer trait. Future
+writer interfaces must keep actor/audit input mandatory and must not loosen
+private file checks or redaction. The scheduler-job writer expansion changes no
+schema, protocol, agent capability, or API route; the API remains read-only.
 
 ## Postgres Scaffold
 

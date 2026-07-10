@@ -84,9 +84,9 @@ merged through pull request `#57`, the scheduler-job configuration slice merged
 through pull request `#58`, and the endpoint-trust fail-closed slice merged
 through pull request `#59`. Atomic scheduler run, outcome, observation, audit,
 and job-clock transitions merged through pull request `#60`. Endpoint binding
-and lifecycle state-machine hardening are locally implemented and verified on
-branch `codex/a1-endpoint-binding-state-machine`; publication and CI evidence
-are pending. This slice requires bidirectional unique Active bindings at every
+and lifecycle state-machine hardening are published in pull request `#61` from
+branch `codex/a1-endpoint-binding-state-machine`; CI and merge evidence are
+pending. This slice requires bidirectional unique Active bindings at every
 dispatch boundary, closes and audits effective lifecycle transitions, moves the
 node registry pointer during rotation, terminalizes trust during removal, and
 adds aggregate-only doctor diagnostics plus a production bypass guard. It does

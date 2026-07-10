@@ -30,7 +30,7 @@ for every status below.
 | 5. Local ocserv collector | Complete constrained implementation | Added `ocfleet-ocserv-collector`, fixed snapshot-v2 validation, private atomic output, snapshot-provider compatibility tests, hardened opt-in systemd units, and operator docs. It deliberately performs no live discovery or local tool invocation. |
 | 6. Trust policy as code | Complete review-only implementation | Added TOML/YAML parity, strict explicit-topology validation, deterministic bounded diffs, JSON/Markdown output, private create-new Markdown files, example policy, and CI helper. No apply or agent contact exists. |
 | 7. Governance/RBAC foundation | Complete foundation | Actor resolution now fails closed for invalid explicit values, including non-UTF-8 environment data. Fixed viewer/operator/security-admin policy tests exist; API principals remain viewer-only and local CLI RBAC remains intentionally unenforced. |
-| 8. Store abstraction | Implemented slice, expansion active | Added `StoreReader`, `StoreWriter`, `MigrationManager`, and `AuditWriter`; bounded SQLite reads fail closed on contaminated dynamic JSON. Node add/enable/disable/remove and scheduler job add/enable/disable now use actor-bearing atomic writer methods with audit-failure rollback tests. Scheduler run/outcome/observation, health/alert/delivery, retention, and other writers are not all migrated. API retains a narrower independent read adapter. |
+| 8. Store abstraction | Implemented slice, expansion active | Added `StoreReader`, `StoreWriter`, `MigrationManager`, and `AuditWriter`; bounded SQLite reads fail closed on contaminated dynamic JSON. Node lifecycle, scheduler job configuration, and scheduler run start/outcome/finish transitions now use actor-bearing atomic writer methods with failure-injection rollback tests. Bounded outcomes pair every observation with an audit, and finish atomically updates the owning job clock. Health/alert/delivery, retention, and other writers are not all migrated. API retains a narrower independent read adapter. |
 | 9. Optional Postgres backend | Complete non-connecting scaffold | Added default-off `postgres-backend`, redacted/validated connection-source types, and an always-unavailable connection stub. No client, DSN logging, schema, migration, import, or runtime selection exists. |
 | 10. Controlled writes | Complete dry-run design slice | Added default-off typed DTO/config validation, redacted request `Debug`, signed-intent and rollback consistency checks, outage acknowledgement, and tests proving default and feature-enabled agents still reject every write RPC. No dispatch exists. |
 | 11. CI and release readiness | Complete workflow slice | Pinned Rust 1.96.1 and actions, preserved least privilege, added default/all-feature gates, cargo-deny/audit jobs, tag-bound draft release assembly for four binaries on two architectures, release-version attack tests, install smoke coverage, and v0.2.0 install/release docs. |
@@ -64,10 +64,12 @@ their pinned GitHub Actions jobs are the verification path for this candidate.
 - Convert every dynamic controller JSON column to a closed typed storage schema;
   current writes are bounded and reject forbidden content, and outputs apply
   typed projections, but some internal records still use `serde_json::Value`.
-- Migrate scheduler run/outcome/observation, health/alert/delivery, retention,
-  and other remaining mutations to the atomic `StoreWriter` actor/audit contract
-  before claiming fully fail-closed controller mutation auditing. The completed
-  scheduler-job configuration slice changes no schema, protocol, or API route.
+- Migrate health/alert/delivery, retention, and other remaining mutations to the
+  atomic `StoreWriter` actor/audit contract before claiming fully fail-closed
+  controller mutation auditing. Scheduler job and run/outcome/finish writers
+  now use short atomic boundaries without holding a transaction across RPC;
+  incomplete outcome or finish persistence remains a durable `running` row for
+  later scheduler recovery work. This changes no schema, protocol, or API route.
 - Keep every controller and scheduler RPC gate fail closed on absent as well as
   inactive endpoint trust. The current correction adds fixed missing-trust
   outcomes and rejection audits before key or network access, repeats scheduler

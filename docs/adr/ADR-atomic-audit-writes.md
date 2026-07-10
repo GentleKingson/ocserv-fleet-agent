@@ -33,10 +33,21 @@ at any point before the final commit rolls back both writes. Callers must not ad
 a second success audit for the same mutation.
 
 The first rollout slice covers node add, enable, disable, and remove. The second
-slice covers scheduler job add, enable, and disable. Later slices cover
-scheduler run/outcome/observation, health/alert/delivery, retention, and missing
-enrollment lifecycle transitions. Read-only events may continue to use the
-standalone audit writer because they have no paired business mutation.
+slice covers scheduler job add, enable, and disable. The third slice covers
+scheduler run starts, bounded observation/RPC outcome batches, run finishes,
+and owning-job clock updates. Later slices cover health/alert/delivery,
+retention, and missing enrollment lifecycle transitions. Read-only events may
+continue to use the standalone audit writer because they have no paired
+business mutation.
+
+Scheduler execution uses several short transaction boundaries rather than one
+transaction around a run. The start row and start audit commit before dispatch;
+each bounded task outcome commits its observations and matching audits; and the
+terminal run state, job clock, and finish audit commit together. No SQLite
+transaction crosses an RPC, semaphore wait, or other `.await`. If outcome or
+finish persistence fails, the run stays `running` and the job clock stays
+unchanged. Recovery of that durable incomplete-run marker belongs to scheduler
+reliability work rather than being hidden by a false terminal result.
 
 ## Audit Projection
 
@@ -51,8 +62,9 @@ job names and selector values, including when legacy rows contain unsafe text.
 ## Enforcement
 
 - Backend contracts identify actor-bearing mutation entry points.
-- Integration tests install a failing `BEFORE INSERT` audit trigger and prove
-  that affected node, endpoint-trust, and scheduler-job tables remain unchanged.
+- Integration tests install failing audit, observation, and job-clock triggers
+  and prove that affected node, endpoint-trust, scheduler-job, run, outcome, and
+  clock changes roll back as one unit.
 - Transaction-drop tests exercise the pre-commit boundary.
 - A repository check restricts controller mutation SQL to reviewed storage and
   migration modules; it is a guardrail, not a substitute for code review.
@@ -73,8 +85,8 @@ continues to open SQLite with read-only and query-only enforcement.
 
 ## Rollback
 
-The node-lifecycle and scheduler-job slices have no schema migration. Reverting
-either slice restores its previous call structure but also restores the known
-audit gap, so rollback is appropriate only as an emergency source rollback
-before production use. Stored rows and existing audits remain compatible; no
-protocol or API contract changes are involved.
+The node-lifecycle, scheduler-job, and scheduler-run slices have no schema
+migration. Reverting one restores its previous call structure but also restores
+the known audit gap, so rollback is appropriate only as an emergency source
+rollback before production use. Stored rows and existing audits remain
+compatible; no protocol or API contract changes are involved.

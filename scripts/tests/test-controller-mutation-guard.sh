@@ -66,4 +66,40 @@ if ! grep -Fq 'unsafe_writer.rs:2: controller mutation SQL outside' "$fail_outpu
   exit 1
 fi
 
+rm -f "$cli_src/unsafe_writer.rs"
+printf '%s\n' \
+  'pub fn bypass(store: &Store, observation: &ProbeObservationInsert) {' \
+  '    store.insert_probe_observation(observation);' \
+  '}' \
+  > "$cli_src/unsafe_scheduler_writer.rs"
+
+legacy_fail_output="$tmp_dir/legacy-fail-output"
+if "$GUARD" --repo-root "$fixture_root" "$fixture_root" >"$legacy_fail_output" 2>&1; then
+  printf 'controller mutation guard accepted a legacy scheduler writer call\n' >&2
+  exit 1
+fi
+if ! grep -Fq 'unsafe_scheduler_writer.rs:2: legacy scheduler persistence call outside transactional writer boundary: insert_probe_observation' "$legacy_fail_output"; then
+  printf 'controller mutation guard did not report the legacy scheduler writer call:\n' >&2
+  sed -n '1,120p' "$legacy_fail_output" >&2
+  exit 1
+fi
+
+rm -f "$cli_src/unsafe_scheduler_writer.rs"
+printf '%s\n' \
+  'pub fn bypass(store: &Store, audit: RpcAuditRecord) {' \
+  '    write_rpc_audit(store, audit);' \
+  '}' \
+  > "$cli_src/unsafe_rpc_audit.rs"
+
+rpc_fail_output="$tmp_dir/rpc-fail-output"
+if "$GUARD" --repo-root "$fixture_root" "$fixture_root" >"$rpc_fail_output" 2>&1; then
+  printf 'controller mutation guard accepted a direct RPC audit write\n' >&2
+  exit 1
+fi
+if ! grep -Fq 'unsafe_rpc_audit.rs:2: direct RPC audit write outside reviewed caller boundary: write_rpc_audit' "$rpc_fail_output"; then
+  printf 'controller mutation guard did not report the direct RPC audit write:\n' >&2
+  sed -n '1,120p' "$rpc_fail_output" >&2
+  exit 1
+fi
+
 printf 'Controller mutation SQL guard self-test passed.\n'

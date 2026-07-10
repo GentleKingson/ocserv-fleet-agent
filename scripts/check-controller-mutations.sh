@@ -85,6 +85,19 @@ MUTATION_RE = re.compile(
     r")\b",
     re.IGNORECASE,
 )
+LEGACY_SCHEDULER_WRITER_RE = re.compile(
+    r"(?:\.\s*|\bStore\s*::\s*)"
+    r"(insert_observability_run|finish_observability_run|"
+    r"insert_probe_observation|update_observability_job_run_times)\s*\("
+)
+DIRECT_RPC_AUDIT_RE = re.compile(r"\bwrite_rpc_audit\s*\(")
+LEGACY_SCHEDULER_WRITER_ALLOWED_FILES = {
+    ("crates", "ocfleet-cli", "src", "store.rs"),
+}
+DIRECT_RPC_AUDIT_ALLOWED_FILES = {
+    ("crates", "ocfleet-cli", "src", "controller_rpc.rs"),
+    ("crates", "ocfleet-cli", "src", "main.rs"),
+}
 CFG_TEST_RE = re.compile(r"#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]")
 
 
@@ -232,6 +245,14 @@ def rust_search_text(source):
     return "".join(chars)
 
 
+def rust_code_text(source):
+    _, structure = rust_views(source)
+    chars = list(structure)
+    for start, end in test_only_ranges(structure):
+        mask(chars, start, end)
+    return "".join(chars)
+
+
 def sql_search_text(source):
     chars = list(source)
     index = 0
@@ -266,21 +287,54 @@ if not files:
 violations = []
 checked = 0
 for path in files:
-    if is_allowed(path):
-        continue
     checked += 1
     source = path.read_text(encoding="utf-8")
-    searchable = rust_search_text(source) if path.suffix == ".rs" else sql_search_text(source)
-    for match in MUTATION_RE.finditer(searchable):
-        line = source.count("\n", 0, match.start()) + 1
-        statement = " ".join(match.group(0).split())
-        violations.append((display_path(path), line, statement))
+    if not is_allowed(path):
+        searchable = rust_search_text(source) if path.suffix == ".rs" else sql_search_text(source)
+        for match in MUTATION_RE.finditer(searchable):
+            line = source.count("\n", 0, match.start()) + 1
+            statement = " ".join(match.group(0).split())
+            violations.append(
+                (
+                    display_path(path),
+                    line,
+                    "controller mutation SQL outside reviewed store/migration location",
+                    statement,
+                )
+            )
 
-for path, line, statement in violations:
-    print(
-        f"{path}:{line}: controller mutation SQL outside reviewed store/migration location: {statement}",
-        file=sys.stderr,
-    )
+    if path.suffix != ".rs":
+        continue
+    try:
+        parts = path.resolve().relative_to(repo_root).parts
+    except ValueError:
+        parts = ()
+    code = rust_code_text(source)
+    if parts not in LEGACY_SCHEDULER_WRITER_ALLOWED_FILES:
+        for match in LEGACY_SCHEDULER_WRITER_RE.finditer(code):
+            line = source.count("\n", 0, match.start()) + 1
+            violations.append(
+                (
+                    display_path(path),
+                    line,
+                    "legacy scheduler persistence call outside transactional writer boundary",
+                    match.group(1),
+                )
+            )
+    if parts not in DIRECT_RPC_AUDIT_ALLOWED_FILES:
+        for match in DIRECT_RPC_AUDIT_RE.finditer(code):
+            line = source.count("\n", 0, match.start()) + 1
+            violations.append(
+                (
+                    display_path(path),
+                    line,
+                    "direct RPC audit write outside reviewed caller boundary",
+                    "write_rpc_audit",
+                )
+            )
+
+for path, line, message, statement in violations:
+    print(f"{path}:{line}: {message}: {statement}", file=sys.stderr)
 
 if violations:
     print(

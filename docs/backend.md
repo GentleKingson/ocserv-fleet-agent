@@ -58,12 +58,15 @@ legacy rows does not satisfy the bounded low-sensitive validator. The returned
 records are internal store records, not presentation DTOs; every CLI/API output
 consumer must still use its typed projection. `StoreWriter` deliberately
 exposes only mutation methods that bind actor and audit in one transaction. The
-first production-hardening slice adds node add/enable/disable/remove to this
-contract and removes the CLI's post-commit success audits. Audit-trigger failure
-tests prove both `nodes` and `endpoint_trust` changes roll back. The next slice
-adds scheduler job add/enable/disable to the same contract; audit-trigger
+first production-hardening slice added node add/enable/disable/remove to this
+contract and removed the CLI's post-commit success audits. Audit-trigger failure
+tests prove both `nodes` and `endpoint_trust` changes roll back. The second slice
+added scheduler job add/enable/disable to the same contract; audit-trigger
 failure rolls back the affected `observability_jobs` insert or enabled-state
-update. Scheduler run/outcome/observation writes are not part of this slice.
+update. The scheduler-run expansion adds three closed writer boundaries: run
+start plus audit, one-to-four observation/audit pairs, and run finish plus the
+owning job clock and audit. The writer rejects mixed actors, jobs, run IDs,
+terminal runs, and unbounded batches.
 
 The API retains a narrower `ApiReadStore` adapter for API projections;
 `ReadOnlyStore` opens SQLite with read-only/query-only flags, validates private
@@ -79,11 +82,14 @@ runs migrations, executes through `spawn_blocking`, and closes before key
 loading or network I/O. Callers cannot substitute an unrelated authorization
 database.
 
-Scheduler run/outcome/observation, health/alert/delivery, retention, and some
-enrollment lifecycle flows are not all migrated to the writer trait. Future
-writer interfaces must keep actor/audit input mandatory and must not loosen
-private file checks or redaction. The scheduler-job writer expansion changes no
-schema, protocol, agent capability, or API route; the API remains read-only.
+Scheduler RPC work occurs outside database transactions. A committed start row
+is followed by short bounded outcome transactions and one finish transaction;
+an outcome or finish persistence failure leaves the run `running` and does not
+advance the job clock. Health/alert/delivery, retention, and some enrollment
+lifecycle flows are not all migrated to the writer trait. Future writer
+interfaces must keep actor/audit input mandatory and must not loosen private
+file checks or redaction. The scheduler writer expansions change no schema,
+protocol, agent capability, or API route; the API remains read-only.
 
 ## Postgres Scaffold
 

@@ -1,8 +1,14 @@
+use ocfleet_cli::audit::AuditEvent;
 use ocfleet_cli::backend::StoreWriter;
 use ocfleet_cli::store::{
     AlertDeliveryAttemptRecord, AlertEventRecord, AlertWebhookHookRecord, CURRENT_SCHEMA_VERSION,
     HealthSnapshotRecord, ObservabilityJobRecord, ObservabilityRunInsert, ProbeObservationInsert,
-    RetentionPolicyRecord, Store, StoreError,
+    RetentionPolicyRecord, SchedulerJobClockUpdate, SchedulerOutcomeEntry, SchedulerOutcomeWrite,
+    SchedulerRunFinish, SchedulerRunStart, Store, StoreError,
+};
+use ocfleet_protocol::method::{
+    OCSERV_CONFIG_FINGERPRINT, OCSERV_SERVICE_SUMMARY, OCSERV_SESSIONS_SUMMARY, OCSERV_VERSION,
+    PROBE_CONTROLLER_PING,
 };
 use rusqlite::Connection;
 use serde_json::{Value, json};
@@ -106,6 +112,104 @@ fn assert_job_state_rolls_back_when_audit_fails(enabled_before: bool, enabled_af
     assert_eq!(after, before);
     assert_eq!(after.updated_at, before.updated_at);
     assert_eq!(store.audit_count().expect("audit count"), 1);
+}
+
+fn scheduler_start(job_id: &str, run_id: &str) -> SchedulerRunStart {
+    SchedulerRunStart {
+        run_id: run_id.to_string(),
+        job_id: job_id.to_string(),
+        started_at: "2026-07-08T08:00:00Z".to_string(),
+    }
+}
+
+fn scheduler_clock(job_id: &str) -> SchedulerJobClockUpdate {
+    SchedulerJobClockUpdate {
+        job_id: job_id.to_string(),
+        next_run_at: "2026-07-08T08:02:00Z".to_string(),
+        last_run_at: "2026-07-08T08:01:00Z".to_string(),
+    }
+}
+
+fn scheduler_outcome_entry(
+    actor: &str,
+    event: &str,
+    run_id: Option<&str>,
+    observation_id: &str,
+    method: &str,
+    ok: bool,
+) -> SchedulerOutcomeEntry {
+    let error_code = (!ok).then(|| {
+        if event == "scheduler.job.invalid" {
+            "SCHEDULER_JOB_INVALID".to_string()
+        } else {
+            "SCHEDULER_TEST_FAILED".to_string()
+        }
+    });
+    let observation = ProbeObservationInsert {
+        observation_id: observation_id.to_string(),
+        run_id: run_id.map(ToOwned::to_owned),
+        node_id: Some("scheduler-node".to_string()),
+        endpoint_id: Some("scheduler-endpoint".to_string()),
+        method: method.to_string(),
+        ok: Some(ok),
+        error_code: error_code.clone(),
+        duration_ms: Some(7),
+        observed_at: "2026-07-08T08:00:30Z".to_string(),
+        expires_at: None,
+        result_class: "controller_rpc_summary".to_string(),
+        summary_json: json!({
+            "caller_marker": "bounded-but-not-run-summary",
+            "result_class": "controller_rpc_summary",
+        }),
+    };
+    let mut audit = AuditEvent::new(actor, event);
+    audit.node_id = observation.node_id.clone();
+    audit.endpoint_id = observation.endpoint_id.clone();
+    audit.method = Some(observation.method.clone());
+    audit.ok = observation.ok;
+    audit.error_code = error_code;
+    audit.duration_ms = observation.duration_ms;
+    audit.detail_json = json!({"result_class": "scheduler_summary"});
+    SchedulerOutcomeEntry { observation, audit }
+}
+
+fn scheduler_outcome(
+    job_id: &str,
+    run_id: Option<&str>,
+    entries: Vec<SchedulerOutcomeEntry>,
+) -> SchedulerOutcomeWrite {
+    SchedulerOutcomeWrite {
+        job_id: job_id.to_string(),
+        run_id: run_id.map(ToOwned::to_owned),
+        entries,
+        job_clock: None,
+    }
+}
+
+fn install_failure_trigger(database: &std::path::Path, sql: &str) {
+    Connection::open(database)
+        .expect("open database for scheduler failure injection")
+        .execute_batch(sql)
+        .expect("install scheduler failure trigger");
+}
+
+fn table_count(database: &std::path::Path, table: &str) -> i64 {
+    Connection::open(database)
+        .expect("open database for count")
+        .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+            row.get(0)
+        })
+        .expect("count scheduler table")
+}
+
+fn assert_injected_scheduler_failure(result: Result<(), StoreError>, marker: &str) {
+    match result {
+        Err(StoreError::Sqlite(error)) => assert!(
+            error.to_string().contains(marker),
+            "unexpected SQLite error: {error}"
+        ),
+        other => panic!("expected injected scheduler failure, got {other:?}"),
+    }
 }
 
 #[test]
@@ -466,6 +570,944 @@ fn observability_store_tests_insert_and_finish_observability_run() {
     assert_eq!(finished_at, "2026-07-08T07:31:00Z");
     assert_eq!(status, "succeeded");
     assert_eq!(summary_json, r#"{"observations":1}"#);
+}
+
+#[test]
+fn scheduler_atomic_writers_persist_closed_run_state_and_explicit_actor() {
+    let (_dir, store, db) = open_temp_store();
+    let job = sample_job("job-atomic-success", true);
+    StoreWriter::write_scheduler_job_add(&store, &job, TEST_ACTOR).expect("seed job");
+    let start = scheduler_start(&job.job_id, "run-atomic-success");
+
+    StoreWriter::write_scheduler_run_start(&store, &start, "scheduler-actor")
+        .expect("start scheduler run");
+    let running = store
+        .get_observability_run(&start.run_id)
+        .expect("load running run")
+        .expect("running run exists");
+    assert_eq!(running.status, "running");
+    assert_eq!(running.summary_json["job_id"], job.job_id);
+    assert_eq!(running.summary_json["kind"], "controller-ping");
+    assert!(running.summary_json.get("caller_marker").is_none());
+
+    let outcome = scheduler_outcome(
+        &job.job_id,
+        Some(&start.run_id),
+        vec![scheduler_outcome_entry(
+            "scheduler-actor",
+            "scheduler.task.outcome",
+            Some(&start.run_id),
+            "obs-atomic-success",
+            PROBE_CONTROLLER_PING,
+            true,
+        )],
+    );
+    StoreWriter::write_scheduler_outcome(&store, &outcome, "scheduler-actor")
+        .expect("write scheduler outcome");
+    let clock = scheduler_clock(&job.job_id);
+    StoreWriter::write_scheduler_run_finish(
+        &store,
+        &SchedulerRunFinish {
+            run_id: start.run_id.clone(),
+            finished_at: clock.last_run_at.clone(),
+            job_clock: clock.clone(),
+        },
+        "scheduler-actor",
+    )
+    .expect("finish scheduler run");
+
+    let finished = store
+        .get_observability_run(&start.run_id)
+        .expect("load finished run")
+        .expect("finished run exists");
+    assert_eq!(finished.status, "succeeded");
+    assert_eq!(finished.observation_count, 1);
+    assert_eq!(finished.failed_observation_count, 0);
+    assert_eq!(finished.summary_json["observations"], 1);
+    assert_eq!(finished.summary_json["failed_observations"], 0);
+    assert!(finished.summary_json.get("caller_marker").is_none());
+    let updated_job = store
+        .get_observability_job(&job.job_id)
+        .expect("load updated job")
+        .expect("updated job exists");
+    assert_eq!(
+        updated_job.next_run_at.as_deref(),
+        Some(clock.next_run_at.as_str())
+    );
+    assert_eq!(
+        updated_job.last_run_at.as_deref(),
+        Some(clock.last_run_at.as_str())
+    );
+
+    let conn = Connection::open(db).expect("open scheduler audit database");
+    for event in [
+        "scheduler.run.start",
+        "scheduler.task.outcome",
+        "scheduler.run.finish",
+    ] {
+        let actor: String = conn
+            .query_row(
+                "SELECT actor FROM controller_audit_log WHERE event = ?1",
+                [event],
+                |row| row.get(0),
+            )
+            .expect("load scheduler audit actor");
+        assert_eq!(actor, "scheduler-actor");
+    }
+    let finish_detail: String = conn
+        .query_row(
+            "SELECT detail_json FROM controller_audit_log WHERE event = 'scheduler.run.finish'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("load finish audit detail");
+    let finish_detail: Value = serde_json::from_str(&finish_detail).expect("parse finish detail");
+    assert_eq!(finish_detail["run_id"], start.run_id);
+    assert_eq!(finish_detail["status"], "succeeded");
+    assert!(finish_detail.get("caller_marker").is_none());
+}
+
+#[test]
+fn scheduler_run_start_rolls_back_when_audit_insert_fails() {
+    let (_dir, store, db) = open_temp_store();
+    let job = sample_job("job-start-rollback", true);
+    StoreWriter::write_scheduler_job_add(&store, &job, TEST_ACTOR).expect("seed job");
+    let audit_count_before = store.audit_count().expect("audit count before start");
+    install_failure_trigger(
+        &db,
+        "CREATE TRIGGER fail_scheduler_run_start_audit
+         BEFORE INSERT ON controller_audit_log
+         WHEN NEW.event = 'scheduler.run.start'
+         BEGIN SELECT RAISE(ABORT, 'injected scheduler start failure'); END;",
+    );
+
+    assert_injected_scheduler_failure(
+        StoreWriter::write_scheduler_run_start(
+            &store,
+            &scheduler_start(&job.job_id, "run-start-rollback"),
+            TEST_ACTOR,
+        ),
+        "injected scheduler start failure",
+    );
+    assert!(
+        store
+            .get_observability_run("run-start-rollback")
+            .expect("load rolled back run")
+            .is_none()
+    );
+    assert_eq!(
+        store.audit_count().expect("audit count after start"),
+        audit_count_before
+    );
+}
+
+#[test]
+fn scheduler_run_start_rejects_job_disabled_before_start_boundary() {
+    let (_dir, store, _db) = open_temp_store();
+    let job = sample_job("job-disabled-before-start", true);
+    StoreWriter::write_scheduler_job_add(&store, &job, TEST_ACTOR).expect("seed job");
+    StoreWriter::write_scheduler_job_disable(&store, &job.job_id, TEST_ACTOR)
+        .expect("disable job before start");
+
+    let result = StoreWriter::write_scheduler_run_start(
+        &store,
+        &scheduler_start(&job.job_id, "run-disabled-before-start"),
+        TEST_ACTOR,
+    );
+    assert!(
+        matches!(result, Err(StoreError::InvalidInput(message)) if message.contains("disabled"))
+    );
+    assert!(
+        store
+            .get_observability_run("run-disabled-before-start")
+            .expect("load rejected run")
+            .is_none()
+    );
+}
+
+fn assert_four_entry_scheduler_outcome_rolls_back(trigger_sql: &str, marker: &str) {
+    let (_dir, store, db) = open_temp_store();
+    let mut job = sample_job("job-bundle-rollback", true);
+    job.kind = "ocserv-status".to_string();
+    StoreWriter::write_scheduler_job_add(&store, &job, TEST_ACTOR).expect("seed job");
+    let start = scheduler_start(&job.job_id, "run-bundle-rollback");
+    StoreWriter::write_scheduler_run_start(&store, &start, TEST_ACTOR).expect("start run");
+    let audit_count_before = store.audit_count().expect("audit count before bundle");
+    install_failure_trigger(&db, trigger_sql);
+    let entries = [
+        OCSERV_SERVICE_SUMMARY,
+        OCSERV_VERSION,
+        OCSERV_SESSIONS_SUMMARY,
+        OCSERV_CONFIG_FINGERPRINT,
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, method)| {
+        scheduler_outcome_entry(
+            TEST_ACTOR,
+            "scheduler.task.outcome",
+            Some(&start.run_id),
+            &format!("obs-bundle-{index}"),
+            method,
+            true,
+        )
+    })
+    .collect();
+
+    assert_injected_scheduler_failure(
+        StoreWriter::write_scheduler_outcome(
+            &store,
+            &scheduler_outcome(&job.job_id, Some(&start.run_id), entries),
+            TEST_ACTOR,
+        ),
+        marker,
+    );
+    assert_eq!(table_count(&db, "probe_observations"), 0);
+    assert_eq!(
+        store.audit_count().expect("audit count after bundle"),
+        audit_count_before
+    );
+}
+
+#[test]
+fn scheduler_four_entry_outcome_rolls_back_when_last_audit_fails() {
+    assert_four_entry_scheduler_outcome_rolls_back(
+        "CREATE TRIGGER fail_scheduler_bundle_audit
+         BEFORE INSERT ON controller_audit_log
+         WHEN NEW.event = 'scheduler.task.outcome'
+          AND NEW.method = 'ocserv.config.fingerprint'
+         BEGIN SELECT RAISE(ABORT, 'injected scheduler bundle audit failure'); END;",
+        "injected scheduler bundle audit failure",
+    );
+}
+
+#[test]
+fn scheduler_four_entry_outcome_rolls_back_when_last_observation_fails() {
+    assert_four_entry_scheduler_outcome_rolls_back(
+        "CREATE TRIGGER fail_scheduler_bundle_observation
+         BEFORE INSERT ON probe_observations
+         WHEN NEW.method = 'ocserv.config.fingerprint'
+         BEGIN SELECT RAISE(ABORT, 'injected scheduler observation failure'); END;",
+        "injected scheduler observation failure",
+    );
+}
+
+#[test]
+fn scheduler_runless_outcome_rolls_back_observation_and_audit_when_clock_fails() {
+    let (_dir, store, db) = open_temp_store();
+    let job = sample_job("job-invalid-clock-rollback", true);
+    StoreWriter::write_scheduler_job_add(&store, &job, TEST_ACTOR).expect("seed job");
+    let before = store
+        .get_observability_job(&job.job_id)
+        .expect("load job before clock failure")
+        .expect("job exists");
+    let audit_count_before = store
+        .audit_count()
+        .expect("audit count before invalid outcome");
+    install_failure_trigger(
+        &db,
+        "CREATE TRIGGER fail_scheduler_clock_update
+         BEFORE UPDATE ON observability_jobs
+         WHEN NEW.job_id = 'job-invalid-clock-rollback'
+         BEGIN SELECT RAISE(ABORT, 'injected scheduler clock failure'); END;",
+    );
+    let mut outcome = scheduler_outcome(
+        &job.job_id,
+        None,
+        vec![scheduler_outcome_entry(
+            TEST_ACTOR,
+            "scheduler.job.invalid",
+            None,
+            "obs-invalid-clock-rollback",
+            PROBE_CONTROLLER_PING,
+            false,
+        )],
+    );
+    outcome.job_clock = Some(scheduler_clock(&job.job_id));
+
+    assert_injected_scheduler_failure(
+        StoreWriter::write_scheduler_outcome(&store, &outcome, TEST_ACTOR),
+        "injected scheduler clock failure",
+    );
+    assert_eq!(table_count(&db, "probe_observations"), 0);
+    assert_eq!(
+        store
+            .audit_count()
+            .expect("audit count after invalid outcome"),
+        audit_count_before
+    );
+    let after = store
+        .get_observability_job(&job.job_id)
+        .expect("load job after clock failure")
+        .expect("job exists");
+    assert_eq!(after, before);
+}
+
+#[test]
+fn scheduler_finish_rolls_back_run_and_clock_when_audit_or_clock_fails() {
+    for fail_clock in [false, true] {
+        let (_dir, store, db) = open_temp_store();
+        let job_id = if fail_clock {
+            "job-finish-clock-rollback"
+        } else {
+            "job-finish-audit-rollback"
+        };
+        let job = sample_job(job_id, true);
+        StoreWriter::write_scheduler_job_add(&store, &job, TEST_ACTOR).expect("seed job");
+        let start = scheduler_start(&job.job_id, &format!("run-{job_id}"));
+        StoreWriter::write_scheduler_run_start(&store, &start, TEST_ACTOR).expect("start run");
+        let outcome = scheduler_outcome(
+            &job.job_id,
+            Some(&start.run_id),
+            vec![scheduler_outcome_entry(
+                TEST_ACTOR,
+                "scheduler.task.outcome",
+                Some(&start.run_id),
+                &format!("obs-{job_id}"),
+                PROBE_CONTROLLER_PING,
+                true,
+            )],
+        );
+        StoreWriter::write_scheduler_outcome(&store, &outcome, TEST_ACTOR).expect("write outcome");
+        let job_before = store
+            .get_observability_job(&job.job_id)
+            .expect("load job before finish")
+            .expect("job exists");
+        let marker = if fail_clock {
+            "injected scheduler finish clock failure"
+        } else {
+            "injected scheduler finish audit failure"
+        };
+        let trigger = if fail_clock {
+            format!(
+                "CREATE TRIGGER fail_scheduler_finish_clock
+                 BEFORE UPDATE ON observability_jobs
+                 WHEN NEW.job_id = '{job_id}'
+                 BEGIN SELECT RAISE(ABORT, '{marker}'); END;"
+            )
+        } else {
+            format!(
+                "CREATE TRIGGER fail_scheduler_finish_audit
+                 BEFORE INSERT ON controller_audit_log
+                 WHEN NEW.event = 'scheduler.run.finish'
+                 BEGIN SELECT RAISE(ABORT, '{marker}'); END;"
+            )
+        };
+        install_failure_trigger(&db, &trigger);
+        let clock = scheduler_clock(&job.job_id);
+
+        assert_injected_scheduler_failure(
+            StoreWriter::write_scheduler_run_finish(
+                &store,
+                &SchedulerRunFinish {
+                    run_id: start.run_id.clone(),
+                    finished_at: clock.last_run_at.clone(),
+                    job_clock: clock,
+                },
+                TEST_ACTOR,
+            ),
+            marker,
+        );
+        let run = store
+            .get_observability_run(&start.run_id)
+            .expect("load rolled back finish")
+            .expect("run exists");
+        assert_eq!(run.status, "running");
+        assert!(run.finished_at.is_none());
+        let job_after = store
+            .get_observability_job(&job.job_id)
+            .expect("load job after finish failure")
+            .expect("job exists");
+        assert_eq!(job_after, job_before);
+    }
+}
+
+#[test]
+fn scheduler_outcome_rejects_invalid_bounds_identity_and_required_fields() {
+    let (_dir, store, db) = open_temp_store();
+    let job = sample_job("job-outcome-validation", true);
+    let other_job = sample_job("job-outcome-other", true);
+    StoreWriter::write_scheduler_job_add(&store, &job, TEST_ACTOR).expect("seed job");
+    StoreWriter::write_scheduler_job_add(&store, &other_job, TEST_ACTOR).expect("seed other job");
+    let start = scheduler_start(&job.job_id, "run-outcome-validation");
+    StoreWriter::write_scheduler_run_start(&store, &start, TEST_ACTOR).expect("start run");
+
+    let empty = scheduler_outcome(&job.job_id, Some(&start.run_id), Vec::new());
+    assert!(matches!(
+        StoreWriter::write_scheduler_outcome(&store, &empty, TEST_ACTOR),
+        Err(StoreError::InvalidInput(_))
+    ));
+
+    let runless_success = scheduler_outcome(
+        &job.job_id,
+        None,
+        vec![scheduler_outcome_entry(
+            TEST_ACTOR,
+            "scheduler.job.invalid",
+            None,
+            "obs-runless-success",
+            PROBE_CONTROLLER_PING,
+            true,
+        )],
+    );
+    assert!(matches!(
+        StoreWriter::write_scheduler_outcome(&store, &runless_success, TEST_ACTOR),
+        Err(StoreError::InvalidInput(_))
+    ));
+
+    let mut runless_wrong_error = scheduler_outcome_entry(
+        TEST_ACTOR,
+        "scheduler.job.invalid",
+        None,
+        "obs-runless-wrong-error",
+        PROBE_CONTROLLER_PING,
+        false,
+    );
+    runless_wrong_error.observation.error_code = Some("OTHER_ERROR".to_string());
+    runless_wrong_error.audit.error_code = Some("OTHER_ERROR".to_string());
+    assert!(matches!(
+        StoreWriter::write_scheduler_outcome(
+            &store,
+            &scheduler_outcome(&job.job_id, None, vec![runless_wrong_error]),
+            TEST_ACTOR,
+        ),
+        Err(StoreError::InvalidInput(_))
+    ));
+
+    let too_many = (0..5)
+        .map(|index| {
+            scheduler_outcome_entry(
+                TEST_ACTOR,
+                "scheduler.task.outcome",
+                Some(&start.run_id),
+                &format!("obs-too-many-{index}"),
+                PROBE_CONTROLLER_PING,
+                true,
+            )
+        })
+        .collect();
+    assert!(matches!(
+        StoreWriter::write_scheduler_outcome(
+            &store,
+            &scheduler_outcome(&job.job_id, Some(&start.run_id), too_many),
+            TEST_ACTOR,
+        ),
+        Err(StoreError::InvalidInput(_))
+    ));
+
+    let mixed_actor = scheduler_outcome(
+        &job.job_id,
+        Some(&start.run_id),
+        vec![scheduler_outcome_entry(
+            "different-actor",
+            "scheduler.task.outcome",
+            Some(&start.run_id),
+            "obs-mixed-actor",
+            PROBE_CONTROLLER_PING,
+            true,
+        )],
+    );
+    assert!(matches!(
+        StoreWriter::write_scheduler_outcome(&store, &mixed_actor, TEST_ACTOR),
+        Err(StoreError::InvalidInput(_))
+    ));
+
+    let mixed_run = scheduler_outcome(
+        &job.job_id,
+        Some(&start.run_id),
+        vec![scheduler_outcome_entry(
+            TEST_ACTOR,
+            "scheduler.task.outcome",
+            Some("run-different"),
+            "obs-mixed-run",
+            PROBE_CONTROLLER_PING,
+            true,
+        )],
+    );
+    assert!(matches!(
+        StoreWriter::write_scheduler_outcome(&store, &mixed_run, TEST_ACTOR),
+        Err(StoreError::InvalidInput(_))
+    ));
+
+    let mut missing_required = scheduler_outcome_entry(
+        TEST_ACTOR,
+        "scheduler.task.outcome",
+        Some(&start.run_id),
+        "obs-missing-required",
+        PROBE_CONTROLLER_PING,
+        true,
+    );
+    missing_required.observation.ok = None;
+    missing_required.audit.ok = None;
+    assert!(matches!(
+        StoreWriter::write_scheduler_outcome(
+            &store,
+            &scheduler_outcome(&job.job_id, Some(&start.run_id), vec![missing_required]),
+            TEST_ACTOR,
+        ),
+        Err(StoreError::InvalidInput(_))
+    ));
+
+    let mut missing_duration = scheduler_outcome_entry(
+        TEST_ACTOR,
+        "scheduler.task.outcome",
+        Some(&start.run_id),
+        "obs-missing-duration",
+        PROBE_CONTROLLER_PING,
+        true,
+    );
+    missing_duration.observation.duration_ms = None;
+    missing_duration.audit.duration_ms = None;
+    assert!(matches!(
+        StoreWriter::write_scheduler_outcome(
+            &store,
+            &scheduler_outcome(&job.job_id, Some(&start.run_id), vec![missing_duration]),
+            TEST_ACTOR,
+        ),
+        Err(StoreError::InvalidInput(_))
+    ));
+
+    let mut mismatched_error = scheduler_outcome_entry(
+        TEST_ACTOR,
+        "scheduler.task.outcome",
+        Some(&start.run_id),
+        "obs-mismatched-error",
+        PROBE_CONTROLLER_PING,
+        false,
+    );
+    mismatched_error.audit.error_code = Some("DIFFERENT_ERROR".to_string());
+    assert!(matches!(
+        StoreWriter::write_scheduler_outcome(
+            &store,
+            &scheduler_outcome(&job.job_id, Some(&start.run_id), vec![mismatched_error]),
+            TEST_ACTOR,
+        ),
+        Err(StoreError::InvalidInput(_))
+    ));
+
+    let wrong_method = scheduler_outcome(
+        &job.job_id,
+        Some(&start.run_id),
+        vec![scheduler_outcome_entry(
+            TEST_ACTOR,
+            "scheduler.task.outcome",
+            Some(&start.run_id),
+            "obs-wrong-kind-method",
+            OCSERV_SERVICE_SUMMARY,
+            true,
+        )],
+    );
+    assert!(matches!(
+        StoreWriter::write_scheduler_outcome(&store, &wrong_method, TEST_ACTOR),
+        Err(StoreError::InvalidInput(message)) if message.contains("job kind")
+    ));
+
+    let mut rpc_missing_error = scheduler_outcome_entry(
+        TEST_ACTOR,
+        "rpc.completed",
+        Some(&start.run_id),
+        "obs-rpc-missing-error",
+        PROBE_CONTROLLER_PING,
+        false,
+    );
+    rpc_missing_error.audit.error_code = None;
+    assert!(matches!(
+        StoreWriter::write_scheduler_outcome(
+            &store,
+            &scheduler_outcome(&job.job_id, Some(&start.run_id), vec![rpc_missing_error]),
+            TEST_ACTOR,
+        ),
+        Err(StoreError::InvalidInput(_))
+    ));
+
+    let missing_run = scheduler_outcome(
+        &job.job_id,
+        Some("run-missing"),
+        vec![scheduler_outcome_entry(
+            TEST_ACTOR,
+            "scheduler.task.outcome",
+            Some("run-missing"),
+            "obs-missing-run",
+            PROBE_CONTROLLER_PING,
+            true,
+        )],
+    );
+    assert!(matches!(
+        StoreWriter::write_scheduler_outcome(&store, &missing_run, TEST_ACTOR),
+        Err(StoreError::ObservabilityRunNotFound(run_id)) if run_id == "run-missing"
+    ));
+
+    let mismatched_job = scheduler_outcome(
+        &other_job.job_id,
+        Some(&start.run_id),
+        vec![scheduler_outcome_entry(
+            TEST_ACTOR,
+            "scheduler.task.outcome",
+            Some(&start.run_id),
+            "obs-mismatched-job",
+            PROBE_CONTROLLER_PING,
+            true,
+        )],
+    );
+    assert!(matches!(
+        StoreWriter::write_scheduler_outcome(&store, &mismatched_job, TEST_ACTOR),
+        Err(StoreError::InvalidInput(_))
+    ));
+    assert_eq!(table_count(&db, "probe_observations"), 0);
+
+    let valid = scheduler_outcome(
+        &job.job_id,
+        Some(&start.run_id),
+        vec![scheduler_outcome_entry(
+            TEST_ACTOR,
+            "scheduler.task.outcome",
+            Some(&start.run_id),
+            "obs-before-terminal",
+            PROBE_CONTROLLER_PING,
+            true,
+        )],
+    );
+    StoreWriter::write_scheduler_outcome(&store, &valid, TEST_ACTOR).expect("write valid outcome");
+    let clock = scheduler_clock(&job.job_id);
+    StoreWriter::write_scheduler_run_finish(
+        &store,
+        &SchedulerRunFinish {
+            run_id: start.run_id.clone(),
+            finished_at: clock.last_run_at.clone(),
+            job_clock: clock,
+        },
+        TEST_ACTOR,
+    )
+    .expect("finish run");
+    let terminal = scheduler_outcome(
+        &job.job_id,
+        Some(&start.run_id),
+        vec![scheduler_outcome_entry(
+            TEST_ACTOR,
+            "scheduler.task.outcome",
+            Some(&start.run_id),
+            "obs-after-terminal",
+            PROBE_CONTROLLER_PING,
+            true,
+        )],
+    );
+    assert!(matches!(
+        StoreWriter::write_scheduler_outcome(&store, &terminal, TEST_ACTOR),
+        Err(StoreError::ObservabilityRunNotRunning(run_id))
+            if run_id == "run-outcome-validation"
+    ));
+    assert_eq!(table_count(&db, "probe_observations"), 1);
+}
+
+#[test]
+fn scheduler_failed_rpc_outcome_allows_distinct_present_error_codes() {
+    let (_dir, store, db) = open_temp_store();
+    let job = sample_job("job-rpc-error-mapping", true);
+    StoreWriter::write_scheduler_job_add(&store, &job, TEST_ACTOR).expect("seed job");
+    let start = scheduler_start(&job.job_id, "run-rpc-error-mapping");
+    StoreWriter::write_scheduler_run_start(&store, &start, TEST_ACTOR).expect("start run");
+    let mut entry = scheduler_outcome_entry(
+        TEST_ACTOR,
+        "rpc.completed",
+        Some(&start.run_id),
+        "obs-rpc-error-mapping",
+        PROBE_CONTROLLER_PING,
+        false,
+    );
+    assert_eq!(
+        entry.observation.error_code.as_deref(),
+        Some("SCHEDULER_TEST_FAILED")
+    );
+    entry.audit.error_code = Some("ENDPOINT_NOT_ALLOWED".to_string());
+
+    StoreWriter::write_scheduler_outcome(
+        &store,
+        &scheduler_outcome(&job.job_id, Some(&start.run_id), vec![entry]),
+        TEST_ACTOR,
+    )
+    .expect("write mapped RPC failure");
+    assert_eq!(table_count(&db, "probe_observations"), 1);
+    let audit_error: String = Connection::open(db)
+        .expect("open audit database")
+        .query_row(
+            "SELECT error_code FROM controller_audit_log WHERE event = 'rpc.completed'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("load RPC audit error");
+    assert_eq!(audit_error, "ENDPOINT_NOT_ALLOWED");
+}
+
+#[test]
+fn scheduler_clock_update_rejects_regression_and_rolls_back_outcome_pair() {
+    let (_dir, store, db) = open_temp_store();
+    let job = sample_job("job-clock-monotonic", true);
+    StoreWriter::write_scheduler_job_add(&store, &job, TEST_ACTOR).expect("seed job");
+    let newer_clock = SchedulerJobClockUpdate {
+        job_id: job.job_id.clone(),
+        next_run_at: "2026-07-08T08:06:00Z".to_string(),
+        last_run_at: "2026-07-08T08:05:00.000500Z".to_string(),
+    };
+    let mut newer = scheduler_outcome(
+        &job.job_id,
+        None,
+        vec![scheduler_outcome_entry(
+            TEST_ACTOR,
+            "scheduler.job.invalid",
+            None,
+            "obs-clock-newer",
+            PROBE_CONTROLLER_PING,
+            false,
+        )],
+    );
+    newer.job_clock = Some(newer_clock.clone());
+    StoreWriter::write_scheduler_outcome(&store, &newer, TEST_ACTOR).expect("write newer clock");
+    let audit_count_before = store.audit_count().expect("audit count before stale clock");
+
+    let mut stale = scheduler_outcome(
+        &job.job_id,
+        None,
+        vec![scheduler_outcome_entry(
+            TEST_ACTOR,
+            "scheduler.job.invalid",
+            None,
+            "obs-clock-stale",
+            PROBE_CONTROLLER_PING,
+            false,
+        )],
+    );
+    stale.job_clock = Some(SchedulerJobClockUpdate {
+        job_id: job.job_id.clone(),
+        next_run_at: "2026-07-08T08:06:00Z".to_string(),
+        last_run_at: "2026-07-08T08:05:00.000400Z".to_string(),
+    });
+    let result = StoreWriter::write_scheduler_outcome(&store, &stale, TEST_ACTOR);
+    assert!(
+        matches!(result, Err(StoreError::InvalidInput(message)) if message.contains("regress"))
+    );
+    let mut earlier_next = scheduler_outcome(
+        &job.job_id,
+        None,
+        vec![scheduler_outcome_entry(
+            TEST_ACTOR,
+            "scheduler.job.invalid",
+            None,
+            "obs-clock-earlier-next",
+            PROBE_CONTROLLER_PING,
+            false,
+        )],
+    );
+    earlier_next.job_clock = Some(SchedulerJobClockUpdate {
+        job_id: job.job_id.clone(),
+        next_run_at: "2026-07-08T08:05:30Z".to_string(),
+        last_run_at: newer_clock.last_run_at.clone(),
+    });
+    let result = StoreWriter::write_scheduler_outcome(&store, &earlier_next, TEST_ACTOR);
+    assert!(
+        matches!(result, Err(StoreError::InvalidInput(message)) if message.contains("next_run_at"))
+    );
+    assert_eq!(table_count(&db, "probe_observations"), 1);
+    assert_eq!(
+        store.audit_count().expect("audit count after stale clock"),
+        audit_count_before
+    );
+    let stored = store
+        .get_observability_job(&job.job_id)
+        .expect("load job")
+        .expect("job exists");
+    assert_eq!(
+        stored.next_run_at.as_deref(),
+        Some(newer_clock.next_run_at.as_str())
+    );
+    assert_eq!(
+        stored.last_run_at.as_deref(),
+        Some(newer_clock.last_run_at.as_str())
+    );
+}
+
+#[test]
+fn scheduler_clock_order_uses_rfc3339_instants_not_text_order() {
+    let (_dir, store, db) = open_temp_store();
+    let job = sample_job("job-clock-offset-order", true);
+    StoreWriter::write_scheduler_job_add(&store, &job, TEST_ACTOR).expect("seed job");
+
+    let offset_clock = SchedulerJobClockUpdate {
+        job_id: job.job_id.clone(),
+        next_run_at: "2026-07-08T09:01:00+01:00".to_string(),
+        last_run_at: "2026-07-08T09:00:00+01:00".to_string(),
+    };
+    let mut first = scheduler_outcome(
+        &job.job_id,
+        None,
+        vec![scheduler_outcome_entry(
+            TEST_ACTOR,
+            "scheduler.job.invalid",
+            None,
+            "obs-clock-offset-first",
+            PROBE_CONTROLLER_PING,
+            false,
+        )],
+    );
+    first.job_clock = Some(offset_clock);
+    StoreWriter::write_scheduler_outcome(&store, &first, TEST_ACTOR)
+        .expect("write initial offset clock");
+
+    let newer_clock = SchedulerJobClockUpdate {
+        job_id: job.job_id.clone(),
+        next_run_at: "2026-07-08T08:31:00Z".to_string(),
+        last_run_at: "2026-07-08T08:30:00Z".to_string(),
+    };
+    let mut newer = scheduler_outcome(
+        &job.job_id,
+        None,
+        vec![scheduler_outcome_entry(
+            TEST_ACTOR,
+            "scheduler.job.invalid",
+            None,
+            "obs-clock-offset-newer",
+            PROBE_CONTROLLER_PING,
+            false,
+        )],
+    );
+    newer.job_clock = Some(newer_clock.clone());
+    StoreWriter::write_scheduler_outcome(&store, &newer, TEST_ACTOR)
+        .expect("chronologically newer clock must not be rejected lexically");
+
+    let stale_clock = SchedulerJobClockUpdate {
+        job_id: job.job_id.clone(),
+        next_run_at: "2026-07-08T09:01:00+01:00".to_string(),
+        last_run_at: "2026-07-08T09:00:00+01:00".to_string(),
+    };
+    let mut stale = scheduler_outcome(
+        &job.job_id,
+        None,
+        vec![scheduler_outcome_entry(
+            TEST_ACTOR,
+            "scheduler.job.invalid",
+            None,
+            "obs-clock-offset-stale",
+            PROBE_CONTROLLER_PING,
+            false,
+        )],
+    );
+    stale.job_clock = Some(stale_clock);
+    assert!(matches!(
+        StoreWriter::write_scheduler_outcome(&store, &stale, TEST_ACTOR),
+        Err(StoreError::InvalidInput(message)) if message.contains("regress")
+    ));
+    assert_eq!(table_count(&db, "probe_observations"), 2);
+    let stored = store
+        .get_observability_job(&job.job_id)
+        .expect("load job")
+        .expect("job exists");
+    assert_eq!(
+        stored.next_run_at.as_deref(),
+        Some(newer_clock.next_run_at.as_str())
+    );
+    assert_eq!(
+        stored.last_run_at.as_deref(),
+        Some(newer_clock.last_run_at.as_str())
+    );
+}
+
+#[test]
+fn scheduler_finish_derives_skipped_and_failed_statuses_from_persisted_rows() {
+    let (_dir, store, _db) = open_temp_store();
+    for (suffix, write_failure, expected_status) in
+        [("skipped", false, "skipped"), ("failed", true, "failed")]
+    {
+        let job = sample_job(&format!("job-derived-{suffix}"), true);
+        StoreWriter::write_scheduler_job_add(&store, &job, TEST_ACTOR).expect("seed job");
+        let start = scheduler_start(&job.job_id, &format!("run-derived-{suffix}"));
+        StoreWriter::write_scheduler_run_start(&store, &start, TEST_ACTOR).expect("start run");
+        if write_failure {
+            StoreWriter::write_scheduler_outcome(
+                &store,
+                &scheduler_outcome(
+                    &job.job_id,
+                    Some(&start.run_id),
+                    vec![scheduler_outcome_entry(
+                        TEST_ACTOR,
+                        "scheduler.task.outcome",
+                        Some(&start.run_id),
+                        "obs-derived-failed",
+                        PROBE_CONTROLLER_PING,
+                        false,
+                    )],
+                ),
+                TEST_ACTOR,
+            )
+            .expect("write failed outcome");
+        }
+        let clock = scheduler_clock(&job.job_id);
+        StoreWriter::write_scheduler_run_finish(
+            &store,
+            &SchedulerRunFinish {
+                run_id: start.run_id.clone(),
+                finished_at: clock.last_run_at.clone(),
+                job_clock: clock,
+            },
+            TEST_ACTOR,
+        )
+        .expect("finish derived run");
+        let run = store
+            .get_observability_run(&start.run_id)
+            .expect("load derived run")
+            .expect("derived run exists");
+        assert_eq!(run.status, expected_status);
+        assert_eq!(run.summary_json["status"], expected_status);
+    }
+}
+
+#[test]
+fn scheduler_finish_rejects_missing_terminal_and_mismatched_job() {
+    let (_dir, store, _db) = open_temp_store();
+    let job = sample_job("job-finish-validation", true);
+    let other_job = sample_job("job-finish-validation-other", true);
+    StoreWriter::write_scheduler_job_add(&store, &job, TEST_ACTOR).expect("seed job");
+    StoreWriter::write_scheduler_job_add(&store, &other_job, TEST_ACTOR).expect("seed other job");
+    let missing_clock = scheduler_clock(&job.job_id);
+    assert!(matches!(
+        StoreWriter::write_scheduler_run_finish(
+            &store,
+            &SchedulerRunFinish {
+                run_id: "run-finish-missing".to_string(),
+                finished_at: missing_clock.last_run_at.clone(),
+                job_clock: missing_clock,
+            },
+            TEST_ACTOR,
+        ),
+        Err(StoreError::ObservabilityRunNotFound(run_id)) if run_id == "run-finish-missing"
+    ));
+
+    let start = scheduler_start(&job.job_id, "run-finish-validation");
+    StoreWriter::write_scheduler_run_start(&store, &start, TEST_ACTOR).expect("start run");
+    let other_clock = scheduler_clock(&other_job.job_id);
+    assert!(matches!(
+        StoreWriter::write_scheduler_run_finish(
+            &store,
+            &SchedulerRunFinish {
+                run_id: start.run_id.clone(),
+                finished_at: other_clock.last_run_at.clone(),
+                job_clock: other_clock,
+            },
+            TEST_ACTOR,
+        ),
+        Err(StoreError::InvalidInput(_))
+    ));
+
+    let clock = scheduler_clock(&job.job_id);
+    let finish = SchedulerRunFinish {
+        run_id: start.run_id.clone(),
+        finished_at: clock.last_run_at.clone(),
+        job_clock: clock,
+    };
+    StoreWriter::write_scheduler_run_finish(&store, &finish, TEST_ACTOR).expect("finish run once");
+    assert!(matches!(
+        StoreWriter::write_scheduler_run_finish(&store, &finish, TEST_ACTOR),
+        Err(StoreError::ObservabilityRunNotRunning(run_id))
+            if run_id == "run-finish-validation"
+    ));
 }
 
 #[test]

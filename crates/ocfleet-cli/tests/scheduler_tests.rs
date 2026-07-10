@@ -787,7 +787,8 @@ fn scheduler_tests_daemon_alert_evaluation_failure_writes_warning_and_continues(
     let audit = wait_for_audit_event(
         &database,
         "scheduler.alert.evaluate",
-        Duration::from_secs(5),
+        // Leave margin above SQLite's busy timeout on loaded CI runners.
+        Duration::from_secs(30),
     );
     let still_running = child.try_wait().expect("try wait").is_none();
     let _ = child.kill();

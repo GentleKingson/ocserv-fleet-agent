@@ -64,6 +64,23 @@ pub enum StoreError {
     EndpointNotFound(String),
     #[error("endpoint already exists: {0}")]
     EndpointAlreadyExists(String),
+    #[error("invalid endpoint transition for {endpoint_id}: {from} cannot {action}")]
+    InvalidEndpointTransition {
+        endpoint_id: String,
+        from: String,
+        action: &'static str,
+    },
+    #[error("endpoint binding is inconsistent for {endpoint_id}: {detail}")]
+    EndpointBindingMismatch {
+        endpoint_id: String,
+        detail: &'static str,
+    },
+    #[error("node {0} has multiple active endpoint bindings")]
+    AmbiguousActiveEndpointBinding(String),
+    #[error("endpoint generation exhausted: {0}")]
+    EndpointGenerationExhausted(String),
+    #[error("endpoint rotation lineage is inconsistent: {0}")]
+    EndpointLineageInvalid(String),
     #[error("invalid input: {0}")]
     InvalidInput(String),
 }
@@ -404,6 +421,16 @@ pub struct EndpointTrustRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EndpointDispatchBinding {
+    pub status: EndpointStatus,
+    pub trust_node_id: Option<String>,
+    pub registry_node_id: Option<String>,
+    pub registry_endpoint_id: Option<String>,
+    pub registry_enabled: Option<bool>,
+    pub active_endpoint_count_for_node: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrustSnapshot {
     pub endpoints: Vec<EndpointTrustRecord>,
 }
@@ -439,16 +466,25 @@ impl Store {
         &self.database_path
     }
 
-    pub(crate) fn read_endpoint_trust_status(
-        database_path: &Path,
+    pub(crate) fn get_endpoint_dispatch_binding(
+        &self,
+        expected_node_id: &str,
         endpoint_id: &str,
-    ) -> Result<Option<EndpointStatus>, StoreError> {
+    ) -> Result<Option<EndpointDispatchBinding>, StoreError> {
+        get_endpoint_dispatch_binding_conn(&self.conn, expected_node_id, endpoint_id)
+    }
+
+    pub(crate) fn read_endpoint_dispatch_binding(
+        database_path: &Path,
+        expected_node_id: &str,
+        endpoint_id: &str,
+    ) -> Result<Option<EndpointDispatchBinding>, StoreError> {
         validate_database_files(database_path)?;
         let conn = Connection::open_with_flags(database_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         conn.pragma_update(None, "query_only", "ON")?;
         conn.pragma_update(None, "busy_timeout", 5_000)?;
         validate_database_files(database_path)?;
-        get_endpoint_trust_status_conn(&conn, endpoint_id)
+        get_endpoint_dispatch_binding_conn(&conn, expected_node_id, endpoint_id)
     }
 
     fn open_existing_or_create(
@@ -1626,6 +1662,42 @@ impl Store {
         let tx = self.conn.unchecked_transaction()?;
         let before = get_node_tx(&tx, node_id)?
             .ok_or_else(|| StoreError::NodeNotFound(node_id.to_string()))?;
+        let registry_endpoint_before = get_endpoint_trust_tx(&tx, &before.endpoint_id)?;
+        let mut active_candidates = get_active_endpoint_trust_for_node_tx(&tx, node_id)?;
+        if let Some(endpoint) = &registry_endpoint_before
+            && endpoint.status == EndpointStatus::Active
+            && !active_candidates
+                .iter()
+                .any(|candidate| candidate.endpoint_id == endpoint.endpoint_id)
+        {
+            active_candidates.push(endpoint.clone());
+        }
+        if active_candidates.len() > 1 {
+            return Err(StoreError::AmbiguousActiveEndpointBinding(
+                node_id.to_string(),
+            ));
+        }
+
+        let active_before = active_candidates.pop();
+        if let Some(active) = &active_before
+            && let Some(other_node) = get_node_by_endpoint_tx(&tx, &active.endpoint_id)?
+            && other_node.node_id != node_id
+        {
+            return Err(StoreError::EndpointBindingMismatch {
+                endpoint_id: active.endpoint_id.clone(),
+                detail: "active endpoint is the current endpoint of another node",
+            });
+        }
+        let active_after = active_before
+            .as_ref()
+            .map(|active| transition_endpoint_status_tx(&tx, active, EndpointStatus::Revoked))
+            .transpose()?;
+        let registry_endpoint_after = match (&registry_endpoint_before, &active_after) {
+            (Some(registry), Some(active)) if registry.endpoint_id == active.endpoint_id => {
+                Some(active.clone())
+            }
+            (registry, _) => registry.clone(),
+        };
         let affected = tx.execute("DELETE FROM nodes WHERE node_id = ?1", [node_id])?;
         if affected == 0 {
             return Err(StoreError::NodeNotFound(node_id.to_string()));
@@ -1634,13 +1706,22 @@ impl Store {
         event.node_id = Some(before.node_id.clone());
         event.endpoint_id = Some(before.endpoint_id.clone());
         event.ok = Some(true);
-        event.detail_json = json_detail(
-            "node",
-            &before.node_id,
-            Some(node_audit_json(&before)),
-            None,
-            None,
-        );
+        event.detail_json = serde_json::json!({
+            "actor_type": "user",
+            "target_type": "node",
+            "target_id": before.node_id,
+            "before": node_removal_audit_json(
+                Some(&before),
+                registry_endpoint_before.as_ref(),
+                active_before.as_ref(),
+            ),
+            "after": node_removal_audit_json(
+                None,
+                registry_endpoint_after.as_ref(),
+                active_after.as_ref(),
+            ),
+            "reason": Value::Null,
+        });
         insert_audit_tx(&tx, &event)?;
         tx.commit()?;
         Ok(())
@@ -1657,6 +1738,9 @@ impl Store {
         let tx = self.conn.unchecked_transaction()?;
         let before = get_node_tx(&tx, node_id)?
             .ok_or_else(|| StoreError::NodeNotFound(node_id.to_string()))?;
+        if enabled {
+            validate_active_node_binding_tx(&tx, &before)?;
+        }
         let affected = tx.execute(
             "UPDATE nodes SET enabled = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE node_id = ?2",
             params![bool_to_i64(enabled), node_id],
@@ -2020,14 +2104,103 @@ impl Store {
             validate_endpoint_id(old_endpoint_id).map_err(StoreError::InvalidInput)?;
         let new_endpoint_id =
             validate_endpoint_id(new_endpoint_id).map_err(StoreError::InvalidInput)?;
+        if old_endpoint_id == new_endpoint_id {
+            return Err(StoreError::InvalidInput(
+                "new endpoint_id must differ from old endpoint_id".to_string(),
+            ));
+        }
         let tx = self.conn.unchecked_transaction()?;
         let old_before = get_endpoint_trust_tx(&tx, &old_endpoint_id)?
             .ok_or_else(|| StoreError::EndpointNotFound(old_endpoint_id.clone()))?;
+        validate_endpoint_bundle_projection(&old_before)?;
+
+        if old_before.status == EndpointStatus::Rotated {
+            if old_before.rotated_to.as_deref() != Some(new_endpoint_id.as_str()) {
+                return Err(invalid_endpoint_transition(
+                    &old_before,
+                    "rotate to a different endpoint",
+                ));
+            }
+            let new_after = get_endpoint_trust_tx(&tx, &new_endpoint_id)?
+                .ok_or_else(|| StoreError::EndpointLineageInvalid(old_endpoint_id.clone()))?;
+            validate_rotation_edge(&tx, &old_before, &new_after)?;
+            let Some(node_id) = old_before.node_id.as_deref() else {
+                return Err(StoreError::EndpointBindingMismatch {
+                    endpoint_id: old_endpoint_id.clone(),
+                    detail: "unbound rotation edge cannot be retried",
+                });
+            };
+            let node_before =
+                get_node_tx(&tx, node_id)?.ok_or_else(|| StoreError::EndpointBindingMismatch {
+                    endpoint_id: old_endpoint_id.clone(),
+                    detail: "bound node is missing",
+                })?;
+            validate_legacy_rotation_reconciliation_tx(&tx, node_id, &new_after)?;
+            if node_before.endpoint_id == new_endpoint_id {
+                if new_after.status != EndpointStatus::Active && node_before.enabled {
+                    return Err(StoreError::EndpointBindingMismatch {
+                        endpoint_id: new_endpoint_id.clone(),
+                        detail: "inactive rotated endpoint is bound to an enabled node",
+                    });
+                }
+                return Ok(new_after);
+            }
+            if node_before.endpoint_id != old_endpoint_id {
+                return Err(StoreError::EndpointBindingMismatch {
+                    endpoint_id: old_endpoint_id.clone(),
+                    detail: "bound node does not point to the old or rotated endpoint",
+                });
+            }
+            let disable = new_after.status != EndpointStatus::Active;
+            let affected = tx.execute(
+                "UPDATE nodes
+                 SET endpoint_id = ?1,
+                     enabled = CASE WHEN ?2 THEN 0 ELSE enabled END,
+                     updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+                 WHERE node_id = ?3 AND endpoint_id = ?4",
+                params![
+                    new_endpoint_id.as_str(),
+                    bool_to_i64(disable),
+                    node_id,
+                    old_endpoint_id.as_str(),
+                ],
+            )?;
+            if affected != 1 {
+                return Err(StoreError::EndpointBindingMismatch {
+                    endpoint_id: old_endpoint_id.clone(),
+                    detail: "legacy registry pointer changed during reconciliation",
+                });
+            }
+            let node_after = get_node_tx(&tx, node_id)?.expect("reconciled node exists");
+            audit_endpoint_rotation_tx(
+                &tx,
+                actor,
+                "endpoint.rotate.reconcile",
+                &old_endpoint_id,
+                Some(&node_before),
+                Some(&node_after),
+                &old_before,
+                &old_before,
+                &new_after,
+                reason,
+            )?;
+            tx.commit()?;
+            return Ok(new_after);
+        }
+
+        if !matches!(
+            old_before.status,
+            EndpointStatus::Active | EndpointStatus::Quarantined
+        ) {
+            return Err(invalid_endpoint_transition(&old_before, "rotate"));
+        }
         if get_endpoint_trust_tx(&tx, &new_endpoint_id)?.is_some() {
             return Err(StoreError::EndpointAlreadyExists(new_endpoint_id));
         }
-        let new_generation = old_before.generation + 1;
-        tx.execute(
+        validate_unrotated_lineage(&tx, &old_before)?;
+        let node_before = validate_rotation_binding_tx(&tx, &old_before)?;
+        let new_generation = next_endpoint_generation(&old_before)?;
+        let affected = tx.execute(
             "UPDATE endpoint_trust
              SET status = ?1,
                  generation = ?2,
@@ -2037,13 +2210,16 @@ impl Store {
              WHERE endpoint_id = ?5",
             params![
                 EndpointStatus::Rotated.as_str(),
-                new_generation as i64,
+                endpoint_generation_to_i64(&old_endpoint_id, new_generation)?,
                 new_endpoint_id.as_str(),
                 trust_bundle_json(&old_endpoint_id, new_generation, EndpointStatus::Rotated)
                     .to_string(),
                 old_endpoint_id.as_str(),
             ],
         )?;
+        if affected != 1 {
+            return Err(StoreError::EndpointNotFound(old_endpoint_id));
+        }
         insert_endpoint_trust_tx(
             &tx,
             &EndpointTrustRecord {
@@ -2063,18 +2239,42 @@ impl Store {
                 updated_at: String::new(),
             },
         )?;
+        let node_after = if let Some(node_before) = &node_before {
+            let affected = tx.execute(
+                "UPDATE nodes
+                 SET endpoint_id = ?1,
+                     enabled = CASE WHEN ?2 THEN 0 ELSE enabled END,
+                     updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+                 WHERE node_id = ?3 AND endpoint_id = ?4",
+                params![
+                    new_endpoint_id.as_str(),
+                    bool_to_i64(old_before.status == EndpointStatus::Quarantined),
+                    node_before.node_id.as_str(),
+                    old_endpoint_id.as_str(),
+                ],
+            )?;
+            if affected != 1 {
+                return Err(StoreError::EndpointBindingMismatch {
+                    endpoint_id: old_endpoint_id.clone(),
+                    detail: "bound node endpoint changed during rotation",
+                });
+            }
+            get_node_tx(&tx, &node_before.node_id)?
+        } else {
+            None
+        };
         let old_after = get_endpoint_trust_tx(&tx, &old_endpoint_id)?.expect("old endpoint exists");
         let new_after = get_endpoint_trust_tx(&tx, &new_endpoint_id)?.expect("new endpoint exists");
-        audit_endpoint_lifecycle_tx(
+        audit_endpoint_rotation_tx(
             &tx,
             actor,
             "endpoint.rotate",
-            &new_endpoint_id,
-            Some(endpoint_audit_json(&old_before)),
-            Some(serde_json::json!({
-                "old": endpoint_audit_json(&old_after),
-                "new": endpoint_audit_json(&new_after),
-            })),
+            &old_endpoint_id,
+            node_before.as_ref(),
+            node_after.as_ref(),
+            &old_before,
+            &old_after,
+            &new_after,
             reason,
         )?;
         tx.commit()?;
@@ -2139,7 +2339,7 @@ impl Store {
         status: EndpointStatus,
         actor: &str,
         reason: &str,
-        action: &str,
+        action: &'static str,
     ) -> Result<EndpointTrustRecord, StoreError> {
         validate_actor(actor).map_err(StoreError::InvalidInput)?;
         validate_reason(reason).map_err(StoreError::InvalidInput)?;
@@ -2147,29 +2347,52 @@ impl Store {
         let tx = self.conn.unchecked_transaction()?;
         let before = get_endpoint_trust_tx(&tx, &endpoint_id)?
             .ok_or_else(|| StoreError::EndpointNotFound(endpoint_id.clone()))?;
-        let generation = before.generation + 1;
-        tx.execute(
-            "UPDATE endpoint_trust
-             SET status = ?1,
-                 generation = ?2,
-                 trust_bundle_json = ?3,
-                 updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
-             WHERE endpoint_id = ?4",
-            params![
-                status.as_str(),
-                generation as i64,
-                trust_bundle_json(&endpoint_id, generation, status).to_string(),
-                endpoint_id.as_str(),
-            ],
-        )?;
-        let after = get_endpoint_trust_tx(&tx, &endpoint_id)?.expect("endpoint exists");
-        audit_endpoint_lifecycle_tx(
+        validate_endpoint_bundle_projection(&before)?;
+        if before.status == status {
+            validate_unrotated_lineage(&tx, &before)?;
+            return Ok(before);
+        }
+        let allowed = matches!(
+            (before.status, status),
+            (EndpointStatus::Active, EndpointStatus::Revoked)
+                | (EndpointStatus::Active, EndpointStatus::Quarantined)
+                | (EndpointStatus::Quarantined, EndpointStatus::Revoked)
+        );
+        if !allowed {
+            let transition_action = action.strip_prefix("endpoint.").unwrap_or(action);
+            return Err(invalid_endpoint_transition(&before, transition_action));
+        }
+        let node_before = get_exact_bound_node_tx(&tx, &before)?;
+        let after = transition_endpoint_status_tx(&tx, &before, status)?;
+        let node_after = if let Some(node) = &node_before
+            && node.enabled
+        {
+            let affected = tx.execute(
+                "UPDATE nodes
+                 SET enabled = 0,
+                     updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+                 WHERE node_id = ?1 AND endpoint_id = ?2",
+                params![node.node_id.as_str(), endpoint_id.as_str()],
+            )?;
+            if affected != 1 {
+                return Err(StoreError::EndpointBindingMismatch {
+                    endpoint_id: endpoint_id.clone(),
+                    detail: "bound node changed during endpoint status update",
+                });
+            }
+            get_node_tx(&tx, &node.node_id)?
+        } else {
+            node_before.clone()
+        };
+        audit_endpoint_status_tx(
             &tx,
             actor,
             action,
             &endpoint_id,
-            Some(endpoint_audit_json(&before)),
-            Some(endpoint_audit_json(&after)),
+            node_before.as_ref(),
+            node_after.as_ref(),
+            &before,
+            &after,
             reason,
         )?;
         tx.commit()?;
@@ -2674,6 +2897,7 @@ fn insert_endpoint_trust_tx(
     tx: &Transaction<'_>,
     endpoint: &EndpointTrustRecord,
 ) -> Result<(), StoreError> {
+    let generation = endpoint_generation_to_i64(&endpoint.endpoint_id, endpoint.generation)?;
     tx.execute(
         "INSERT INTO endpoint_trust
          (endpoint_id, node_id, fingerprint, status, generation, previous_endpoint_id, rotated_to, trust_bundle_json, created_at, updated_at)
@@ -2683,7 +2907,7 @@ fn insert_endpoint_trust_tx(
             endpoint.node_id.as_deref(),
             endpoint.fingerprint.as_deref(),
             endpoint.status.as_str(),
-            endpoint.generation as i64,
+            generation,
             endpoint.previous_endpoint_id.as_deref(),
             endpoint.rotated_to.as_deref(),
             endpoint.trust_bundle_json.to_string(),
@@ -2700,6 +2924,36 @@ fn get_node_tx(tx: &Transaction<'_>, node_id: &str) -> Result<Option<NodeRecord>
     )
     .optional()
     .map_err(StoreError::from)
+}
+
+fn get_node_by_endpoint_tx(
+    tx: &Transaction<'_>,
+    endpoint_id: &str,
+) -> Result<Option<NodeRecord>, StoreError> {
+    tx.query_row(
+        "SELECT node_id, endpoint_id, name, region, role, enabled
+         FROM nodes WHERE endpoint_id = ?1",
+        [endpoint_id],
+        node_from_row,
+    )
+    .optional()
+    .map_err(StoreError::from)
+}
+
+fn get_active_endpoint_trust_for_node_tx(
+    tx: &Transaction<'_>,
+    node_id: &str,
+) -> Result<Vec<EndpointTrustRecord>, StoreError> {
+    let mut stmt = tx.prepare(
+        "SELECT endpoint_id, node_id, fingerprint, status, generation, previous_endpoint_id, rotated_to, trust_bundle_json, created_at, updated_at
+         FROM endpoint_trust
+         WHERE node_id = ?1 AND status = 'active'
+         ORDER BY endpoint_id
+         LIMIT 2",
+    )?;
+    let rows = stmt.query_map([node_id], endpoint_trust_from_row)?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(StoreError::from)
 }
 
 fn get_observability_job_tx(
@@ -2731,16 +2985,38 @@ fn get_join_request_tx(
     .map_err(StoreError::from)
 }
 
-fn get_endpoint_trust_status_conn(
+fn get_endpoint_dispatch_binding_conn(
     conn: &Connection,
+    expected_node_id: &str,
     endpoint_id: &str,
-) -> Result<Option<EndpointStatus>, StoreError> {
+) -> Result<Option<EndpointDispatchBinding>, StoreError> {
     conn.query_row(
-        "SELECT status FROM endpoint_trust WHERE endpoint_id = ?1",
-        [endpoint_id],
+        "SELECT trust.status,
+                trust.node_id,
+                registry.node_id,
+                registry.endpoint_id,
+                registry.enabled,
+                (SELECT COUNT(*)
+                 FROM endpoint_trust AS active
+                 WHERE active.node_id = ?1 AND active.status = 'active')
+         FROM endpoint_trust AS trust
+         LEFT JOIN nodes AS registry ON registry.node_id = ?1
+         WHERE trust.endpoint_id = ?2",
+        params![expected_node_id, endpoint_id],
         |row| {
             let status: String = row.get(0)?;
-            parse_status(&status, 0)
+            let enabled = row
+                .get::<_, Option<i64>>(4)?
+                .map(|value| i64_to_bool(value, 4))
+                .transpose()?;
+            Ok(EndpointDispatchBinding {
+                status: parse_status(&status, 0)?,
+                trust_node_id: row.get(1)?,
+                registry_node_id: row.get(2)?,
+                registry_endpoint_id: row.get(3)?,
+                registry_enabled: enabled,
+                active_endpoint_count_for_node: i64_to_u64(row.get(5)?)?,
+            })
         },
     )
     .optional()
@@ -2759,6 +3035,256 @@ fn get_endpoint_trust_tx(
     )
     .optional()
     .map_err(StoreError::from)
+}
+
+fn invalid_endpoint_transition(endpoint: &EndpointTrustRecord, action: &'static str) -> StoreError {
+    StoreError::InvalidEndpointTransition {
+        endpoint_id: endpoint.endpoint_id.clone(),
+        from: endpoint.status.as_str().to_string(),
+        action,
+    }
+}
+
+fn endpoint_generation_to_i64(endpoint_id: &str, generation: u64) -> Result<i64, StoreError> {
+    i64::try_from(generation)
+        .map_err(|_| StoreError::EndpointGenerationExhausted(endpoint_id.to_string()))
+}
+
+fn next_endpoint_generation(endpoint: &EndpointTrustRecord) -> Result<u64, StoreError> {
+    if endpoint.generation >= i64::MAX as u64 {
+        return Err(StoreError::EndpointGenerationExhausted(
+            endpoint.endpoint_id.clone(),
+        ));
+    }
+    Ok(endpoint.generation + 1)
+}
+
+fn validate_endpoint_bundle_projection(endpoint: &EndpointTrustRecord) -> Result<(), StoreError> {
+    let bundle: TrustBundle = serde_json::from_value(endpoint.trust_bundle_json.clone())
+        .map_err(|_| StoreError::EndpointLineageInvalid(endpoint.endpoint_id.clone()))?;
+    if bundle.endpoint_id != endpoint.endpoint_id
+        || bundle.generation != endpoint.generation
+        || bundle.status != endpoint.status
+    {
+        return Err(StoreError::EndpointLineageInvalid(
+            endpoint.endpoint_id.clone(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_unrotated_lineage(
+    tx: &Transaction<'_>,
+    endpoint: &EndpointTrustRecord,
+) -> Result<(), StoreError> {
+    validate_endpoint_bundle_projection(endpoint)?;
+    if endpoint.rotated_to.is_some() {
+        return Err(StoreError::EndpointLineageInvalid(
+            endpoint.endpoint_id.clone(),
+        ));
+    }
+    let Some(previous_endpoint_id) = endpoint.previous_endpoint_id.as_deref() else {
+        return Ok(());
+    };
+    let previous = get_endpoint_trust_tx(tx, previous_endpoint_id)?
+        .ok_or_else(|| StoreError::EndpointLineageInvalid(endpoint.endpoint_id.clone()))?;
+    validate_endpoint_bundle_projection(&previous)?;
+    if previous.status != EndpointStatus::Rotated
+        || previous.rotated_to.as_deref() != Some(endpoint.endpoint_id.as_str())
+        || previous.node_id != endpoint.node_id
+        || previous.fingerprint != endpoint.fingerprint
+        || previous.generation > endpoint.generation
+    {
+        return Err(StoreError::EndpointLineageInvalid(
+            endpoint.endpoint_id.clone(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_rotation_edge(
+    tx: &Transaction<'_>,
+    old: &EndpointTrustRecord,
+    new: &EndpointTrustRecord,
+) -> Result<(), StoreError> {
+    validate_endpoint_bundle_projection(old)?;
+    validate_endpoint_bundle_projection(new)?;
+    if old.status != EndpointStatus::Rotated
+        || old.rotated_to.as_deref() != Some(new.endpoint_id.as_str())
+        || new.previous_endpoint_id.as_deref() != Some(old.endpoint_id.as_str())
+        || old.node_id != new.node_id
+        || old.fingerprint != new.fingerprint
+        || old.generation > new.generation
+    {
+        return Err(StoreError::EndpointLineageInvalid(old.endpoint_id.clone()));
+    }
+    if new.status != EndpointStatus::Rotated {
+        validate_unrotated_lineage(tx, new)?;
+    }
+    if let Some(previous_endpoint_id) = old.previous_endpoint_id.as_deref() {
+        let previous = get_endpoint_trust_tx(tx, previous_endpoint_id)?
+            .ok_or_else(|| StoreError::EndpointLineageInvalid(old.endpoint_id.clone()))?;
+        if previous.status != EndpointStatus::Rotated
+            || previous.rotated_to.as_deref() != Some(old.endpoint_id.as_str())
+        {
+            return Err(StoreError::EndpointLineageInvalid(old.endpoint_id.clone()));
+        }
+    }
+    Ok(())
+}
+
+fn validate_rotation_binding_tx(
+    tx: &Transaction<'_>,
+    endpoint: &EndpointTrustRecord,
+) -> Result<Option<NodeRecord>, StoreError> {
+    let Some(node_id) = endpoint.node_id.as_deref() else {
+        return Err(StoreError::EndpointBindingMismatch {
+            endpoint_id: endpoint.endpoint_id.clone(),
+            detail: "unbound endpoint cannot be rotated",
+        });
+    };
+    let node = get_node_tx(tx, node_id)?.ok_or_else(|| StoreError::EndpointBindingMismatch {
+        endpoint_id: endpoint.endpoint_id.clone(),
+        detail: "bound node is missing",
+    })?;
+    if node.endpoint_id != endpoint.endpoint_id {
+        return Err(StoreError::EndpointBindingMismatch {
+            endpoint_id: endpoint.endpoint_id.clone(),
+            detail: "bound node does not point to the endpoint",
+        });
+    }
+    let active = get_active_endpoint_trust_for_node_tx(tx, node_id)?;
+    let clean = match endpoint.status {
+        EndpointStatus::Active => {
+            active.len() == 1 && active[0].endpoint_id == endpoint.endpoint_id
+        }
+        EndpointStatus::Quarantined => active.is_empty(),
+        EndpointStatus::Revoked | EndpointStatus::Rotated => false,
+    };
+    if !clean {
+        return if active.len() > 1 {
+            Err(StoreError::AmbiguousActiveEndpointBinding(
+                node_id.to_string(),
+            ))
+        } else {
+            Err(StoreError::EndpointBindingMismatch {
+                endpoint_id: endpoint.endpoint_id.clone(),
+                detail: "node has an inconsistent active endpoint binding",
+            })
+        };
+    }
+    Ok(Some(node))
+}
+
+fn validate_legacy_rotation_reconciliation_tx(
+    tx: &Transaction<'_>,
+    node_id: &str,
+    rotated_to: &EndpointTrustRecord,
+) -> Result<(), StoreError> {
+    if rotated_to.status == EndpointStatus::Rotated {
+        return Err(StoreError::EndpointBindingMismatch {
+            endpoint_id: rotated_to.endpoint_id.clone(),
+            detail: "rotated child is not a deterministic current endpoint",
+        });
+    }
+    let active = get_active_endpoint_trust_for_node_tx(tx, node_id)?;
+    let clean = match rotated_to.status {
+        EndpointStatus::Active => {
+            active.len() == 1 && active[0].endpoint_id == rotated_to.endpoint_id
+        }
+        EndpointStatus::Quarantined | EndpointStatus::Revoked => active.is_empty(),
+        EndpointStatus::Rotated => false,
+    };
+    if !clean {
+        return if active.len() > 1 {
+            Err(StoreError::AmbiguousActiveEndpointBinding(
+                node_id.to_string(),
+            ))
+        } else {
+            Err(StoreError::EndpointBindingMismatch {
+                endpoint_id: rotated_to.endpoint_id.clone(),
+                detail: "legacy rotation does not have one deterministic child",
+            })
+        };
+    }
+    Ok(())
+}
+
+fn get_exact_bound_node_tx(
+    tx: &Transaction<'_>,
+    endpoint: &EndpointTrustRecord,
+) -> Result<Option<NodeRecord>, StoreError> {
+    let Some(node_id) = endpoint.node_id.as_deref() else {
+        return Ok(None);
+    };
+    Ok(get_node_tx(tx, node_id)?.filter(|node| node.endpoint_id == endpoint.endpoint_id))
+}
+
+fn validate_active_node_binding_tx(
+    tx: &Transaction<'_>,
+    node: &NodeRecord,
+) -> Result<(), StoreError> {
+    let endpoint = get_endpoint_trust_tx(tx, &node.endpoint_id)?.ok_or_else(|| {
+        StoreError::EndpointBindingMismatch {
+            endpoint_id: node.endpoint_id.clone(),
+            detail: "endpoint trust is missing",
+        }
+    })?;
+    validate_unrotated_lineage(tx, &endpoint)?;
+    if endpoint.status != EndpointStatus::Active
+        || endpoint.node_id.as_deref() != Some(node.node_id.as_str())
+    {
+        return Err(StoreError::EndpointBindingMismatch {
+            endpoint_id: node.endpoint_id.clone(),
+            detail: "node does not have an active bidirectional endpoint binding",
+        });
+    }
+    let active = get_active_endpoint_trust_for_node_tx(tx, &node.node_id)?;
+    if active.len() > 1 {
+        return Err(StoreError::AmbiguousActiveEndpointBinding(
+            node.node_id.clone(),
+        ));
+    }
+    if active.len() != 1 || active[0].endpoint_id != node.endpoint_id {
+        return Err(StoreError::EndpointBindingMismatch {
+            endpoint_id: node.endpoint_id.clone(),
+            detail: "node does not have exactly one active endpoint binding",
+        });
+    }
+    Ok(())
+}
+
+fn transition_endpoint_status_tx(
+    tx: &Transaction<'_>,
+    before: &EndpointTrustRecord,
+    status: EndpointStatus,
+) -> Result<EndpointTrustRecord, StoreError> {
+    validate_unrotated_lineage(tx, before)?;
+    let generation = next_endpoint_generation(before)?;
+    let affected = tx.execute(
+        "UPDATE endpoint_trust
+         SET status = ?1,
+             generation = ?2,
+             trust_bundle_json = ?3,
+             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+         WHERE endpoint_id = ?4 AND status = ?5 AND generation = ?6",
+        params![
+            status.as_str(),
+            endpoint_generation_to_i64(&before.endpoint_id, generation)?,
+            trust_bundle_json(&before.endpoint_id, generation, status).to_string(),
+            before.endpoint_id.as_str(),
+            before.status.as_str(),
+            endpoint_generation_to_i64(&before.endpoint_id, before.generation)?,
+        ],
+    )?;
+    if affected != 1 {
+        return Err(StoreError::EndpointBindingMismatch {
+            endpoint_id: before.endpoint_id.clone(),
+            detail: "endpoint state changed during transition",
+        });
+    }
+    get_endpoint_trust_tx(tx, &before.endpoint_id)?
+        .ok_or_else(|| StoreError::EndpointNotFound(before.endpoint_id.clone()))
 }
 
 fn audit_join_rejection_tx(
@@ -2780,19 +3306,72 @@ fn audit_join_rejection_tx(
     insert_audit_tx(tx, &event)
 }
 
-fn audit_endpoint_lifecycle_tx(
+#[allow(clippy::too_many_arguments)]
+fn audit_endpoint_rotation_tx(
     tx: &Transaction<'_>,
     actor: &str,
     action: &str,
-    endpoint_id: &str,
-    before: Option<Value>,
-    after: Option<Value>,
+    old_endpoint_id: &str,
+    node_before: Option<&NodeRecord>,
+    node_after: Option<&NodeRecord>,
+    old_before: &EndpointTrustRecord,
+    old_after: &EndpointTrustRecord,
+    new_after: &EndpointTrustRecord,
     reason: &str,
 ) -> Result<(), StoreError> {
     let mut event = AuditEvent::new(actor, action);
     event.ok = Some(true);
+    event.node_id = old_before.node_id.clone();
+    event.endpoint_id = Some(old_endpoint_id.to_string());
+    event.detail_json = serde_json::json!({
+        "actor_type": "user",
+        "target_type": "endpoint_rotation",
+        "target_id": old_endpoint_id,
+        "new_endpoint_id": new_after.endpoint_id,
+        "before": {
+            "node": node_before.map(node_audit_json),
+            "old_endpoint": endpoint_audit_json(old_before),
+        },
+        "after": {
+            "node": node_after.map(node_audit_json),
+            "old_endpoint": endpoint_audit_json(old_after),
+            "new_endpoint": endpoint_audit_json(new_after),
+        },
+        "reason": reason,
+    });
+    insert_audit_tx(tx, &event)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn audit_endpoint_status_tx(
+    tx: &Transaction<'_>,
+    actor: &str,
+    action: &str,
+    endpoint_id: &str,
+    node_before: Option<&NodeRecord>,
+    node_after: Option<&NodeRecord>,
+    endpoint_before: &EndpointTrustRecord,
+    endpoint_after: &EndpointTrustRecord,
+    reason: &str,
+) -> Result<(), StoreError> {
+    let mut event = AuditEvent::new(actor, action);
+    event.ok = Some(true);
+    event.node_id = endpoint_before.node_id.clone();
     event.endpoint_id = Some(endpoint_id.to_string());
-    event.detail_json = json_detail("endpoint", endpoint_id, before, after, Some(reason));
+    event.detail_json = serde_json::json!({
+        "actor_type": "user",
+        "target_type": "endpoint",
+        "target_id": endpoint_id,
+        "before": {
+            "node": node_before.map(node_audit_json),
+            "endpoint": endpoint_audit_json(endpoint_before),
+        },
+        "after": {
+            "node": node_after.map(node_audit_json),
+            "endpoint": endpoint_audit_json(endpoint_after),
+        },
+        "reason": reason,
+    });
     insert_audit_tx(tx, &event)
 }
 
@@ -2900,11 +3479,23 @@ fn endpoint_audit_json(endpoint: &EndpointTrustRecord) -> Value {
     serde_json::json!({
         "endpoint_id": endpoint.endpoint_id.clone(),
         "node_id": endpoint.node_id.clone(),
-        "fingerprint": endpoint.fingerprint.clone(),
+        "fingerprint_present": endpoint.fingerprint.is_some(),
         "status": endpoint.status.as_str(),
         "generation": endpoint.generation,
         "previous_endpoint_id": endpoint.previous_endpoint_id.clone(),
         "rotated_to": endpoint.rotated_to.clone(),
+    })
+}
+
+fn node_removal_audit_json(
+    node: Option<&NodeRecord>,
+    registry_endpoint: Option<&EndpointTrustRecord>,
+    active_endpoint: Option<&EndpointTrustRecord>,
+) -> Value {
+    serde_json::json!({
+        "node": node.map(node_audit_json),
+        "registry_endpoint": registry_endpoint.map(endpoint_audit_json),
+        "active_endpoint": active_endpoint.map(endpoint_audit_json),
     })
 }
 
@@ -3920,7 +4511,7 @@ mod tests {
     }
 
     #[test]
-    fn read_endpoint_trust_status_returns_active_missing_and_inactive() {
+    fn endpoint_dispatch_binding_returns_active_missing_and_inactive() {
         let dir = tempfile::tempdir().expect("temp dir");
         let db = dir.path().join("controller.sqlite");
         let store = Store::open(&db).expect("store opens");
@@ -3934,27 +4525,54 @@ mod tests {
         };
         store.add_node(&node, TEST_ACTOR).expect("insert node");
 
-        let active = Store::read_endpoint_trust_status(store.database_path(), &node.endpoint_id)
-            .expect("read active endpoint")
-            .expect("active endpoint exists");
-        assert_eq!(active, EndpointStatus::Active);
+        let active = Store::read_endpoint_dispatch_binding(
+            store.database_path(),
+            &node.node_id,
+            &node.endpoint_id,
+        )
+        .expect("read active endpoint")
+        .expect("active endpoint exists");
+        assert_eq!(active.status, EndpointStatus::Active);
+        assert_eq!(active.trust_node_id.as_deref(), Some(node.node_id.as_str()));
+        assert_eq!(
+            active.registry_endpoint_id.as_deref(),
+            Some(node.endpoint_id.as_str())
+        );
+        assert_eq!(active.registry_enabled, Some(true));
+        assert_eq!(active.active_endpoint_count_for_node, 1);
+        assert_eq!(
+            store
+                .get_endpoint_dispatch_binding(&node.node_id, &node.endpoint_id)
+                .expect("read binding from open store"),
+            Some(active)
+        );
         assert!(
-            Store::read_endpoint_trust_status(store.database_path(), "missing-endpoint")
-                .expect("read missing endpoint")
-                .is_none()
+            Store::read_endpoint_dispatch_binding(
+                store.database_path(),
+                &node.node_id,
+                "missing-endpoint",
+            )
+            .expect("read missing endpoint")
+            .is_none()
         );
 
         store
             .quarantine_endpoint(&node.endpoint_id, TEST_ACTOR, "test quarantine")
             .expect("quarantine endpoint");
-        let inactive = Store::read_endpoint_trust_status(store.database_path(), &node.endpoint_id)
-            .expect("read inactive endpoint")
-            .expect("inactive endpoint exists");
-        assert_eq!(inactive, EndpointStatus::Quarantined);
+        let inactive = Store::read_endpoint_dispatch_binding(
+            store.database_path(),
+            &node.node_id,
+            &node.endpoint_id,
+        )
+        .expect("read inactive endpoint")
+        .expect("inactive endpoint exists");
+        assert_eq!(inactive.status, EndpointStatus::Quarantined);
+        assert_eq!(inactive.registry_enabled, Some(false));
+        assert_eq!(inactive.active_endpoint_count_for_node, 0);
     }
 
     #[test]
-    fn read_endpoint_trust_status_is_query_only_and_does_not_run_migrations() {
+    fn endpoint_dispatch_binding_is_query_only_and_does_not_run_migrations() {
         let dir = tempfile::tempdir().expect("temp dir");
         let db = dir.path().join("controller.sqlite");
         let store = Store::open(&db).expect("store opens");
@@ -3983,11 +4601,13 @@ mod tests {
         drop(conn);
         let database_before = std::fs::read(&database_path).expect("read database before lookup");
 
-        let status = Store::read_endpoint_trust_status(&database_path, &node.endpoint_id)
-            .expect("read endpoint")
-            .expect("endpoint exists");
+        let binding =
+            Store::read_endpoint_dispatch_binding(&database_path, &node.node_id, &node.endpoint_id)
+                .expect("read endpoint")
+                .expect("endpoint exists");
 
-        assert_eq!(status, EndpointStatus::Active);
+        assert_eq!(binding.status, EndpointStatus::Active);
+        assert_eq!(binding.active_endpoint_count_for_node, 1);
         assert_eq!(
             std::fs::read(&database_path).expect("read database after lookup"),
             database_before
@@ -4009,7 +4629,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn read_endpoint_trust_status_rejects_unsafe_database_permissions() {
+    fn endpoint_dispatch_binding_rejects_unsafe_database_permissions() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().expect("temp dir");
@@ -4019,19 +4639,19 @@ mod tests {
             .expect("make database unsafe");
 
         assert!(matches!(
-            Store::read_endpoint_trust_status(&db, "endpoint"),
+            Store::read_endpoint_dispatch_binding(&db, "node", "endpoint"),
             Err(StoreError::UnsafePermissions)
         ));
     }
 
     #[cfg(unix)]
     #[test]
-    fn read_endpoint_trust_status_rejects_missing_database() {
+    fn endpoint_dispatch_binding_rejects_missing_database() {
         let dir = tempfile::tempdir().expect("temp dir");
         let db = dir.path().join("missing.sqlite");
 
         assert!(matches!(
-            Store::read_endpoint_trust_status(&db, "endpoint"),
+            Store::read_endpoint_dispatch_binding(&db, "node", "endpoint"),
             Err(StoreError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound
         ));
     }

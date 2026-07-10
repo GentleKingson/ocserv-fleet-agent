@@ -83,10 +83,16 @@ The current execution node is **A1** on issue `#33`. The node-lifecycle slice
 merged through pull request `#57`, the scheduler-job configuration slice merged
 through pull request `#58`, and the endpoint-trust fail-closed slice merged
 through pull request `#59`. Atomic scheduler run, outcome, observation, audit,
-and job-clock transitions are active on branch
-`codex/a1-scheduler-persistence-atomicity` in pull request `#60`. Statuses
-describe the milestone, not just the amount of supporting code already in the
-repository.
+and job-clock transitions merged through pull request `#60`. Endpoint binding
+and lifecycle state-machine hardening are published in pull request `#61` from
+branch `codex/a1-endpoint-binding-state-machine`; CI and merge evidence are
+pending. This slice requires bidirectional unique Active bindings at every
+dispatch boundary, closes and audits effective lifecycle transitions, moves the
+node registry pointer during rotation, terminalizes trust during removal, and
+adds aggregate-only doctor diagnostics plus a production bypass guard. It does
+not change schema, protocol, API routes, agent capabilities, or the default
+read-only boundary. Statuses describe the milestone, not just the amount of
+supporting code already in the repository.
 
 ### Baseline And Production Foundation
 

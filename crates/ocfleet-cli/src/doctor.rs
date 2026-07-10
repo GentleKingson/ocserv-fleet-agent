@@ -341,6 +341,7 @@ fn check_registry(conn: &Connection, checks: &mut Vec<DoctorCheck>) {
     }
 
     check_endpoint_trust_coverage(conn, checks, nodes.len());
+    check_endpoint_trust_bindings(conn, checks);
     check_audit_relationship_references(
         conn,
         checks,
@@ -384,6 +385,94 @@ fn check_endpoint_trust_coverage(
             json!({"error": err.to_string()}),
         )),
     }
+}
+
+fn check_endpoint_trust_bindings(conn: &Connection, checks: &mut Vec<DoctorCheck>) {
+    let counts = conn.query_row(
+        "SELECT
+           (SELECT count(*)
+              FROM endpoint_trust AS trust
+             WHERE trust.status = 'active'
+               AND (trust.node_id IS NULL OR trim(trust.node_id) = '')),
+           (SELECT count(*)
+              FROM endpoint_trust AS trust
+             WHERE trust.status = 'active'
+               AND trust.node_id IS NOT NULL
+               AND trim(trust.node_id) <> ''
+               AND NOT EXISTS (
+                 SELECT 1 FROM nodes AS node WHERE node.node_id = trust.node_id
+               )),
+           (SELECT count(*)
+              FROM nodes AS node
+              JOIN endpoint_trust AS trust ON trust.endpoint_id = node.endpoint_id
+             WHERE trust.node_id IS NULL OR trust.node_id <> node.node_id),
+           (SELECT count(*)
+              FROM nodes AS node
+              JOIN endpoint_trust AS trust ON trust.endpoint_id = node.endpoint_id
+             WHERE node.enabled = 1
+               AND trust.status <> 'active'),
+           (SELECT count(*)
+              FROM endpoint_trust AS trust
+              JOIN nodes AS node ON node.node_id = trust.node_id
+             WHERE trust.status = 'active'
+               AND trust.endpoint_id <> node.endpoint_id)",
+        [],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        },
+    );
+
+    match counts {
+        Ok((0, 0, 0, 0, 0)) => checks.push(ok(
+            "registry.endpoint_trust.bindings",
+            "active endpoint trust bindings match the node registry",
+            endpoint_trust_binding_details(0, 0, 0, 0, 0),
+        )),
+        Ok((
+            active_unbound,
+            active_orphan,
+            current_binding_mismatch,
+            inactive_current,
+            active_extra_for_node,
+        )) => checks.push(error(
+            "registry.endpoint_trust.bindings",
+            "endpoint trust bindings are inconsistent with the node registry",
+            endpoint_trust_binding_details(
+                active_unbound,
+                active_orphan,
+                current_binding_mismatch,
+                inactive_current,
+                active_extra_for_node,
+            ),
+        )),
+        Err(err) => checks.push(error(
+            "registry.endpoint_trust.bindings",
+            "failed to inspect endpoint trust bindings",
+            json!({"error": err.to_string()}),
+        )),
+    }
+}
+
+fn endpoint_trust_binding_details(
+    active_unbound: i64,
+    active_orphan: i64,
+    current_binding_mismatch: i64,
+    inactive_current: i64,
+    active_extra_for_node: i64,
+) -> Value {
+    json!({
+        "active_unbound": active_unbound,
+        "active_orphan": active_orphan,
+        "current_binding_mismatch": current_binding_mismatch,
+        "inactive_current": inactive_current,
+        "active_extra_for_node": active_extra_for_node,
+    })
 }
 
 fn check_audit_relationship_references(

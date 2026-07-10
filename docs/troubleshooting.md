@@ -28,6 +28,9 @@ JSON fields `status`, `exit_code`, `schema_version_expected`, `schema_version_ac
 - The recorded schema version is newer than this binary supports.
 - A previous migration could not create its private backup or checksum.
 - Registry rows contain invalid or duplicated EndpointIDs.
+- `registry.endpoint_trust.bindings` reports Active unbound/orphan trust, a
+  current node/trust pointer mismatch, an enabled node with an inactive current
+  endpoint, or an extra Active binding.
 
 ### Verification Commands
 
@@ -49,6 +52,27 @@ ocfleet --database /var/lib/ocfleet-controller/controller.sqlite --secret-key /v
 ```
 
 If a migration backup failed, inspect disk space and parent directory permissions, then rerun the same binary. Restore from a verified backup only if the database itself is damaged.
+
+### Endpoint Trust Binding Counts
+
+The `registry.endpoint_trust.bindings` doctor check exposes only aggregate
+counts:
+
+- `active_unbound`: Active trust has no node binding.
+- `active_orphan`: Active trust names a node that no longer exists.
+- `current_binding_mismatch`: a node and its current trust row do not point to
+  each other.
+- `inactive_current`: an enabled node points to non-Active trust.
+- `active_extra_for_node`: a node has another Active bound endpoint.
+
+Disabled nodes may intentionally point to revoked or quarantined trust.
+Historical inactive tombstones that outlive a node are also valid and are not
+counted as Active orphans. Do not edit SQLite directly or bind from
+agent-reported hostname to clear these counts. Preserve the database and audit
+log, identify the last audited node/endpoint lifecycle operation, and use only
+an allowed explicit transition. Legacy enrollment approvals can account for
+`active_unbound`; there is currently no safe reconciliation command, and those
+rows remain rejected for dispatch.
 
 ## EndpointID Mismatch
 
@@ -72,10 +96,23 @@ ocfleet --database /var/lib/ocfleet-controller/controller.sqlite --secret-key /v
 
 ### Fix Steps
 
+If the running agent has a newly generated and reviewed replacement EndpointID
+that is not already present in `endpoint_trust`, rotate from the registry's
+current EndpointID so the trust rows and node pointer move atomically:
+
 ```bash
-ocfleet --database /var/lib/ocfleet-controller/controller.sqlite --secret-key /var/lib/ocfleet-controller/controller.secret node remove hk-ocserv-01 --yes
-ocfleet --database /var/lib/ocfleet-controller/controller.sqlite --secret-key /var/lib/ocfleet-controller/controller.secret node add hk-ocserv-01 --endpoint-id "$AGENT_ENDPOINT_ID" --region hk --role ocserv
+ocfleet --database /var/lib/ocfleet-controller/controller.sqlite --secret-key /var/lib/ocfleet-controller/controller.secret endpoint rotate "$OLD_ENDPOINT_ID" --new-endpoint-id "$AGENT_ENDPOINT_ID" --reason "approved key replacement"
+ocfleet --database /var/lib/ocfleet-controller/controller.sqlite --secret-key /var/lib/ocfleet-controller/controller.secret doctor --json
 ```
+
+Do not remove and re-add the same EndpointID. Removal revokes the unique Active
+trust tombstone, and node add does not overwrite existing trust. For contaminated
+or ambiguous bindings, preserve state and investigate the audit trail rather
+than selecting a row manually.
+
+An EndpointID already inserted by the legacy enrollment approval flow cannot be
+used as a rotation destination because it already exists as Active unbound trust.
+It remains rejected and awaits the explicit reconciliation follow-up.
 
 ### Logs And Metrics
 
@@ -111,6 +148,10 @@ Re-enable only after confirming the EndpointID is still trusted and expected:
 ocfleet --database /var/lib/ocfleet-controller/controller.sqlite --secret-key /var/lib/ocfleet-controller/controller.secret trust diff --format json
 ocfleet --database /var/lib/ocfleet-controller/controller.sqlite --secret-key /var/lib/ocfleet-controller/controller.secret node enable hk-ocserv-01
 ```
+
+`node enable` also requires a clean bidirectional binding and exactly one Active
+trust row. If it rejects the node, use the doctor binding counts and lifecycle
+audit trail; do not bypass the check with direct SQL.
 
 ### Logs And Metrics
 
@@ -219,6 +260,8 @@ Connection is rejected before a structured RPC response, or audit shows `ENDPOIN
 - A source agent is missing from target `[[security.peers]]`.
 - A peer entry exists but `enabled = false`.
 - The wrong SecretKey is running on the controller or source agent.
+- Controller trust is Active but unbound, points to a different node, or is one
+  of multiple Active bindings for the node.
 
 ### Verification Commands
 
@@ -257,6 +300,10 @@ sudo systemctl restart ocfleet-agent
 
 - Agent audit: `event=rpc_rejected`, `stage=connection_admission`, `error_code=ENDPOINT_NOT_ALLOWED`.
 - Fields: `remote_endpoint_id`, `reason`, `resource=connection`.
+- Controller/scheduler observations may use `ENDPOINT_TRUST_UNBOUND`,
+  `ENDPOINT_TRUST_BINDING_MISMATCH`, `TARGET_ENDPOINT_TRUST_UNBOUND`, or
+  `TARGET_ENDPOINT_TRUST_BINDING_MISMATCH`. These remain protocol-level
+  `ENDPOINT_NOT_ALLOWED` failures.
 
 ## Endpoint Revoked, Quarantined, Or Rotated
 
@@ -267,7 +314,8 @@ sudo systemctl restart ocfleet-agent
 ### Common Causes
 
 - The EndpointID was explicitly revoked or quarantined during incident response.
-- A node SecretKey was rotated and the registry still points to the old EndpointID.
+- A pre-hardening or restored database has a stale registry pointer from an old
+  rotation.
 - A restored controller database contains stale lifecycle state.
 - An agent config still allows an old controller or peer EndpointID.
 
@@ -287,6 +335,15 @@ Use explicit lifecycle commands; never rely on first contact to trust a new key:
 ocfleet --database /var/lib/ocfleet-controller/controller.sqlite --secret-key /var/lib/ocfleet-controller/controller.secret endpoint rotate "$OLD_ENDPOINT_ID" --new-endpoint-id "$NEW_ENDPOINT_ID" --reason "planned key rotation"
 ocfleet --database /var/lib/ocfleet-controller/controller.sqlite --secret-key /var/lib/ocfleet-controller/controller.secret trust diff --format json
 ```
+
+A successful rotation moves the bound node pointer in the same transaction. An
+exact retry of the recorded old/new pair is allowed; a different successor from
+a rotated row is rejected. Revoked rows are terminal, while quarantined rows may
+only rotate or revoke. A rotation from quarantine leaves the replacement node
+disabled until an explicit, clean `node enable`. Exact no-ops do not increment
+generation or write another audit row. An exact retry that repairs the one
+deterministic legacy stale pointer writes `endpoint.rotate.reconcile` without a
+generation increment.
 
 For compromise or investigation:
 

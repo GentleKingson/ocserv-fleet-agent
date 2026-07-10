@@ -18,6 +18,9 @@ production-complete.
   and scheduler run/outcome/observation/job-clock writes use actor-bearing
   `StoreWriter` transactions for state and audit. Health/alert/delivery,
   retention, and other legacy controller mutations are still being migrated.
+- Controller dispatch requires an enabled node and one Active trust row bound
+  bidirectionally to that node. Active status by itself is not authorization;
+  scheduler workers repeat the same binding check after concurrency waits.
 - The project is not production-complete.
 
 ## What It Does
@@ -33,6 +36,8 @@ production-complete.
   - one-time enrollment tokens stored as hashes.
   - pending join requests with manual approval.
   - EndpointID rotate, revoke, and quarantine lifecycle states.
+  - closed lifecycle transitions that keep the node registry and its unique
+    Active EndpointID binding consistent.
   - controller-side trust diff reporting.
 - Supports Phase 11 fixed low-sensitive ocserv read-only RPCs:
   - service summary
@@ -210,7 +215,8 @@ target/debug/ocfleet node add hk-ocserv-01 \
   --role ocserv
 ```
 
-Or use the Phase 10 approval flow:
+The Phase 10 approval records enrollment state, but it is not yet a replacement
+for the manual bound `node add` path:
 
 ```bash
 target/debug/ocfleet enroll token create \
@@ -233,8 +239,13 @@ target/debug/ocfleet enroll approve <join-request-id> \
   --reason "ticket-123"
 ```
 
-Enrollment tokens only create pending join requests. Agents do not receive
-peer or path-probe authorization until approval.
+Enrollment tokens only create pending join requests. The current approval flow
+creates a legacy Active trust row without an operator-selected node binding.
+That row is rejected by controller and scheduler dispatch even after approval;
+there is no automatic hostname-based binding or startup repair. Use the manual
+bound `node add` path for dispatch until an explicit reconciliation workflow is
+implemented. Avoid approving and then trying to add the same EndpointID, because
+the existing trust row is retained rather than overwritten.
 Avoid passing enrollment tokens as command-line arguments; use `--token-file` or
 `--token-stdin` so the token is less likely to leak through shell history,
 process listings, or audit collection.
@@ -441,6 +452,13 @@ finishes, and job clocks use actor-bound atomic writer boundaries. No database
 transaction remains open across an RPC or semaphore wait. Health, alerts,
 retention, and audit export use controller SQLite state and bounded
 low-sensitive summaries.
+Before any manual or scheduled RPC, the controller requires the registry node to
+be enabled, to point to the requested EndpointID, and to have exactly one Active
+trust row pointing back to that node. Source and path-target bindings are checked
+again after scheduler concurrency waits. Missing, inactive, unbound, mismatched,
+or ambiguous trust fails closed with protocol-level `ENDPOINT_NOT_ALLOWED`.
+This hardening does not change the SQLite schema, RPC protocol, agent method
+allowlist, read-only HTTP API, or default read-only product boundary.
 Webhook alert hooks require explicit HTTPS endpoints, host allowlists, private
 HMAC secret files, bounded retries, and no redirect following.
 
@@ -486,6 +504,9 @@ Networking must allow the controller to reach the agent through iroh using the r
 - SecretKey, SQLite, and agent audit files are expected to be private on Unix systems.
 - Unsafe existing sensitive files fail closed instead of being automatically chmodded.
 - Resource limits protect handshake tasks, connections, streams, nonce cache size, and repeated rejection audit logs.
+- Endpoint lifecycle changes and node removal keep registry/trust state in one
+  audited `StoreWriter` transaction. Exact lifecycle no-ops do not increment the
+  trust generation or add an audit row.
 - Agent audit durability metrics are written to the configured metrics path. The default runtime path is derived from `audit.path`.
 
 ## Development

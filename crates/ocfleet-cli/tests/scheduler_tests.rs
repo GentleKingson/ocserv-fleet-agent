@@ -926,17 +926,18 @@ fn scheduler_tests_targeted_run_executes_only_selected_job_and_queries_run() {
     let dir = tempfile::tempdir().expect("temp dir");
     let database = dir.path().join("controller.sqlite");
     let database_arg = database.to_string_lossy().into_owned();
-    {
+    let (first_endpoint, second_endpoint) = {
         let store = Store::open(&database).expect("open store");
         let first_endpoint = add_node_with_generated_endpoint(&store, "hk-ocserv-01");
         let second_endpoint = add_node_with_generated_endpoint(&store, "sg-ocserv-01");
-        store
-            .revoke_endpoint(&first_endpoint, "scheduler-user", "test preflight")
-            .expect("revoke first endpoint");
-        store
-            .revoke_endpoint(&second_endpoint, "scheduler-user", "test preflight")
-            .expect("revoke second endpoint");
-    }
+        (first_endpoint, second_endpoint)
+    };
+    set_inactive_status_for_trust_gate_fixture(&database, &first_endpoint, EndpointStatus::Revoked);
+    set_inactive_status_for_trust_gate_fixture(
+        &database,
+        &second_endpoint,
+        EndpointStatus::Revoked,
+    );
 
     let first = run_ocfleet(&[
         "--database",
@@ -1692,6 +1693,23 @@ fn add_node_with_generated_endpoint(store: &Store, node_id: &str) -> String {
     endpoint_id
 }
 
+fn set_inactive_status_for_trust_gate_fixture(
+    database: &Path,
+    endpoint_id: &str,
+    status: EndpointStatus,
+) {
+    assert_ne!(status, EndpointStatus::Active);
+    // Deliberately bypass lifecycle invariants: these tests exercise the dispatch gate against
+    // a contaminated enabled-node projection while leaving the trust bundle untouched.
+    Connection::open(database)
+        .expect("open database for contaminated trust-gate fixture")
+        .execute(
+            "UPDATE endpoint_trust SET status = ?1 WHERE endpoint_id = ?2",
+            rusqlite::params![status.as_str(), endpoint_id],
+        )
+        .expect("set contaminated endpoint status fixture");
+}
+
 fn assert_path_probe_target_endpoint_status_rejected(status: EndpointStatus, expected_code: &str) {
     let dir = tempfile::tempdir().expect("temp dir");
     let database = dir.path().join("controller.sqlite");
@@ -1700,33 +1718,9 @@ fn assert_path_probe_target_endpoint_status_rejected(status: EndpointStatus, exp
     let target_endpoint_id = {
         let store = Store::open(&database).expect("open store");
         add_node_with_generated_endpoint(&store, "source-node");
-        let target_endpoint_id = add_node_with_generated_endpoint(&store, "target-node");
-        match status {
-            EndpointStatus::Revoked => {
-                store
-                    .revoke_endpoint(&target_endpoint_id, "operator", "test revoke")
-                    .expect("revoke endpoint");
-            }
-            EndpointStatus::Quarantined => {
-                store
-                    .quarantine_endpoint(&target_endpoint_id, "operator", "test quarantine")
-                    .expect("quarantine endpoint");
-            }
-            EndpointStatus::Rotated => {
-                let new_endpoint_id = iroh::SecretKey::generate().public().to_string();
-                store
-                    .rotate_endpoint(
-                        &target_endpoint_id,
-                        &new_endpoint_id,
-                        "operator",
-                        "test rotate",
-                    )
-                    .expect("rotate endpoint");
-            }
-            EndpointStatus::Active => panic!("active endpoint is not a rejection case"),
-        }
-        target_endpoint_id
+        add_node_with_generated_endpoint(&store, "target-node")
     };
+    set_inactive_status_for_trust_gate_fixture(&database, &target_endpoint_id, status);
 
     run_ocfleet(&[
         "--database",

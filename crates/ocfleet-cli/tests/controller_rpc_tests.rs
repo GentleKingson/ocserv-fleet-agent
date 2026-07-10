@@ -41,6 +41,16 @@ fn delete_endpoint_trust(database: &std::path::Path, endpoint_id: &str) {
         .expect("delete endpoint trust");
 }
 
+fn set_endpoint_trust_node(database: &std::path::Path, endpoint_id: &str, node_id: Option<&str>) {
+    Connection::open(database)
+        .expect("open sqlite")
+        .execute(
+            "UPDATE endpoint_trust SET node_id = ?1 WHERE endpoint_id = ?2",
+            rusqlite::params![node_id, endpoint_id],
+        )
+        .expect("update endpoint trust binding");
+}
+
 fn rpc_rejection_audits(database: &std::path::Path) -> Vec<(String, String, serde_json::Value)> {
     let conn = Connection::open(database).expect("open sqlite");
     let mut stmt = conn
@@ -122,6 +132,67 @@ async fn controller_rpc_missing_endpoint_trust_fails_closed_before_secret_io() {
 }
 
 #[tokio::test]
+async fn controller_rpc_unbound_endpoint_trust_fails_closed_before_secret_io() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("controller.sqlite");
+    let missing_secret_key = dir.path().join("does-not-exist.secret");
+    let store = Store::open(&db).expect("store opens");
+    let endpoint_id = seed_active_node(&store);
+    set_endpoint_trust_node(&db, &endpoint_id, None);
+
+    let outcome = ControllerRpcRunner::new(&store, &missing_secret_key)
+        .run_fixed_node_rpc(TEST_NODE_ID, PROBE_CONTROLLER_PING)
+        .await;
+
+    assert_eq!(outcome.error_code.as_deref(), Some("ENDPOINT_NOT_ALLOWED"));
+    assert_eq!(outcome.summary_json["endpoint_trust_state"], "unbound");
+    assert_eq!(outcome.summary_json["endpoint_status"], "active");
+    assert!(
+        outcome
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("trust is unbound"))
+    );
+    assert!(!missing_secret_key.exists());
+    let audits = rpc_rejection_audits(&db);
+    assert_eq!(audits.len(), 1);
+    assert_eq!(audits[0].1, "ENDPOINT_NOT_ALLOWED");
+    assert_eq!(audits[0].2["endpoint_trust_state"], "unbound");
+}
+
+#[tokio::test]
+async fn controller_rpc_binding_mismatch_fails_closed_before_secret_io() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("controller.sqlite");
+    let missing_secret_key = dir.path().join("does-not-exist.secret");
+    let store = Store::open(&db).expect("store opens");
+    let endpoint_id = seed_active_node(&store);
+    set_endpoint_trust_node(&db, &endpoint_id, Some("different-node"));
+
+    let outcome = ControllerRpcRunner::new(&store, &missing_secret_key)
+        .run_fixed_node_rpc(TEST_NODE_ID, PROBE_CONTROLLER_PING)
+        .await;
+
+    assert_eq!(outcome.error_code.as_deref(), Some("ENDPOINT_NOT_ALLOWED"));
+    assert_eq!(
+        outcome.summary_json["endpoint_trust_state"],
+        "binding_mismatch"
+    );
+    assert_eq!(outcome.summary_json["endpoint_status"], "active");
+    assert!(
+        outcome
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("trust binding mismatch"))
+    );
+    assert!(!missing_secret_key.exists());
+    let audits = rpc_rejection_audits(&db);
+    assert_eq!(audits.len(), 1);
+    assert_eq!(audits[0].1, "ENDPOINT_NOT_ALLOWED");
+    assert_eq!(audits[0].2["endpoint_trust_state"], "binding_mismatch");
+}
+
+#[tokio::test]
 async fn ocserv_rpc_missing_endpoint_trust_fails_closed_before_secret_io() {
     let dir = tempfile::tempdir().expect("temp dir");
     let db = dir.path().join("controller.sqlite");
@@ -191,7 +262,8 @@ async fn controller_rpc_preserves_active_and_inactive_endpoint_behavior() {
     let active_store = Store::open(&active_db).expect("active store opens");
     let active_endpoint_id = seed_active_node(&active_store);
     assert_eq!(
-        endpoint_trust_rejection(&active_store, &active_endpoint_id).expect("read active trust"),
+        endpoint_trust_rejection(&active_store, TEST_NODE_ID, &active_endpoint_id)
+            .expect("read active trust"),
         None
     );
 
@@ -208,11 +280,15 @@ async fn controller_rpc_preserves_active_and_inactive_endpoint_behavior() {
     let inactive_secret_key = inactive_dir.path().join("does-not-exist.secret");
     let inactive_store = Store::open(&inactive_db).expect("inactive store opens");
     let inactive_endpoint_id = seed_active_node(&inactive_store);
-    inactive_store
-        .revoke_endpoint(&inactive_endpoint_id, TEST_ACTOR, "test revoke")
-        .expect("revoke endpoint");
+    Connection::open(&inactive_db)
+        .expect("open inactive fixture database")
+        .execute(
+            "UPDATE endpoint_trust SET status = 'revoked' WHERE endpoint_id = ?1",
+            [&inactive_endpoint_id],
+        )
+        .expect("mark endpoint inactive without changing node state");
     assert_eq!(
-        endpoint_trust_rejection(&inactive_store, &inactive_endpoint_id)
+        endpoint_trust_rejection(&inactive_store, TEST_NODE_ID, &inactive_endpoint_id)
             .expect("read inactive trust"),
         Some(EndpointTrustRejection::Inactive(
             ocfleet_protocol::enrollment::EndpointStatus::Revoked
@@ -304,6 +380,7 @@ fn controller_rpc_fixed_rpc_variants_define_method_and_params() {
     assert_eq!(FixedControllerRpc::ProbeControllerPing.params(), json!({}));
 
     let path = FixedControllerRpc::ProbePathEcho {
+        target_node_id: "target-node".to_string(),
         target_agent_endpoint_id: "target-endpoint".to_string(),
     };
     assert_eq!(path.method(), PROBE_PATH_ECHO);

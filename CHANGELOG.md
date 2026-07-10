@@ -24,6 +24,11 @@
 - Node add, enable, disable, and remove now take an explicit resolved actor and
   commit their registry/trust change and success audit in one SQLite
   transaction through `StoreWriter`.
+- Endpoint rotation, revocation, and quarantine now execute through
+  `StoreWriter` and a closed lifecycle table. Rotation atomically moves the node
+  registry pointer; revocation and quarantine disable the current bound node;
+  node removal revokes its unique Active trust. Exact no-ops do not increment
+  generation or write another audit row.
 - Scheduler job add, enable, and disable now take the resolved actor and commit
   the job configuration change and success audit in one SQLite transaction
   through `StoreWriter`.
@@ -49,9 +54,23 @@
   concurrency waits at the dispatch boundary. Missing trust is distinct from
   active trust, produces fixed low-sensitive failure codes and rejection
   audits, and is reported by `ocfleet doctor`.
+- Active status alone no longer authorizes dispatch. The controller requires an
+  enabled registry node, matching node-to-endpoint and trust-to-node pointers,
+  and exactly one Active binding. Scheduler workers repeat that full snapshot
+  after concurrency waits. Unbound and mismatched source/path-target failures
+  use fixed low-sensitive observation codes while retaining protocol-level
+  `ENDPOINT_NOT_ALLOWED`.
+- `ocfleet doctor` now reports aggregate-only counts for Active unbound rows,
+  Active orphans, current binding mismatches, enabled nodes with inactive
+  current endpoints, and extra Active bindings. Disabled lifecycle states and
+  historical inactive tombstones are not binding-integrity errors.
+- Endpoint binding and lifecycle hardening changes no SQLite schema version, RPC
+  protocol, agent capability, read-only API route, or default read-only behavior.
 - Added audit-insert failure and pre-commit transaction-drop coverage proving
   node registry and endpoint-trust mutations roll back instead of committing
   without audit, plus a CI guard for controller mutation SQL placement.
+- Extended the production mutation guard to reject direct node and endpoint
+  lifecycle mutator calls outside the reviewed SQLite store/backend boundary.
 - Added audit-insert failure coverage proving scheduler job add, enable, and
   disable roll back their `observability_jobs` changes instead of committing
   without audit. Scheduler audit before/after projections use only fixed job
@@ -93,6 +112,10 @@
   mutations have not yet all moved to atomic `StoreWriter` actor/audit
   transactions. Recovery of incomplete scheduler `running` rows remains A3
   scheduler-reliability work.
+- Enrollment approval still creates a legacy Active unbound trust row. It is
+  rejected by the bidirectional dispatch gate and has no automatic hostname or
+  startup reconciliation; an explicit operator binding workflow remains
+  follow-up work.
 - Controlled writes are validation-only scaffolding and have no live code path.
 - API TLS termination remains an external deployment responsibility.
 - Browser screenshot QA, cargo-deny, cargo-audit, Linux multi-architecture

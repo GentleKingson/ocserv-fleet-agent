@@ -4,6 +4,7 @@ use ocfleet_protocol::enrollment::EndpointStatus;
 use ocfleet_protocol::method::{
     OCSERV_CERT_EXPIRY, OCSERV_SERVICE_SUMMARY, OCSERV_VERSION, PROBE_CONTROLLER_PING,
 };
+use rusqlite::Connection;
 use serde_json::{Value, json};
 use std::process::{Command, Output};
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
@@ -180,25 +181,15 @@ fn health_summary_tests_inactive_endpoint_overrides_recent_success() {
             .expect("get node")
             .expect("node exists")
             .endpoint_id;
-        match status {
-            EndpointStatus::Revoked => {
-                store
-                    .revoke_endpoint(&endpoint_id, "operator", "test revoke")
-                    .expect("revoke endpoint");
-            }
-            EndpointStatus::Quarantined => {
-                store
-                    .quarantine_endpoint(&endpoint_id, "operator", "test quarantine")
-                    .expect("quarantine endpoint");
-            }
-            EndpointStatus::Rotated => {
-                let new_endpoint_id = iroh::SecretKey::generate().public().to_string();
-                store
-                    .rotate_endpoint(&endpoint_id, &new_endpoint_id, "operator", "test rotate")
-                    .expect("rotate endpoint");
-            }
-            EndpointStatus::Active => panic!("active endpoint is not a rejection case"),
-        }
+        // Preserve an enabled legacy registry pointer so this test isolates the
+        // health evaluator's inactive-trust precedence rather than lifecycle disablement.
+        Connection::open(&database)
+            .expect("open database")
+            .execute(
+                "UPDATE endpoint_trust SET status = ?1 WHERE endpoint_id = ?2",
+                rusqlite::params![status.as_str(), endpoint_id],
+            )
+            .expect("mark current endpoint inactive");
         let observed_at = now_rfc3339();
         insert_observation(
             &store,

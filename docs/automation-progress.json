@@ -2,11 +2,11 @@
   "baseline_commit": "b3c906a94823b4620dc1a2077a44e7160c0848b2",
   "current_phase": "A1",
   "completed_phases": [],
-  "active_branch": "codex/a1-scheduler-persistence-atomicity",
+  "active_branch": "codex/a1-endpoint-binding-state-machine",
   "active_issue": 33,
-  "active_pr": 60,
+  "active_pr": 61,
   "last_test_result": "passed",
-  "last_updated_at": "2026-07-10T17:50:53Z",
+  "last_updated_at": "2026-07-10T19:26:48Z",
   "blockers": [],
-  "next_action": "Monitor pull request 60, fix any failures, and merge only after all required checks pass."
+  "next_action": "Monitor pull request #61 CI, fix any failures, merge it when green, then begin explicit enrollment binding and writer migration."
 }

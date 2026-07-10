@@ -30,7 +30,7 @@ for every status below.
 | 5. Local ocserv collector | Complete constrained implementation | Added `ocfleet-ocserv-collector`, fixed snapshot-v2 validation, private atomic output, snapshot-provider compatibility tests, hardened opt-in systemd units, and operator docs. It deliberately performs no live discovery or local tool invocation. |
 | 6. Trust policy as code | Complete review-only implementation | Added TOML/YAML parity, strict explicit-topology validation, deterministic bounded diffs, JSON/Markdown output, private create-new Markdown files, example policy, and CI helper. No apply or agent contact exists. |
 | 7. Governance/RBAC foundation | Complete foundation | Actor resolution now fails closed for invalid explicit values, including non-UTF-8 environment data. Fixed viewer/operator/security-admin policy tests exist; API principals remain viewer-only and local CLI RBAC remains intentionally unenforced. |
-| 8. Store abstraction | Implemented slice, expansion active | Added `StoreReader`, `StoreWriter`, `MigrationManager`, and `AuditWriter`; bounded SQLite reads fail closed on contaminated dynamic JSON. Node lifecycle, scheduler job configuration, and scheduler run start/outcome/finish transitions now use actor-bearing atomic writer methods with failure-injection rollback tests. Bounded outcomes pair every observation with an audit, and finish atomically updates the owning job clock. Health/alert/delivery, retention, and other writers are not all migrated. API retains a narrower independent read adapter. |
+| 8. Store abstraction | Implemented slice, expansion active | Added `StoreReader`, `StoreWriter`, `MigrationManager`, and `AuditWriter`; bounded SQLite reads fail closed on contaminated dynamic JSON. Node and endpoint lifecycle, scheduler job configuration, and scheduler run start/outcome/finish transitions use actor-bearing writer methods. A static guard rejects direct production node/endpoint mutator bypasses. Bounded outcomes pair every observation with an audit, and finish atomically updates the owning job clock. Health/alert/delivery, retention, and other writers are not all migrated. API retains a narrower independent read adapter. |
 | 9. Optional Postgres backend | Complete non-connecting scaffold | Added default-off `postgres-backend`, redacted/validated connection-source types, and an always-unavailable connection stub. No client, DSN logging, schema, migration, import, or runtime selection exists. |
 | 10. Controlled writes | Complete dry-run design slice | Added default-off typed DTO/config validation, redacted request `Debug`, signed-intent and rollback consistency checks, outage acknowledgement, and tests proving default and feature-enabled agents still reject every write RPC. No dispatch exists. |
 | 11. CI and release readiness | Complete workflow slice | Pinned Rust 1.96.1 and actions, preserved least privilege, added default/all-feature gates, cargo-deny/audit jobs, tag-bound draft release assembly for four binaries on two architectures, release-version attack tests, install smoke coverage, and v0.2.0 install/release docs. |
@@ -48,6 +48,8 @@ can distinguish source checks from CI-only runtime checks:
 - crate-specific API, CLI, agent, config, and protocol tests, including
   all-feature controlled-write rejection
 - `bash scripts/check-doc-claims.sh`
+- `bash scripts/check-controller-mutations.sh`
+- `bash scripts/tests/test-controller-mutation-guard.sh`
 - `./scripts/check-github-actions-pinning.sh`
 - `./scripts/test-release-version-validation.sh`
 - `CARGO="$HOME/.cargo/bin/cargo" ./scripts/build-release.sh v0.2.0`
@@ -70,12 +72,17 @@ their pinned GitHub Actions jobs are the verification path for this candidate.
   now use short atomic boundaries without holding a transaction across RPC;
   incomplete outcome or finish persistence remains a durable `running` row for
   later scheduler recovery work. This changes no schema, protocol, or API route.
-- Keep every controller and scheduler RPC gate fail closed on absent as well as
-  inactive endpoint trust. The current correction adds fixed missing-trust
-  outcomes and rejection audits before key or network access, repeats scheduler
-  source/target checks after concurrency waits, and adds an aggregate doctor
-  coverage check. It changes no schema, protocol, or API route; endpoint binding
-  and lifecycle-state invariants remain separate A1 work.
+- Keep every controller and scheduler RPC gate fail closed on missing, inactive,
+  unbound, mismatched, stale, disabled, or ambiguous endpoint trust. Dispatch now
+  requires an enabled registry node with matching bidirectional pointers and one
+  Active binding, and scheduler workers repeat the full source/target snapshot
+  after concurrency waits. Lifecycle transitions keep the node pointer and trust
+  state together, while doctor reports aggregate binding counts. This changes no
+  schema, protocol, or API route.
+- Add an explicit operator-controlled reconciliation path for legacy enrollment
+  approvals that created Active unbound trust. Those rows remain rejected for
+  dispatch; the controller must not infer node identity from agent hostname or
+  repair them automatically at startup.
 - Consolidate the API-specific read adapter with the backend-neutral reader only
   after their projection contracts can remain equally strict.
 - Add a real Postgres client/schema/import path only as a separately reviewed,

@@ -35,10 +35,12 @@ a second success audit for the same mutation.
 The first rollout slice covers node add, enable, disable, and remove. The second
 slice covers scheduler job add, enable, and disable. The third slice covers
 scheduler run starts, bounded observation/RPC outcome batches, run finishes,
-and owning-job clock updates. Later slices cover health/alert/delivery,
-retention, and missing enrollment lifecycle transitions. Read-only events may
-continue to use the standalone audit writer because they have no paired
-business mutation.
+and owning-job clock updates. The fourth slice closes endpoint lifecycle
+transitions: rotation moves the node registry pointer with both trust rows,
+revocation and quarantine disable the current node, and removal terminalizes
+the unique active trust. Later slices cover health/alert/delivery, retention,
+and missing enrollment lifecycle transitions. Read-only events may continue to
+use the standalone audit writer because they have no paired business mutation.
 
 Scheduler execution uses several short transaction boundaries rather than one
 transaction around a run. The start row and start audit commit before dispatch;
@@ -64,7 +66,8 @@ job names and selector values, including when legacy rows contain unsafe text.
 - Backend contracts identify actor-bearing mutation entry points.
 - Integration tests install failing audit, observation, and job-clock triggers
   and prove that affected node, endpoint-trust, scheduler-job, run, outcome, and
-  clock changes roll back as one unit.
+  clock changes roll back as one unit. Endpoint tests additionally inject
+  failures between lineage and registry updates.
 - Transaction-drop tests exercise the pre-commit boundary.
 - A repository check restricts controller mutation SQL to reviewed storage and
   migration modules; it is a guardrail, not a substitute for code review.
@@ -85,8 +88,9 @@ continues to open SQLite with read-only and query-only enforcement.
 
 ## Rollback
 
-The node-lifecycle, scheduler-job, and scheduler-run slices have no schema
-migration. Reverting one restores its previous call structure but also restores
-the known audit gap, so rollback is appropriate only as an emergency source
-rollback before production use. Stored rows and existing audits remain
-compatible; no protocol or API contract changes are involved.
+The node-lifecycle, scheduler-job, scheduler-run, and endpoint-lifecycle slices
+have no schema migration. Reverting one restores its previous call structure
+but also restores the known audit or integrity gap, so rollback is appropriate
+only as an emergency source rollback before production use. Stored rows and
+existing audits remain compatible; no protocol or API contract changes are
+involved.

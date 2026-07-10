@@ -81,13 +81,42 @@ The config must not be a symlink or hardlink. Replace it atomically with a priva
 ## EndpointID Lifecycle
 
 Endpoint trust is explicit. There is no TOFU and no automatic path-probe trust.
+An Active trust row is not sufficient by itself: the controller also requires an
+enabled registry node, matching node-to-endpoint and trust-to-node pointers, and
+exactly one Active trust binding for that node. Scheduler source and path-target
+bindings are checked again after concurrency waits.
 
 - Rotate: use `ocfleet endpoint rotate <old-endpoint-id> --new-endpoint-id <new-endpoint-id> --reason <reason>` after the replacement agent identity is known and approved.
 - Revoke: use `ocfleet endpoint revoke <endpoint-id> --reason <reason>` when a key is compromised or a node is retired.
 - Quarantine: use `ocfleet endpoint quarantine <endpoint-id> --reason <reason>` when investigation is needed before a permanent revoke or rotation.
 - Review: use `ocfleet trust diff --format json` after any lifecycle change.
 
-Endpoint lifecycle commands update only controller-local SQLite trust state and write controller audit records. They do not modify ocserv, restart services, disconnect users, or push config to agents.
+The accepted transition table is deliberately closed:
+
+| Current state | Rotate | Revoke | Quarantine |
+| --- | --- | --- | --- |
+| `active` | apply | apply | apply |
+| `quarantined` | apply | apply | exact no-op |
+| `revoked` | reject | exact no-op | reject |
+| `rotated` | exact linked retry only | reject | reject |
+
+Exact no-ops do not increment generation or write another audit row. Rotation
+atomically changes the old/new trust rows and the bound node pointer. Revoke and
+quarantine disable the current bound node. Node removal revokes its unique Active
+trust before deleting the registry row; ambiguous state fails closed. These
+commands update only controller-local SQLite registry/trust state and audit. They
+do not modify ocserv, restart services, disconnect users, or push config to
+agents.
+
+Run `ocfleet doctor --json` after lifecycle changes. The
+`registry.endpoint_trust.bindings` check reports counts only for
+`active_unbound`, `active_orphan`, `current_binding_mismatch`,
+`inactive_current`, and `active_extra_for_node`; it does not expose raw node or
+EndpointID values. `inactive_current` counts only enabled nodes, so disabled
+revoked or quarantined lifecycle state and historical inactive tombstones are
+valid. A legacy enrollment approval may leave Active unbound trust, which
+remains rejected until an explicit operator reconciliation workflow exists.
+Never bind it from agent hostname or repair it automatically at startup.
 
 ## Audit And Observability
 

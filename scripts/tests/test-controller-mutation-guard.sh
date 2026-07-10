@@ -28,10 +28,23 @@ printf '%s\n' \
   'mod tests {' \
   '    const FIXTURE_SQL: &str = "UPDATE nodes SET enabled = 0";' \
   '}' \
+  'pub fn reviewed(store: &Store, node: &NodeInsert) {' \
+  '    Store::add_node(store, node, "actor");' \
+  '    store.enable_node("node", "actor");' \
+  '    store.disable_node("node", "actor");' \
+  '    store.remove_node("node", "actor");' \
+  '    store.rotate_endpoint("old", "new", "actor", "reason");' \
+  '    store.revoke_endpoint("endpoint", "actor", "reason");' \
+  '    store.quarantine_endpoint("endpoint", "actor", "reason");' \
+  '}' \
   'pub const OTHER_QUERY: &str = "SELECT enabled FROM nodes";' \
   > "$cli_src/backend.rs"
 printf '%s\n' \
   'pub const FIXTURE_SQL: &str = "DELETE FROM nodes";' \
+  'pub fn integration_fixture(store: &Store, node: &NodeInsert) {' \
+  '    store.add_node(node, "actor");' \
+  '    store.remove_node("node", "actor");' \
+  '}' \
   > "$fixture_root/crates/ocfleet-cli/tests/controller.rs"
 printf '%s\n' \
   'INSERT INTO nodes (node_id) VALUES ("fixture")' \
@@ -39,6 +52,11 @@ printf '%s\n' \
 printf '%s\n' \
   '// UPDATE nodes SET enabled = 0' \
   'pub const QUERY: &str = "SELECT node_id FROM nodes";' \
+  '#[cfg(test)]' \
+  'fn test_fixture(store: &Store) {' \
+  '    store.remove_node("node", "actor");' \
+  '    Store::revoke_endpoint(store, "endpoint", "actor", "reason");' \
+  '}' \
   > "$fixture_root/crates/ocfleet-api/src/readonly_store.rs"
 
 pass_output="$tmp_dir/pass-output"
@@ -101,5 +119,39 @@ if ! grep -Fq 'unsafe_rpc_audit.rs:2: direct RPC audit write outside reviewed ca
   sed -n '1,120p' "$rpc_fail_output" >&2
   exit 1
 fi
+
+rm -f "$cli_src/unsafe_rpc_audit.rs"
+printf '%s\n' \
+  'pub fn bypass(store: &Store, node: &NodeInsert) {' \
+  '    store.add_node(node, "actor");' \
+  '    Store::enable_node(store, "node", "actor");' \
+  '    store.disable_node("node", "actor");' \
+  '    Store::remove_node(store, "node", "actor");' \
+  '    store.rotate_endpoint("old", "new", "actor", "reason");' \
+  '    Store::revoke_endpoint(store, "endpoint", "actor", "reason");' \
+  '    store.quarantine_endpoint("endpoint", "actor", "reason");' \
+  '}' \
+  > "$cli_src/unsafe_node_endpoint_mutator.rs"
+
+node_endpoint_fail_output="$tmp_dir/node-endpoint-fail-output"
+if "$GUARD" --repo-root "$fixture_root" "$fixture_root" >"$node_endpoint_fail_output" 2>&1; then
+  printf 'controller mutation guard accepted direct node/endpoint mutator calls\n' >&2
+  exit 1
+fi
+for expected in \
+  'unsafe_node_endpoint_mutator.rs:2: direct node/endpoint mutator call outside reviewed store/backend boundary: add_node' \
+  'unsafe_node_endpoint_mutator.rs:3: direct node/endpoint mutator call outside reviewed store/backend boundary: enable_node' \
+  'unsafe_node_endpoint_mutator.rs:4: direct node/endpoint mutator call outside reviewed store/backend boundary: disable_node' \
+  'unsafe_node_endpoint_mutator.rs:5: direct node/endpoint mutator call outside reviewed store/backend boundary: remove_node' \
+  'unsafe_node_endpoint_mutator.rs:6: direct node/endpoint mutator call outside reviewed store/backend boundary: rotate_endpoint' \
+  'unsafe_node_endpoint_mutator.rs:7: direct node/endpoint mutator call outside reviewed store/backend boundary: revoke_endpoint' \
+  'unsafe_node_endpoint_mutator.rs:8: direct node/endpoint mutator call outside reviewed store/backend boundary: quarantine_endpoint'
+do
+  if ! grep -Fq "$expected" "$node_endpoint_fail_output"; then
+    printf 'controller mutation guard did not report expected mutator violation: %s\n' "$expected" >&2
+    sed -n '1,160p' "$node_endpoint_fail_output" >&2
+    exit 1
+  fi
+done
 
 printf 'Controller mutation SQL guard self-test passed.\n'

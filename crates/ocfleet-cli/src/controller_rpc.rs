@@ -27,7 +27,7 @@ use crate::rpc_client::{
     RpcClientError, bind_controller_endpoint, build_request, call_endpoint_addr,
     validate_path_echo_result, validate_rpc_response,
 };
-use crate::store::{NodeRecord, Store};
+use crate::store::{EndpointDispatchBinding, NodeRecord, Store};
 
 pub const CONTROLLER_RPC_RESULT_CLASS: &str = "controller_rpc_summary";
 pub const OCSERV_RESULT_CLASS: &str = "low_sensitive_summary";
@@ -36,6 +36,8 @@ pub const OCSERV_RESULT_CLASS: &str = "low_sensitive_summary";
 pub enum EndpointTrustRejection {
     Missing,
     Inactive(EndpointStatus),
+    Unbound,
+    BindingMismatch,
 }
 
 impl EndpointTrustRejection {
@@ -43,6 +45,8 @@ impl EndpointTrustRejection {
         match self {
             Self::Missing => "missing",
             Self::Inactive(status) => status.as_str(),
+            Self::Unbound => "unbound",
+            Self::BindingMismatch => "binding_mismatch",
         }
     }
 
@@ -50,10 +54,43 @@ impl EndpointTrustRejection {
         matches!(self, Self::Missing)
     }
 
-    fn endpoint_status(self) -> Option<EndpointStatus> {
+    pub fn endpoint_status(self) -> Option<EndpointStatus> {
         match self {
             Self::Missing => None,
             Self::Inactive(status) => Some(status),
+            Self::Unbound | Self::BindingMismatch => Some(EndpointStatus::Active),
+        }
+    }
+
+    pub fn trust_state(self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::Inactive(_) => "inactive",
+            Self::Unbound => "unbound",
+            Self::BindingMismatch => "binding_mismatch",
+        }
+    }
+
+    pub fn message(self, target: bool, node_id: &str, endpoint_id: &str) -> String {
+        let label = if target {
+            "target endpoint"
+        } else {
+            "endpoint"
+        };
+        match self {
+            Self::Missing => {
+                format!("{label} trust missing: node_id={node_id} endpoint_id={endpoint_id}")
+            }
+            Self::Inactive(status) => format!(
+                "{label} not active: node_id={node_id} endpoint_id={endpoint_id} status={}",
+                status.as_str(),
+            ),
+            Self::Unbound => {
+                format!("{label} trust is unbound: node_id={node_id} endpoint_id={endpoint_id}")
+            }
+            Self::BindingMismatch => format!(
+                "{label} trust binding mismatch: node_id={node_id} endpoint_id={endpoint_id}"
+            ),
         }
     }
 }
@@ -75,7 +112,10 @@ pub enum FixedControllerRpc {
     NodePing,
     NodeInfo,
     ProbeControllerPing,
-    ProbePathEcho { target_agent_endpoint_id: String },
+    ProbePathEcho {
+        target_node_id: String,
+        target_agent_endpoint_id: String,
+    },
     OcservServiceSummary,
     OcservVersion,
     OcservSessionsSummary,
@@ -121,6 +161,7 @@ impl FixedControllerRpc {
         match self {
             Self::ProbePathEcho {
                 target_agent_endpoint_id,
+                ..
             } => json!({ "target_agent_endpoint_id": target_agent_endpoint_id }),
             _ => json!({}),
         }
@@ -570,45 +611,67 @@ fn write_rpc_rejection_audits(
 
 pub fn endpoint_trust_rejection(
     store: &Store,
+    expected_node_id: &str,
     endpoint_id: &str,
 ) -> Result<Option<EndpointTrustRejection>> {
     Ok(classify_endpoint_trust(
         store
-            .get_endpoint_trust(endpoint_id)?
-            .map(|endpoint| endpoint.status),
+            .get_endpoint_dispatch_binding(expected_node_id, endpoint_id)?
+            .as_ref(),
+        expected_node_id,
+        endpoint_id,
     ))
 }
 
-fn classify_endpoint_trust(status: Option<EndpointStatus>) -> Option<EndpointTrustRejection> {
-    match status {
-        None => Some(EndpointTrustRejection::Missing),
-        Some(EndpointStatus::Active) => None,
-        Some(status) => Some(EndpointTrustRejection::Inactive(status)),
+fn classify_endpoint_trust(
+    binding: Option<&EndpointDispatchBinding>,
+    expected_node_id: &str,
+    endpoint_id: &str,
+) -> Option<EndpointTrustRejection> {
+    let Some(binding) = binding else {
+        return Some(EndpointTrustRejection::Missing);
+    };
+    match binding.status {
+        EndpointStatus::Active => {}
+        status => return Some(EndpointTrustRejection::Inactive(status)),
     }
+    let Some(trust_node_id) = binding.trust_node_id.as_deref() else {
+        return Some(EndpointTrustRejection::Unbound);
+    };
+    if trust_node_id != expected_node_id
+        || binding.registry_node_id.as_deref() != Some(expected_node_id)
+        || binding.registry_endpoint_id.as_deref() != Some(endpoint_id)
+        || binding.registry_enabled != Some(true)
+        || binding.active_endpoint_count_for_node != 1
+    {
+        return Some(EndpointTrustRejection::BindingMismatch);
+    }
+    None
 }
 
 fn ensure_fixed_rpc_trust(
     node: &NodeRecord,
     rpc: &FixedControllerRpc,
-    mut lookup: impl FnMut(&str) -> Result<Option<EndpointTrustRejection>>,
+    mut lookup: impl FnMut(&str, &str) -> Result<Option<EndpointTrustRejection>>,
 ) -> Result<(), RpcCommandFailure> {
     let result_class = rpc_result_class(rpc.method());
     if let Some(rejection) =
-        lookup(&node.endpoint_id).map_err(|_| trust_read_failure(result_class))?
+        lookup(&node.node_id, &node.endpoint_id).map_err(|_| trust_read_failure(result_class))?
     {
         return Err(endpoint_trust_failure(node, rejection, result_class, None));
     }
     if let FixedControllerRpc::ProbePathEcho {
+        target_node_id,
         target_agent_endpoint_id,
     } = rpc
-        && let Some(rejection) =
-            lookup(target_agent_endpoint_id).map_err(|_| trust_read_failure(result_class))?
+        && let Some(rejection) = lookup(target_node_id, target_agent_endpoint_id)
+            .map_err(|_| trust_read_failure(result_class))?
     {
         return Err(endpoint_trust_failure(
             node,
             rejection,
             result_class,
-            Some(target_agent_endpoint_id),
+            Some((target_node_id, target_agent_endpoint_id)),
         ));
     }
     Ok(())
@@ -630,26 +693,19 @@ fn endpoint_trust_failure(
     node: &NodeRecord,
     rejection: EndpointTrustRejection,
     result_class: &str,
-    target_endpoint_id: Option<&str>,
+    target: Option<(&str, &str)>,
 ) -> RpcCommandFailure {
-    let target = target_endpoint_id.is_some();
-    let message = match target_endpoint_id {
-        Some(endpoint_id) if rejection.is_missing() => {
-            format!("target endpoint trust missing: endpoint_id={endpoint_id}")
-        }
-        Some(endpoint_id) => format!(
-            "target endpoint not active: endpoint_id={} status={}",
-            endpoint_id,
-            rejection.as_str()
-        ),
+    let is_target = target.is_some();
+    let message = match target {
+        Some((target_node_id, endpoint_id)) => rejection.message(true, target_node_id, endpoint_id),
         None => endpoint_trust_rejection_message(node, rejection),
     };
-    let trust_state_field = if target {
+    let trust_state_field = if is_target {
         "target_endpoint_trust_state"
     } else {
         "endpoint_trust_state"
     };
-    let endpoint_status_field = if target {
+    let endpoint_status_field = if is_target {
         "target_endpoint_status"
     } else {
         "endpoint_status"
@@ -658,20 +714,17 @@ fn endpoint_trust_failure(
         "message": message,
         "result_class": result_class,
     });
-    detail[trust_state_field] = Value::String(
-        if rejection.is_missing() {
-            "missing"
-        } else {
-            "inactive"
-        }
-        .to_string(),
-    );
+    detail[trust_state_field] = Value::String(rejection.trust_state().to_string());
+    if let Some((target_node_id, target_endpoint_id)) = target {
+        detail["target_node_id"] = Value::String(target_node_id.to_string());
+        detail["target_endpoint_id"] = Value::String(target_endpoint_id.to_string());
+    }
     if let Some(status) = rejection.endpoint_status() {
         detail[endpoint_status_field] = Value::String(status.as_str().to_string());
     }
     RpcCommandFailure::new(ErrorCode::EndpointNotAllowed, message, None, detail)
         .with_endpoint_id(Some(node.endpoint_id.clone()))
-        .with_endpoint_trust_rejection(rejection, target)
+        .with_endpoint_trust_rejection(rejection, is_target)
 }
 
 fn rpc_result_class(method: &str) -> &'static str {
@@ -717,14 +770,16 @@ pub fn load_ocserv_rpc_node(store: &Store, node_id: &str) -> Result<NodeRecord, 
             low_sensitive_detail(&message),
         ));
     }
-    if let Some(rejection) = endpoint_trust_rejection(store, &node.endpoint_id).map_err(|err| {
-        RpcCommandFailure::new(
-            ErrorCode::SqliteError,
-            err.to_string(),
-            None,
-            low_sensitive_detail("controller endpoint trust read failed"),
-        )
-    })? {
+    if let Some(rejection) = endpoint_trust_rejection(store, &node.node_id, &node.endpoint_id)
+        .map_err(|err| {
+            RpcCommandFailure::new(
+                ErrorCode::SqliteError,
+                err.to_string(),
+                None,
+                low_sensitive_detail("controller endpoint trust read failed"),
+            )
+        })?
+    {
         return Err(endpoint_trust_failure(
             &node,
             rejection,
@@ -986,8 +1041,8 @@ pub async fn execute_fixed_node_rpc(
     node: &NodeRecord,
     rpc: FixedControllerRpc,
 ) -> Result<RpcCommandSuccess, RpcCommandFailure> {
-    ensure_fixed_rpc_trust(node, &rpc, |endpoint_id| {
-        endpoint_trust_rejection(store, endpoint_id)
+    ensure_fixed_rpc_trust(node, &rpc, |expected_node_id, endpoint_id| {
+        endpoint_trust_rejection(store, expected_node_id, endpoint_id)
     })?;
     execute_fixed_node_rpc_unchecked(secret_key_path, node, rpc).await
 }
@@ -1003,9 +1058,17 @@ pub(crate) async fn execute_fixed_node_rpc_from_database(
     let gate_rpc = rpc.clone();
     let result_class = rpc_result_class(rpc.method());
     tokio::task::spawn_blocking(move || {
-        ensure_fixed_rpc_trust(&gate_node, &gate_rpc, |endpoint_id| {
-            let status = Store::read_endpoint_trust_status(&gate_database_path, endpoint_id)?;
-            Ok(classify_endpoint_trust(status))
+        ensure_fixed_rpc_trust(&gate_node, &gate_rpc, |expected_node_id, endpoint_id| {
+            let binding = Store::read_endpoint_dispatch_binding(
+                &gate_database_path,
+                expected_node_id,
+                endpoint_id,
+            )?;
+            Ok(classify_endpoint_trust(
+                binding.as_ref(),
+                expected_node_id,
+                endpoint_id,
+            ))
         })
     })
     .await
@@ -1412,14 +1475,16 @@ fn load_fixed_rpc_node(store: &Store, node_id: &str) -> Result<NodeRecord, RpcCo
         )
         .with_endpoint_id(Some(node.endpoint_id)));
     }
-    if let Some(rejection) = endpoint_trust_rejection(store, &node.endpoint_id).map_err(|err| {
-        RpcCommandFailure::new(
-            ErrorCode::SqliteError,
-            err.to_string(),
-            None,
-            json!({ "message": "controller endpoint trust read failed" }),
-        )
-    })? {
+    if let Some(rejection) = endpoint_trust_rejection(store, &node.node_id, &node.endpoint_id)
+        .map_err(|err| {
+            RpcCommandFailure::new(
+                ErrorCode::SqliteError,
+                err.to_string(),
+                None,
+                json!({ "message": "controller endpoint trust read failed" }),
+            )
+        })?
+    {
         return Err(endpoint_trust_failure(
             &node,
             rejection,
@@ -1434,18 +1499,7 @@ fn endpoint_trust_rejection_message(
     node: &NodeRecord,
     rejection: EndpointTrustRejection,
 ) -> String {
-    match rejection {
-        EndpointTrustRejection::Missing => format!(
-            "endpoint trust missing: node_id={} endpoint_id={}",
-            node.node_id, node.endpoint_id
-        ),
-        EndpointTrustRejection::Inactive(status) => format!(
-            "endpoint not active: node_id={} endpoint_id={} status={}",
-            node.node_id,
-            node.endpoint_id,
-            status.as_str()
-        ),
-    }
+    rejection.message(false, &node.node_id, &node.endpoint_id)
 }
 
 fn validate_response_for_method(

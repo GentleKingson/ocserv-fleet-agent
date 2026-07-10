@@ -1,4 +1,6 @@
-use ocfleet_cli::store::{EnrollmentTokenInsert, JoinRequestInsert, NodeInsert, Store};
+use ocfleet_cli::store::{
+    ApprovalInput, EnrollmentTokenInsert, JoinRequestInsert, NodeInsert, Store,
+};
 use ocfleet_protocol::enrollment::{EndpointStatus, JoinRequestStatus};
 use rusqlite::Connection;
 use serde_json::Value;
@@ -90,6 +92,43 @@ fn latest_audit_event(database: &Path) -> (String, Value) {
     )
 }
 
+fn seed_join_request(
+    store: &Store,
+    token_id: &str,
+    token_plaintext: &str,
+    requested_endpoint_id: Option<String>,
+) -> ocfleet_cli::store::JoinRequestRecord {
+    store
+        .create_enrollment_token(
+            &EnrollmentTokenInsert {
+                token_id: token_id.to_string(),
+                token_hash: Store::hash_enrollment_token(token_plaintext),
+                created_by: "seed-operator".to_string(),
+                expires_at: "2099-01-01T00:00:00Z".to_string(),
+                max_uses: 1,
+                description: None,
+                labels_json: serde_json::json!({}),
+                scope_json: serde_json::json!({}),
+            },
+            "seed-operator",
+        )
+        .expect("create enrollment token");
+    store
+        .submit_join_request(
+            &JoinRequestInsert {
+                token_plaintext: token_plaintext.to_string(),
+                agent_public_key: "agent-public-key".to_string(),
+                fingerprint: "agent-fingerprint".to_string(),
+                requested_endpoint_id,
+                hostname: "agent-supplied.example".to_string(),
+                agent_version: "0.2.0".to_string(),
+                requested_labels_json: serde_json::json!({"node_id": "ignored"}),
+            },
+            "agent",
+        )
+        .expect("submit join request")
+}
+
 #[test]
 fn enroll_token_create_prints_plaintext_once_and_stores_only_hash() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -165,11 +204,17 @@ fn enroll_approve_activates_pending_join_request() {
     run_ocfleet(&[
         "--database",
         &database_arg,
+        "--actor",
+        "approval-operator",
         "enroll",
         "approve",
         &join.request_id,
         "--endpoint-id",
         &endpoint_id,
+        "--node-id",
+        "approved-node",
+        "--region",
+        "hk",
         "--reason",
         "ticket-123",
     ]);
@@ -184,11 +229,123 @@ fn enroll_approve_activates_pending_join_request() {
         approved.assigned_endpoint_id.as_deref(),
         Some(endpoint_id.as_str())
     );
+    assert_eq!(approved.approved_by.as_deref(), Some("approval-operator"));
+    let node = store
+        .get_node("approved-node")
+        .expect("load approved node")
+        .expect("approved node exists");
+    assert_eq!(node.endpoint_id, endpoint_id);
+    assert_eq!(node.name, "approved-node");
+    assert_eq!(node.region, "hk");
+    assert!(node.enabled);
     let endpoint = store
         .get_endpoint_trust(&endpoint_id)
         .expect("load endpoint")
         .expect("endpoint exists");
     assert_eq!(endpoint.status, EndpointStatus::Active);
+    assert_eq!(endpoint.node_id.as_deref(), Some("approved-node"));
+
+    let conn = Connection::open(&database).expect("open approval audit database");
+    let audit_actor: String = conn
+        .query_row(
+            "SELECT actor FROM controller_audit_log
+             WHERE event = 'enrollment.approve' AND request_id = ?1",
+            [&join.request_id],
+            |row| row.get(0),
+        )
+        .expect("load approval audit actor");
+    assert_eq!(audit_actor, "approval-operator");
+}
+
+#[test]
+fn enroll_claim_binds_only_an_explicit_legacy_approval() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let database_arg = database.to_string_lossy().into_owned();
+    let endpoint_id = iroh::SecretKey::generate().public().to_string();
+    let store = Store::open(&database).expect("store opens");
+    let join = seed_join_request(
+        &store,
+        "tok-legacy-claim",
+        "legacy-claim-token",
+        Some(endpoint_id.clone()),
+    );
+    store
+        .approve_join_request(
+            &ApprovalInput {
+                request_id: join.request_id.clone(),
+                endpoint_id: endpoint_id.clone(),
+                node_id: "legacy-node-old".to_string(),
+                region: "hk".to_string(),
+                role: "ocserv".to_string(),
+                reason: "original approval".to_string(),
+                approved_labels_json: serde_json::json!({}),
+            },
+            "original-operator",
+        )
+        .expect("seed approved binding");
+    drop(store);
+
+    let conn = Connection::open(&database).expect("open legacy fixture database");
+    conn.execute("DELETE FROM nodes WHERE node_id = 'legacy-node-old'", [])
+        .expect("remove legacy node");
+    conn.execute(
+        "UPDATE endpoint_trust SET node_id = NULL WHERE endpoint_id = ?1",
+        [&endpoint_id],
+    )
+    .expect("make trust unbound");
+    conn.execute(
+        "UPDATE controller_audit_log SET node_id = NULL
+         WHERE event = 'enrollment.approve' AND request_id = ?1",
+        [&join.request_id],
+    )
+    .expect("make approval audit legacy-compatible");
+    drop(conn);
+
+    let output = run_ocfleet(&[
+        "--database",
+        &database_arg,
+        "--actor",
+        "claim-operator",
+        "enroll",
+        "claim",
+        &join.request_id,
+        "--endpoint-id",
+        &endpoint_id,
+        "--node-id",
+        "legacy-node-new",
+        "--region",
+        "hk",
+        "--reason",
+        "legacy repair",
+    ]);
+    let text = stdout(&output);
+    assert_eq!(field(&text, "join_request_id"), join.request_id);
+    assert_eq!(field(&text, "status"), "approved");
+    assert_eq!(field(&text, "assigned_endpoint_id"), endpoint_id);
+    assert_eq!(field(&text, "node_id"), "legacy-node-new");
+
+    let store = Store::open(&database).expect("store reopens");
+    let node = store
+        .get_node("legacy-node-new")
+        .expect("load claimed node")
+        .expect("claimed node exists");
+    assert_eq!(node.endpoint_id, endpoint_id);
+    let endpoint = store
+        .get_endpoint_trust(&endpoint_id)
+        .expect("load claimed trust")
+        .expect("claimed trust exists");
+    assert_eq!(endpoint.node_id.as_deref(), Some("legacy-node-new"));
+    let conn = Connection::open(&database).expect("open claimed database");
+    let claim_actor: String = conn
+        .query_row(
+            "SELECT actor FROM controller_audit_log
+             WHERE event = 'enrollment.claim' AND request_id = ?1",
+            [&join.request_id],
+            |row| row.get(0),
+        )
+        .expect("load claim audit actor");
+    assert_eq!(claim_actor, "claim-operator");
 }
 
 #[test]
@@ -382,11 +539,15 @@ fn enroll_approve_rejects_endpoint_mismatch_when_request_named_endpoint() {
         &join.request_id,
         "--endpoint-id",
         &different_endpoint_id,
+        "--node-id",
+        "mismatch-node",
+        "--region",
+        "hk",
         "--reason",
         "ticket-123",
     ]);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("requested_endpoint_id"));
+    assert!(stderr.contains("requested endpoint"));
 
     let store = Store::open(&database).expect("store reopens");
     assert!(
@@ -443,6 +604,10 @@ fn enroll_approve_rejects_non_canonical_endpoint_id() {
         &join.request_id,
         "--endpoint-id",
         "endpoint-approved",
+        "--node-id",
+        "invalid-endpoint-node",
+        "--region",
+        "hk",
         "--reason",
         "ticket-123",
     ]);

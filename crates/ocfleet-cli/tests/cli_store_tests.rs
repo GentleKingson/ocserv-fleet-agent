@@ -1,13 +1,14 @@
 use ocfleet_cli::audit::AuditEvent;
 use ocfleet_cli::backend::StoreWriter;
+use ocfleet_cli::doctor::{CheckStatus, DoctorOptions, run_doctor};
 use ocfleet_cli::store::{
-    ApprovalInput, CURRENT_SCHEMA_VERSION, EnrollmentTokenInsert, JoinRequestInsert, NodeInsert,
-    Store, StoreError,
+    ApprovalInput, CURRENT_SCHEMA_VERSION, EnrollmentTokenInsert, JoinRequestInsert,
+    JoinRequestRecord, LegacyEnrollmentClaimInput, NodeInsert, Store, StoreError,
 };
 use ocfleet_protocol::enrollment::{EndpointStatus, EnrollmentTokenStatus, JoinRequestStatus};
 use rusqlite::Connection;
 use std::path::Path;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Barrier, Mutex, OnceLock};
 
 const TEST_ACTOR: &str = "store-test";
 
@@ -573,6 +574,105 @@ fn inject_audit_insert_failure(database: &Path) {
     .expect("install audit failure trigger");
 }
 
+fn seed_pending_enrollment(
+    store: &Store,
+    token_id: &str,
+    token_plaintext: &str,
+    requested_endpoint_id: Option<String>,
+) -> JoinRequestRecord {
+    store
+        .create_enrollment_token(
+            &EnrollmentTokenInsert {
+                token_id: token_id.to_string(),
+                token_hash: Store::hash_enrollment_token(token_plaintext),
+                created_by: "operator".to_string(),
+                expires_at: future_time(),
+                max_uses: 1,
+                description: None,
+                labels_json: serde_json::json!({}),
+                scope_json: serde_json::json!({}),
+            },
+            "operator",
+        )
+        .expect("create enrollment token");
+    store
+        .submit_join_request(
+            &JoinRequestInsert {
+                token_plaintext: token_plaintext.to_string(),
+                agent_public_key: "agent-public-key".to_string(),
+                fingerprint: "agent-fingerprint".to_string(),
+                requested_endpoint_id,
+                hostname: "agent-self-reported.example".to_string(),
+                agent_version: "0.2.0".to_string(),
+                requested_labels_json: serde_json::json!({"node_id": "must-not-be-used"}),
+            },
+            "agent",
+        )
+        .expect("create pending join request")
+}
+
+fn approval_input(request_id: &str, endpoint_id: &str, node_id: &str) -> ApprovalInput {
+    ApprovalInput {
+        request_id: request_id.to_string(),
+        endpoint_id: endpoint_id.to_string(),
+        node_id: node_id.to_string(),
+        region: "hk".to_string(),
+        role: "ocserv".to_string(),
+        reason: "ticket-123".to_string(),
+        approved_labels_json: serde_json::json!({}),
+    }
+}
+
+fn legacy_claim_input(
+    request_id: &str,
+    endpoint_id: &str,
+    node_id: &str,
+) -> LegacyEnrollmentClaimInput {
+    LegacyEnrollmentClaimInput {
+        request_id: request_id.to_string(),
+        endpoint_id: endpoint_id.to_string(),
+        node_id: node_id.to_string(),
+        region: "hk".to_string(),
+        role: "ocserv".to_string(),
+        reason: "legacy reconciliation".to_string(),
+    }
+}
+
+fn make_approved_binding_legacy_unbound(database: &Path, node_id: &str, endpoint_id: &str) {
+    let conn = Connection::open(database).expect("open database for legacy fixture");
+    let deleted = conn
+        .execute("DELETE FROM nodes WHERE node_id = ?1", [node_id])
+        .expect("remove node from legacy fixture");
+    assert_eq!(deleted, 1);
+    let updated = conn
+        .execute(
+            "UPDATE endpoint_trust SET node_id = NULL WHERE endpoint_id = ?1",
+            [endpoint_id],
+        )
+        .expect("make endpoint trust legacy unbound");
+    assert_eq!(updated, 1);
+    let updated_audit = conn
+        .execute(
+            "UPDATE controller_audit_log
+             SET node_id = NULL
+             WHERE event = 'enrollment.approve' AND endpoint_id = ?1",
+            [endpoint_id],
+        )
+        .expect("make approval audit match legacy unbound shape");
+    assert_eq!(updated_audit, 1);
+}
+
+fn audit_event_count(database: &Path, event: &str) -> i64 {
+    Connection::open(database)
+        .expect("open database for audit count")
+        .query_row(
+            "SELECT COUNT(*) FROM controller_audit_log WHERE event = ?1",
+            [event],
+            |row| row.get(0),
+        )
+        .expect("count audit events")
+}
+
 #[test]
 fn enrollment_token_is_hash_only_and_use_creates_pending_join_request() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -757,13 +857,18 @@ fn approving_join_request_creates_active_endpoint_and_audit_before_after() {
 
     let endpoint_id = iroh::SecretKey::generate().public().to_string();
     let approved = store
-        .approve_join_request(&ApprovalInput {
-            request_id: join.request_id.clone(),
-            endpoint_id: endpoint_id.clone(),
-            approved_by: "operator".to_string(),
-            reason: "ticket-123".to_string(),
-            approved_labels_json: serde_json::json!({"region": "hk", "role": "ocserv"}),
-        })
+        .approve_join_request(
+            &ApprovalInput {
+                request_id: join.request_id.clone(),
+                endpoint_id: endpoint_id.clone(),
+                node_id: "approved-node".to_string(),
+                region: "hk".to_string(),
+                role: "ocserv".to_string(),
+                reason: "ticket-123".to_string(),
+                approved_labels_json: serde_json::json!({"region": "hk", "role": "ocserv"}),
+            },
+            "operator",
+        )
         .expect("join request approved");
 
     assert_eq!(approved.status, JoinRequestStatus::Approved);
@@ -779,16 +884,828 @@ fn approving_join_request_creates_active_endpoint_and_audit_before_after() {
     assert_eq!(endpoint.status, EndpointStatus::Active);
     assert_eq!(endpoint.generation, 1);
     assert_eq!(endpoint.fingerprint.as_deref(), Some("agent-fingerprint"));
-    assert_eq!(
-        endpoint.node_id, None,
-        "approval must not trust or bind agent self-reported hostname"
-    );
+    assert_eq!(endpoint.node_id.as_deref(), Some("approved-node"));
+    let node = store
+        .get_node("approved-node")
+        .expect("load approved node")
+        .expect("approved node exists");
+    assert_eq!(node.name, "approved-node");
+    assert_eq!(node.endpoint_id, endpoint_id);
+    assert!(node.enabled);
 
     let (event, detail) = latest_audit_event(&db);
     assert_eq!(event, "enrollment.approve");
-    assert_eq!(detail["before"]["status"], "pending");
-    assert_eq!(detail["after"]["status"], "approved");
+    assert_eq!(detail["before"]["join_request"]["status"], "pending");
+    assert_eq!(detail["after"]["join_request"]["status"], "approved");
+    assert_eq!(detail["before"]["node"], serde_json::Value::Null);
+    assert_eq!(detail["after"]["node"]["node_id"], "approved-node");
+    assert_eq!(detail["after"]["endpoint"]["fingerprint_present"], true);
+    let detail_text = detail.to_string();
+    for forbidden in [
+        token_plaintext,
+        "agent-public-key",
+        "agent-fingerprint",
+        "hk-ocserv-01",
+        "0.1.0",
+    ] {
+        assert!(!detail_text.contains(forbidden));
+    }
     assert_eq!(detail["reason"], "ticket-123");
+}
+
+#[test]
+fn enrollment_approval_audit_failure_rolls_back_join_node_and_trust() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("controller.sqlite");
+    let store = Store::open(&db).expect("store opens");
+    let endpoint_id = iroh::SecretKey::generate().public().to_string();
+    let join = seed_pending_enrollment(
+        &store,
+        "tok-approval-rollback",
+        "approval-rollback-token",
+        Some(endpoint_id.clone()),
+    );
+    inject_audit_insert_failure(&db);
+
+    let err = store
+        .approve_join_request(
+            &approval_input(&join.request_id, &endpoint_id, "approval-rollback-node"),
+            "operator",
+        )
+        .expect_err("audit failure rejects approval");
+    assert!(matches!(err, StoreError::Sqlite(_)));
+
+    let unchanged = store
+        .get_join_request(&join.request_id)
+        .expect("load join after rollback")
+        .expect("join remains");
+    assert_eq!(unchanged.status, JoinRequestStatus::Pending);
+    assert!(unchanged.assigned_endpoint_id.is_none());
+    assert!(
+        store
+            .get_node("approval-rollback-node")
+            .expect("query rolled-back node")
+            .is_none()
+    );
+    assert!(
+        store
+            .get_endpoint_trust(&endpoint_id)
+            .expect("query rolled-back trust")
+            .is_none()
+    );
+}
+
+#[test]
+fn enrollment_approval_exact_retry_is_noop_and_does_not_reenable_node() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("controller.sqlite");
+    let store = Store::open(&db).expect("store opens");
+    let endpoint_id = iroh::SecretKey::generate().public().to_string();
+    let join = seed_pending_enrollment(
+        &store,
+        "tok-approval-retry",
+        "approval-retry-token",
+        Some(endpoint_id.clone()),
+    );
+    let approval = approval_input(&join.request_id, &endpoint_id, "approval-retry-node");
+    let first = store
+        .approve_join_request(&approval, "first-operator")
+        .expect("first approval succeeds");
+    let not_legacy = store
+        .claim_legacy_enrollment(
+            &legacy_claim_input(&join.request_id, &endpoint_id, "approval-retry-node"),
+            "claiming-operator",
+        )
+        .expect_err("new bound approval is not a legacy claim candidate");
+    assert!(matches!(
+        not_legacy,
+        StoreError::InvalidEnrollmentBinding {
+            detail: "approval audit provenance is missing or ambiguous",
+            ..
+        }
+    ));
+    StoreWriter::write_node_disable(&store, "approval-retry-node", "security-operator")
+        .expect("disable approved node");
+    let endpoint_before = store
+        .get_endpoint_trust(&endpoint_id)
+        .expect("load endpoint before retry")
+        .expect("endpoint exists");
+    let approval_audits_before = audit_event_count(&db, "enrollment.approve");
+
+    let retry = store
+        .approve_join_request(&approval, "retrying-operator")
+        .expect("exact approval retry succeeds");
+
+    assert_eq!(retry, first);
+    assert_eq!(
+        store
+            .get_endpoint_trust(&endpoint_id)
+            .expect("load endpoint after retry")
+            .expect("endpoint exists"),
+        endpoint_before
+    );
+    assert!(
+        !store
+            .get_node("approval-retry-node")
+            .expect("load node after retry")
+            .expect("node exists")
+            .enabled
+    );
+    assert_eq!(
+        audit_event_count(&db, "enrollment.approve"),
+        approval_audits_before
+    );
+}
+
+#[test]
+fn legacy_enrollment_claim_repairs_only_explicit_provenance_and_is_idempotent() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("controller.sqlite");
+    let secret_key = dir.path().join("missing-controller-secret");
+    let store = Store::open(&db).expect("store opens");
+    let endpoint_id = iroh::SecretKey::generate().public().to_string();
+    let join = seed_pending_enrollment(
+        &store,
+        "tok-legacy-claim",
+        "legacy-claim-token",
+        Some(endpoint_id.clone()),
+    );
+    store
+        .approve_join_request(
+            &approval_input(&join.request_id, &endpoint_id, "legacy-original-node"),
+            "legacy-operator",
+        )
+        .expect("seed approved binding");
+    make_approved_binding_legacy_unbound(&db, "legacy-original-node", &endpoint_id);
+    let endpoint_before = store
+        .get_endpoint_trust(&endpoint_id)
+        .expect("load legacy trust")
+        .expect("legacy trust exists");
+    assert!(endpoint_before.node_id.is_none());
+
+    let before_report = run_doctor(&DoctorOptions {
+        database: db.clone(),
+        secret_key: secret_key.clone(),
+    });
+    let before_binding = before_report
+        .checks
+        .iter()
+        .find(|check| check.id == "registry.endpoint_trust.bindings")
+        .expect("binding check exists");
+    assert_eq!(before_binding.details["active_unbound"], 1);
+
+    let claim = legacy_claim_input(&join.request_id, &endpoint_id, "operator-chosen-node");
+    let claimed = store
+        .claim_legacy_enrollment(&claim, "claiming-operator")
+        .expect("legacy claim succeeds");
+    assert_eq!(claimed.status, JoinRequestStatus::Approved);
+    let endpoint_after = store
+        .get_endpoint_trust(&endpoint_id)
+        .expect("load claimed trust")
+        .expect("claimed trust exists");
+    assert_eq!(
+        endpoint_after.node_id.as_deref(),
+        Some("operator-chosen-node")
+    );
+    assert_eq!(endpoint_after.generation, endpoint_before.generation);
+    assert_eq!(
+        endpoint_after.trust_bundle_json,
+        endpoint_before.trust_bundle_json
+    );
+    let node = store
+        .get_node("operator-chosen-node")
+        .expect("load claimed node")
+        .expect("claimed node exists");
+    assert_eq!(node.name, "operator-chosen-node");
+    assert_ne!(node.name, join.hostname);
+    assert!(node.enabled);
+
+    let (event, detail) = latest_audit_event(&db);
+    assert_eq!(event, "enrollment.claim");
+    assert_eq!(detail["before"]["node"], serde_json::Value::Null);
+    assert_eq!(
+        detail["before"]["endpoint"]["node_id"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        detail["after"]["endpoint"]["node_id"],
+        "operator-chosen-node"
+    );
+    let detail_text = detail.to_string();
+    for forbidden in [
+        "legacy-claim-token",
+        "agent-public-key",
+        "agent-fingerprint",
+        "agent-self-reported.example",
+        "must-not-be-used",
+    ] {
+        assert!(!detail_text.contains(forbidden));
+    }
+
+    StoreWriter::write_node_disable(&store, "operator-chosen-node", "security-operator")
+        .expect("disable claimed node");
+    let claim_audits_before = audit_event_count(&db, "enrollment.claim");
+    store
+        .claim_legacy_enrollment(&claim, "retrying-operator")
+        .expect("exact claim retry succeeds");
+    assert!(
+        !store
+            .get_node("operator-chosen-node")
+            .expect("load node after claim retry")
+            .expect("node exists")
+            .enabled
+    );
+    assert_eq!(
+        audit_event_count(&db, "enrollment.claim"),
+        claim_audits_before
+    );
+
+    let after_report = run_doctor(&DoctorOptions {
+        database: db,
+        secret_key,
+    });
+    let after_binding = after_report
+        .checks
+        .iter()
+        .find(|check| check.id == "registry.endpoint_trust.bindings")
+        .expect("binding check exists");
+    assert_eq!(after_binding.status, CheckStatus::Ok);
+    for key in [
+        "active_unbound",
+        "active_orphan",
+        "current_binding_mismatch",
+        "inactive_current",
+        "active_extra_for_node",
+    ] {
+        assert_eq!(after_binding.details[key], 0, "unexpected {key}");
+    }
+}
+
+#[test]
+fn legacy_enrollment_claim_audit_failure_rolls_back_node_and_binding() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("controller.sqlite");
+    let store = Store::open(&db).expect("store opens");
+    let endpoint_id = iroh::SecretKey::generate().public().to_string();
+    let join = seed_pending_enrollment(
+        &store,
+        "tok-claim-rollback",
+        "claim-rollback-token",
+        Some(endpoint_id.clone()),
+    );
+    store
+        .approve_join_request(
+            &approval_input(&join.request_id, &endpoint_id, "claim-rollback-old"),
+            "operator",
+        )
+        .expect("seed approved binding");
+    make_approved_binding_legacy_unbound(&db, "claim-rollback-old", &endpoint_id);
+    inject_audit_insert_failure(&db);
+
+    let err = store
+        .claim_legacy_enrollment(
+            &legacy_claim_input(&join.request_id, &endpoint_id, "claim-rollback-new"),
+            "operator",
+        )
+        .expect_err("audit failure rejects legacy claim");
+    assert!(matches!(err, StoreError::Sqlite(_)));
+    assert!(
+        store
+            .get_node("claim-rollback-new")
+            .expect("query rolled-back node")
+            .is_none()
+    );
+    assert!(
+        store
+            .get_endpoint_trust(&endpoint_id)
+            .expect("load endpoint after rollback")
+            .expect("endpoint remains")
+            .node_id
+            .is_none()
+    );
+}
+
+#[test]
+fn legacy_enrollment_claim_rejects_contamination_and_approval_requires_claim() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("controller.sqlite");
+    let store = Store::open(&db).expect("store opens");
+    let endpoint_id = iroh::SecretKey::generate().public().to_string();
+    let join = seed_pending_enrollment(
+        &store,
+        "tok-claim-contamination",
+        "claim-contamination-token",
+        Some(endpoint_id.clone()),
+    );
+    let approval = approval_input(&join.request_id, &endpoint_id, "claim-contamination-old");
+    store
+        .approve_join_request(&approval, "operator")
+        .expect("seed approved binding");
+    make_approved_binding_legacy_unbound(&db, "claim-contamination-old", &endpoint_id);
+
+    let approve_retry = store
+        .approve_join_request(&approval, "operator")
+        .expect_err("approval never implicitly claims legacy trust");
+    assert!(matches!(
+        approve_retry,
+        StoreError::InvalidEnrollmentBinding {
+            detail: "legacy claim required",
+            ..
+        }
+    ));
+
+    Connection::open(&db)
+        .expect("open database for contamination")
+        .execute(
+            "UPDATE endpoint_trust SET fingerprint = 'different-fingerprint' WHERE endpoint_id = ?1",
+            [&endpoint_id],
+        )
+        .expect("contaminate endpoint fingerprint");
+    let claim_err = store
+        .claim_legacy_enrollment(
+            &legacy_claim_input(&join.request_id, &endpoint_id, "claim-contamination-new"),
+            "operator",
+        )
+        .expect_err("contaminated fingerprint rejects claim");
+    assert!(matches!(
+        claim_err,
+        StoreError::InvalidEnrollmentBinding {
+            detail: "endpoint fingerprint does not match join request",
+            ..
+        }
+    ));
+    assert!(
+        store
+            .get_node("claim-contamination-new")
+            .expect("query rejected claim node")
+            .is_none()
+    );
+    assert_eq!(audit_event_count(&db, "enrollment.claim"), 0);
+}
+
+#[test]
+fn legacy_enrollment_claim_rejects_status_lineage_and_bundle_contamination() {
+    for contamination in [
+        "status",
+        "generation",
+        "previous",
+        "rotated_to",
+        "bundle_authority",
+    ] {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = dir.path().join("controller.sqlite");
+        let store = Store::open(&db).expect("store opens");
+        let endpoint_id = generated_endpoint_id();
+        let join = seed_pending_enrollment(
+            &store,
+            &format!("tok-claim-{contamination}"),
+            &format!("claim-{contamination}-token"),
+            Some(endpoint_id.clone()),
+        );
+        let original_node_id = format!("legacy-{contamination}-old");
+        store
+            .approve_join_request(
+                &approval_input(&join.request_id, &endpoint_id, &original_node_id),
+                "operator",
+            )
+            .expect("seed approved binding");
+        make_approved_binding_legacy_unbound(&db, &original_node_id, &endpoint_id);
+
+        let conn = Connection::open(&db).expect("open database for contamination");
+        match contamination {
+            "status" => {
+                conn.execute(
+                    "UPDATE endpoint_trust SET status = 'quarantined' WHERE endpoint_id = ?1",
+                    [&endpoint_id],
+                )
+                .expect("contaminate status");
+            }
+            "generation" => {
+                conn.execute(
+                    "UPDATE endpoint_trust SET generation = 2, trust_bundle_json = ?1
+                     WHERE endpoint_id = ?2",
+                    rusqlite::params![
+                        trust_bundle_fixture(&endpoint_id, 2, EndpointStatus::Active),
+                        endpoint_id,
+                    ],
+                )
+                .expect("contaminate generation");
+            }
+            "previous" => {
+                conn.execute(
+                    "UPDATE endpoint_trust SET previous_endpoint_id = ?1 WHERE endpoint_id = ?2",
+                    rusqlite::params![generated_endpoint_id(), endpoint_id],
+                )
+                .expect("contaminate predecessor");
+            }
+            "rotated_to" => {
+                conn.execute(
+                    "UPDATE endpoint_trust SET rotated_to = ?1 WHERE endpoint_id = ?2",
+                    rusqlite::params![generated_endpoint_id(), endpoint_id],
+                )
+                .expect("contaminate successor");
+            }
+            "bundle_authority" => {
+                let bundle = serde_json::json!({
+                    "endpoint_id": endpoint_id.clone(),
+                    "generation": 1,
+                    "status": "active",
+                    "trusted_controllers": [generated_endpoint_id()],
+                    "trusted_peers": [],
+                    "authorized_path_probes": [],
+                });
+                conn.execute(
+                    "UPDATE endpoint_trust SET trust_bundle_json = ?1 WHERE endpoint_id = ?2",
+                    rusqlite::params![bundle.to_string(), endpoint_id],
+                )
+                .expect("contaminate trust bundle authority");
+            }
+            _ => unreachable!(),
+        }
+        drop(conn);
+
+        let claimed_node_id = format!("legacy-{contamination}-new");
+        let error = store
+            .claim_legacy_enrollment(
+                &legacy_claim_input(&join.request_id, &endpoint_id, &claimed_node_id),
+                "operator",
+            )
+            .expect_err("contaminated legacy trust must fail closed");
+        assert!(
+            matches!(error, StoreError::InvalidEnrollmentBinding { .. }),
+            "unexpected {contamination} error: {error}"
+        );
+        assert!(
+            store
+                .get_node(&claimed_node_id)
+                .expect("query rejected claim node")
+                .is_none()
+        );
+        assert_eq!(audit_event_count(&db, "enrollment.claim"), 0);
+    }
+}
+
+#[test]
+fn legacy_enrollment_claim_rejects_ambiguous_approved_assignment() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("controller.sqlite");
+    let store = Store::open(&db).expect("store opens");
+    let endpoint_id = iroh::SecretKey::generate().public().to_string();
+    let join = seed_pending_enrollment(
+        &store,
+        "tok-claim-ambiguous",
+        "claim-ambiguous-token",
+        Some(endpoint_id.clone()),
+    );
+    store
+        .approve_join_request(
+            &approval_input(&join.request_id, &endpoint_id, "claim-ambiguous-old"),
+            "operator",
+        )
+        .expect("seed approved binding");
+    make_approved_binding_legacy_unbound(&db, "claim-ambiguous-old", &endpoint_id);
+    Connection::open(&db)
+        .expect("open database for duplicate approval")
+        .execute(
+            "INSERT INTO join_requests
+             (request_id, token_id, status, agent_public_key, fingerprint,
+              requested_endpoint_id, assigned_endpoint_id, hostname, agent_version,
+              requested_labels_json, approved_labels_json, created_at, approved_at,
+              approved_by, rejection_reason, audit_correlation_id)
+             SELECT 'join-ambiguous-copy', token_id, status, agent_public_key, fingerprint,
+                    requested_endpoint_id, assigned_endpoint_id, hostname, agent_version,
+                    requested_labels_json, approved_labels_json, created_at, approved_at,
+                    approved_by, rejection_reason, 'corr-ambiguous-copy'
+             FROM join_requests WHERE request_id = ?1",
+            [&join.request_id],
+        )
+        .expect("insert duplicate approved assignment");
+
+    let err = store
+        .claim_legacy_enrollment(
+            &legacy_claim_input(&join.request_id, &endpoint_id, "claim-ambiguous-new"),
+            "operator",
+        )
+        .expect_err("ambiguous approved assignment rejects claim");
+    assert!(matches!(
+        err,
+        StoreError::InvalidEnrollmentBinding {
+            detail: "approved endpoint assignment is ambiguous",
+            ..
+        }
+    ));
+    assert!(
+        store
+            .get_node("claim-ambiguous-new")
+            .expect("query rejected claim node")
+            .is_none()
+    );
+}
+
+#[test]
+fn legacy_enrollment_claim_rejects_reusing_a_node_identity_with_trust_history() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("controller.sqlite");
+    let store = Store::open(&db).expect("store opens");
+    let endpoint_id = generated_endpoint_id();
+    let join = seed_pending_enrollment(
+        &store,
+        "tok-claim-history",
+        "claim-history-token",
+        Some(endpoint_id.clone()),
+    );
+    store
+        .approve_join_request(
+            &approval_input(&join.request_id, &endpoint_id, "claim-history-old"),
+            "operator",
+        )
+        .expect("seed approved binding");
+    make_approved_binding_legacy_unbound(&db, "claim-history-old", &endpoint_id);
+
+    let historical_node = seed_generated_node(&store, "reused-node-id");
+    StoreWriter::write_node_remove(&store, &historical_node.node_id, "operator")
+        .expect("remove historical node while retaining trust tombstone");
+    assert!(
+        store
+            .get_node(&historical_node.node_id)
+            .expect("query removed node")
+            .is_none()
+    );
+
+    let error = store
+        .claim_legacy_enrollment(
+            &legacy_claim_input(&join.request_id, &endpoint_id, &historical_node.node_id),
+            "operator",
+        )
+        .expect_err("trust history must not be conflated with a new enrollment binding");
+    assert!(matches!(
+        error,
+        StoreError::InvalidEnrollmentBinding {
+            detail: "node id has existing endpoint trust history",
+            ..
+        }
+    ));
+    assert_eq!(audit_event_count(&db, "enrollment.claim"), 0);
+}
+
+#[test]
+fn legacy_enrollment_claim_requires_exact_approval_audit_provenance() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("controller.sqlite");
+    let store = Store::open(&db).expect("store opens");
+    let endpoint_id = iroh::SecretKey::generate().public().to_string();
+    let join = seed_pending_enrollment(
+        &store,
+        "tok-claim-audit-provenance",
+        "claim-audit-provenance-token",
+        Some(endpoint_id.clone()),
+    );
+    store
+        .approve_join_request(
+            &approval_input(&join.request_id, &endpoint_id, "claim-audit-old"),
+            "approving-operator",
+        )
+        .expect("seed approved binding");
+    make_approved_binding_legacy_unbound(&db, "claim-audit-old", &endpoint_id);
+    Connection::open(&db)
+        .expect("open database for audit contamination")
+        .execute(
+            "UPDATE controller_audit_log
+             SET actor = 'different-operator'
+             WHERE event = 'enrollment.approve' AND request_id = ?1",
+            [&join.request_id],
+        )
+        .expect("break approval audit provenance");
+
+    let err = store
+        .claim_legacy_enrollment(
+            &legacy_claim_input(&join.request_id, &endpoint_id, "claim-audit-new"),
+            "claiming-operator",
+        )
+        .expect_err("mismatched approval audit rejects claim");
+    assert!(matches!(
+        err,
+        StoreError::InvalidEnrollmentBinding {
+            detail: "approval audit provenance is missing or ambiguous",
+            ..
+        }
+    ));
+    assert!(
+        store
+            .get_node("claim-audit-new")
+            .expect("query rejected claim node")
+            .is_none()
+    );
+}
+
+#[test]
+fn enrollment_binding_writer_validates_operator_node_fields() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("controller.sqlite");
+    let store = Store::open(&db).expect("store opens");
+    let endpoint_id = iroh::SecretKey::generate().public().to_string();
+    let join = seed_pending_enrollment(
+        &store,
+        "tok-binding-validation",
+        "binding-validation-token",
+        Some(endpoint_id.clone()),
+    );
+
+    for (node_id, region, role) in [
+        ("invalid/node", "hk", "ocserv"),
+        ("valid-node", "invalid region", "ocserv"),
+        ("valid-node", "hk", "viewer"),
+    ] {
+        let mut approval = approval_input(&join.request_id, &endpoint_id, node_id);
+        approval.region = region.to_string();
+        approval.role = role.to_string();
+        assert!(matches!(
+            store.approve_join_request(&approval, "operator"),
+            Err(StoreError::InvalidInput(_))
+        ));
+    }
+    assert_eq!(
+        store
+            .get_join_request(&join.request_id)
+            .expect("load unchanged join")
+            .expect("join remains")
+            .status,
+        JoinRequestStatus::Pending
+    );
+    assert!(store.list_nodes().expect("list nodes").is_empty());
+    assert!(
+        store
+            .get_endpoint_trust(&endpoint_id)
+            .expect("query trust")
+            .is_none()
+    );
+}
+
+#[test]
+fn enrollment_approval_rejects_pending_rows_with_decision_metadata() {
+    for contamination in [
+        "assigned_endpoint_id",
+        "approved_at",
+        "approved_by",
+        "rejection_reason",
+        "approved_labels_json",
+    ] {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = dir.path().join("controller.sqlite");
+        let store = Store::open(&db).expect("store opens");
+        let endpoint_id = generated_endpoint_id();
+        let join = seed_pending_enrollment(
+            &store,
+            &format!("tok-pending-{contamination}"),
+            &format!("pending-{contamination}-token"),
+            Some(endpoint_id.clone()),
+        );
+        let sql = match contamination {
+            "assigned_endpoint_id" => {
+                "UPDATE join_requests SET assigned_endpoint_id = 'contaminated' WHERE request_id = ?1"
+            }
+            "approved_at" => {
+                "UPDATE join_requests SET approved_at = '2026-07-11T00:00:00Z' WHERE request_id = ?1"
+            }
+            "approved_by" => {
+                "UPDATE join_requests SET approved_by = 'unexpected-operator' WHERE request_id = ?1"
+            }
+            "rejection_reason" => {
+                "UPDATE join_requests SET rejection_reason = 'unexpected-decision' WHERE request_id = ?1"
+            }
+            "approved_labels_json" => {
+                "UPDATE join_requests SET approved_labels_json = '{\"unexpected\":true}' WHERE request_id = ?1"
+            }
+            _ => unreachable!(),
+        };
+        Connection::open(&db)
+            .expect("open database for pending contamination")
+            .execute(sql, [&join.request_id])
+            .expect("contaminate pending decision metadata");
+
+        let error = store
+            .approve_join_request(
+                &approval_input(&join.request_id, &endpoint_id, "pending-contamination-node"),
+                "operator",
+            )
+            .expect_err("contaminated pending request must fail closed");
+        assert!(matches!(
+            error,
+            StoreError::InvalidEnrollmentBinding {
+                detail: "pending join request has decision metadata",
+                ..
+            }
+        ));
+        assert!(
+            store
+                .get_node("pending-contamination-node")
+                .expect("query rejected approval node")
+                .is_none()
+        );
+        assert!(
+            store
+                .get_endpoint_trust(&endpoint_id)
+                .expect("query rejected approval trust")
+                .is_none()
+        );
+        assert_eq!(audit_event_count(&db, "enrollment.approve"), 0);
+    }
+}
+
+#[test]
+fn enrollment_approval_immediate_transactions_serialize_conflicting_writers() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("controller.sqlite");
+    let store = Store::open(&db).expect("store opens");
+    let endpoint_id = iroh::SecretKey::generate().public().to_string();
+    let join = seed_pending_enrollment(
+        &store,
+        "tok-approval-race",
+        "approval-race-token",
+        Some(endpoint_id.clone()),
+    );
+    drop(store);
+
+    let barrier = Arc::new(Barrier::new(2));
+    let mut handles = Vec::new();
+    for node_id in ["race-node-one", "race-node-two"] {
+        let database = db.clone();
+        let barrier = Arc::clone(&barrier);
+        let request_id = join.request_id.clone();
+        let endpoint_id = endpoint_id.clone();
+        handles.push(std::thread::spawn(move || {
+            let store = Store::open(&database).expect("open racing store");
+            barrier.wait();
+            store.approve_join_request(&approval_input(&request_id, &endpoint_id, node_id), node_id)
+        }));
+    }
+    let results = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("racing writer joins"))
+        .collect::<Vec<_>>();
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| matches!(result, Err(StoreError::InvalidEnrollmentBinding { .. })))
+            .count(),
+        1
+    );
+
+    let store = Store::open(&db).expect("reopen raced store");
+    let nodes = store.list_nodes().expect("list raced nodes");
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(nodes[0].endpoint_id, endpoint_id);
+    assert_eq!(audit_event_count(&db, "enrollment.approve"), 1);
+}
+
+#[test]
+fn legacy_enrollment_claim_immediate_transactions_collapse_exact_races() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("controller.sqlite");
+    let store = Store::open(&db).expect("store opens");
+    let endpoint_id = generated_endpoint_id();
+    let join = seed_pending_enrollment(
+        &store,
+        "tok-claim-race",
+        "claim-race-token",
+        Some(endpoint_id.clone()),
+    );
+    store
+        .approve_join_request(
+            &approval_input(&join.request_id, &endpoint_id, "claim-race-old"),
+            "operator",
+        )
+        .expect("seed approved binding");
+    make_approved_binding_legacy_unbound(&db, "claim-race-old", &endpoint_id);
+    drop(store);
+
+    let barrier = Arc::new(Barrier::new(2));
+    let mut handles = Vec::new();
+    for _ in 0..2 {
+        let database = db.clone();
+        let barrier = Arc::clone(&barrier);
+        let request_id = join.request_id.clone();
+        let endpoint_id = endpoint_id.clone();
+        handles.push(std::thread::spawn(move || {
+            let store = Store::open(&database).expect("open racing store");
+            let claim = legacy_claim_input(&request_id, &endpoint_id, "claim-race-new");
+            barrier.wait();
+            store.claim_legacy_enrollment(&claim, "operator")
+        }));
+    }
+    let results = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("racing writer joins"))
+        .collect::<Vec<_>>();
+    assert!(results.iter().all(Result::is_ok));
+
+    let store = Store::open(&db).expect("reopen raced store");
+    let nodes = store.list_nodes().expect("list raced nodes");
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(nodes[0].node_id, "claim-race-new");
+    assert_eq!(nodes[0].endpoint_id, endpoint_id);
+    assert_eq!(audit_event_count(&db, "enrollment.claim"), 1);
 }
 
 #[test]
@@ -891,17 +1808,22 @@ fn approving_join_request_requires_requested_endpoint_match_when_present() {
         .expect("join request created");
 
     let err = store
-        .approve_join_request(&ApprovalInput {
-            request_id: join.request_id,
-            endpoint_id: different_endpoint_id.clone(),
-            approved_by: "operator".to_string(),
-            reason: "ticket-123".to_string(),
-            approved_labels_json: serde_json::json!({}),
-        })
+        .approve_join_request(
+            &ApprovalInput {
+                request_id: join.request_id,
+                endpoint_id: different_endpoint_id.clone(),
+                node_id: "approved-node".to_string(),
+                region: "hk".to_string(),
+                role: "ocserv".to_string(),
+                reason: "ticket-123".to_string(),
+                approved_labels_json: serde_json::json!({}),
+            },
+            "operator",
+        )
         .expect_err("different endpoint id rejected");
 
     assert!(
-        matches!(err, StoreError::InvalidInput(ref message) if message.contains("requested_endpoint_id")),
+        matches!(err, StoreError::InvalidEnrollmentBinding { detail, .. } if detail.contains("requested endpoint")),
         "unexpected approval error: {err}"
     );
     assert!(
@@ -950,13 +1872,18 @@ fn approving_join_request_rejects_non_canonical_endpoint_id() {
         .expect("join request created");
 
     let err = store
-        .approve_join_request(&ApprovalInput {
-            request_id: join.request_id,
-            endpoint_id: "endpoint-approved".to_string(),
-            approved_by: "operator".to_string(),
-            reason: "ticket-123".to_string(),
-            approved_labels_json: serde_json::json!({}),
-        })
+        .approve_join_request(
+            &ApprovalInput {
+                request_id: join.request_id,
+                endpoint_id: "endpoint-approved".to_string(),
+                node_id: "approved-node".to_string(),
+                region: "hk".to_string(),
+                role: "ocserv".to_string(),
+                reason: "ticket-123".to_string(),
+                approved_labels_json: serde_json::json!({}),
+            },
+            "operator",
+        )
         .expect_err("invalid endpoint id must be rejected");
 
     assert!(matches!(err, StoreError::InvalidInput(_)));

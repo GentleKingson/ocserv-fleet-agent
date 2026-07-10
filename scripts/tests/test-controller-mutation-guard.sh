@@ -28,7 +28,7 @@ printf '%s\n' \
   'mod tests {' \
   '    const FIXTURE_SQL: &str = "UPDATE nodes SET enabled = 0";' \
   '}' \
-  'pub fn reviewed(store: &Store, node: &NodeInsert) {' \
+  'pub fn reviewed(store: &Store, node: &NodeInsert, approval: &ApprovalInput, claim: &LegacyEnrollmentClaimInput) {' \
   '    Store::add_node(store, node, "actor");' \
   '    store.enable_node("node", "actor");' \
   '    store.disable_node("node", "actor");' \
@@ -36,6 +36,8 @@ printf '%s\n' \
   '    store.rotate_endpoint("old", "new", "actor", "reason");' \
   '    store.revoke_endpoint("endpoint", "actor", "reason");' \
   '    store.quarantine_endpoint("endpoint", "actor", "reason");' \
+  '    store.approve_join_request(approval, "actor");' \
+  '    Store::claim_legacy_enrollment(store, claim, "actor");' \
   '}' \
   'pub const OTHER_QUERY: &str = "SELECT enabled FROM nodes";' \
   > "$cli_src/backend.rs"
@@ -150,6 +152,30 @@ do
   if ! grep -Fq "$expected" "$node_endpoint_fail_output"; then
     printf 'controller mutation guard did not report expected mutator violation: %s\n' "$expected" >&2
     sed -n '1,160p' "$node_endpoint_fail_output" >&2
+    exit 1
+  fi
+done
+
+rm -f "$cli_src/unsafe_node_endpoint_mutator.rs"
+printf '%s\n' \
+  'pub fn bypass(store: &Store, approval: &ApprovalInput, claim: &LegacyEnrollmentClaimInput) {' \
+  '    store.approve_join_request(approval, "actor");' \
+  '    Store::claim_legacy_enrollment(store, claim, "actor");' \
+  '}' \
+  > "$cli_src/unsafe_enrollment_mutator.rs"
+
+enrollment_fail_output="$tmp_dir/enrollment-fail-output"
+if "$GUARD" --repo-root "$fixture_root" "$fixture_root" >"$enrollment_fail_output" 2>&1; then
+  printf 'controller mutation guard accepted direct enrollment mutator calls\n' >&2
+  exit 1
+fi
+for expected in \
+  'unsafe_enrollment_mutator.rs:2: direct enrollment mutator call outside reviewed store/backend boundary: approve_join_request' \
+  'unsafe_enrollment_mutator.rs:3: direct enrollment mutator call outside reviewed store/backend boundary: claim_legacy_enrollment'
+do
+  if ! grep -Fq "$expected" "$enrollment_fail_output"; then
+    printf 'controller mutation guard did not report expected enrollment mutator violation: %s\n' "$expected" >&2
+    sed -n '1,120p' "$enrollment_fail_output" >&2
     exit 1
   fi
 done

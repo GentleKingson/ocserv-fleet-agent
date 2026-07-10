@@ -836,6 +836,10 @@ fn parses_enroll_approve_command() {
         "join-123",
         "--endpoint-id",
         "endpoint-approved",
+        "--node-id",
+        "hk-ocserv-01",
+        "--region",
+        "hk",
         "--reason",
         "ticket-123",
     ]);
@@ -845,6 +849,9 @@ fn parses_enroll_approve_command() {
             EnrollCommand::Approve {
                 join_request_id,
                 endpoint_id,
+                node_id,
+                region,
+                role,
                 reason,
             },
     } = cli.command
@@ -854,7 +861,74 @@ fn parses_enroll_approve_command() {
 
     assert_eq!(join_request_id, "join-123");
     assert_eq!(endpoint_id, "endpoint-approved");
+    assert_eq!(node_id, "hk-ocserv-01");
+    assert_eq!(region, "hk");
+    assert_eq!(role, "ocserv");
     assert_eq!(reason, "ticket-123");
+}
+
+#[test]
+fn parses_enroll_claim_command_with_explicit_role() {
+    let cli = Cli::parse_from([
+        "ocfleet",
+        "enroll",
+        "claim",
+        "join-legacy",
+        "--endpoint-id",
+        "endpoint-approved",
+        "--node-id",
+        "edge-proxy-01",
+        "--region",
+        "sg",
+        "--role",
+        "ocserv",
+        "--reason",
+        "legacy repair",
+    ]);
+
+    let Command::Enroll {
+        command:
+            EnrollCommand::Claim {
+                join_request_id,
+                endpoint_id,
+                node_id,
+                region,
+                role,
+                reason,
+            },
+    } = cli.command
+    else {
+        panic!("expected enroll claim command");
+    };
+
+    assert_eq!(join_request_id, "join-legacy");
+    assert_eq!(endpoint_id, "endpoint-approved");
+    assert_eq!(node_id, "edge-proxy-01");
+    assert_eq!(region, "sg");
+    assert_eq!(role, "ocserv");
+    assert_eq!(reason, "legacy repair");
+}
+
+#[test]
+fn enrollment_binding_commands_require_node_and_region() {
+    for command in ["approve", "claim"] {
+        let err = Cli::try_parse_from([
+            "ocfleet",
+            "enroll",
+            command,
+            "join-123",
+            "--endpoint-id",
+            "endpoint-approved",
+            "--reason",
+            "ticket-123",
+        ])
+        .expect_err("node and region are required");
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+        let message = err.to_string();
+        assert!(message.contains("--node-id"));
+        assert!(message.contains("--region"));
+    }
 }
 
 #[test]

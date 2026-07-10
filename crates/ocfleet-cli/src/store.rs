@@ -1,3 +1,4 @@
+use ocfleet_config::validation::{validate_node_id, validate_region, validate_role};
 use ocfleet_protocol::enrollment::{
     EndpointStatus, EnrollmentTokenStatus, JoinRequestStatus, TrustBundle,
 };
@@ -5,7 +6,9 @@ use ocfleet_protocol::method::{
     OCSERV_CERT_EXPIRY, OCSERV_CONFIG_FINGERPRINT, OCSERV_SERVICE_SUMMARY, OCSERV_SESSIONS_SUMMARY,
     OCSERV_VERSION, PROBE_CONTROLLER_PING, PROBE_PATH_ECHO,
 };
-use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params, types::Type};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params, types::Type,
+};
 use serde_json::Value;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -48,6 +51,8 @@ pub enum StoreError {
     DatabaseIntegrityCheckFailed { check: &'static str, detail: String },
     #[error("node not found: {0}")]
     NodeNotFound(String),
+    #[error("node already exists: {0}")]
+    NodeAlreadyExists(String),
     #[error("observability job not found: {0}")]
     ObservabilityJobNotFound(String),
     #[error("observability run not found: {0}")]
@@ -58,8 +63,17 @@ pub enum StoreError {
     EnrollmentRejected(String),
     #[error("join request not found: {0}")]
     JoinRequestNotFound(String),
-    #[error("join request {request_id} is {status}, expected pending")]
-    InvalidJoinRequestStatus { request_id: String, status: String },
+    #[error("join request {request_id} is {status}, expected {expected}")]
+    InvalidJoinRequestStatus {
+        request_id: String,
+        status: String,
+        expected: &'static str,
+    },
+    #[error("enrollment binding rejected for join request {request_id}: {detail}")]
+    InvalidEnrollmentBinding {
+        request_id: String,
+        detail: &'static str,
+    },
     #[error("endpoint not found: {0}")]
     EndpointNotFound(String),
     #[error("endpoint already exists: {0}")]
@@ -381,9 +395,21 @@ pub struct JoinRequestInsert {
 pub struct ApprovalInput {
     pub request_id: String,
     pub endpoint_id: String,
-    pub approved_by: String,
+    pub node_id: String,
+    pub region: String,
+    pub role: String,
     pub reason: String,
     pub approved_labels_json: Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct LegacyEnrollmentClaimInput {
+    pub request_id: String,
+    pub endpoint_id: String,
+    pub node_id: String,
+    pub region: String,
+    pub role: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1999,81 +2025,272 @@ impl Store {
     pub fn approve_join_request(
         &self,
         approval: &ApprovalInput,
+        actor: &str,
     ) -> Result<JoinRequestRecord, StoreError> {
-        validate_actor(&approval.approved_by).map_err(StoreError::InvalidInput)?;
+        validate_actor(actor).map_err(StoreError::InvalidInput)?;
         validate_reason(&approval.reason).map_err(StoreError::InvalidInput)?;
-        let endpoint_id =
-            validate_endpoint_id(&approval.endpoint_id).map_err(StoreError::InvalidInput)?;
+        validate_enrollment_request_id(&approval.request_id)?;
+        let node = enrollment_node_insert(
+            &approval.node_id,
+            &approval.endpoint_id,
+            &approval.region,
+            &approval.role,
+        )?;
         validate_label_json(&approval.approved_labels_json, "approved_labels")
             .map_err(StoreError::InvalidInput)?;
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let before = get_join_request_tx(&tx, &approval.request_id)?
             .ok_or_else(|| StoreError::JoinRequestNotFound(approval.request_id.clone()))?;
+
+        if before.status == JoinRequestStatus::Approved {
+            validate_approved_join_provenance_tx(&tx, &before, &node.endpoint_id)?;
+            let endpoint = get_endpoint_trust_tx(&tx, &node.endpoint_id)?.ok_or_else(|| {
+                invalid_enrollment_binding(
+                    &approval.request_id,
+                    "approved endpoint trust is missing",
+                )
+            })?;
+            validate_enrollment_endpoint_origin(&before, &endpoint, &approval.request_id)?;
+            if endpoint.node_id.is_none() {
+                validate_approved_join_audit_provenance_tx(&tx, &before, &node.endpoint_id, None)?;
+                return Err(invalid_enrollment_binding(
+                    &approval.request_id,
+                    "legacy claim required",
+                ));
+            }
+            validate_approved_join_audit_provenance_tx(
+                &tx,
+                &before,
+                &node.endpoint_id,
+                Some(&node.node_id),
+            )?;
+            validate_exact_enrollment_binding_tx(
+                &tx,
+                &before,
+                &endpoint,
+                &node,
+                Some(&approval.approved_labels_json),
+                "approval retry does not match the existing binding",
+            )?;
+            tx.commit()?;
+            return Ok(before);
+        }
+
         if before.status != JoinRequestStatus::Pending {
             return Err(StoreError::InvalidJoinRequestStatus {
                 request_id: approval.request_id.clone(),
                 status: before.status.as_str().to_string(),
+                expected: "pending",
             });
         }
-        if let Some(requested_endpoint_id) = &before.requested_endpoint_id
-            && requested_endpoint_id != &endpoint_id
+        validate_pending_join_for_approval(&before)?;
+        if before
+            .requested_endpoint_id
+            .as_deref()
+            .is_some_and(|requested| requested != node.endpoint_id)
         {
-            return Err(StoreError::InvalidInput(
-                "approved endpoint_id must match requested_endpoint_id".to_string(),
+            return Err(invalid_enrollment_binding(
+                &approval.request_id,
+                "approved endpoint does not match requested endpoint",
             ));
         }
-        if get_endpoint_trust_tx(&tx, &endpoint_id)?.is_some() {
-            return Err(StoreError::EndpointAlreadyExists(endpoint_id));
+        if get_node_tx(&tx, &node.node_id)?.is_some() {
+            return Err(StoreError::NodeAlreadyExists(node.node_id));
+        }
+        if get_node_by_endpoint_tx(&tx, &node.endpoint_id)?.is_some() {
+            return Err(StoreError::EndpointAlreadyExists(node.endpoint_id));
+        }
+        if get_endpoint_trust_tx(&tx, &node.endpoint_id)?.is_some() {
+            return Err(StoreError::EndpointAlreadyExists(node.endpoint_id));
+        }
+        if endpoint_trust_count_for_node_tx(&tx, &node.node_id)? != 0 {
+            return Err(invalid_enrollment_binding(
+                &approval.request_id,
+                "node id has existing endpoint trust history",
+            ));
         }
 
-        let bundle = trust_bundle_json(&endpoint_id, 1, EndpointStatus::Active);
+        insert_node_tx(&tx, &node)?;
         insert_endpoint_trust_tx(
             &tx,
             &EndpointTrustRecord {
-                endpoint_id: endpoint_id.clone(),
-                node_id: None,
+                endpoint_id: node.endpoint_id.clone(),
+                node_id: Some(node.node_id.clone()),
                 fingerprint: Some(before.fingerprint.clone()),
                 status: EndpointStatus::Active,
                 generation: 1,
                 previous_endpoint_id: None,
                 rotated_to: None,
-                trust_bundle_json: bundle,
+                trust_bundle_json: trust_bundle_json(&node.endpoint_id, 1, EndpointStatus::Active),
                 created_at: String::new(),
                 updated_at: String::new(),
             },
         )?;
-        tx.execute(
+        let affected = tx.execute(
             "UPDATE join_requests
              SET status = ?1,
                  assigned_endpoint_id = ?2,
                  approved_labels_json = ?3,
                  approved_at = strftime('%Y-%m-%dT%H:%M:%SZ','now'),
                  approved_by = ?4
-             WHERE request_id = ?5",
+             WHERE request_id = ?5 AND status = ?6",
             params![
                 JoinRequestStatus::Approved.as_str(),
-                endpoint_id.as_str(),
+                node.endpoint_id.as_str(),
                 approval.approved_labels_json.to_string(),
-                approval.approved_by.as_str(),
+                actor,
                 approval.request_id.as_str(),
+                JoinRequestStatus::Pending.as_str(),
             ],
         )?;
+        if affected != 1 {
+            return Err(invalid_enrollment_binding(
+                &approval.request_id,
+                "join request changed during approval",
+            ));
+        }
         let after =
             get_join_request_tx(&tx, &approval.request_id)?.expect("approved request exists");
-        let mut event = AuditEvent::new(&approval.approved_by, "enrollment.approve");
-        event.ok = Some(true);
-        event.request_id = Some(approval.request_id.clone());
-        event.endpoint_id = Some(endpoint_id);
-        event.detail_json = json_detail(
-            "join_request",
+        let node_after = get_node_tx(&tx, &node.node_id)?.expect("approved node exists");
+        let endpoint_after =
+            get_endpoint_trust_tx(&tx, &node.endpoint_id)?.expect("approved endpoint trust exists");
+        validate_exact_enrollment_binding_tx(
+            &tx,
+            &after,
+            &endpoint_after,
+            &node,
+            Some(&approval.approved_labels_json),
+            "approved binding is inconsistent",
+        )?;
+        audit_enrollment_binding_tx(
+            &tx,
+            actor,
+            "enrollment.approve",
             &approval.request_id,
-            Some(join_request_audit_json(&before)),
-            Some(join_request_audit_json(&after)),
-            Some(&approval.reason),
-        );
-        insert_audit_tx(&tx, &event)?;
+            &before,
+            &after,
+            None,
+            Some(&node_after),
+            None,
+            Some(&endpoint_after),
+            &approval.reason,
+        )?;
         tx.commit()?;
         Ok(after)
+    }
+
+    pub fn claim_legacy_enrollment(
+        &self,
+        claim: &LegacyEnrollmentClaimInput,
+        actor: &str,
+    ) -> Result<JoinRequestRecord, StoreError> {
+        validate_actor(actor).map_err(StoreError::InvalidInput)?;
+        validate_reason(&claim.reason).map_err(StoreError::InvalidInput)?;
+        validate_enrollment_request_id(&claim.request_id)?;
+        let node = enrollment_node_insert(
+            &claim.node_id,
+            &claim.endpoint_id,
+            &claim.region,
+            &claim.role,
+        )?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let join = get_join_request_tx(&tx, &claim.request_id)?
+            .ok_or_else(|| StoreError::JoinRequestNotFound(claim.request_id.clone()))?;
+        if join.status != JoinRequestStatus::Approved {
+            return Err(StoreError::InvalidJoinRequestStatus {
+                request_id: claim.request_id.clone(),
+                status: join.status.as_str().to_string(),
+                expected: "approved",
+            });
+        }
+        validate_approved_join_provenance_tx(&tx, &join, &node.endpoint_id)?;
+        validate_approved_join_audit_provenance_tx(&tx, &join, &node.endpoint_id, None)?;
+        let endpoint_before = get_endpoint_trust_tx(&tx, &node.endpoint_id)?.ok_or_else(|| {
+            invalid_enrollment_binding(&claim.request_id, "approved endpoint trust is missing")
+        })?;
+        validate_enrollment_endpoint_origin(&join, &endpoint_before, &claim.request_id)?;
+
+        if endpoint_before.node_id.is_some() {
+            validate_enrollment_claim_audit_provenance_tx(
+                &tx,
+                &join,
+                &node.endpoint_id,
+                &node.node_id,
+            )?;
+            validate_exact_enrollment_binding_tx(
+                &tx,
+                &join,
+                &endpoint_before,
+                &node,
+                None,
+                "claim retry does not match the existing binding",
+            )?;
+            tx.commit()?;
+            return Ok(join);
+        }
+        if get_node_tx(&tx, &node.node_id)?.is_some() {
+            return Err(StoreError::NodeAlreadyExists(node.node_id));
+        }
+        if get_node_by_endpoint_tx(&tx, &node.endpoint_id)?.is_some() {
+            return Err(StoreError::EndpointAlreadyExists(node.endpoint_id));
+        }
+        if endpoint_trust_count_for_node_tx(&tx, &node.node_id)? != 0 {
+            return Err(invalid_enrollment_binding(
+                &claim.request_id,
+                "node id has existing endpoint trust history",
+            ));
+        }
+
+        insert_node_tx(&tx, &node)?;
+        let affected = tx.execute(
+            "UPDATE endpoint_trust
+             SET node_id = ?1,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+             WHERE endpoint_id = ?2
+               AND node_id IS NULL
+               AND status = 'active'
+               AND generation = 1
+               AND previous_endpoint_id IS NULL
+               AND rotated_to IS NULL
+               AND fingerprint = ?3",
+            params![
+                node.node_id.as_str(),
+                node.endpoint_id.as_str(),
+                join.fingerprint.as_str(),
+            ],
+        )?;
+        if affected != 1 {
+            return Err(invalid_enrollment_binding(
+                &claim.request_id,
+                "legacy endpoint trust changed during claim",
+            ));
+        }
+        let node_after = get_node_tx(&tx, &node.node_id)?.expect("claimed node exists");
+        let endpoint_after =
+            get_endpoint_trust_tx(&tx, &node.endpoint_id)?.expect("claimed endpoint trust exists");
+        validate_exact_enrollment_binding_tx(
+            &tx,
+            &join,
+            &endpoint_after,
+            &node,
+            None,
+            "claimed binding is inconsistent",
+        )?;
+        audit_enrollment_binding_tx(
+            &tx,
+            actor,
+            "enrollment.claim",
+            &claim.request_id,
+            &join,
+            &join,
+            None,
+            Some(&node_after),
+            Some(&endpoint_before),
+            Some(&endpoint_after),
+            &claim.reason,
+        )?;
+        tx.commit()?;
+        Ok(join)
     }
 
     pub fn get_endpoint_trust(
@@ -2940,6 +3157,96 @@ fn get_node_by_endpoint_tx(
     .map_err(StoreError::from)
 }
 
+fn insert_node_tx(tx: &Transaction<'_>, node: &NodeInsert) -> Result<(), StoreError> {
+    tx.execute(
+        "INSERT INTO nodes
+         (node_id, endpoint_id, name, region, role, enabled, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, 1,
+                 strftime('%Y-%m-%dT%H:%M:%SZ','now'),
+                 strftime('%Y-%m-%dT%H:%M:%SZ','now'))",
+        params![
+            node.node_id.as_str(),
+            node.endpoint_id.as_str(),
+            node.name.as_str(),
+            node.region.as_str(),
+            node.role.as_str(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn endpoint_trust_count_for_node_tx(
+    tx: &Transaction<'_>,
+    node_id: &str,
+) -> Result<u64, StoreError> {
+    let count: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM endpoint_trust WHERE node_id = ?1",
+        [node_id],
+        |row| row.get(0),
+    )?;
+    Ok(i64_to_u64(count)?)
+}
+
+fn approved_join_assignment_count_tx(
+    tx: &Transaction<'_>,
+    endpoint_id: &str,
+) -> Result<u64, StoreError> {
+    let count: i64 = tx.query_row(
+        "SELECT COUNT(*)
+         FROM join_requests
+         WHERE status = 'approved' AND assigned_endpoint_id = ?1",
+        [endpoint_id],
+        |row| row.get(0),
+    )?;
+    Ok(i64_to_u64(count)?)
+}
+
+fn approved_join_audit_count_tx(
+    tx: &Transaction<'_>,
+    join: &JoinRequestRecord,
+    endpoint_id: &str,
+    node_id: Option<&str>,
+) -> Result<u64, StoreError> {
+    let count: i64 = tx.query_row(
+        "SELECT COUNT(*)
+         FROM controller_audit_log
+         WHERE event = 'enrollment.approve'
+           AND request_id = ?1
+           AND endpoint_id = ?2
+           AND actor = ?3
+           AND ok = 1
+           AND node_id IS ?4",
+        params![
+            join.request_id.as_str(),
+            endpoint_id,
+            join.approved_by.as_deref(),
+            node_id,
+        ],
+        |row| row.get(0),
+    )?;
+    Ok(i64_to_u64(count)?)
+}
+
+fn enrollment_claim_audit_count_tx(
+    tx: &Transaction<'_>,
+    request_id: &str,
+    endpoint_id: &str,
+    node_id: &str,
+) -> Result<u64, StoreError> {
+    let count: i64 = tx.query_row(
+        "SELECT COUNT(*)
+         FROM controller_audit_log
+         WHERE event = 'enrollment.claim'
+           AND request_id = ?1
+           AND endpoint_id = ?2
+           AND node_id = ?3
+           AND ok = 1",
+        params![request_id, endpoint_id, node_id],
+        |row| row.get(0),
+    )?;
+    Ok(i64_to_u64(count)?)
+}
+
 fn get_active_endpoint_trust_for_node_tx(
     tx: &Transaction<'_>,
     node_id: &str,
@@ -3035,6 +3342,201 @@ fn get_endpoint_trust_tx(
     )
     .optional()
     .map_err(StoreError::from)
+}
+
+fn invalid_enrollment_binding(request_id: &str, detail: &'static str) -> StoreError {
+    StoreError::InvalidEnrollmentBinding {
+        request_id: request_id.to_string(),
+        detail,
+    }
+}
+
+fn validate_enrollment_request_id(request_id: &str) -> Result<(), StoreError> {
+    validate_audit_text(request_id, "join request_id", 128)
+}
+
+fn enrollment_node_insert(
+    node_id: &str,
+    endpoint_id: &str,
+    region: &str,
+    role: &str,
+) -> Result<NodeInsert, StoreError> {
+    validate_node_id(node_id).map_err(|err| StoreError::InvalidInput(err.to_string()))?;
+    let endpoint_id = validate_endpoint_id(endpoint_id).map_err(StoreError::InvalidInput)?;
+    validate_region(region).map_err(|err| StoreError::InvalidInput(err.to_string()))?;
+    validate_role(role).map_err(|err| StoreError::InvalidInput(err.to_string()))?;
+    Ok(NodeInsert {
+        node_id: node_id.to_string(),
+        endpoint_id,
+        name: node_id.to_string(),
+        region: region.to_string(),
+        role: role.to_string(),
+    })
+}
+
+fn validate_approved_join_provenance_tx(
+    tx: &Transaction<'_>,
+    join: &JoinRequestRecord,
+    endpoint_id: &str,
+) -> Result<(), StoreError> {
+    let reject = |detail| invalid_enrollment_binding(&join.request_id, detail);
+    if join.status != JoinRequestStatus::Approved {
+        return Err(reject("join request is not approved"));
+    }
+    if join.assigned_endpoint_id.as_deref() != Some(endpoint_id) {
+        return Err(reject("assigned endpoint does not match"));
+    }
+    if join
+        .requested_endpoint_id
+        .as_deref()
+        .is_some_and(|requested| requested != endpoint_id)
+    {
+        return Err(reject(
+            "assigned endpoint does not match requested endpoint",
+        ));
+    }
+    let Some(approved_by) = join.approved_by.as_deref() else {
+        return Err(reject("approval metadata is incomplete"));
+    };
+    if validate_actor(approved_by).is_err()
+        || join
+            .approved_at
+            .as_deref()
+            .is_none_or(|approved_at| OffsetDateTime::parse(approved_at, &Rfc3339).is_err())
+        || join.rejection_reason.is_some()
+    {
+        return Err(reject("approval metadata is invalid"));
+    }
+    validate_agent_fingerprint(&join.fingerprint)
+        .map_err(|_| reject("stored fingerprint is invalid"))?;
+    validate_label_json(&join.approved_labels_json, "approved_labels")
+        .map_err(|_| reject("approved labels are invalid"))?;
+    if approved_join_assignment_count_tx(tx, endpoint_id)? != 1 {
+        return Err(reject("approved endpoint assignment is ambiguous"));
+    }
+    Ok(())
+}
+
+fn validate_approved_join_audit_provenance_tx(
+    tx: &Transaction<'_>,
+    join: &JoinRequestRecord,
+    endpoint_id: &str,
+    node_id: Option<&str>,
+) -> Result<(), StoreError> {
+    if approved_join_audit_count_tx(tx, join, endpoint_id, node_id)? != 1 {
+        return Err(invalid_enrollment_binding(
+            &join.request_id,
+            "approval audit provenance is missing or ambiguous",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_enrollment_claim_audit_provenance_tx(
+    tx: &Transaction<'_>,
+    join: &JoinRequestRecord,
+    endpoint_id: &str,
+    node_id: &str,
+) -> Result<(), StoreError> {
+    if enrollment_claim_audit_count_tx(tx, &join.request_id, endpoint_id, node_id)? != 1 {
+        return Err(invalid_enrollment_binding(
+            &join.request_id,
+            "claim retry audit provenance is missing or ambiguous",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_enrollment_endpoint_origin(
+    join: &JoinRequestRecord,
+    endpoint: &EndpointTrustRecord,
+    request_id: &str,
+) -> Result<(), StoreError> {
+    let reject = |detail| invalid_enrollment_binding(request_id, detail);
+    if endpoint.endpoint_id != join.assigned_endpoint_id.as_deref().unwrap_or_default()
+        || endpoint.status != EndpointStatus::Active
+        || endpoint.generation != 1
+        || endpoint.previous_endpoint_id.is_some()
+        || endpoint.rotated_to.is_some()
+    {
+        return Err(reject(
+            "endpoint trust is not an original active enrollment",
+        ));
+    }
+    if endpoint.fingerprint.as_deref() != Some(join.fingerprint.as_str()) {
+        return Err(reject("endpoint fingerprint does not match join request"));
+    }
+    validate_endpoint_bundle_projection(endpoint)
+        .map_err(|_| reject("endpoint trust bundle is inconsistent"))?;
+    if endpoint.trust_bundle_json
+        != trust_bundle_json(&endpoint.endpoint_id, 1, EndpointStatus::Active)
+    {
+        return Err(reject("endpoint trust bundle is not the enrollment bundle"));
+    }
+    Ok(())
+}
+
+fn validate_pending_join_for_approval(join: &JoinRequestRecord) -> Result<(), StoreError> {
+    let reject = |detail| invalid_enrollment_binding(&join.request_id, detail);
+    if join.status != JoinRequestStatus::Pending
+        || join.assigned_endpoint_id.is_some()
+        || join.approved_at.is_some()
+        || join.approved_by.is_some()
+        || join.rejection_reason.is_some()
+        || join
+            .approved_labels_json
+            .as_object()
+            .is_none_or(|labels| !labels.is_empty())
+    {
+        return Err(reject("pending join request has decision metadata"));
+    }
+    validate_agent_public_key(&join.agent_public_key)
+        .map_err(|_| reject("stored agent public key is invalid"))?;
+    validate_agent_fingerprint(&join.fingerprint)
+        .map_err(|_| reject("stored fingerprint is invalid"))?;
+    validate_hostname(&join.hostname).map_err(|_| reject("stored hostname is invalid"))?;
+    validate_agent_version(&join.agent_version)
+        .map_err(|_| reject("stored agent version is invalid"))?;
+    validate_label_json(&join.requested_labels_json, "requested_labels")
+        .map_err(|_| reject("stored requested labels are invalid"))?;
+    validate_audit_text(&join.audit_correlation_id, "join correlation_id", 128)
+        .map_err(|_| reject("stored audit correlation is invalid"))?;
+    Ok(())
+}
+
+fn validate_exact_enrollment_binding_tx(
+    tx: &Transaction<'_>,
+    join: &JoinRequestRecord,
+    endpoint: &EndpointTrustRecord,
+    expected_node: &NodeInsert,
+    expected_approved_labels: Option<&Value>,
+    failure_detail: &'static str,
+) -> Result<(), StoreError> {
+    validate_approved_join_provenance_tx(tx, join, &expected_node.endpoint_id)?;
+    validate_enrollment_endpoint_origin(join, endpoint, &join.request_id)?;
+    if expected_approved_labels.is_some_and(|expected| expected != &join.approved_labels_json)
+        || endpoint.node_id.as_deref() != Some(expected_node.node_id.as_str())
+    {
+        return Err(invalid_enrollment_binding(&join.request_id, failure_detail));
+    }
+    let Some(node) = get_node_tx(tx, &expected_node.node_id)? else {
+        return Err(invalid_enrollment_binding(&join.request_id, failure_detail));
+    };
+    if node.node_id != expected_node.node_id
+        || node.endpoint_id != expected_node.endpoint_id
+        || node.name != expected_node.name
+        || node.region != expected_node.region
+        || node.role != expected_node.role
+        || get_node_by_endpoint_tx(tx, &expected_node.endpoint_id)?
+            .is_none_or(|by_endpoint| by_endpoint.node_id != expected_node.node_id)
+    {
+        return Err(invalid_enrollment_binding(&join.request_id, failure_detail));
+    }
+    let active = get_active_endpoint_trust_for_node_tx(tx, &expected_node.node_id)?;
+    if active.len() != 1 || active[0].endpoint_id != expected_node.endpoint_id {
+        return Err(invalid_enrollment_binding(&join.request_id, failure_detail));
+    }
+    Ok(())
 }
 
 fn invalid_endpoint_transition(endpoint: &EndpointTrustRecord, action: &'static str) -> StoreError {
@@ -3392,20 +3894,53 @@ fn json_detail(
     })
 }
 
-fn join_request_audit_json(join: &JoinRequestRecord) -> Value {
+fn enrollment_join_audit_json(join: &JoinRequestRecord) -> Value {
     serde_json::json!({
         "request_id": join.request_id.clone(),
-        "token_id": join.token_id.clone(),
         "status": join.status.as_str(),
-        "fingerprint": join.fingerprint.clone(),
-        "requested_endpoint_id": join.requested_endpoint_id.clone(),
+        "requested_endpoint_id_present": join.requested_endpoint_id.is_some(),
         "assigned_endpoint_id": join.assigned_endpoint_id.clone(),
-        "hostname": join.hostname.clone(),
-        "agent_version": join.agent_version.clone(),
-        "requested_labels": join.requested_labels_json.clone(),
-        "approved_labels": join.approved_labels_json.clone(),
-        "approved_by": join.approved_by.clone(),
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn audit_enrollment_binding_tx(
+    tx: &Transaction<'_>,
+    actor: &str,
+    action: &str,
+    request_id: &str,
+    join_before: &JoinRequestRecord,
+    join_after: &JoinRequestRecord,
+    node_before: Option<&NodeRecord>,
+    node_after: Option<&NodeRecord>,
+    endpoint_before: Option<&EndpointTrustRecord>,
+    endpoint_after: Option<&EndpointTrustRecord>,
+    reason: &str,
+) -> Result<(), StoreError> {
+    let mut event = AuditEvent::new(actor, action);
+    event.ok = Some(true);
+    event.request_id = Some(request_id.to_string());
+    event.node_id = node_after.or(node_before).map(|node| node.node_id.clone());
+    event.endpoint_id = endpoint_after
+        .or(endpoint_before)
+        .map(|endpoint| endpoint.endpoint_id.clone());
+    event.detail_json = serde_json::json!({
+        "actor_type": "user",
+        "target_type": "enrollment_binding",
+        "target_id": request_id,
+        "before": {
+            "join_request": enrollment_join_audit_json(join_before),
+            "node": node_before.map(node_audit_json),
+            "endpoint": endpoint_before.map(endpoint_audit_json),
+        },
+        "after": {
+            "join_request": enrollment_join_audit_json(join_after),
+            "node": node_after.map(node_audit_json),
+            "endpoint": endpoint_after.map(endpoint_audit_json),
+        },
+        "reason": reason,
+    });
+    insert_audit_tx(tx, &event)
 }
 
 fn node_audit_json(node: &NodeRecord) -> Value {

@@ -148,6 +148,25 @@ pub enum EnrollCommand {
         #[arg(long)]
         endpoint_id: String,
         #[arg(long)]
+        node_id: String,
+        #[arg(long)]
+        region: String,
+        #[arg(long, default_value = "ocserv")]
+        role: String,
+        #[arg(long)]
+        reason: String,
+    },
+    Claim {
+        join_request_id: String,
+        #[arg(long)]
+        endpoint_id: String,
+        #[arg(long)]
+        node_id: String,
+        #[arg(long)]
+        region: String,
+        #[arg(long, default_value = "ocserv")]
+        role: String,
+        #[arg(long)]
         reason: String,
     },
 }

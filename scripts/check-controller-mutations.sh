@@ -95,11 +95,19 @@ DIRECT_NODE_ENDPOINT_MUTATOR_RE = re.compile(
     r"(add_node|enable_node|disable_node|remove_node|rotate_endpoint|"
     r"revoke_endpoint|quarantine_endpoint)\s*\("
 )
+DIRECT_ENROLLMENT_MUTATOR_RE = re.compile(
+    r"(?:\.\s*|\bStore\s*::\s*)"
+    r"(approve_join_request|claim_legacy_enrollment)\s*\("
+)
 DIRECT_RPC_AUDIT_RE = re.compile(r"\bwrite_rpc_audit\s*\(")
 LEGACY_SCHEDULER_WRITER_ALLOWED_FILES = {
     ("crates", "ocfleet-cli", "src", "store.rs"),
 }
 DIRECT_NODE_ENDPOINT_MUTATOR_ALLOWED_FILES = {
+    ("crates", "ocfleet-cli", "src", "store.rs"),
+    ("crates", "ocfleet-cli", "src", "backend.rs"),
+}
+DIRECT_ENROLLMENT_MUTATOR_ALLOWED_FILES = {
     ("crates", "ocfleet-cli", "src", "store.rs"),
     ("crates", "ocfleet-cli", "src", "backend.rs"),
 }
@@ -338,6 +346,17 @@ for path in files:
                     display_path(path),
                     line,
                     "direct node/endpoint mutator call outside reviewed store/backend boundary",
+                    match.group(1),
+                )
+            )
+    if parts not in DIRECT_ENROLLMENT_MUTATOR_ALLOWED_FILES:
+        for match in DIRECT_ENROLLMENT_MUTATOR_RE.finditer(code):
+            line = source.count("\n", 0, match.start()) + 1
+            violations.append(
+                (
+                    display_path(path),
+                    line,
+                    "direct enrollment mutator call outside reviewed store/backend boundary",
                     match.group(1),
                 )
             )

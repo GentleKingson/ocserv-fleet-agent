@@ -32,8 +32,9 @@ use ocfleet_cli::ocserv_output::{
 use ocfleet_cli::retention::run_retention_command;
 use ocfleet_cli::scheduler::run_schedule_command;
 use ocfleet_cli::store::{
-    ApprovalInput, EndpointTrustRecord, EnrollmentTokenInsert, JoinRequestInsert, NodeInsert,
-    NodeRecord, ProbeHistoryRecord, ProbeObservationRecord, Store,
+    ApprovalInput, EndpointTrustRecord, EnrollmentTokenInsert, JoinRequestInsert,
+    LegacyEnrollmentClaimInput, NodeInsert, NodeRecord, ProbeHistoryRecord, ProbeObservationRecord,
+    Store,
 };
 use ocfleet_cli::trust_policy::{run_trust_policy_diff, run_trust_policy_validate};
 use ocfleet_config::validation::{
@@ -234,8 +235,35 @@ async fn main() -> anyhow::Result<()> {
                 EnrollCommand::Approve {
                     join_request_id,
                     endpoint_id,
+                    node_id,
+                    region,
+                    role,
                     reason,
-                } => run_enroll_approve(&store, &join_request_id, &endpoint_id, &reason)?,
+                } => run_enroll_approve(
+                    &store,
+                    &join_request_id,
+                    &endpoint_id,
+                    &node_id,
+                    &region,
+                    &role,
+                    &reason,
+                )?,
+                EnrollCommand::Claim {
+                    join_request_id,
+                    endpoint_id,
+                    node_id,
+                    region,
+                    role,
+                    reason,
+                } => run_enroll_claim(
+                    &store,
+                    &join_request_id,
+                    &endpoint_id,
+                    &node_id,
+                    &region,
+                    &role,
+                    &reason,
+                )?,
             }
         }
         Command::Endpoint { command } => {
@@ -408,23 +436,82 @@ fn run_enroll_approve(
     store: &Store,
     join_request_id: &str,
     endpoint_id: &str,
+    node_id: &str,
+    region: &str,
+    role: &str,
     reason: &str,
 ) -> anyhow::Result<()> {
+    let endpoint_id =
+        validate_enrollment_binding_input(endpoint_id, node_id, region, role, reason)?;
+    let actor = local_actor();
+    let approved = StoreWriter::write_enrollment_approval(
+        store,
+        &ApprovalInput {
+            request_id: join_request_id.to_string(),
+            endpoint_id,
+            node_id: node_id.to_string(),
+            region: region.to_string(),
+            role: role.to_string(),
+            reason: reason.to_string(),
+            approved_labels_json: json!({}),
+        },
+        &actor,
+    )?;
+    print_enrollment_binding(&approved, node_id);
+    Ok(())
+}
+
+fn run_enroll_claim(
+    store: &Store,
+    join_request_id: &str,
+    endpoint_id: &str,
+    node_id: &str,
+    region: &str,
+    role: &str,
+    reason: &str,
+) -> anyhow::Result<()> {
+    let endpoint_id =
+        validate_enrollment_binding_input(endpoint_id, node_id, region, role, reason)?;
+    let actor = local_actor();
+    let claimed = StoreWriter::write_legacy_enrollment_claim(
+        store,
+        &LegacyEnrollmentClaimInput {
+            request_id: join_request_id.to_string(),
+            endpoint_id,
+            node_id: node_id.to_string(),
+            region: region.to_string(),
+            role: role.to_string(),
+            reason: reason.to_string(),
+        },
+        &actor,
+    )?;
+    print_enrollment_binding(&claimed, node_id);
+    Ok(())
+}
+
+fn validate_enrollment_binding_input(
+    endpoint_id: &str,
+    node_id: &str,
+    region: &str,
+    role: &str,
+    reason: &str,
+) -> anyhow::Result<String> {
+    validate_node_id(node_id)?;
+    let endpoint_id = canonicalize_node_endpoint_id(endpoint_id)?;
+    validate_region(region)?;
+    validate_role(role)?;
     validate_reason(reason).map_err(anyhow::Error::msg)?;
-    let approved = store.approve_join_request(&ApprovalInput {
-        request_id: join_request_id.to_string(),
-        endpoint_id: endpoint_id.to_string(),
-        approved_by: local_actor(),
-        reason: reason.to_string(),
-        approved_labels_json: json!({}),
-    })?;
+    Ok(endpoint_id)
+}
+
+fn print_enrollment_binding(approved: &ocfleet_cli::store::JoinRequestRecord, node_id: &str) {
     println!("join_request_id={}", approved.request_id);
     println!("status={}", approved.status.as_str());
     println!(
         "assigned_endpoint_id={}",
         approved.assigned_endpoint_id.as_deref().unwrap_or("<none>")
     );
-    Ok(())
+    println!("node_id={node_id}");
 }
 
 struct EnrollRequestCreateInput {

@@ -194,7 +194,7 @@ token labels/scope and join-request requested/approved labels in closed,
 kind-bound typed scalar maps. Exact legacy objects migrate; writers and readers
 reject unknown, nested, sensitive, malformed, future-version, wrong-kind, or
 decision-inconsistent data without changing enrollment identity or trust.
-Publication is in progress.
+The slice is published in pull request `#76`.
 
 ### Baseline And Production Foundation
 

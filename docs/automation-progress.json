@@ -4,9 +4,9 @@
   "completed_phases": ["A1", "A2"],
   "active_branch": "codex/a3-scheduler-retry",
   "active_issue": 35,
-  "active_pr": null,
+  "active_pr": 83,
   "last_test_result": "passed",
   "last_updated_at": "2026-07-11T18:37:00Z",
   "blockers": [],
-  "next_action": "Validate and publish bounded scheduler retries, then implement maintenance and graceful shutdown for issue #35."
+  "next_action": "Merge pull request #83, then implement maintenance and graceful shutdown for issue #35."
 }

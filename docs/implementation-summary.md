@@ -30,7 +30,7 @@ for every status below.
 | 5. Local ocserv collector | Complete constrained implementation | Added `ocfleet-ocserv-collector`, fixed snapshot-v2 validation, private atomic output, snapshot-provider compatibility tests, hardened opt-in systemd units, and operator docs. It deliberately performs no live discovery or local tool invocation. |
 | 6. Trust policy as code | Complete review-only implementation | Added TOML/YAML parity, strict explicit-topology validation, deterministic bounded diffs, JSON/Markdown output, private create-new Markdown files, example policy, and CI helper. No apply or agent contact exists. |
 | 7. Governance/RBAC foundation | Complete foundation | Actor resolution now fails closed for invalid explicit values, including non-UTF-8 environment data. Fixed viewer/operator/security-admin policy tests exist; API principals remain viewer-only and local CLI RBAC remains intentionally unenforced. |
-| 8. Store abstraction | Implemented slice, expansion active | Added `StoreReader`, `StoreWriter`, `MigrationManager`, and `AuditWriter`; bounded SQLite reads fail closed on contaminated dynamic JSON. Node and endpoint lifecycle, scheduler job configuration, and scheduler run start/outcome/finish transitions use actor-bearing writer methods. A static guard rejects direct production node/endpoint mutator bypasses. Bounded outcomes pair every observation with an audit, and finish atomically updates the owning job clock. Health/alert/delivery, retention, and other writers are not all migrated. API retains a narrower independent read adapter. |
+| 8. Store abstraction | Implemented slice, expansion active | Added `StoreReader`, `StoreWriter`, `MigrationManager`, and `AuditWriter`; bounded SQLite reads fail closed on contaminated dynamic JSON. Enrollment token/request/approval/claim, node and endpoint lifecycle, scheduler job configuration, and scheduler run start/outcome/finish transitions use actor-bearing writer methods. A static guard rejects direct production mutator bypasses for those families. Bounded outcomes pair every observation with an audit, and finish atomically updates the owning job clock. Health/alert/delivery, retention, and other writers are not all migrated. API retains a narrower independent read adapter. |
 | 9. Optional Postgres backend | Complete non-connecting scaffold | Added default-off `postgres-backend`, redacted/validated connection-source types, and an always-unavailable connection stub. No client, DSN logging, schema, migration, import, or runtime selection exists. |
 | 10. Controlled writes | Complete dry-run design slice | Added default-off typed DTO/config validation, redacted request `Debug`, signed-intent and rollback consistency checks, outage acknowledgement, and tests proving default and feature-enabled agents still reject every write RPC. No dispatch exists. |
 | 11. CI and release readiness | Complete workflow slice | Pinned Rust 1.96.1 and actions, preserved least privilege, added default/all-feature gates, cargo-deny/audit jobs, tag-bound draft release assembly for four binaries on two architectures, release-version attack tests, install smoke coverage, and v0.2.0 install/release docs. |
@@ -66,8 +66,7 @@ their pinned GitHub Actions jobs are the verification path for this candidate.
 - Convert every dynamic controller JSON column to a closed typed storage schema;
   current writes are bounded and reject forbidden content, and outputs apply
   typed projections, but some internal records still use `serde_json::Value`.
-- Migrate enrollment token/request transitions, health/alert/delivery,
-  retention, and other remaining mutations to the
+- Migrate health/alert/delivery, retention, and other remaining mutations to the
   atomic `StoreWriter` actor/audit contract before claiming fully fail-closed
   controller mutation auditing. Scheduler job and run/outcome/finish writers
   now use short atomic boundaries without holding a transaction across RPC;
@@ -85,6 +84,11 @@ their pinned GitHub Actions jobs are the verification path for this candidate.
   claim` reconciles only the strict legacy approved-unbound shape. Hostname and
   labels never select node identity, and there is no startup or dispatch repair.
   Exact retries are no-ops and divergent or contaminated state fails closed.
+- Enrollment token creation/use, lazy expiry, revocation, and request rejection
+  now commit state and low-sensitive audit together. Stable optional request IDs
+  make exact submissions idempotent, final-use races serialize, and divergent
+  actor/reason/input retries fail closed without token or submitted-identity
+  material in audit or `Debug` output.
 - Consolidate the API-specific read adapter with the backend-neutral reader only
   after their projection contracts can remain equally strict.
 - Add a real Postgres client/schema/import path only as a separately reviewed,

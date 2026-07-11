@@ -23,6 +23,7 @@ strict legacy approved-unbound shape.
    install -m 0600 /dev/null ./enrollment.token
    # Put the plaintext token printed above into ./enrollment.token.
    ocfleet enroll request create \
+     --request-id join-<uuid> \
      --token-file ./enrollment.token \
      --agent-public-key <agent-public-key> \
      --fingerprint <agent-fingerprint> \
@@ -35,6 +36,10 @@ strict legacy approved-unbound shape.
    or path-probe trust. Prefer `--token-file` or `--token-stdin`; `--token`
    remains available for compatibility but is discouraged because command-line
    arguments can leak through shell history, process listings, and audit tools.
+   `--request-id` is optional; the CLI generates a `join-<uuid>` value when it
+   is omitted. Retrying the exact request ID and inputs with the same resolved
+   actor is a no-op and does not consume a second token use. A reused request ID
+   with different inputs or actor fails closed.
 
 3. A controller operator approves the request:
 
@@ -53,6 +58,25 @@ strict legacy approved-unbound shape.
    event. Those changes commit in one SQLite transaction. `node_id`, region, and
    role are operator inputs; hostname and labels never select controller
    identity.
+
+An operator may reject a pending request or revoke an active token explicitly:
+
+```bash
+ocfleet enroll request reject <join-request-id> --reason "identity mismatch"
+ocfleet enroll token revoke <token-id> --reason "onboarding cancelled"
+```
+
+Request decisions are closed: `pending` may become `approved` or `rejected`,
+and neither terminal decision can be rewritten. Token state is also closed:
+`active` may become `revoked`; an expired token cannot be rewritten as revoked.
+Exact same-actor, same-reason retries are no-ops. Divergent actor, reason, or
+input provenance is rejected rather than silently adopted.
+
+Token creation, use, lazy expiry, revocation, request rejection, and approval
+all use immediate SQLite transactions. The state row, usage counter, and audit
+event commit together; any audit failure rolls back the business change. The
+last permitted token use is compare-and-set under that transaction, so racing
+requests cannot both consume it.
 
 ### Legacy Binding Claim
 
@@ -154,6 +178,9 @@ The controller audit log records:
 - `enrollment.token.create`
 - `enrollment.token.use`
 - `enrollment.token.reject`
+- `enrollment.token.expire`
+- `enrollment.token.revoke`
+- `enrollment.reject`
 - `enrollment.approve`
 - `enrollment.claim`
 - `endpoint.rotate`
@@ -163,10 +190,13 @@ The controller audit log records:
 Audit detail includes actor type, target type/id, before and after state where
 applicable, reason, and request/correlation context.
 
-Enrollment approval/claim plus node and endpoint lifecycle commands enter
-through actor-bearing `StoreWriter` methods. A production source guard rejects
-direct mutator calls outside the reviewed SQLite store/backend boundary. Exact
-approval, claim, and lifecycle no-ops do not create misleading audit events.
+Enrollment token/request transitions, approval/claim, and node and endpoint
+lifecycle commands enter through actor-bearing `StoreWriter` methods. A
+production source guard rejects direct mutator calls outside the reviewed
+SQLite store/backend boundary. Exact no-ops do not create misleading audit
+events. Token plaintext and hashes, public keys, fingerprints, hostnames, and
+label values are excluded from enrollment audit detail and redacted from
+secret-bearing store-record `Debug` output.
 
 ## Safety Boundary
 
@@ -179,3 +209,5 @@ version, RPC protocol, read-only HTTP API route, agent capability, or default
 read-only behavior. The decision and rejected automatic-binding alternatives
 are recorded in
 [ADR-enrollment-binding-ownership](adr/ADR-enrollment-binding-ownership.md).
+Atomic token/request transition and idempotency rules are recorded in
+[ADR-enrollment-transition-atomicity](adr/ADR-enrollment-transition-atomicity.md).

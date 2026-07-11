@@ -33,6 +33,11 @@
   atomically commits the registry node, bound generation-1 trust, request
   decision, and audit through `StoreWriter`. `enroll claim` repairs only the
   strict legacy approved-unbound shape; exact retries are no-ops.
+- Enrollment token creation/use, lazy expiry, revocation, and join-request
+  rejection now use actor-bearing atomic `StoreWriter` transactions. Stable
+  optional `join-<uuid>` request IDs make exact submission retries no-ops,
+  compare-and-set usage prevents final-use races, and closed terminal
+  transitions reject divergent actors, reasons, or inputs.
 - Scheduler job add, enable, and disable now take the resolved actor and commit
   the job configuration change and success audit in one SQLite transaction
   through `StoreWriter`.
@@ -76,9 +81,11 @@
 - Extended the production mutation guard to reject direct node and endpoint
   lifecycle mutator calls outside the reviewed SQLite store/backend boundary.
 - Extended the production mutation guard to reject direct enrollment approval
-  and legacy-claim mutators. Audit-insert failure, concurrent retry, and
-  contaminated-state tests cover their all-or-nothing binding boundary without
-  recording fingerprints, agent keys, hostnames, labels, or token material.
+  and legacy-claim mutators, plus token create/revoke and request submit/reject
+  mutators. Audit-insert failure, concurrent retry, final-use race, and
+  contaminated-state tests cover their all-or-nothing boundaries without
+  recording fingerprints, agent keys, hostnames, label values, token hashes,
+  or plaintext token material.
 - Added audit-insert failure coverage proving scheduler job add, enable, and
   disable roll back their `observability_jobs` changes instead of committing
   without audit. Scheduler audit before/after projections use only fixed job
@@ -120,9 +127,8 @@
   mutations have not yet all moved to atomic `StoreWriter` actor/audit
   transactions. Recovery of incomplete scheduler `running` rows remains A3
   scheduler-reliability work.
-- Enrollment token/request lifecycle transitions and actor normalization remain
-  A1 follow-up work. Legacy approved-unbound rows require an explicit exact
-  `enroll claim`; there is intentionally no automatic discovery or repair.
+- Legacy approved-unbound enrollment rows require an explicit exact `enroll
+  claim`; there is intentionally no automatic discovery or repair.
 - Controlled writes are validation-only scaffolding and have no live code path.
 - API TLS termination remains an external deployment responsibility.
 - Browser screenshot QA, cargo-deny, cargo-audit, Linux multi-architecture

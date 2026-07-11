@@ -120,6 +120,15 @@ EndpointID, fingerprint, generation, lineage, trust bundle, and approval audit,
 then binds explicit operator-owned node metadata in one transaction. Never bind
 from agent hostname or labels, scan for candidates, or repair at startup.
 
+Use a stable `--request-id join-<uuid>` when an enrollment submission may be
+retried. Exact same-actor retries do not consume another token use. Revoke an
+unused token with `ocfleet enroll token revoke` and close an unwanted pending
+request with `ocfleet enroll request reject`; both require a reason and use
+closed, atomically audited transitions. A changed actor, reason, or submission
+input is not treated as an idempotent retry. Token plaintext/hash and submitted
+key, fingerprint, hostname, and label values are excluded from audit detail and
+secret-bearing `Debug` output.
+
 ## Audit And Observability
 
 - Keep controller audit exports redacted by default.

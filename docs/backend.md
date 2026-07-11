@@ -75,6 +75,12 @@ bound generation-1 trust, request decision, and audit together. A separate
 writer claims only the strict legacy approved-unbound shape. Exact retries do
 not change enabled state, timestamps, trust data, or audit count, and the source
 guard rejects production bypasses of both enrollment writers.
+Token creation/use, lazy expiry, revocation, and request rejection now use the
+same actor-bearing writer contract. Caller-visible `join-<uuid>` IDs provide
+submission idempotency, token usage uses a compare-and-set counter, and terminal
+retries require exact actor/reason audit provenance. Audit failures roll back
+token/request state and counters. Token material and submitted identity values
+are excluded from audit detail and redacted from secret-bearing `Debug` output.
 
 The API retains a narrower `ApiReadStore` adapter for API projections;
 `ReadOnlyStore` opens SQLite with read-only/query-only flags, validates private
@@ -95,9 +101,8 @@ authorization database.
 Scheduler RPC work occurs outside database transactions. A committed start row
 is followed by short bounded outcome transactions and one finish transaction;
 an outcome or finish persistence failure leaves the run `running` and does not
-advance the job clock. Health/alert/delivery, retention, and enrollment
-token/request lifecycle transitions are not all migrated to the writer trait.
-Future writer
+advance the job clock. Health/alert/delivery, retention, and other legacy
+mutations are not all migrated to the writer trait. Future writer
 interfaces must keep actor/audit input mandatory and must not loosen private
 file checks or redaction. The scheduler writer expansions change no schema,
 protocol, agent capability, or API route; neither does the binding/lifecycle

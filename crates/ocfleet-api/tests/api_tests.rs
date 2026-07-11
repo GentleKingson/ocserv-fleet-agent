@@ -294,6 +294,22 @@ async fn observations_route_fails_closed_for_contaminated_versioned_summary() {
 }
 
 #[tokio::test]
+async fn runs_route_fails_closed_for_contaminated_versioned_summary() {
+    let fixture = Fixture::new();
+    Connection::open(&fixture.database)
+        .expect("open fixture")
+        .execute(
+            "UPDATE observability_runs SET summary_json = ?1 WHERE run_id = 'run-a'",
+            [r#"{"schema":"ocfleet.run.summary.v1","result_class":"scheduler_summary","job_id":"job-a","kind":null,"status":"succeeded","triggered_by":"scheduler.run.once","observations":null,"failed_observations":null,"client_address":"10.0.0.2"}"#],
+        )
+        .expect("contaminate run summary");
+
+    let (status, _, body) = raw_request(fixture.router(None), Method::GET, "/runs", None).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(!body.contains("10.0.0.2"));
+}
+
+#[tokio::test]
 async fn forbidden_methods_do_not_write() {
     let fixture = Fixture::new();
     let before = table_counts(&fixture.database);

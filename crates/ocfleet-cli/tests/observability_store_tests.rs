@@ -621,7 +621,53 @@ fn observability_store_tests_insert_and_finish_observability_run() {
         .expect("query observability run");
     assert_eq!(finished_at, "2026-07-08T07:31:00Z");
     assert_eq!(status, "succeeded");
-    assert_eq!(summary_json, r#"{"observations":1}"#);
+    let summary_json: Value = serde_json::from_str(&summary_json).expect("typed run summary");
+    assert_eq!(summary_json["schema"], "ocfleet.run.summary.v1");
+    assert_eq!(summary_json["status"], "succeeded");
+    assert_eq!(summary_json["triggered_by"], "manual");
+    assert_eq!(summary_json["observations"], 1);
+}
+
+#[test]
+fn observability_store_tests_run_summary_is_closed_and_reader_fails_closed() {
+    let (_dir, store, db) = open_temp_store();
+    let mut run = ObservabilityRunInsert {
+        run_id: "run-closed-summary".to_string(),
+        job_id: None,
+        started_at: "2026-07-08T07:30:00Z".to_string(),
+        finished_at: None,
+        status: "running".to_string(),
+        triggered_by: "manual".to_string(),
+        summary_json: json!({"started": true, "client_address": "10.0.0.2"}),
+    };
+    assert!(store.insert_observability_run(&run).is_err());
+
+    run.summary_json = json!({"started": true});
+    store
+        .insert_observability_run(&run)
+        .expect("canonicalize safe legacy run summary");
+    Connection::open(db)
+        .expect("open contaminated fixture")
+        .execute(
+            "UPDATE observability_runs SET summary_json = ?1 WHERE run_id = ?2",
+            rusqlite::params![
+                json!({
+                    "schema": "ocfleet.run.summary.v1",
+                    "result_class": "scheduler_summary",
+                    "job_id": null,
+                    "kind": null,
+                    "status": "running",
+                    "triggered_by": "manual",
+                    "observations": null,
+                    "failed_observations": null,
+                    "token": "secret"
+                })
+                .to_string(),
+                run.run_id
+            ],
+        )
+        .expect("contaminate run summary");
+    assert!(store.list_observability_runs(10).is_err());
 }
 
 #[test]

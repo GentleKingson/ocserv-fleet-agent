@@ -12,8 +12,9 @@ use time::{OffsetDateTime, macros::format_description};
 use crate::private_file::{self, PrivateFileError};
 use crate::storage_payloads::{
     HEALTH_SUMMARY_SCHEMA_V1, HealthDegradedMethodsPayloadV1, HealthSummaryPayloadV1,
-    ObservationSummaryPayloadV1, SchedulerPairPayloadV1, SchedulerSelectorPayloadV1,
-    validate_health_payload_relationship, validate_scheduler_payload_relationship,
+    ObservationSummaryPayloadV1, RunSummaryPayloadV1, SchedulerPairPayloadV1,
+    SchedulerSelectorPayloadV1, validate_health_payload_relationship,
+    validate_scheduler_payload_relationship,
 };
 use crate::store::{CURRENT_SCHEMA_VERSION, StoreError};
 
@@ -97,6 +98,12 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         name: "0011_versioned_observation_summaries",
         description: "Migrate observation summaries to closed versioned v1 payloads.",
         apply: apply_0011_versioned_observation_summaries,
+    },
+    Migration {
+        version: 12,
+        name: "0012_versioned_run_summaries",
+        description: "Migrate observability run summaries to closed versioned v1 payloads.",
+        apply: apply_0012_versioned_run_summaries,
     },
 ];
 
@@ -861,6 +868,52 @@ fn apply_0011_versioned_observation_summaries(tx: &Transaction<'_>) -> Result<()
         tx.execute(
             "UPDATE probe_observations SET summary_json = ?1 WHERE observation_id = ?2",
             (payload.to_value().to_string(), observation_id),
+        )?;
+    }
+    Ok(())
+}
+
+fn apply_0012_versioned_run_summaries(tx: &Transaction<'_>) -> Result<(), StoreError> {
+    let rows = {
+        let mut stmt = tx.prepare(
+            "SELECT r.run_id, r.job_id, j.kind, r.status, r.triggered_by, r.summary_json
+             FROM observability_runs r
+             LEFT JOIN observability_jobs j ON j.job_id = r.job_id
+             ORDER BY r.run_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    for (run_id, job_id, kind, status, triggered_by, summary_json) in rows {
+        let value: Value = serde_json::from_str(&summary_json).map_err(|_| {
+            StoreError::InvalidInput("legacy run summary JSON is invalid".to_string())
+        })?;
+        let payload = RunSummaryPayloadV1::from_value(&value)
+            .or_else(|_| {
+                RunSummaryPayloadV1::from_legacy(
+                    job_id.as_deref(),
+                    kind.as_deref(),
+                    &status,
+                    &triggered_by,
+                    &value,
+                )
+            })
+            .map_err(StoreError::InvalidInput)?;
+        payload
+            .validate_relationship(job_id.as_deref(), kind.as_deref(), &status, &triggered_by)
+            .map_err(StoreError::InvalidInput)?;
+        tx.execute(
+            "UPDATE observability_runs SET summary_json = ?1 WHERE run_id = ?2",
+            (payload.to_value().to_string(), run_id),
         )?;
     }
     Ok(())

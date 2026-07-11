@@ -159,6 +159,14 @@ summaries. Writers canonicalize before persistence; migration and CLI/API reader
 reject unknown, nested, secret-like, address, raw, future-version, or mismatched
 data while public projections omit the storage wrapper.
 
+The fourth A2 slice advances SQLite to migration `0012` and stores
+observability run summaries in a closed payload bound to relational job, job
+kind, status, and trigger. Migration derives missing legacy relational fields,
+preserves bounded terminal counts, and rejects unknown, sensitive, impossible,
+future-version, or mismatched data. CLI and independent API readers validate
+the envelope and omit its storage wrapper. The slice is published in pull
+request `#72`.
+
 ### Baseline And Production Foundation
 
 | ID | Issue | Status | Depends on | Release target | Acceptance and required evidence |

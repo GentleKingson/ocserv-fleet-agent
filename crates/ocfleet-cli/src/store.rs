@@ -29,11 +29,11 @@ use crate::migrations;
 use crate::private_file::{self, PrivateFileError};
 use crate::storage_payloads::{
     HealthDegradedMethodsPayloadV1, HealthSummaryPayloadV1, ObservationSummaryPayloadV1,
-    SchedulerPairPayloadV1, SchedulerSelectorPayloadV1, validate_health_payload_relationship,
-    validate_scheduler_payload_relationship,
+    RunSummaryPayloadV1, SchedulerPairPayloadV1, SchedulerSelectorPayloadV1,
+    validate_health_payload_relationship, validate_scheduler_payload_relationship,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 11;
+pub const CURRENT_SCHEMA_VERSION: i64 = 12;
 pub const DEFAULT_HEALTH_STALE_WINDOW_SECONDS: u64 = 24 * 60 * 60;
 pub const DEFAULT_HEALTH_UNREACHABLE_FAILURES: u64 = 3;
 pub const DEFAULT_HEALTH_CERT_WARNING_DAYS: u64 = 30;
@@ -1236,7 +1236,13 @@ impl Store {
             "failed_observations": failed_observation_count,
             "result_class": "scheduler_summary",
         });
-        validate_low_sensitive_json(&summary_json, "observability run summary")?;
+        let summary_json = canonical_run_summary(
+            run.job_id.as_deref(),
+            Some(&kind),
+            status,
+            "scheduler.run.once",
+            &summary_json,
+        )?;
         let affected = tx.execute(
             "UPDATE observability_runs
              SET finished_at = ?1,
@@ -1307,15 +1313,59 @@ impl Store {
         status: &str,
         summary_json: &Value,
     ) -> Result<(), StoreError> {
-        validate_low_sensitive_json(summary_json, "observability run summary")?;
         let tx = self.conn.unchecked_transaction()?;
+        let (job_id, kind, current_status, triggered_by, stored_summary): (
+            Option<String>,
+            Option<String>,
+            String,
+            String,
+            String,
+        ) = tx
+            .query_row(
+                "SELECT r.job_id, j.kind, r.status, r.triggered_by, r.summary_json
+                 FROM observability_runs r
+                 LEFT JOIN observability_jobs j ON j.job_id = r.job_id
+                 WHERE r.run_id = ?1",
+                [run_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::ObservabilityRunNotFound(run_id.to_string()))?;
+        let stored_value: Value = serde_json::from_str(&stored_summary).map_err(|_| {
+            StoreError::InvalidInput("stored run summary JSON is invalid".to_string())
+        })?;
+        let stored_payload =
+            RunSummaryPayloadV1::from_value(&stored_value).map_err(StoreError::InvalidInput)?;
+        stored_payload
+            .validate_relationship(
+                job_id.as_deref(),
+                kind.as_deref(),
+                &current_status,
+                &triggered_by,
+            )
+            .map_err(StoreError::InvalidInput)?;
+        let summary_json = canonical_run_summary(
+            job_id.as_deref(),
+            kind.as_deref(),
+            status,
+            &triggered_by,
+            summary_json,
+        )?;
         tx.execute(
             "UPDATE observability_runs
              SET finished_at = ?1,
                  status = ?2,
                  summary_json = ?3
              WHERE run_id = ?4",
-            params![finished_at, status, compact_json(summary_json), run_id],
+            params![finished_at, status, compact_json(&summary_json), run_id],
         )?;
         tx.commit()?;
         Ok(())
@@ -1329,10 +1379,12 @@ impl Store {
         let mut stmt = self.conn.prepare(
             "SELECT r.run_id, r.job_id, r.started_at, r.finished_at, r.status, r.triggered_by, r.summary_json,
                     COUNT(o.observation_id) AS observation_count,
-                    COALESCE(SUM(CASE WHEN o.ok = 0 THEN 1 ELSE 0 END), 0) AS failed_observation_count
+                    COALESCE(SUM(CASE WHEN o.ok = 0 THEN 1 ELSE 0 END), 0) AS failed_observation_count,
+                    j.kind
              FROM observability_runs r
              LEFT JOIN probe_observations o ON o.run_id = r.run_id
-             GROUP BY r.run_id, r.job_id, r.started_at, r.finished_at, r.status, r.triggered_by, r.summary_json
+             LEFT JOIN observability_jobs j ON j.job_id = r.job_id
+             GROUP BY r.run_id, r.job_id, r.started_at, r.finished_at, r.status, r.triggered_by, r.summary_json, j.kind
              ORDER BY r.started_at DESC, r.run_id DESC
              LIMIT ?1",
         )?;
@@ -1349,11 +1401,13 @@ impl Store {
             .query_row(
                 "SELECT r.run_id, r.job_id, r.started_at, r.finished_at, r.status, r.triggered_by, r.summary_json,
                         COUNT(o.observation_id) AS observation_count,
-                        COALESCE(SUM(CASE WHEN o.ok = 0 THEN 1 ELSE 0 END), 0) AS failed_observation_count
+                        COALESCE(SUM(CASE WHEN o.ok = 0 THEN 1 ELSE 0 END), 0) AS failed_observation_count,
+                        j.kind
                  FROM observability_runs r
                  LEFT JOIN probe_observations o ON o.run_id = r.run_id
+                 LEFT JOIN observability_jobs j ON j.job_id = r.job_id
                  WHERE r.run_id = ?1
-                 GROUP BY r.run_id, r.job_id, r.started_at, r.finished_at, r.status, r.triggered_by, r.summary_json",
+                 GROUP BY r.run_id, r.job_id, r.started_at, r.finished_at, r.status, r.triggered_by, r.summary_json, j.kind",
                 [run_id],
                 observability_run_from_row,
             )
@@ -3455,7 +3509,17 @@ fn insert_observability_run_tx(
     tx: &Transaction<'_>,
     run: &ObservabilityRunInsert,
 ) -> Result<(), StoreError> {
-    validate_low_sensitive_json(&run.summary_json, "observability run summary")?;
+    let summary_json = canonical_run_summary(
+        run.job_id.as_deref(),
+        match run.job_id.as_deref() {
+            Some(job_id) => get_observability_job_kind_tx(tx, job_id)?,
+            None => None,
+        }
+        .as_deref(),
+        &run.status,
+        &run.triggered_by,
+        &run.summary_json,
+    )?;
     tx.execute(
         "INSERT INTO observability_runs
          (run_id, job_id, started_at, finished_at, status, triggered_by, summary_json)
@@ -3467,10 +3531,28 @@ fn insert_observability_run_tx(
             run.finished_at.as_deref(),
             run.status.as_str(),
             run.triggered_by.as_str(),
-            compact_json(&run.summary_json),
+            compact_json(&summary_json),
         ],
     )?;
     Ok(())
+}
+
+fn canonical_run_summary(
+    job_id: Option<&str>,
+    kind_hint: Option<&str>,
+    status: &str,
+    triggered_by: &str,
+    summary_json: &Value,
+) -> Result<Value, StoreError> {
+    let payload = RunSummaryPayloadV1::from_value(summary_json)
+        .or_else(|_| {
+            RunSummaryPayloadV1::from_legacy(job_id, kind_hint, status, triggered_by, summary_json)
+        })
+        .map_err(StoreError::InvalidInput)?;
+    payload
+        .validate_relationship(job_id, kind_hint, status, triggered_by)
+        .map_err(StoreError::InvalidInput)?;
+    Ok(payload.to_value())
 }
 
 fn canonical_observation_summary(
@@ -5204,14 +5286,35 @@ fn observability_run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Obser
     let summary_json: String = row.get(6)?;
     let observation_count: i64 = row.get(7)?;
     let failed_observation_count: i64 = row.get(8)?;
+    let kind: Option<String> = row.get(9)?;
+    let job_id: Option<String> = row.get(1)?;
+    let status: String = row.get(4)?;
+    let triggered_by: String = row.get(5)?;
+    let summary_json = parse_json_column(&summary_json, 6)?;
+    let payload = RunSummaryPayloadV1::from_value(&summary_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            6,
+            Type::Text,
+            Box::new(io::Error::new(io::ErrorKind::InvalidData, error)),
+        )
+    })?;
+    payload
+        .validate_relationship(job_id.as_deref(), kind.as_deref(), &status, &triggered_by)
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                6,
+                Type::Text,
+                Box::new(io::Error::new(io::ErrorKind::InvalidData, error)),
+            )
+        })?;
     Ok(ObservabilityRunRecord {
         run_id: row.get(0)?,
-        job_id: row.get(1)?,
+        job_id,
         started_at: row.get(2)?,
         finished_at: row.get(3)?,
-        status: row.get(4)?,
-        triggered_by: row.get(5)?,
-        summary_json: parse_json_column(&summary_json, 6)?,
+        status,
+        triggered_by,
+        summary_json: payload.public_summary(),
         observation_count: i64_to_u64(observation_count)?,
         failed_observation_count: i64_to_u64(failed_observation_count)?,
     })

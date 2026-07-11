@@ -302,6 +302,12 @@ content, unsupported versions, malformed JSON, and relational mismatches stop
 the upgrade and leave the version-10 database unchanged beside its private
 pre-migration backup.
 
+Schema version 12 canonicalizes observability run summaries into closed
+job/kind/status/trigger-bound payloads with bounded terminal counts. Unknown or
+sensitive fields, unsupported versions or job kinds, impossible counts,
+malformed JSON, and relational mismatches stop the upgrade and leave the
+version-11 database unchanged beside its private pre-migration backup.
+
 Before upgrades, keep an operator-managed backup as well:
 
 ```bash

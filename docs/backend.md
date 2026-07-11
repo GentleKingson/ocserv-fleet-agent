@@ -76,6 +76,11 @@ observation summaries over a fixed field DTO bound to method and result class.
 The SQLite and independent API readers validate persisted envelopes and return
 only public summary fields.
 
+The fourth A2 slice advances SQLite to schema version 12 and closes
+observability run summaries over fixed job, kind, status, trigger, and bounded
+count fields. Writers and both read adapters bind those fields to the
+relational run and never expose the persisted schema wrapper.
+
 The first production-hardening slice added node add/enable/disable/remove to this
 contract and removed the CLI's post-commit success audits. Audit-trigger failure
 tests prove both `nodes` and `endpoint_trust` changes roll back. The second slice

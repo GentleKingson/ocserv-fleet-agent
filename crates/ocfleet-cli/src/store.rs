@@ -472,6 +472,40 @@ pub struct AlertDeliveryFinalizeWrite {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlertDeliveryQueueEnqueue {
+    pub queue_id: String,
+    pub alert_id: String,
+    pub hook_id: String,
+    pub idempotency_key: String,
+    pub group_key: String,
+    pub enqueued_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlertDeliveryQueueClaim {
+    pub queue_id: String,
+    pub alert_id: String,
+    pub hook_id: String,
+    pub idempotency_key: String,
+    pub group_key: String,
+    pub attempt_count: u64,
+    pub owner_id: String,
+    pub fence_token: u64,
+    pub claimed_at: String,
+    pub lease_expires_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlertDeliveryQueueOutcome {
+    pub claim: AlertDeliveryQueueClaim,
+    pub attempt: AlertDeliveryAttemptRecord,
+    pub completed_at: String,
+    pub retry_at: Option<String>,
+    pub retryable: bool,
+    pub max_attempts: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetentionPolicyRecord {
     pub scope: String,
     pub max_age_days: Option<u64>,
@@ -2508,6 +2542,326 @@ impl Store {
             "reason": Value::Null,
         });
         insert_audit_tx(&tx, &event)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn write_alert_delivery_queue_enqueue(
+        &self,
+        enqueue: &AlertDeliveryQueueEnqueue,
+        actor: &str,
+    ) -> Result<(), StoreError> {
+        validate_actor(actor).map_err(StoreError::InvalidInput)?;
+        validate_alert_delivery_queue_enqueue(enqueue)?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let existing = tx
+            .query_row(
+                "SELECT queue_id, alert_id, hook_id, idempotency_key, group_key, created_at
+                 FROM alert_delivery_queue
+                 WHERE queue_id = ?1 OR idempotency_key = ?4",
+                params![
+                    enqueue.queue_id,
+                    enqueue.alert_id,
+                    enqueue.hook_id,
+                    enqueue.idempotency_key
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some(existing) = existing {
+            if existing
+                == (
+                    enqueue.queue_id.clone(),
+                    enqueue.alert_id.clone(),
+                    enqueue.hook_id.clone(),
+                    enqueue.idempotency_key.clone(),
+                    enqueue.group_key.clone(),
+                    enqueue.enqueued_at.clone(),
+                )
+            {
+                let audit_actor = tx
+                    .query_row(
+                        "SELECT actor FROM controller_audit_log
+                         WHERE request_id = ?1 AND event = 'alert.delivery.queue.enqueue'",
+                        [enqueue.queue_id.as_str()],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?;
+                if audit_actor.as_deref() != Some(actor) {
+                    return Err(StoreError::AlertMutationConflict {
+                        operation_id: enqueue.queue_id.clone(),
+                        detail: "delivery queue audit provenance is mismatched or missing",
+                    });
+                }
+                tx.commit()?;
+                return Ok(());
+            }
+            return Err(StoreError::AlertMutationConflict {
+                operation_id: enqueue.queue_id.clone(),
+                detail: "delivery queue identity or idempotency key is already bound",
+            });
+        }
+        let hook_enabled = tx
+            .query_row(
+                "SELECT enabled FROM alert_hooks WHERE hook_id = ?1 AND hook_type = 'webhook'",
+                [enqueue.hook_id.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        if hook_enabled != Some(1) {
+            return Err(StoreError::InvalidInput(
+                "delivery queue hook is missing, disabled, or not a webhook".to_string(),
+            ));
+        }
+        let alert_exists = tx
+            .query_row(
+                "SELECT 1 FROM alert_events WHERE alert_id = ?1 AND state = 'open'",
+                [enqueue.alert_id.as_str()],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !alert_exists {
+            return Err(StoreError::InvalidInput(
+                "delivery queue alert is missing or is not open".to_string(),
+            ));
+        }
+        tx.execute(
+            "INSERT INTO alert_delivery_queue
+             (queue_id, alert_id, hook_id, idempotency_key, group_key, status,
+              next_attempt_at, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?6, ?6)",
+            params![
+                enqueue.queue_id,
+                enqueue.alert_id,
+                enqueue.hook_id,
+                enqueue.idempotency_key,
+                enqueue.group_key,
+                enqueue.enqueued_at
+            ],
+        )?;
+        insert_alert_delivery_queue_audit_tx(
+            &tx,
+            actor,
+            "alert.delivery.queue.enqueue",
+            &enqueue.queue_id,
+            true,
+            None,
+            json!({
+                "queue_id": enqueue.queue_id,
+                "hook_id": enqueue.hook_id,
+                "alert_id": enqueue.alert_id,
+                "group_key": enqueue.group_key,
+                "state": "pending",
+            }),
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn write_alert_delivery_queue_claim_next(
+        &self,
+        owner_id: &str,
+        now: &str,
+        lease_seconds: u64,
+        actor: &str,
+    ) -> Result<Option<AlertDeliveryQueueClaim>, StoreError> {
+        validate_actor(actor).map_err(StoreError::InvalidInput)?;
+        validate_alert_delivery_queue_claim_input(owner_id, now, lease_seconds)?;
+        let now_instant = OffsetDateTime::parse(now, &Rfc3339).expect("validated queue timestamp");
+        let lease_expires_at = (now_instant + time::Duration::seconds(lease_seconds as i64))
+            .format(&Rfc3339)
+            .expect("queue lease timestamp formats");
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        recover_expired_alert_delivery_claims_tx(&tx, now_instant, now, actor)?;
+        let mut candidates = {
+            let mut stmt = tx.prepare(
+                "SELECT queue_id, next_attempt_at FROM alert_delivery_queue
+                 WHERE status IN ('pending', 'retry')
+                 ORDER BY queue_id LIMIT 1000",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        }
+        .into_iter()
+        .map(|(queue_id, due_at)| {
+            OffsetDateTime::parse(&due_at, &Rfc3339)
+                .map(|instant| (queue_id, instant))
+                .map_err(|_| {
+                    StoreError::InvalidInput(
+                        "stored alert delivery next_attempt_at is invalid".to_string(),
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+        candidates.retain(|(_, due_at)| *due_at <= now_instant);
+        candidates.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
+        let Some((queue_id, _)) = candidates.into_iter().next() else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        let changed = tx.execute(
+            "UPDATE alert_delivery_queue
+             SET status = 'claimed', owner_id = ?2, fence_token = fence_token + 1,
+                 claimed_at = ?3, lease_expires_at = ?4, updated_at = ?3
+             WHERE queue_id = ?1 AND status IN ('pending', 'retry')",
+            params![queue_id, owner_id, now, lease_expires_at],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::AlertMutationConflict {
+                operation_id: queue_id,
+                detail: "delivery queue item changed before claim",
+            });
+        }
+        let claim = get_alert_delivery_queue_claim_tx(&tx, &queue_id)?.ok_or_else(|| {
+            StoreError::AlertMutationConflict {
+                operation_id: queue_id.clone(),
+                detail: "claimed delivery queue item disappeared",
+            }
+        })?;
+        insert_alert_delivery_queue_audit_tx(
+            &tx,
+            actor,
+            "alert.delivery.queue.claim",
+            &claim.queue_id,
+            true,
+            None,
+            alert_delivery_claim_audit_json(&claim, "claimed"),
+        )?;
+        tx.commit()?;
+        Ok(Some(claim))
+    }
+
+    pub fn write_alert_delivery_queue_renew(
+        &self,
+        claim: &AlertDeliveryQueueClaim,
+        now: &str,
+        lease_seconds: u64,
+        actor: &str,
+    ) -> Result<AlertDeliveryQueueClaim, StoreError> {
+        validate_actor(actor).map_err(StoreError::InvalidInput)?;
+        validate_alert_delivery_queue_claim(claim)?;
+        validate_alert_delivery_queue_claim_input(&claim.owner_id, now, lease_seconds)?;
+        let now_instant = OffsetDateTime::parse(now, &Rfc3339).expect("validated queue timestamp");
+        let lease_expires_at = (now_instant + time::Duration::seconds(lease_seconds as i64))
+            .format(&Rfc3339)
+            .expect("queue lease timestamp formats");
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "UPDATE alert_delivery_queue SET lease_expires_at = ?4, updated_at = ?3
+             WHERE queue_id = ?1 AND status = 'claimed' AND owner_id = ?2
+               AND fence_token = ?5 AND lease_expires_at > ?3",
+            params![
+                claim.queue_id,
+                claim.owner_id,
+                now,
+                lease_expires_at,
+                u64_to_i64(claim.fence_token)?
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::AlertMutationConflict {
+                operation_id: claim.queue_id.clone(),
+                detail: "delivery queue lease or fence was lost",
+            });
+        }
+        let renewed = AlertDeliveryQueueClaim {
+            lease_expires_at,
+            ..claim.clone()
+        };
+        insert_alert_delivery_queue_audit_tx(
+            &tx,
+            actor,
+            "alert.delivery.queue.renew",
+            &claim.queue_id,
+            true,
+            None,
+            alert_delivery_claim_audit_json(&renewed, "renewed"),
+        )?;
+        tx.commit()?;
+        Ok(renewed)
+    }
+
+    pub fn write_alert_delivery_queue_outcome(
+        &self,
+        outcome: &AlertDeliveryQueueOutcome,
+        actor: &str,
+    ) -> Result<(), StoreError> {
+        validate_actor(actor).map_err(StoreError::InvalidInput)?;
+        validate_alert_delivery_queue_outcome(outcome)?;
+        let next_attempt = outcome.claim.attempt_count + 1;
+        let succeeded = outcome.attempt.status == "succeeded";
+        let should_retry = !succeeded && outcome.retryable && next_attempt < outcome.max_attempts;
+        let status = if succeeded {
+            "succeeded"
+        } else if should_retry {
+            "retry"
+        } else {
+            "dead_letter"
+        };
+        let next_attempt_at = if should_retry {
+            outcome
+                .retry_at
+                .as_deref()
+                .expect("validated retry timestamp")
+        } else {
+            outcome.completed_at.as_str()
+        };
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "UPDATE alert_delivery_queue
+             SET status = ?6, attempt_count = ?7, next_attempt_at = ?8,
+                 owner_id = NULL, claimed_at = NULL, lease_expires_at = NULL,
+                 last_error_code = ?9, updated_at = ?5, delivered_at = ?10
+             WHERE queue_id = ?1 AND status = 'claimed' AND owner_id = ?2
+               AND fence_token = ?3 AND lease_expires_at > ?5",
+            params![
+                outcome.claim.queue_id,
+                outcome.claim.owner_id,
+                u64_to_i64(outcome.claim.fence_token)?,
+                outcome.claim.lease_expires_at,
+                outcome.completed_at,
+                status,
+                u64_to_i64(next_attempt)?,
+                next_attempt_at,
+                outcome.attempt.error_code,
+                succeeded.then_some(outcome.completed_at.as_str()),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::AlertMutationConflict {
+                operation_id: outcome.claim.queue_id.clone(),
+                detail: "delivery queue lease or fence was lost before outcome",
+            });
+        }
+        insert_alert_delivery_attempt_tx(&tx, &outcome.attempt)?;
+        insert_alert_delivery_queue_audit_tx(
+            &tx,
+            actor,
+            "alert.delivery.queue.outcome",
+            &outcome.claim.queue_id,
+            succeeded,
+            outcome.attempt.error_code.as_deref(),
+            json!({
+                "queue_id": outcome.claim.queue_id,
+                "hook_id": outcome.claim.hook_id,
+                "alert_id": outcome.claim.alert_id,
+                "attempt_no": next_attempt,
+                "state": status,
+                "next_attempt_at": should_retry.then_some(next_attempt_at),
+            }),
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -6698,6 +7052,257 @@ fn validate_alert_delivery_attempt_record(
     }
     delivery_attempt_detail_payload(attempt)?;
     Ok(())
+}
+
+fn validate_alert_delivery_queue_enqueue(
+    enqueue: &AlertDeliveryQueueEnqueue,
+) -> Result<(), StoreError> {
+    validate_safe_id("delivery queue_id", &enqueue.queue_id, 96)?;
+    if !enqueue.queue_id.starts_with("delivery-queue-") {
+        return Err(StoreError::InvalidInput(
+            "delivery queue_id must use delivery-queue- prefix".to_string(),
+        ));
+    }
+    validate_safe_id("delivery alert_id", &enqueue.alert_id, 128)?;
+    validate_safe_id("delivery hook_id", &enqueue.hook_id, 128)?;
+    validate_sha256_hex(&enqueue.idempotency_key, "delivery idempotency key")?;
+    validate_audit_text(&enqueue.group_key, "delivery group key", 128)?;
+    validate_rfc3339(&enqueue.enqueued_at, "delivery enqueued_at")
+}
+
+fn validate_alert_delivery_queue_claim_input(
+    owner_id: &str,
+    now: &str,
+    lease_seconds: u64,
+) -> Result<(), StoreError> {
+    validate_safe_id("delivery owner_id", owner_id, 128)?;
+    validate_rfc3339(now, "delivery claim timestamp")?;
+    if !(30..=600).contains(&lease_seconds) {
+        return Err(StoreError::InvalidInput(
+            "delivery lease_seconds must be between 30 and 600".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_alert_delivery_queue_claim(claim: &AlertDeliveryQueueClaim) -> Result<(), StoreError> {
+    validate_safe_id("delivery queue_id", &claim.queue_id, 96)?;
+    validate_safe_id("delivery alert_id", &claim.alert_id, 128)?;
+    validate_safe_id("delivery hook_id", &claim.hook_id, 128)?;
+    validate_sha256_hex(&claim.idempotency_key, "delivery idempotency key")?;
+    validate_audit_text(&claim.group_key, "delivery group key", 128)?;
+    validate_safe_id("delivery owner_id", &claim.owner_id, 128)?;
+    if claim.fence_token == 0 || claim.fence_token > i64::MAX as u64 {
+        return Err(StoreError::InvalidInput(
+            "delivery fence token must be positive".to_string(),
+        ));
+    }
+    if claim.attempt_count > 5 {
+        return Err(StoreError::InvalidInput(
+            "delivery attempt_count exceeds five".to_string(),
+        ));
+    }
+    validate_rfc3339(&claim.claimed_at, "delivery claimed_at")?;
+    validate_rfc3339(&claim.lease_expires_at, "delivery lease_expires_at")?;
+    let claimed_at = OffsetDateTime::parse(&claim.claimed_at, &Rfc3339)
+        .expect("validated delivery claim timestamp");
+    let expires_at = OffsetDateTime::parse(&claim.lease_expires_at, &Rfc3339)
+        .expect("validated delivery lease timestamp");
+    if expires_at <= claimed_at {
+        return Err(StoreError::InvalidInput(
+            "delivery lease must expire after claim".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_alert_delivery_queue_outcome(
+    outcome: &AlertDeliveryQueueOutcome,
+) -> Result<(), StoreError> {
+    validate_alert_delivery_queue_claim(&outcome.claim)?;
+    validate_alert_delivery_attempt_record(&outcome.attempt)?;
+    validate_rfc3339(&outcome.completed_at, "delivery completed_at")?;
+    if !matches!(outcome.attempt.status.as_str(), "succeeded" | "failed") {
+        return Err(StoreError::InvalidInput(
+            "queued delivery attempt must be succeeded or failed".to_string(),
+        ));
+    }
+    if outcome.attempt.alert_id != outcome.claim.alert_id
+        || outcome.attempt.hook_id != outcome.claim.hook_id
+        || outcome.attempt.attempt_no != outcome.claim.attempt_count + 1
+    {
+        return Err(StoreError::InvalidInput(
+            "delivery attempt does not match claimed queue item".to_string(),
+        ));
+    }
+    if !(1..=5).contains(&outcome.max_attempts) {
+        return Err(StoreError::InvalidInput(
+            "delivery max_attempts must be between one and five".to_string(),
+        ));
+    }
+    let succeeded = outcome.attempt.status == "succeeded";
+    if succeeded && (outcome.retryable || outcome.retry_at.is_some()) {
+        return Err(StoreError::InvalidInput(
+            "successful delivery cannot request retry".to_string(),
+        ));
+    }
+    let should_retry =
+        !succeeded && outcome.retryable && outcome.attempt.attempt_no < outcome.max_attempts;
+    if should_retry != outcome.retry_at.is_some() {
+        return Err(StoreError::InvalidInput(
+            "delivery retry timestamp does not match retry policy".to_string(),
+        ));
+    }
+    if let Some(retry_at) = &outcome.retry_at {
+        validate_rfc3339(retry_at, "delivery retry_at")?;
+        let completed = OffsetDateTime::parse(&outcome.completed_at, &Rfc3339)
+            .expect("validated delivery completed timestamp");
+        let retry =
+            OffsetDateTime::parse(retry_at, &Rfc3339).expect("validated delivery retry timestamp");
+        if retry <= completed || retry - completed > time::Duration::hours(1) {
+            return Err(StoreError::InvalidInput(
+                "delivery retry_at must be within one hour after completion".to_string(),
+            ));
+        }
+    }
+    let claimed = OffsetDateTime::parse(&outcome.claim.claimed_at, &Rfc3339)
+        .expect("validated delivery claim timestamp");
+    let attempted = OffsetDateTime::parse(&outcome.attempt.attempted_at, &Rfc3339)
+        .expect("validated delivery attempt timestamp");
+    let completed = OffsetDateTime::parse(&outcome.completed_at, &Rfc3339)
+        .expect("validated delivery completion timestamp");
+    if attempted < claimed || completed < attempted {
+        return Err(StoreError::InvalidInput(
+            "delivery attempt timestamps are out of order".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn get_alert_delivery_queue_claim_tx(
+    tx: &Transaction<'_>,
+    queue_id: &str,
+) -> Result<Option<AlertDeliveryQueueClaim>, StoreError> {
+    tx.query_row(
+        "SELECT queue_id, alert_id, hook_id, idempotency_key, group_key,
+                attempt_count, owner_id, fence_token, claimed_at, lease_expires_at
+         FROM alert_delivery_queue WHERE queue_id = ?1 AND status = 'claimed'",
+        [queue_id],
+        |row| {
+            let attempt_count = row.get::<_, i64>(5)?;
+            let fence_token = row.get::<_, i64>(7)?;
+            Ok(AlertDeliveryQueueClaim {
+                queue_id: row.get(0)?,
+                alert_id: row.get(1)?,
+                hook_id: row.get(2)?,
+                idempotency_key: row.get(3)?,
+                group_key: row.get(4)?,
+                attempt_count: u64::try_from(attempt_count)
+                    .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(5, attempt_count))?,
+                owner_id: row.get(6)?,
+                fence_token: u64::try_from(fence_token)
+                    .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(7, fence_token))?,
+                claimed_at: row.get(8)?,
+                lease_expires_at: row.get(9)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(StoreError::from)
+}
+
+fn recover_expired_alert_delivery_claims_tx(
+    tx: &Transaction<'_>,
+    now_instant: OffsetDateTime,
+    now: &str,
+    actor: &str,
+) -> Result<(), StoreError> {
+    let rows = {
+        let mut stmt = tx.prepare(
+            "SELECT queue_id, lease_expires_at FROM alert_delivery_queue
+             WHERE status = 'claimed' ORDER BY queue_id LIMIT 1000",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    let mut expired = rows
+        .into_iter()
+        .map(|(queue_id, expires_at)| {
+            OffsetDateTime::parse(&expires_at, &Rfc3339)
+                .map(|instant| (queue_id, instant))
+                .map_err(|_| {
+                    StoreError::InvalidInput(
+                        "stored delivery lease_expires_at is invalid".to_string(),
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    expired.retain(|(_, expires_at)| *expires_at <= now_instant);
+    expired.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
+    for (queue_id, _) in expired.into_iter().take(100) {
+        let changed = tx.execute(
+            "UPDATE alert_delivery_queue
+             SET status = 'retry', owner_id = NULL, claimed_at = NULL,
+                 lease_expires_at = NULL, next_attempt_at = ?2,
+                 last_error_code = 'ALERT_DELIVERY_LEASE_EXPIRED', updated_at = ?2
+             WHERE queue_id = ?1 AND status = 'claimed'",
+            params![queue_id, now],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::AlertMutationConflict {
+                operation_id: queue_id,
+                detail: "delivery queue item changed during recovery",
+            });
+        }
+        insert_alert_delivery_queue_audit_tx(
+            tx,
+            actor,
+            "alert.delivery.queue.recover",
+            &queue_id,
+            false,
+            Some("ALERT_DELIVERY_LEASE_EXPIRED"),
+            json!({
+                "queue_id": queue_id,
+                "state": "retry",
+                "next_attempt_at": now,
+            }),
+        )?;
+    }
+    Ok(())
+}
+
+fn alert_delivery_claim_audit_json(claim: &AlertDeliveryQueueClaim, state: &str) -> Value {
+    json!({
+        "queue_id": claim.queue_id,
+        "hook_id": claim.hook_id,
+        "alert_id": claim.alert_id,
+        "group_key": claim.group_key,
+        "owner_id": claim.owner_id,
+        "generation": claim.fence_token,
+        "claimed_at": claim.claimed_at,
+        "lease_expires_at": claim.lease_expires_at,
+        "attempt_no": claim.attempt_count + 1,
+        "state": state,
+    })
+}
+
+fn insert_alert_delivery_queue_audit_tx(
+    tx: &Transaction<'_>,
+    actor: &str,
+    event_name: &str,
+    queue_id: &str,
+    ok: bool,
+    error_code: Option<&str>,
+    detail: Value,
+) -> Result<(), StoreError> {
+    let mut event = AuditEvent::new(actor, event_name);
+    event.request_id = Some(queue_id.to_string());
+    event.ok = Some(ok);
+    event.error_code = error_code.map(str::to_string);
+    event.detail_json = detail;
+    insert_audit_tx(tx, &event)
 }
 
 fn validate_alert_delivery_finalize(write: &AlertDeliveryFinalizeWrite) -> Result<(), StoreError> {

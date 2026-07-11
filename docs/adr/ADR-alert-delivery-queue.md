@@ -30,6 +30,14 @@ persisted hook at dispatch time and continue using the existing hardened HTTPS
 transport. JSONL remains an explicit operator-supplied local action because its
 path is not persisted and must not become daemon-selected filesystem authority.
 
+Actor-bound `StoreWriter` methods enqueue exact idempotent work, acquire the
+earliest due item, renew its lease, recover at most 100 expired claims, and
+commit each attempt with its retry, dead-letter, or success transition and audit
+in one immediate transaction. Recovery does not consume an attempt. Claims use
+monotonic fences, and stale owners cannot renew or persist outcomes after
+takeover. Retry timestamps are explicit, bounded to one hour, and permitted only
+for retryable failures below the hook attempt cap.
+
 ## Compatibility And Rollback
 
 The migration creates an empty queue and three indexes. It does not enqueue old

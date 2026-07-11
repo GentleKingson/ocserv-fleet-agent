@@ -2,11 +2,11 @@
   "baseline_commit": "b3c906a94823b4620dc1a2077a44e7160c0848b2",
   "current_phase": "A5",
   "completed_phases": ["A1", "A2", "A3", "A4"],
-  "active_branch": "codex/a5-alert-delivery-worker",
+  "active_branch": "codex/a5-alert-delivery-queue-writers",
   "active_issue": 37,
-  "active_pr": 92,
+  "active_pr": null,
   "last_test_result": "passed",
-  "last_updated_at": "2026-07-11T23:29:00Z",
+  "last_updated_at": "2026-07-11T23:50:00Z",
   "blockers": [],
-  "next_action": "Publish schema 22 delivery queue persistence, then implement audited queue writers and fenced claims."
+  "next_action": "Publish audited queue writers and fenced claims, then integrate the hardened webhook transport worker."
 }

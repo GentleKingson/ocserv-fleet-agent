@@ -1,6 +1,7 @@
 use crate::audit::AuditEvent;
 use crate::store::{
-    AlertDeliveryAttemptWrite, AlertDeliveryFinalizeWrite, AlertEvaluationWrite, AlertEventRecord,
+    AlertDeliveryAttemptWrite, AlertDeliveryFinalizeWrite, AlertDeliveryQueueClaim,
+    AlertDeliveryQueueEnqueue, AlertDeliveryQueueOutcome, AlertEvaluationWrite, AlertEventRecord,
     AlertStateTransition, AlertWebhookHookRecord, ApprovalInput, AuditRecord, EndpointTrustRecord,
     EnrollmentTokenInsert, EnrollmentTokenRecord, HealthEvaluationFailure, HealthEvaluationFinish,
     HealthEvaluationStart, HealthPolicyRecord, HealthSnapshotRecord, HealthSnapshotWrite,
@@ -176,6 +177,30 @@ pub trait StoreWriter {
     fn write_alert_delivery_attempt(
         &self,
         write: &AlertDeliveryAttemptWrite,
+        actor: &str,
+    ) -> Result<(), Self::Error>;
+    fn write_alert_delivery_queue_enqueue(
+        &self,
+        enqueue: &AlertDeliveryQueueEnqueue,
+        actor: &str,
+    ) -> Result<(), Self::Error>;
+    fn write_alert_delivery_queue_claim_next(
+        &self,
+        owner_id: &str,
+        now: &str,
+        lease_seconds: u64,
+        actor: &str,
+    ) -> Result<Option<AlertDeliveryQueueClaim>, Self::Error>;
+    fn write_alert_delivery_queue_renew(
+        &self,
+        claim: &AlertDeliveryQueueClaim,
+        now: &str,
+        lease_seconds: u64,
+        actor: &str,
+    ) -> Result<AlertDeliveryQueueClaim, Self::Error>;
+    fn write_alert_delivery_queue_outcome(
+        &self,
+        outcome: &AlertDeliveryQueueOutcome,
         actor: &str,
     ) -> Result<(), Self::Error>;
     fn write_alert_delivery_finalize(
@@ -563,6 +588,42 @@ impl StoreWriter for Store {
         actor: &str,
     ) -> Result<(), Self::Error> {
         Store::write_alert_delivery_attempt(self, write, actor)
+    }
+
+    fn write_alert_delivery_queue_enqueue(
+        &self,
+        enqueue: &AlertDeliveryQueueEnqueue,
+        actor: &str,
+    ) -> Result<(), Self::Error> {
+        Store::write_alert_delivery_queue_enqueue(self, enqueue, actor)
+    }
+
+    fn write_alert_delivery_queue_claim_next(
+        &self,
+        owner_id: &str,
+        now: &str,
+        lease_seconds: u64,
+        actor: &str,
+    ) -> Result<Option<AlertDeliveryQueueClaim>, Self::Error> {
+        Store::write_alert_delivery_queue_claim_next(self, owner_id, now, lease_seconds, actor)
+    }
+
+    fn write_alert_delivery_queue_renew(
+        &self,
+        claim: &AlertDeliveryQueueClaim,
+        now: &str,
+        lease_seconds: u64,
+        actor: &str,
+    ) -> Result<AlertDeliveryQueueClaim, Self::Error> {
+        Store::write_alert_delivery_queue_renew(self, claim, now, lease_seconds, actor)
+    }
+
+    fn write_alert_delivery_queue_outcome(
+        &self,
+        outcome: &AlertDeliveryQueueOutcome,
+        actor: &str,
+    ) -> Result<(), Self::Error> {
+        Store::write_alert_delivery_queue_outcome(self, outcome, actor)
     }
 
     fn write_alert_delivery_finalize(

@@ -187,7 +187,7 @@ webhook host allowlists in a closed payload with canonical, bounded, unique
 hosts bound to the relational endpoint host. Exact legacy arrays migrate;
 writers and readers reject unknown, forbidden, malformed, noncanonical,
 future-version, or mismatched data before output or delivery. Publication is in
-progress.
+pull request `#75`.
 
 ### Baseline And Production Foundation
 

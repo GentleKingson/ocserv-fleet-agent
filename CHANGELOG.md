@@ -6,6 +6,8 @@
 
 - Scheduler lease heartbeats renew active claims every 30 seconds with a
   two-minute expiry and fail closed when fencing is lost.
+- Scheduler misfires coalesce any overdue backlog into one audited execution
+  with a bounded omitted-invocation count and no catch-up loop.
 - OpenAPI 3.1.1 contract and drift tests for the 14-route `GET`-only API.
 - Read-only dashboard views for fleet health, nodes, jobs, runs, observations,
   alerts, and bounded audit previews.

@@ -14,6 +14,8 @@
   due and targeted scheduler RPC without changing job clocks or trust state.
 - Scheduler daemons stop admission on SIGINT/SIGTERM, drain admitted work and
   claim release, audit the transition, and restart with a fresh owner identity.
+- Scheduler jobs accept bounded per-attempt timeouts and deterministic bounded
+  post-run jitter; timeouts emit typed observations and RPC audits.
 - OpenAPI 3.1.1 contract and drift tests for the 14-route `GET`-only API.
 - Read-only dashboard views for fleet health, nodes, jobs, runs, observations,
   alerts, and bounded audit previews.

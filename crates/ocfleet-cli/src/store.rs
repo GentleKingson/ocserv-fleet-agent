@@ -967,6 +967,14 @@ impl Store {
             .map_err(StoreError::InvalidInput)?;
         validate_scheduler_payload_relationship(&job.kind, &selector, pair.as_ref())
             .map_err(StoreError::InvalidInput)?;
+        validate_u64_range("interval_seconds", job.interval_seconds, 60, 86_400)?;
+        validate_u64_range("jitter_seconds", job.jitter_seconds, 0, 3_600)?;
+        if job.jitter_seconds > job.interval_seconds {
+            return Err(StoreError::InvalidInput(
+                "jitter_seconds must not exceed interval_seconds".to_string(),
+            ));
+        }
+        validate_u64_range("timeout_ms", job.timeout_ms, 1_000, 30_000)?;
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
             "INSERT INTO observability_jobs

@@ -1,5 +1,6 @@
 use anyhow::{Context, bail};
 use ocfleet_config::validation::validate_node_id;
+#[cfg(test)]
 use ocfleet_protocol::DEFAULT_DEADLINE_MS;
 use ocfleet_protocol::error::ErrorCode;
 use ocfleet_protocol::method::{
@@ -52,6 +53,9 @@ const EXPLICIT_PAIR_SELECTOR: &str = "explicit-pair";
 const SCHEDULER_RESULT_CLASS: &str = "scheduler_summary";
 const MIN_INTERVAL_SECONDS: u64 = 60;
 const MAX_INTERVAL_SECONDS: u64 = 24 * 60 * 60;
+const MAX_JITTER_SECONDS: u64 = 60 * 60;
+const MIN_JOB_TIMEOUT_MS: u64 = 1_000;
+const MAX_JOB_TIMEOUT_MS: u64 = 30_000;
 const MIN_TICK_SECONDS: u64 = 10;
 const MAX_TICK_SECONDS: u64 = 60 * 60;
 pub const MAX_ALLOWED_CONCURRENCY: usize = 32;
@@ -253,6 +257,7 @@ trait SchedulerTaskExecutor: Clone + Send + Sync + 'static {
 struct ProductionSchedulerTaskExecutor {
     database_path: Arc<PathBuf>,
     secret_key_path: Arc<PathBuf>,
+    timeout_ms: u64,
 }
 
 impl SchedulerTaskExecutor for ProductionSchedulerTaskExecutor {
@@ -262,9 +267,29 @@ impl SchedulerTaskExecutor for ProductionSchedulerTaskExecutor {
     ) -> Pin<Box<dyn Future<Output = SchedulerTaskOutcome> + Send>> {
         let database_path = Arc::clone(&self.database_path);
         let secret_key_path = Arc::clone(&self.secret_key_path);
+        let timeout_ms = self.timeout_ms;
         Box::pin(async move {
-            execute_production_scheduler_task(database_path, secret_key_path, task).await
+            await_scheduler_task_with_timeout(
+                task.clone(),
+                timeout_ms,
+                execute_production_scheduler_task(database_path, secret_key_path, task.clone()),
+            )
+            .await
         })
+    }
+}
+
+async fn await_scheduler_task_with_timeout<F>(
+    task: ResolvedSchedulerTask,
+    timeout_ms: u64,
+    execution: F,
+) -> SchedulerTaskOutcome
+where
+    F: Future<Output = SchedulerTaskOutcome>,
+{
+    match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), execution).await {
+        Ok(outcome) => outcome,
+        Err(_) => scheduler_task_timeout_failure(task, timeout_ms),
     }
 }
 
@@ -442,6 +467,8 @@ fn run_schedule_job_command(
             name,
             kind,
             interval,
+            jitter_seconds,
+            timeout_ms,
             selector,
             source_node_id,
             target_node_id,
@@ -452,6 +479,8 @@ fn run_schedule_job_command(
                 name,
                 kind,
                 interval,
+                jitter_seconds,
+                timeout_ms,
                 selector,
                 source_node_id,
                 target_node_id,
@@ -469,6 +498,8 @@ struct AddJobInput {
     name: Option<String>,
     kind: ScheduleJobKind,
     interval: String,
+    jitter_seconds: u64,
+    timeout_ms: u64,
     selector: Option<String>,
     source_node_id: Option<String>,
     target_node_id: Option<String>,
@@ -479,6 +510,12 @@ fn add_job(store: &Store, actor: &str, input: AddJobInput) -> anyhow::Result<()>
         validate_description(name).map_err(anyhow::Error::msg)?;
     }
     let interval_seconds = parse_interval_seconds(&input.interval)?;
+    if input.jitter_seconds > interval_seconds || input.jitter_seconds > MAX_JITTER_SECONDS {
+        bail!("--jitter-seconds must not exceed the interval or {MAX_JITTER_SECONDS}");
+    }
+    if !(MIN_JOB_TIMEOUT_MS..=MAX_JOB_TIMEOUT_MS).contains(&input.timeout_ms) {
+        bail!("--timeout-ms must be between {MIN_JOB_TIMEOUT_MS} and {MAX_JOB_TIMEOUT_MS}");
+    }
     let (selector_value, pair_selector_json) = build_selectors(
         input.kind,
         input.selector,
@@ -494,8 +531,8 @@ fn add_job(store: &Store, actor: &str, input: AddJobInput) -> anyhow::Result<()>
             .to_value(),
         pair_selector_json,
         interval_seconds,
-        jitter_seconds: 0,
-        timeout_ms: DEFAULT_DEADLINE_MS,
+        jitter_seconds: input.jitter_seconds,
+        timeout_ms: input.timeout_ms,
         enabled: true,
         next_run_at: Some(now.clone()),
         last_run_at: None,
@@ -1344,16 +1381,32 @@ fn scheduler_job_clock(
 ) -> anyhow::Result<SchedulerJobClockUpdate> {
     let interval_seconds =
         i64::try_from(job.interval_seconds).context("scheduler job interval is too large")?;
+    let jitter_seconds = i64::try_from(scheduler_job_jitter_seconds(job, finished_at))
+        .context("scheduler job jitter is too large")?;
     let next_run_at = offset_to_rfc3339(
         OffsetDateTime::parse(finished_at, &Rfc3339)
             .context("scheduler finished_at must be RFC3339")?
-            + Duration::seconds(interval_seconds),
+            + Duration::seconds(interval_seconds + jitter_seconds),
     );
     Ok(SchedulerJobClockUpdate {
         job_id: job.job_id.clone(),
         next_run_at,
         last_run_at: finished_at.to_string(),
     })
+}
+
+fn scheduler_job_jitter_seconds(job: &ObservabilityJobRecord, finished_at: &str) -> u64 {
+    if job.jitter_seconds == 0 {
+        return 0;
+    }
+    let mut input = Vec::with_capacity(job.job_id.len() + finished_at.len() + 1);
+    input.extend_from_slice(job.job_id.as_bytes());
+    input.push(0);
+    input.extend_from_slice(finished_at.as_bytes());
+    let digest = blake3::hash(&input);
+    let mut bytes = [0_u8; 8];
+    bytes.copy_from_slice(&digest.as_bytes()[..8]);
+    u64::from_le_bytes(bytes) % (job.jitter_seconds + 1)
 }
 
 fn scheduler_missed_intervals(
@@ -1566,6 +1619,7 @@ async fn run_job_after_start(
                 let executor = ProductionSchedulerTaskExecutor {
                     database_path: Arc::new(tick_context.database_path.to_path_buf()),
                     secret_key_path: Arc::new(tick_context.secret_key_path.to_path_buf()),
+                    timeout_ms: job.timeout_ms,
                 };
                 outcomes.extend(
                     execute_resolved_scheduler_tasks(tasks, tick_context.limits, executor).await,
@@ -2032,6 +2086,53 @@ fn scheduler_task_runtime_failure(
             }),
         }],
         Vec::new(),
+    )
+}
+
+fn scheduler_task_timeout_failure(
+    task: ResolvedSchedulerTask,
+    timeout_ms: u64,
+) -> SchedulerTaskOutcome {
+    let method = first_method_for_stored_kind(task.kind).to_string();
+    let params = match &task.rpc {
+        SchedulerTaskRpc::Fixed(rpc) => rpc.params(),
+        SchedulerTaskRpc::OcservStatusBundle => json!({}),
+        SchedulerTaskRpc::PathProbe {
+            target_endpoint_id, ..
+        } => json!({"target_agent_endpoint_id": target_endpoint_id}),
+    };
+    SchedulerTaskOutcome::from_observations(
+        task.clone(),
+        vec![SchedulerObservationOutcome {
+            node_id: Some(task.node.node_id.clone()),
+            endpoint_id: Some(task.node.endpoint_id.clone()),
+            method: method.clone(),
+            ok: false,
+            error_code: Some("RPC_TIMEOUT".to_string()),
+            duration_ms: timeout_ms,
+            result_class: SCHEDULER_RESULT_CLASS.to_string(),
+            summary_json: json!({
+                "message": "scheduler task timed out",
+                "timeout_ms": timeout_ms,
+                "result_class": SCHEDULER_RESULT_CLASS,
+            }),
+        }],
+        vec![RpcAuditRecord {
+            actor: task.actor.clone(),
+            node_id: task.node.node_id.clone(),
+            endpoint_id: Some(task.node.endpoint_id.clone()),
+            method,
+            request_id: None,
+            params_hash: hash_json_value(&params),
+            ok: false,
+            error_code: Some(ErrorCode::RpcTimeout),
+            duration_ms: timeout_ms,
+            detail_json: json!({
+                "message": "scheduler task timed out",
+                "timeout_ms": timeout_ms,
+                "result_class": SCHEDULER_RESULT_CLASS,
+            }),
+        }],
     )
 }
 
@@ -2862,6 +2963,7 @@ async fn run_path_probe_job(
     let executor = ProductionSchedulerTaskExecutor {
         database_path: Arc::new(tick_context.database_path.to_path_buf()),
         secret_key_path: Arc::new(tick_context.secret_key_path.to_path_buf()),
+        timeout_ms: job.timeout_ms,
     };
     outcomes.extend(execute_resolved_scheduler_tasks(tasks, tick_context.limits, executor).await);
     write_scheduler_task_outcomes(tick_context.store, tick_context.actor, outcomes, stats)?;
@@ -4342,6 +4444,48 @@ mod tests {
         .await;
         assert!(!outcome.all_observations_ok());
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn scheduler_task_timeout_is_bounded_and_audited() {
+        let task = test_task("job-timeout", "node-timeout", PROBE_CONTROLLER_PING);
+        let delayed_task = task.clone();
+        let outcome = await_scheduler_task_with_timeout(task, 5, async move {
+            tokio::time::sleep(StdDuration::from_millis(50)).await;
+            scheduler_task_runtime_failure(delayed_task, "LATE_RESULT")
+        })
+        .await;
+
+        assert_eq!(outcome.observations.len(), 1);
+        assert_eq!(
+            outcome.observations[0].error_code.as_deref(),
+            Some("RPC_TIMEOUT")
+        );
+        assert_eq!(outcome.observations[0].duration_ms, 5);
+        assert_eq!(outcome.rpc_audits.len(), 1);
+        assert_eq!(
+            outcome.rpc_audits[0].error_code,
+            Some(ErrorCode::RpcTimeout)
+        );
+        assert_eq!(outcome.rpc_audits[0].duration_ms, 5);
+    }
+
+    #[test]
+    fn scheduler_jitter_is_deterministic_bounded_and_advances_the_clock() {
+        let mut job = test_job("job-jitter");
+        job.jitter_seconds = 30;
+        let finished_at = "2026-01-01T00:00:00Z";
+        let first = scheduler_job_jitter_seconds(&job, finished_at);
+        let second = scheduler_job_jitter_seconds(&job, finished_at);
+        assert_eq!(first, second);
+        assert!(first <= 30);
+        let clock = scheduler_job_clock(&job, finished_at).expect("jittered clock");
+        let next = OffsetDateTime::parse(&clock.next_run_at, &Rfc3339).expect("next run");
+        let finished = OffsetDateTime::parse(finished_at, &Rfc3339).expect("finish");
+        assert_eq!(
+            (next - finished).whole_seconds(),
+            i64::try_from(job.interval_seconds + first).expect("clock delta")
+        );
     }
 
     #[tokio::test]

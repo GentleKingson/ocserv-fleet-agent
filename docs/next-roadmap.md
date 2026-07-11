@@ -180,7 +180,7 @@ in a closed payload containing fixed methods, bounded low-sensitive summary
 fields, and typed silence or resolution metadata. Exact legacy rows migrate;
 writers and CLI/API readers reject unknown, nested, sensitive, malformed,
 future-version, or relationally unsafe data. Current-schema contamination fails
-closed without delivery or output. Publication is in progress.
+closed without delivery or output. The slice is published in pull request `#74`.
 
 ### Baseline And Production Foundation
 

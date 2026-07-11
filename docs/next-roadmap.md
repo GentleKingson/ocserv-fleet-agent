@@ -251,6 +251,7 @@ snapshot completion, typed failure, audit rollback, and bounded abandoned-run
 recovery are implemented. The independent graceful evaluator loop remains
 active A4 work.
 Schema 21 evaluator-run persistence is published in pull request `#88`.
+Atomic evaluator lifecycle and recovery are published in pull request `#89`.
 
 ### Baseline And Production Foundation
 

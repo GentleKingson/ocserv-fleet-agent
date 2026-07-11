@@ -4,9 +4,9 @@
   "completed_phases": ["A1", "A2", "A3"],
   "active_branch": "codex/a4-health-evaluator-lifecycle",
   "active_issue": 36,
-  "active_pr": null,
+  "active_pr": 89,
   "last_test_result": "passed",
-  "last_updated_at": "2026-07-11T21:30:00Z",
+  "last_updated_at": "2026-07-11T22:02:00Z",
   "blockers": [],
   "next_action": "Publish atomic health evaluation lifecycle and recovery, then implement the independent graceful evaluator loop."
 }

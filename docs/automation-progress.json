@@ -2,11 +2,11 @@
   "baseline_commit": "b3c906a94823b4620dc1a2077a44e7160c0848b2",
   "current_phase": "A3",
   "completed_phases": ["A1", "A2"],
-  "active_branch": "codex/a3-scheduler-retry",
+  "active_branch": "codex/a3-scheduler-maintenance",
   "active_issue": 35,
-  "active_pr": 83,
+  "active_pr": null,
   "last_test_result": "passed",
-  "last_updated_at": "2026-07-11T18:37:00Z",
+  "last_updated_at": "2026-07-11T19:02:00Z",
   "blockers": [],
-  "next_action": "Merge pull request #83, then implement maintenance and graceful shutdown for issue #35."
+  "next_action": "Validate and publish schema-v20 scheduler maintenance, then implement graceful shutdown and the final A3 acceptance audit."
 }

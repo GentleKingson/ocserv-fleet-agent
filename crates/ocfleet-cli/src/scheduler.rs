@@ -24,7 +24,10 @@ use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 use crate::alerts::{AlertEvaluationSummary, evaluate_alerts_with_summary};
-use crate::args::{ScheduleCommand, ScheduleJobCommand, ScheduleJobKind, ScheduleRunCommand};
+use crate::args::{
+    ScheduleCommand, ScheduleJobCommand, ScheduleJobKind, ScheduleMaintenanceCommand,
+    ScheduleRunCommand,
+};
 use crate::audit::AuditEvent;
 use crate::backend::StoreWriter;
 use crate::controller_rpc::{
@@ -39,8 +42,8 @@ use crate::storage_payloads::{SchedulerPairPayloadV1, SchedulerSelectorPayloadV1
 use crate::store::{
     InvalidObservabilityJobRecord, NodeRecord, ObservabilityJobLoadResult, ObservabilityJobRecord,
     ObservabilityRunRecord, ProbeObservationInsert, SchedulerJobClaim, SchedulerJobClockUpdate,
-    SchedulerOutcomeEntry, SchedulerOutcomeWrite, SchedulerRunFinish, SchedulerRunStart, Store,
-    StoreError,
+    SchedulerMaintenanceWindow, SchedulerOutcomeEntry, SchedulerOutcomeWrite, SchedulerRunFinish,
+    SchedulerRunStart, Store, StoreError,
 };
 
 const DEFAULT_SELECTOR: &str = "role=ocserv";
@@ -361,8 +364,71 @@ pub async fn run_schedule_command(
             )
             .await
         }
+        ScheduleCommand::Maintenance { command } => {
+            run_schedule_maintenance_command(store, actor, command)
+        }
         ScheduleCommand::Status { json } => run_schedule_status_command(store, json),
     }
+}
+
+fn run_schedule_maintenance_command(
+    store: &Store,
+    actor: &str,
+    command: ScheduleMaintenanceCommand,
+) -> anyhow::Result<()> {
+    match command {
+        ScheduleMaintenanceCommand::Set { from, to, reason } => {
+            StoreWriter::write_scheduler_maintenance_set(
+                store,
+                &SchedulerMaintenanceWindow {
+                    starts_at: from,
+                    ends_at: to,
+                    reason,
+                    updated_at: now_rfc3339(),
+                },
+                actor,
+            )?;
+            println!("status=configured");
+        }
+        ScheduleMaintenanceCommand::Clear => {
+            let removed =
+                StoreWriter::write_scheduler_maintenance_clear(store, &now_rfc3339(), actor)?;
+            println!(
+                "status={}",
+                if removed { "cleared" } else { "already-clear" }
+            );
+        }
+        ScheduleMaintenanceCommand::Show { json: json_output } => {
+            let window = store.get_scheduler_maintenance()?;
+            let active = store
+                .scheduler_maintenance_active_at(&now_rfc3339())?
+                .is_some();
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "active": active,
+                        "window": window.as_ref().map(|window| json!({
+                            "from": window.starts_at,
+                            "to": window.ends_at,
+                            "reason": window.reason,
+                            "updated_at": window.updated_at,
+                        })),
+                    }))?
+                );
+            } else if let Some(window) = window {
+                println!("active={active}");
+                println!("from={}", window.starts_at);
+                println!("to={}", window.ends_at);
+                println!("reason={}", window.reason);
+                println!("updated_at={}", window.updated_at);
+            } else {
+                println!("active=false");
+                println!("status=not-configured");
+            }
+        }
+    }
+    Ok(())
 }
 
 fn run_schedule_job_command(
@@ -889,6 +955,35 @@ async fn run_due_jobs_once(
             .count(),
         ..RunStats::default()
     };
+    if let Some(window) = store.scheduler_maintenance_active_at(&offset_to_rfc3339(now))? {
+        let due_jobs = jobs
+            .iter()
+            .filter(|job| match job {
+                ObservabilityJobLoadResult::Valid(job) => {
+                    job.enabled && job_due_at_or_before(job, now).unwrap_or(true)
+                }
+                ObservabilityJobLoadResult::Invalid(job) => {
+                    job.enabled && invalid_job_due_at_or_before(job, now)
+                }
+            })
+            .count();
+        stats.due_jobs = due_jobs;
+        stats.skipped_jobs += due_jobs;
+        write_scheduler_audit(
+            store,
+            actor,
+            "scheduler.maintenance.skip",
+            true,
+            json!({
+                "from": window.starts_at,
+                "to": window.ends_at,
+                "reason": window.reason,
+                "skipped_jobs": due_jobs,
+                "result_class": SCHEDULER_RESULT_CLASS,
+            }),
+        )?;
+        return Ok(stats);
+    }
     for job_load in jobs {
         let job = match job_load {
             ObservabilityJobLoadResult::Valid(job) => job,
@@ -1031,6 +1126,12 @@ async fn run_target_job_once(
     };
     if !job.enabled {
         bail!("observability job is disabled: {job_id}");
+    }
+    if store
+        .scheduler_maintenance_active_at(&now_rfc3339())?
+        .is_some()
+    {
+        bail!("scheduler maintenance window is active");
     }
     let prepared = prepare_scheduler_job(store, &job)?;
     validate_prepared_scheduler_job(store, &job, &prepared)?;

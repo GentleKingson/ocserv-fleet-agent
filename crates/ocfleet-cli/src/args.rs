@@ -353,7 +353,28 @@ pub enum ScheduleCommand {
         #[arg(long, default_value_t = 60)]
         tick_seconds: u64,
     },
+    Maintenance {
+        #[command(subcommand)]
+        command: ScheduleMaintenanceCommand,
+    },
     Status {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ScheduleMaintenanceCommand {
+    Set {
+        #[arg(long)]
+        from: String,
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        reason: String,
+    },
+    Clear,
+    Show {
         #[arg(long)]
         json: bool,
     },

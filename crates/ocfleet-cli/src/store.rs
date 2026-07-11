@@ -9,7 +9,7 @@ use ocfleet_protocol::method::{
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params, types::Type,
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::fmt;
 use std::io;
@@ -35,7 +35,7 @@ use crate::storage_payloads::{
     validate_health_payload_relationship, validate_scheduler_payload_relationship,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 19;
+pub const CURRENT_SCHEMA_VERSION: i64 = 20;
 pub const DEFAULT_HEALTH_STALE_WINDOW_SECONDS: u64 = 24 * 60 * 60;
 pub const DEFAULT_HEALTH_UNREACHABLE_FAILURES: u64 = 3;
 pub const DEFAULT_HEALTH_CERT_WARNING_DAYS: u64 = 30;
@@ -290,6 +290,14 @@ pub struct SchedulerJobClaim {
     pub claimed_at: String,
     pub lease_expires_at: String,
     pub active_run_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchedulerMaintenanceWindow {
+    pub starts_at: String,
+    pub ends_at: String,
+    pub reason: String,
+    pub updated_at: String,
 }
 
 pub const MIN_SCHEDULER_LEASE_SECONDS: u64 = 5;
@@ -1214,6 +1222,105 @@ impl Store {
             )
             .optional()
             .map_err(StoreError::from)
+    }
+
+    pub fn get_scheduler_maintenance(
+        &self,
+    ) -> Result<Option<SchedulerMaintenanceWindow>, StoreError> {
+        let window = self
+            .conn
+            .query_row(
+                "SELECT starts_at, ends_at, reason, updated_at
+                 FROM scheduler_maintenance WHERE singleton_id = 1",
+                [],
+                |row| {
+                    Ok(SchedulerMaintenanceWindow {
+                        starts_at: row.get(0)?,
+                        ends_at: row.get(1)?,
+                        reason: row.get(2)?,
+                        updated_at: row.get(3)?,
+                    })
+                },
+            )
+            .optional()?;
+        window
+            .map(validate_scheduler_maintenance_window)
+            .transpose()
+    }
+
+    pub fn scheduler_maintenance_active_at(
+        &self,
+        now: &str,
+    ) -> Result<Option<SchedulerMaintenanceWindow>, StoreError> {
+        let now = validate_bounded_rfc3339(now, "scheduler maintenance check timestamp")?;
+        Ok(self.get_scheduler_maintenance()?.filter(|window| {
+            let starts_at = OffsetDateTime::parse(&window.starts_at, &Rfc3339)
+                .expect("validated maintenance start parses");
+            let ends_at = OffsetDateTime::parse(&window.ends_at, &Rfc3339)
+                .expect("validated maintenance end parses");
+            starts_at <= now && now < ends_at
+        }))
+    }
+
+    pub(crate) fn set_scheduler_maintenance(
+        &self,
+        window: &SchedulerMaintenanceWindow,
+        actor: &str,
+    ) -> Result<(), StoreError> {
+        validate_actor(actor).map_err(StoreError::InvalidInput)?;
+        let window = validate_scheduler_maintenance_window(window.clone())?;
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO scheduler_maintenance
+             (singleton_id, starts_at, ends_at, reason, updated_at)
+             VALUES (1, ?1, ?2, ?3, ?4)
+             ON CONFLICT(singleton_id) DO UPDATE SET
+               starts_at = excluded.starts_at,
+               ends_at = excluded.ends_at,
+               reason = excluded.reason,
+               updated_at = excluded.updated_at",
+            params![
+                window.starts_at.as_str(),
+                window.ends_at.as_str(),
+                window.reason.as_str(),
+                window.updated_at.as_str(),
+            ],
+        )?;
+        let mut event = AuditEvent::new(actor, "scheduler.maintenance.set");
+        event.ok = Some(true);
+        event.detail_json = json!({
+            "from": window.starts_at,
+            "to": window.ends_at,
+            "reason": window.reason,
+            "state": "configured",
+            "result_class": "scheduler_summary",
+        });
+        insert_audit_tx(&tx, &event)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn clear_scheduler_maintenance(
+        &self,
+        cleared_at: &str,
+        actor: &str,
+    ) -> Result<bool, StoreError> {
+        validate_actor(actor).map_err(StoreError::InvalidInput)?;
+        validate_bounded_rfc3339(cleared_at, "scheduler maintenance cleared_at")?;
+        let tx = self.conn.unchecked_transaction()?;
+        let removed = tx.execute(
+            "DELETE FROM scheduler_maintenance WHERE singleton_id = 1",
+            [],
+        )? == 1;
+        let mut event = AuditEvent::new(actor, "scheduler.maintenance.clear");
+        event.ok = Some(true);
+        event.detail_json = json!({
+            "state": if removed { "cleared" } else { "already_clear" },
+            "result_class": "scheduler_summary",
+        });
+        insert_audit_tx(&tx, &event)?;
+        tx.commit()?;
+        Ok(removed)
     }
 
     pub fn set_observability_job_enabled(
@@ -3637,6 +3744,21 @@ fn validate_scheduler_claim(claim: &SchedulerJobClaim) -> Result<(), StoreError>
         ));
     }
     Ok(())
+}
+
+fn validate_scheduler_maintenance_window(
+    window: SchedulerMaintenanceWindow,
+) -> Result<SchedulerMaintenanceWindow, StoreError> {
+    let starts_at = validate_bounded_rfc3339(&window.starts_at, "maintenance starts_at")?;
+    let ends_at = validate_bounded_rfc3339(&window.ends_at, "maintenance ends_at")?;
+    if starts_at >= ends_at {
+        return Err(StoreError::InvalidInput(
+            "maintenance ends_at must be later than starts_at".to_string(),
+        ));
+    }
+    validate_reason(&window.reason).map_err(StoreError::InvalidInput)?;
+    validate_bounded_rfc3339(&window.updated_at, "maintenance updated_at")?;
+    Ok(window)
 }
 
 fn scheduler_lease_expiry(now: &str, lease_seconds: u64) -> Result<String, StoreError> {

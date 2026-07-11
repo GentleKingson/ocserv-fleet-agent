@@ -6,7 +6,8 @@ use crate::store::{
     HealthSnapshotWrite, JoinRequestInsert, JoinRequestRecord, LegacyEnrollmentClaimInput,
     NodeInsert, NodeRecord, ObservabilityJobRecord, ObservabilityRunRecord, ProbeObservationRecord,
     RetentionApplyInput, RetentionApplyResult, RetentionPolicyRecord, SchedulerJobClaim,
-    SchedulerOutcomeWrite, SchedulerRunFinish, SchedulerRunStart, Store, StoreError,
+    SchedulerMaintenanceWindow, SchedulerOutcomeWrite, SchedulerRunFinish, SchedulerRunStart,
+    Store, StoreError,
 };
 
 pub const MAX_STORE_READER_ROWS: u64 = 1_000;
@@ -59,6 +60,16 @@ pub trait StoreWriter {
     ) -> Result<(), Self::Error>;
     fn write_scheduler_job_enable(&self, job_id: &str, actor: &str) -> Result<(), Self::Error>;
     fn write_scheduler_job_disable(&self, job_id: &str, actor: &str) -> Result<(), Self::Error>;
+    fn write_scheduler_maintenance_set(
+        &self,
+        window: &SchedulerMaintenanceWindow,
+        actor: &str,
+    ) -> Result<(), Self::Error>;
+    fn write_scheduler_maintenance_clear(
+        &self,
+        cleared_at: &str,
+        actor: &str,
+    ) -> Result<bool, Self::Error>;
     fn write_scheduler_claim_next_due(
         &self,
         owner_id: &str,
@@ -350,6 +361,22 @@ impl StoreWriter for Store {
 
     fn write_scheduler_job_disable(&self, job_id: &str, actor: &str) -> Result<(), Self::Error> {
         Store::set_observability_job_enabled(self, job_id, false, actor)
+    }
+
+    fn write_scheduler_maintenance_set(
+        &self,
+        window: &SchedulerMaintenanceWindow,
+        actor: &str,
+    ) -> Result<(), Self::Error> {
+        Store::set_scheduler_maintenance(self, window, actor)
+    }
+
+    fn write_scheduler_maintenance_clear(
+        &self,
+        cleared_at: &str,
+        actor: &str,
+    ) -> Result<bool, Self::Error> {
+        Store::clear_scheduler_maintenance(self, cleared_at, actor)
     }
 
     fn write_scheduler_claim_next_due(

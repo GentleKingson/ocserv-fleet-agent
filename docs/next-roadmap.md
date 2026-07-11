@@ -217,6 +217,7 @@ enrollment-metadata families discovered during the audit, now use typed
 versioned writes, fail-closed migration, strict readers, and public projections
 that omit storage envelopes. The completion audit makes A2 operationally mature
 without changing the read-only or trust boundary.
+The completion audit is published in pull request `#79`.
 
 ### Baseline And Production Foundation
 

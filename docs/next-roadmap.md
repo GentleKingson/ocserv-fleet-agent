@@ -234,6 +234,7 @@ closes admission, drains the admitted job and claim, then supports restart with
 a fresh owner. Per-attempt timeouts produce typed audits and observations;
 deterministic bounded jitter spreads post-run clocks. The completed acceptance
 matrix is recorded in `docs/a3-scheduler-reliability-inventory.md`.
+The A3 completion audit is published in pull request `#87`.
 Timeout and jitter enforcement are published in pull request `#86`.
 Graceful daemon drain and restart are published in pull request `#85`.
 The schema-v20 maintenance policy is published in pull request `#84`.

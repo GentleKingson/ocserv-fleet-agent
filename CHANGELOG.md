@@ -49,6 +49,10 @@
   canonical payload bound to the relational endpoint host. Migration preserves
   exact legacy meaning; writers and readers reject unknown, forbidden,
   noncanonical, future-version, or mismatched data.
+- SQLite schema version 16 stores enrollment token labels/scope and join-request
+  requested/approved labels in closed kind-bound scalar-map payloads. Migration,
+  writers, and readers reject unknown, nested, sensitive, malformed,
+  future-version, or decision-inconsistent data.
 - Node add, enable, disable, and remove now take an explicit resolved actor and
   commit their registry/trust change and success audit in one SQLite
   transaction through `StoreWriter`.

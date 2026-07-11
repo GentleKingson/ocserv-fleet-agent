@@ -716,6 +716,91 @@ fn migration_tests_alert_host_allow_v1_migrates_or_fails_closed() {
     assert_eq!(backup_files(bad_dir.path()).len(), 1);
 }
 
+#[test]
+fn migration_tests_enrollment_metadata_v1_migrates_or_fails_closed() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("controller.sqlite");
+    create_legacy_fixture(&db, 15, 1);
+    let conn = Connection::open(&db).expect("open v15 db");
+    conn.execute(
+        "UPDATE enrollment_tokens SET labels_json = ?1, scope_json = ?2 WHERE token_id = 'token-0000'",
+        (r#"{"env":"prod","enabled":true}"#, r#"{"region":"hk","priority":3}"#),
+    )
+    .expect("seed legacy token metadata");
+    insert_legacy_join_request(&conn, r#"{"role":"ocserv"}"#, "{}", "pending");
+    drop(conn);
+    let store = Store::open(&db).expect("migrate v15 enrollment metadata");
+    let token = store
+        .get_enrollment_token("token-0000")
+        .expect("read migrated token")
+        .expect("token exists");
+    assert_eq!(token.labels_json["env"], "prod");
+    assert_eq!(token.scope_json["priority"], 3);
+    let join = store
+        .get_join_request("join-legacy")
+        .expect("read migrated join")
+        .expect("join exists");
+    assert_eq!(join.requested_labels_json["role"], "ocserv");
+    assert_eq!(join.approved_labels_json, serde_json::json!({}));
+    drop(store);
+    let conn = Connection::open(&db).expect("open migrated db");
+    let raw: String = conn
+        .query_row(
+            "SELECT labels_json FROM enrollment_tokens WHERE token_id = 'token-0000'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read typed token labels");
+    let raw: serde_json::Value = serde_json::from_str(&raw).expect("typed token labels JSON");
+    assert_eq!(raw["schema"], "ocfleet.enrollment.metadata.v1");
+    assert_eq!(raw["kind"], "token_labels");
+    assert_eq!(raw["values"]["env"], "prod");
+
+    let bad_dir = tempfile::tempdir().expect("bad temp dir");
+    let bad_db = bad_dir.path().join("controller.sqlite");
+    create_legacy_fixture(&bad_db, 15, 1);
+    let conn = Connection::open(&bad_db).expect("open contaminated v15 db");
+    conn.execute(
+        "UPDATE enrollment_tokens SET labels_json = ?1 WHERE token_id = 'token-0000'",
+        [r#"{"client_address":"10.0.0.2"}"#],
+    )
+    .expect("contaminate token metadata");
+    drop(conn);
+    make_private_database_file(&bad_db);
+    assert!(Store::open(&bad_db).is_err());
+    assert_eq!(backup_files(bad_dir.path()).len(), 1);
+
+    let decision_dir = tempfile::tempdir().expect("decision temp dir");
+    let decision_db = decision_dir.path().join("controller.sqlite");
+    create_legacy_fixture(&decision_db, 15, 1);
+    let conn = Connection::open(&decision_db).expect("open inconsistent v15 db");
+    insert_legacy_join_request(
+        &conn,
+        r#"{"role":"ocserv"}"#,
+        r#"{"approved":true}"#,
+        "pending",
+    );
+    drop(conn);
+    make_private_database_file(&decision_db);
+    assert!(Store::open(&decision_db).is_err());
+    assert_eq!(backup_files(decision_dir.path()).len(), 1);
+}
+
+fn insert_legacy_join_request(
+    conn: &Connection,
+    requested_labels_json: &str,
+    approved_labels_json: &str,
+    status: &str,
+) {
+    conn.execute(
+        "INSERT INTO join_requests
+         (request_id, token_id, status, agent_public_key, fingerprint, requested_endpoint_id, assigned_endpoint_id, hostname, agent_version, requested_labels_json, approved_labels_json, created_at, approved_at, approved_by, rejection_reason, audit_correlation_id)
+         VALUES ('join-legacy', 'token-0000', ?1, 'agent-public-key', 'agent-fingerprint', NULL, NULL, 'legacy.example', '0.2.0', ?2, ?3, ?4, NULL, NULL, NULL, 'corr-legacy')",
+        (status, requested_labels_json, approved_labels_json, NOW),
+    )
+    .expect("insert legacy join request");
+}
+
 fn insert_legacy_alert_hook(conn: &Connection, host_allow_json: &str) {
     conn.execute(
         "INSERT INTO alert_hooks
@@ -791,11 +876,27 @@ fn insert_legacy_rows(conn: &Connection, version: i64, rows: usize) {
         .expect("insert audit");
         if version >= 2 {
             let token_id = format!("token-{idx:04}");
+            let labels_json = if version >= 16 {
+                r#"{"schema":"ocfleet.enrollment.metadata.v1","kind":"token_labels","values":{}}"#
+            } else {
+                "{}"
+            };
+            let scope_json = if version >= 16 {
+                r#"{"schema":"ocfleet.enrollment.metadata.v1","kind":"token_scope","values":{}}"#
+            } else {
+                "{}"
+            };
             conn.execute(
                 "INSERT INTO enrollment_tokens
                  (token_id, token_hash, created_at, created_by, expires_at, max_uses, used_count, status, description, labels_json, scope_json)
-                 VALUES (?1, ?2, ?3, 'operator', '2099-01-01T00:00:00Z', 10, 0, 'active', NULL, '{}', '{}')",
-                (&token_id, format!("hash-{idx:04}"), NOW),
+                 VALUES (?1, ?2, ?3, 'operator', '2099-01-01T00:00:00Z', 10, 0, 'active', NULL, ?4, ?5)",
+                (
+                    &token_id,
+                    format!("hash-{idx:04}"),
+                    NOW,
+                    labels_json,
+                    scope_json,
+                ),
             )
             .expect("insert enrollment token");
         }

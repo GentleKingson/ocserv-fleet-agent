@@ -96,6 +96,11 @@ webhook host-allow storage over a canonical bounded host list bound to the
 relational endpoint host. Writers persist the typed envelope; readers reject
 contamination or relationship mismatches before hook output or delivery.
 
+The eighth A2 slice advances SQLite to schema version 16 and closes enrollment
+token label/scope and join-request requested/approved-label storage over typed,
+kind-bound scalar maps. Writers persist closed envelopes; readers unwrap only
+validated public objects and reject kind, contamination, or decision mismatches.
+
 The first production-hardening slice added node add/enable/disable/remove to this
 contract and removed the CLI's post-commit success audits. Audit-trigger failure
 tests prove both `nodes` and `endpoint_trust` changes roll back. The second slice

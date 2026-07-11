@@ -7,6 +7,7 @@ use ocfleet_cli::store::{
 };
 use ocfleet_protocol::enrollment::{EndpointStatus, EnrollmentTokenStatus, JoinRequestStatus};
 use rusqlite::Connection;
+use serde_json::Value;
 use std::path::Path;
 use std::sync::{Arc, Barrier, Mutex, OnceLock};
 
@@ -782,6 +783,20 @@ fn enrollment_token_is_hash_only_and_use_creates_pending_join_request() {
     assert_ne!(stored.token_hash, token_plaintext);
     assert_eq!(stored.status, EnrollmentTokenStatus::Active);
     assert_eq!(stored.used_count, 0);
+    let conn = Connection::open(&db).expect("open typed token fixture");
+    let (labels, scope): (String, String) = conn
+        .query_row(
+            "SELECT labels_json, scope_json FROM enrollment_tokens WHERE token_id = 'tok-1'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("read typed token metadata");
+    let labels: Value = serde_json::from_str(&labels).expect("typed labels");
+    let scope: Value = serde_json::from_str(&scope).expect("typed scope");
+    assert_eq!(labels["schema"], "ocfleet.enrollment.metadata.v1");
+    assert_eq!(labels["kind"], "token_labels");
+    assert_eq!(labels["values"]["env"], "prod");
+    assert_eq!(scope["kind"], "token_scope");
 
     let join = store
         .submit_join_request(
@@ -802,12 +817,63 @@ fn enrollment_token_is_hash_only_and_use_creates_pending_join_request() {
     assert_eq!(join.token_id, "tok-1");
     assert_eq!(join.status, JoinRequestStatus::Pending);
     assert_eq!(join.hostname, "hk-ocserv-01");
+    let (requested, approved): (String, String) = conn
+        .query_row(
+            "SELECT requested_labels_json, approved_labels_json FROM join_requests WHERE request_id = ?1",
+            [&join.request_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("read typed join metadata");
+    let requested: Value = serde_json::from_str(&requested).expect("typed requested labels");
+    let approved: Value = serde_json::from_str(&approved).expect("typed approved labels");
+    assert_eq!(requested["kind"], "requested_labels");
+    assert_eq!(requested["values"]["role"], "ocserv");
+    assert_eq!(approved["kind"], "approved_labels");
+    assert_eq!(approved["values"], serde_json::json!({}));
 
     let stored_after_use = store
         .get_enrollment_token("tok-1")
         .expect("load token after use")
         .expect("token exists");
     assert_eq!(stored_after_use.used_count, 1);
+}
+
+#[test]
+fn enrollment_metadata_readers_fail_closed_on_current_schema_contamination() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("controller.sqlite");
+    let store = Store::open(&db).expect("store opens");
+    let join = seed_pending_enrollment(
+        &store,
+        "tok-metadata-contaminated",
+        "metadata-contaminated-token",
+        None,
+    );
+    let conn = Connection::open(&db).expect("open contamination fixture");
+    conn.execute(
+        "UPDATE enrollment_tokens SET labels_json = ?1 WHERE token_id = 'tok-metadata-contaminated'",
+        [r#"{"schema":"ocfleet.enrollment.metadata.v1","kind":"token_labels","values":{},"client_address":"10.0.0.2"}"#],
+    )
+    .expect("contaminate token labels");
+    conn.execute(
+        "UPDATE join_requests SET requested_labels_json = ?1 WHERE request_id = ?2",
+        rusqlite::params![
+            r#"{"schema":"ocfleet.enrollment.metadata.v1","kind":"requested_labels","values":{},"token":"super-secret"}"#,
+            join.request_id
+        ],
+    )
+    .expect("contaminate requested labels");
+
+    let token_error = store
+        .get_enrollment_token("tok-metadata-contaminated")
+        .expect_err("contaminated token metadata must fail closed");
+    assert!(token_error.to_string().contains("enrollment metadata"));
+    assert!(!token_error.to_string().contains("10.0.0.2"));
+    let join_error = store
+        .get_join_request(&join.request_id)
+        .expect_err("contaminated join metadata must fail closed");
+    assert!(join_error.to_string().contains("enrollment metadata"));
+    assert!(!join_error.to_string().contains("super-secret"));
 }
 
 #[test]
@@ -2156,7 +2222,7 @@ fn enrollment_approval_rejects_pending_rows_with_decision_metadata() {
                 "UPDATE join_requests SET rejection_reason = 'unexpected-decision' WHERE request_id = ?1"
             }
             "approved_labels_json" => {
-                "UPDATE join_requests SET approved_labels_json = '{\"unexpected\":true}' WHERE request_id = ?1"
+                "UPDATE join_requests SET approved_labels_json = '{\"schema\":\"ocfleet.enrollment.metadata.v1\",\"kind\":\"approved_labels\",\"values\":{\"unexpected\":true}}' WHERE request_id = ?1"
             }
             _ => unreachable!(),
         };
@@ -2171,13 +2237,17 @@ fn enrollment_approval_rejects_pending_rows_with_decision_metadata() {
                 "operator",
             )
             .expect_err("contaminated pending request must fail closed");
-        assert!(matches!(
-            error,
-            StoreError::InvalidEnrollmentBinding {
-                detail: "pending join request has decision metadata",
-                ..
-            }
-        ));
+        if contamination == "approved_labels_json" {
+            assert!(error.to_string().contains("approved labels"));
+        } else {
+            assert!(matches!(
+                error,
+                StoreError::InvalidEnrollmentBinding {
+                    detail: "pending join request has decision metadata",
+                    ..
+                }
+            ));
+        }
         assert!(
             store
                 .get_node("pending-contamination-node")

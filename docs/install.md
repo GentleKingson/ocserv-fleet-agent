@@ -327,6 +327,12 @@ versions, forbidden or malformed hosts, empty or oversized lists, and endpoint
 mismatches stop the upgrade and leave the version-14 database unchanged beside
 its private backup.
 
+Schema version 16 canonicalizes enrollment token labels/scope and join-request
+requested/approved labels into closed kind-bound scalar maps. Unknown fields,
+unsupported versions or kinds, nested values, invalid keys or bounds,
+sensitive/address-like data, and approved labels on non-approved requests stop
+the upgrade and leave the version-15 database unchanged beside its backup.
+
 Before upgrades, keep an operator-managed backup as well:
 
 ```bash

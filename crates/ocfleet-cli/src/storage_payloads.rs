@@ -5,9 +5,10 @@ use ocfleet_protocol::method::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
-use crate::input_validation::{validate_description, validate_reason};
+use crate::input_validation::{validate_description, validate_label_json, validate_reason};
 
 pub const SCHEDULER_SELECTOR_SCHEMA_V1: &str = "ocfleet.scheduler.selector.v1";
 pub const SCHEDULER_PAIR_SCHEMA_V1: &str = "ocfleet.scheduler.pair.v1";
@@ -18,6 +19,7 @@ pub const RUN_SUMMARY_SCHEMA_V1: &str = "ocfleet.run.summary.v1";
 pub const TRUST_BUNDLE_SCHEMA_V1: &str = "ocfleet.trust.bundle.v1";
 pub const ALERT_DETAIL_SCHEMA_V1: &str = "ocfleet.alert.detail.v1";
 pub const ALERT_HOST_ALLOW_SCHEMA_V1: &str = "ocfleet.alert.host-allow.v1";
+pub const ENROLLMENT_METADATA_SCHEMA_V1: &str = "ocfleet.enrollment.metadata.v1";
 
 const HEALTH_DEGRADED_METHODS: [&str; 5] = [
     "ocserv.cert.expiry",
@@ -895,6 +897,93 @@ impl AlertHostAllowPayloadV1 {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnrollmentMetadataKindV1 {
+    TokenLabels,
+    TokenScope,
+    RequestedLabels,
+    ApprovedLabels,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum EnrollmentMetadataValueV1 {
+    Null,
+    Bool(bool),
+    Number(serde_json::Number),
+    String(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnrollmentMetadataPayloadV1 {
+    pub schema: String,
+    pub kind: EnrollmentMetadataKindV1,
+    pub values: BTreeMap<String, EnrollmentMetadataValueV1>,
+}
+
+impl EnrollmentMetadataPayloadV1 {
+    pub fn new(kind: EnrollmentMetadataKindV1, value: &Value) -> Result<Self, String> {
+        let values = serde_json::from_value(value.clone())
+            .map_err(|_| format!("{} must contain scalar values", kind.field_name()))?;
+        let payload = Self {
+            schema: ENROLLMENT_METADATA_SCHEMA_V1.to_string(),
+            kind,
+            values,
+        };
+        payload.validate(kind)?;
+        Ok(payload)
+    }
+
+    pub fn from_legacy(kind: EnrollmentMetadataKindV1, value: &Value) -> Result<Self, String> {
+        Self::new(kind, value)
+    }
+
+    pub fn from_value(
+        expected_kind: EnrollmentMetadataKindV1,
+        value: &Value,
+    ) -> Result<Self, String> {
+        let payload: Self = serde_json::from_value(value.clone())
+            .map_err(|_| "enrollment metadata payload is not closed v1 data".to_string())?;
+        payload.validate(expected_kind)?;
+        Ok(payload)
+    }
+
+    pub fn to_value(&self) -> Value {
+        serde_json::to_value(self).expect("enrollment metadata payload serializes")
+    }
+
+    pub fn public_value(&self) -> Value {
+        serde_json::to_value(&self.values).expect("enrollment metadata values serialize")
+    }
+
+    fn validate(&self, expected_kind: EnrollmentMetadataKindV1) -> Result<(), String> {
+        if self.schema != ENROLLMENT_METADATA_SCHEMA_V1 {
+            return Err("enrollment metadata payload schema is unsupported".to_string());
+        }
+        if self.kind != expected_kind {
+            return Err("enrollment metadata payload kind is inconsistent".to_string());
+        }
+        let public = self.public_value();
+        validate_label_json(&public, self.kind.field_name())?;
+        crate::store::validate_low_sensitive_json(&self.to_value(), "enrollment metadata payload")
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+}
+
+impl EnrollmentMetadataKindV1 {
+    fn field_name(self) -> &'static str {
+        match self {
+            Self::TokenLabels => "labels",
+            Self::TokenScope => "scope",
+            Self::RequestedLabels => "requested_labels",
+            Self::ApprovedLabels => "approved_labels",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ObservationSummaryPayloadV1 {
@@ -1147,7 +1236,8 @@ mod tests {
 
     use super::{
         ALERT_DETAIL_SCHEMA_V1, ALERT_HOST_ALLOW_SCHEMA_V1, AlertDetailPayloadV1,
-        AlertHostAllowPayloadV1, HEALTH_DEGRADED_METHODS_SCHEMA_V1, HEALTH_SUMMARY_SCHEMA_V1,
+        AlertHostAllowPayloadV1, ENROLLMENT_METADATA_SCHEMA_V1, EnrollmentMetadataKindV1,
+        EnrollmentMetadataPayloadV1, HEALTH_DEGRADED_METHODS_SCHEMA_V1, HEALTH_SUMMARY_SCHEMA_V1,
         HealthDegradedMethodsPayloadV1, HealthSummaryPayloadV1, OBSERVATION_SUMMARY_SCHEMA_V1,
         ObservationSummaryPayloadV1, RUN_SUMMARY_SCHEMA_V1, RunSummaryPayloadV1,
         SCHEDULER_PAIR_SCHEMA_V1, SCHEDULER_SELECTOR_SCHEMA_V1, SchedulerPairPayloadV1,
@@ -1542,5 +1632,52 @@ mod tests {
             .is_err()
         );
         assert!(AlertHostAllowPayloadV1::from_legacy(&json!(["localhost"])).is_err());
+    }
+
+    #[test]
+    fn enrollment_metadata_payload_is_closed_typed_and_kind_bound() {
+        let payload = EnrollmentMetadataPayloadV1::from_legacy(
+            EnrollmentMetadataKindV1::RequestedLabels,
+            &json!({
+                "enabled": true,
+                "priority": 3,
+                "region": "ap-east",
+                "unset": null
+            }),
+        )
+        .expect("valid enrollment metadata");
+        assert_eq!(payload.schema, ENROLLMENT_METADATA_SCHEMA_V1);
+        assert_eq!(payload.public_value()["priority"], 3);
+        assert_eq!(
+            EnrollmentMetadataPayloadV1::from_value(
+                EnrollmentMetadataKindV1::RequestedLabels,
+                &payload.to_value(),
+            )
+            .expect("round trip"),
+            payload
+        );
+        assert!(
+            EnrollmentMetadataPayloadV1::from_value(
+                EnrollmentMetadataKindV1::ApprovedLabels,
+                &payload.to_value(),
+            )
+            .is_err()
+        );
+        let mut contaminated = payload.to_value();
+        contaminated["client_address"] = json!("10.0.0.2");
+        assert!(
+            EnrollmentMetadataPayloadV1::from_value(
+                EnrollmentMetadataKindV1::RequestedLabels,
+                &contaminated,
+            )
+            .is_err()
+        );
+        assert!(
+            EnrollmentMetadataPayloadV1::from_legacy(
+                EnrollmentMetadataKindV1::RequestedLabels,
+                &json!({"nested": {"value": true}}),
+            )
+            .is_err()
+        );
     }
 }

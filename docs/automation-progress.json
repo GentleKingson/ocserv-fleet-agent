@@ -4,9 +4,9 @@
   "completed_phases": ["A1", "A2", "A3"],
   "active_branch": "codex/a4-health-evaluator",
   "active_issue": 36,
-  "active_pr": null,
+  "active_pr": 88,
   "last_test_result": "passed",
-  "last_updated_at": "2026-07-11T20:45:00Z",
+  "last_updated_at": "2026-07-11T21:04:00Z",
   "blockers": [],
   "next_action": "Publish schema 21 health evaluation run persistence, then implement atomic completion, recovery, and the independent evaluator loop."
 }

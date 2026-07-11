@@ -249,6 +249,7 @@ computation-version tuple establishes the replay boundary without storing raw
 observations or expanding evaluator authority. Atomic snapshot completion,
 abandoned-run recovery, and the independent graceful evaluator loop remain
 active A4 work.
+Schema 21 evaluator-run persistence is published in pull request `#88`.
 
 ### Baseline And Production Foundation
 

@@ -99,8 +99,9 @@ approval one atomic operator-owned node/request/trust/audit transition and adds
 a strict manual claim for legacy approved-unbound rows. It introduces no schema,
 protocol, API, agent-capability, or default read-only boundary change.
 Enrollment token lifecycle and request-decision transitions are active on branch
-`codex/a1-enrollment-transitions`. This slice routes token create/revoke and
-request submit/reject through actor-bearing immediate transactions, adds stable
+`codex/a1-enrollment-transitions` in pull request `#63`. This slice routes token
+create/revoke and request submit/reject through actor-bearing immediate
+transactions, adds stable
 optional request IDs, serializes the final token use, closes terminal
 transitions, and keeps token/submitted-identity material out of audit and
 `Debug`. It changes no schema, protocol, API route, agent capability, or default

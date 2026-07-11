@@ -70,16 +70,18 @@ scheduler run start/outcome/finish transitions are actor-bound `StoreWriter`
 operations audited in their SQLite transaction. Failure-injection tests prove
 that enrollment request/node/trust, endpoint lifecycle, scheduler job
 configuration, observation, RPC audit, run state, and job-clock changes roll
-back at their declared boundaries. Health/alert/delivery, retention, and other
+back at their declared boundaries. Retention policy/apply also uses atomic
+writers; each scope's bounded delete batches share a transaction with their
+audit, and stable operation IDs make exact retries no-ops. Health/alert/delivery and other
 call sites remain to migrate.
 Completing those families is required before claiming fully fail-closed
 controller mutation audit. The API remains read-only while that work is
 incomplete. The governing decision is recorded in
 [ADR-atomic-audit-writes](adr/ADR-atomic-audit-writes.md).
 
-Enrollment token/request/approval/claim and endpoint lifecycle CLI calls are
+Enrollment token/request/approval/claim, retention, and endpoint lifecycle CLI calls are
 routed through `StoreWriter`. A static source guard rejects direct production
-calls to those enrollment writers, node add/enable/disable/remove, and endpoint
+calls to those enrollment/retention writers, node add/enable/disable/remove, and endpoint
 rotate/revoke/quarantine outside the reviewed SQLite store and backend adapter.
 This guard is a review backstop, not RBAC; the resolved actor and transactional
 audit remain the authority record.

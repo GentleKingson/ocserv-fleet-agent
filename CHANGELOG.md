@@ -48,6 +48,10 @@
 - Health `unreachable` now honors the configured consecutive ping-failure
   threshold; a single recent failure is degraded.
 - Retention dry-run performs no deletion and writes no audit row.
+- Retention policy changes and each non-dry-run scope apply now use
+  actor-bearing `StoreWriter` transactions. Stable `retention-<uuid>` operation
+  IDs make exact applies replayable without another deletion; all bounded
+  batches and their audit commit together or roll back together.
 - Scheduler alert evaluation remains local-only and delivery remains an
   explicit CLI action.
 - API SQLite startup now validates private database/sidecar files, schema,
@@ -86,6 +90,10 @@
   contaminated-state tests cover their all-or-nothing boundaries without
   recording fingerprints, agent keys, hostnames, label values, token hashes,
   or plaintext token material.
+- Extended the production mutation guard to reject direct retention policy and
+  apply mutators. Audit-trigger, concurrent replay, divergent replay, and
+  multi-scope partial-progress tests prove every committed deletion scope has
+  exactly one matching audit and no audit failure can leave unaudited deletes.
 - Added audit-insert failure coverage proving scheduler job add, enable, and
   disable roll back their `observability_jobs` changes instead of committing
   without audit. Scheduler audit before/after projections use only fixed job
@@ -123,7 +131,7 @@
 - The collector normalizes operator-supplied aggregate metadata; it does not
   discover live ocserv state or call administration/log/service tools.
 - SQLite is the only runtime backend; Postgres always returns unavailable.
-- Health/alert/delivery, retention, and other remaining legacy controller
+- Health/alert/delivery and other remaining legacy controller
   mutations have not yet all moved to atomic `StoreWriter` actor/audit
   transactions. Recovery of incomplete scheduler `running` rows remains A3
   scheduler-reliability work.

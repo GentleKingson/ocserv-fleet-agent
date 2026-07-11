@@ -101,7 +101,10 @@ authorization database.
 Scheduler RPC work occurs outside database transactions. A committed start row
 is followed by short bounded outcome transactions and one finish transaction;
 an outcome or finish persistence failure leaves the run `running` and does not
-advance the job clock. Health/alert/delivery, retention, and other legacy
+advance the job clock. Retention policy writes and each scope apply now commit
+through actor-bearing writers. Apply uses a stable operation ID, one immediate
+transaction for all bounded batches in a scope, and exact audit-backed replay;
+legacy unaudited prune entry points are removed. Health/alert/delivery and other legacy
 mutations are not all migrated to the writer trait. Future writer
 interfaces must keep actor/audit input mandatory and must not loosen private
 file checks or redaction. The scheduler writer expansions change no schema,

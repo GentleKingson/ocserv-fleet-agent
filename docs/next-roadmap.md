@@ -234,6 +234,7 @@ closes admission, drains the admitted job and claim, then supports restart with
 a fresh owner. Per-attempt timeouts produce typed audits and observations;
 deterministic bounded jitter spreads post-run clocks. The remaining A3
 acceptance matrix are still active work.
+Timeout and jitter enforcement are published in pull request `#86`.
 Graceful daemon drain and restart are published in pull request `#85`.
 The schema-v20 maintenance policy is published in pull request `#84`.
 The bounded retry policy is published in pull request `#83`.

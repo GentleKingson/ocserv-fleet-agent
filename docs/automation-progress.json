@@ -4,9 +4,9 @@
   "completed_phases": ["A1", "A2"],
   "active_branch": "codex/a3-scheduler-maintenance",
   "active_issue": 35,
-  "active_pr": null,
+  "active_pr": 84,
   "last_test_result": "passed",
   "last_updated_at": "2026-07-11T19:02:00Z",
   "blockers": [],
-  "next_action": "Validate and publish schema-v20 scheduler maintenance, then implement graceful shutdown and the final A3 acceptance audit."
+  "next_action": "Merge pull request #84, then implement graceful shutdown and the final A3 acceptance audit."
 }

@@ -232,6 +232,7 @@ per-tick budget. Schema `0020` adds an atomically audited global maintenance
 window that suppresses claims and RPC without advancing clocks. Graceful
 in-flight shutdown and the remaining A3
 acceptance matrix are still active work.
+The schema-v20 maintenance policy is published in pull request `#84`.
 The bounded retry policy is published in pull request `#83`.
 The bounded misfire policy is published in pull request `#82`.
 The lease-heartbeat follow-up is published in pull request `#81`.

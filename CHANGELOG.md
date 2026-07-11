@@ -62,6 +62,10 @@
   writers and CLI/API readers reject unknown, unsafe, malformed,
   future-version, or relationally inconsistent data without exposing the
   storage envelope.
+- SQLite schema version 19 adds deterministic expiring scheduler job claims,
+  monotonic fence tokens, active-run binding, and atomic abandoned-run recovery.
+  Competing instances cannot claim one due job twice, and stale owners cannot
+  persist after an expired takeover.
 - Node add, enable, disable, and remove now take an explicit resolved actor and
   commit their registry/trust change and success audit in one SQLite
   transaction through `StoreWriter`.

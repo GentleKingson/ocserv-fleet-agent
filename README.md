@@ -572,6 +572,8 @@ Networking must allow the controller to reach the agent through iroh using the r
   delivery-attempt details bound to relational history.
 - `docs/adr/ADR-versioned-audit-detail-storage.md`: schema-v18 closed typed
   audit details bound to the complete relational record.
+- `docs/adr/ADR-scheduler-job-claims.md`: schema-v19 deterministic scheduler
+  claims, fencing, expiry, and abandoned-run recovery.
 - `docs/a2-storage-inventory.md`: A2 payload-family closure inventory and
   migration/read-boundary evidence.
 - `docs/trust-policy.md`: trust policy as code schema, validation, and diff behavior.

@@ -112,6 +112,12 @@ relational audit column. The table is rebuilt with required versioned detail;
 controller and independent API readers reject contamination and expose only the
 validated public fields.
 
+The first A3 slice advances SQLite to schema version 19 and adds a
+backend-neutral scheduler claim contract: immediate deterministic acquisition,
+bounded expiry, monotonic fences, active-run binding, and atomic abandoned-run
+recovery. Production scheduler paths acquire before starting work and release
+after terminal persistence; stale owners fail closed after takeover.
+
 The first production-hardening slice added node add/enable/disable/remove to this
 contract and removed the CLI's post-commit success audits. Audit-trigger failure
 tests prove both `nodes` and `endpoint_trust` changes roll back. The second slice

@@ -17,6 +17,7 @@ use ocfleet_protocol::method::{
 };
 use rusqlite::Connection;
 use serde_json::{Value, json};
+use std::sync::{Arc, Barrier};
 
 const TEST_ACTOR: &str = "observability-store-test";
 
@@ -59,6 +60,223 @@ fn sample_job(job_id: &str, enabled: bool) -> ObservabilityJobRecord {
         created_at: "2026-07-08T07:00:00Z".to_string(),
         updated_at: "2026-07-08T07:00:00Z".to_string(),
     }
+}
+
+#[test]
+fn scheduler_claims_are_deterministic_exclusive_expiring_and_fenced() {
+    let (_dir, store_a, db) = open_temp_store();
+    let job_b = sample_job("job-claim-b", true);
+    let job_a = sample_job("job-claim-a", true);
+    StoreWriter::write_scheduler_job_add(&store_a, &job_b, TEST_ACTOR).expect("add job b");
+    StoreWriter::write_scheduler_job_add(&store_a, &job_a, TEST_ACTOR).expect("add job a");
+    let store_b = Store::open(&db).expect("open competing store");
+
+    let claim_a = StoreWriter::write_scheduler_claim_next_due(
+        &store_a,
+        "scheduler-a",
+        "2026-07-08T09:00:00Z",
+        30,
+        TEST_ACTOR,
+    )
+    .expect("claim next job")
+    .expect("claim acquired");
+    assert_eq!(claim_a.job_id, "job-claim-a");
+    assert_eq!(claim_a.fence_token, 1);
+
+    let claim_b = StoreWriter::write_scheduler_claim_next_due(
+        &store_b,
+        "scheduler-b",
+        "2026-07-08T09:00:01Z",
+        30,
+        TEST_ACTOR,
+    )
+    .expect("claim distinct due job")
+    .expect("second job acquired");
+    assert_eq!(claim_b.job_id, "job-claim-b");
+    assert!(
+        StoreWriter::write_scheduler_claim(
+            &store_b,
+            "job-claim-a",
+            "scheduler-b",
+            "2026-07-08T09:00:01Z",
+            30,
+            TEST_ACTOR,
+        )
+        .expect("contended claim")
+        .is_none()
+    );
+
+    let takeover = StoreWriter::write_scheduler_claim(
+        &store_b,
+        "job-claim-a",
+        "scheduler-b",
+        "2026-07-08T09:00:30Z",
+        30,
+        TEST_ACTOR,
+    )
+    .expect("expired takeover")
+    .expect("takeover acquired");
+    assert_eq!(takeover.fence_token, 2);
+    assert!(matches!(
+        StoreWriter::write_scheduler_claim_renew(
+            &store_a,
+            &claim_a,
+            "2026-07-08T09:00:31Z",
+            30,
+            TEST_ACTOR,
+        ),
+        Err(StoreError::SchedulerClaimLost(job_id)) if job_id == "job-claim-a"
+    ));
+    assert!(matches!(
+        StoreWriter::write_scheduler_claim_release(
+            &store_a,
+            &claim_a,
+            "2026-07-08T09:00:31Z",
+            TEST_ACTOR,
+        ),
+        Err(StoreError::SchedulerClaimLost(job_id)) if job_id == "job-claim-a"
+    ));
+    assert_eq!(
+        store_b
+            .get_scheduler_job_claim("job-claim-a")
+            .expect("read current claim")
+            .expect("claim exists"),
+        takeover
+    );
+}
+
+#[test]
+fn scheduler_claim_mutation_rolls_back_when_audit_fails() {
+    let (_dir, store, db) = open_temp_store();
+    let job = sample_job("job-claim-audit-rollback", true);
+    StoreWriter::write_scheduler_job_add(&store, &job, TEST_ACTOR).expect("add job");
+    inject_job_audit_failure(&db, "scheduler.claim.acquire");
+
+    let result = StoreWriter::write_scheduler_claim(
+        &store,
+        &job.job_id,
+        "scheduler-a",
+        "2026-07-08T09:00:00Z",
+        30,
+        TEST_ACTOR,
+    );
+    assert!(matches!(result, Err(StoreError::Sqlite(_))));
+    assert!(
+        store
+            .get_scheduler_job_claim(&job.job_id)
+            .expect("read rolled-back claim")
+            .is_none()
+    );
+}
+
+#[test]
+fn competing_scheduler_instances_claim_one_due_job_exactly_once() {
+    let (_dir, store, db) = open_temp_store();
+    let job = sample_job("job-competing-claim", true);
+    StoreWriter::write_scheduler_job_add(&store, &job, TEST_ACTOR).expect("add job");
+    drop(store);
+
+    let barrier = Arc::new(Barrier::new(3));
+    let handles = ["scheduler-a", "scheduler-b"].map(|owner| {
+        let barrier = Arc::clone(&barrier);
+        let db = db.clone();
+        std::thread::spawn(move || {
+            let store = Store::open(&db).expect("open competing store");
+            barrier.wait();
+            StoreWriter::write_scheduler_claim_due(
+                &store,
+                "job-competing-claim",
+                owner,
+                "2026-07-08T09:00:00Z",
+                30,
+                TEST_ACTOR,
+            )
+            .expect("attempt competing claim")
+        })
+    });
+    barrier.wait();
+    let claims = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("join claim thread"))
+        .collect::<Vec<_>>();
+    assert_eq!(claims.iter().filter(|claim| claim.is_some()).count(), 1);
+    assert_eq!(claims.iter().filter(|claim| claim.is_none()).count(), 1);
+}
+
+#[test]
+fn scheduler_stale_fence_cannot_persist_run_outcomes_after_takeover() {
+    let (_dir, store_a, db) = open_temp_store();
+    let job = sample_job("job-stale-fence", true);
+    StoreWriter::write_scheduler_job_add(&store_a, &job, TEST_ACTOR).expect("add job");
+    let claim_a = StoreWriter::write_scheduler_claim(
+        &store_a,
+        &job.job_id,
+        "scheduler-a",
+        "2026-07-08T07:59:50Z",
+        30,
+        TEST_ACTOR,
+    )
+    .expect("claim job")
+    .expect("claim acquired");
+    let start = scheduler_start(&job.job_id, "run-stale-fence");
+    StoreWriter::write_scheduler_claimed_run_start(&store_a, &start, &claim_a, TEST_ACTOR)
+        .expect("start claimed run");
+
+    let store_b = Store::open(&db).expect("open takeover store");
+    let claim_b = StoreWriter::write_scheduler_claim(
+        &store_b,
+        &job.job_id,
+        "scheduler-b",
+        "2026-07-08T08:00:20Z",
+        30,
+        TEST_ACTOR,
+    )
+    .expect("take over expired claim")
+    .expect("takeover acquired");
+    assert_eq!(claim_b.fence_token, claim_a.fence_token + 1);
+    let recovered = store_b
+        .get_observability_run(&start.run_id)
+        .expect("load recovered run")
+        .expect("recovered run exists");
+    assert_eq!(recovered.status, "failed");
+    assert_eq!(
+        recovered.finished_at.as_deref(),
+        Some("2026-07-08T08:00:20Z")
+    );
+    let recovery_audits: i64 = Connection::open(&db)
+        .expect("open recovery audit query")
+        .query_row(
+            "SELECT COUNT(*) FROM controller_audit_log
+             WHERE event = 'scheduler.run.recover' AND error_code = 'SCHEDULER_LEASE_EXPIRED'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count recovery audits");
+    assert_eq!(recovery_audits, 1);
+
+    let outcome = SchedulerOutcomeWrite {
+        job_id: job.job_id.clone(),
+        run_id: Some(start.run_id.clone()),
+        entries: vec![scheduler_outcome_entry(
+            TEST_ACTOR,
+            "scheduler.task.outcome",
+            Some(&start.run_id),
+            "obs-stale-fence",
+            PROBE_CONTROLLER_PING,
+            true,
+        )],
+        job_clock: None,
+    };
+    assert!(matches!(
+        StoreWriter::write_scheduler_outcome(&store_a, &outcome, TEST_ACTOR),
+        Err(StoreError::SchedulerClaimLost(job_id)) if job_id == "job-stale-fence"
+    ));
+    assert!(
+        store_a
+            .list_probe_observations(None, 10)
+            .expect("list observations")
+            .is_empty()
+    );
 }
 
 fn latest_job_audit(database: &std::path::Path) -> (String, String, Value) {

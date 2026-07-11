@@ -37,8 +37,9 @@ use crate::controller_rpc::{
 use crate::input_validation::{validate_description, validate_selector};
 use crate::storage_payloads::{SchedulerPairPayloadV1, SchedulerSelectorPayloadV1};
 use crate::store::{
-    InvalidObservabilityJobRecord, NodeRecord, ObservabilityJobLoadResult, ObservabilityJobRecord,
-    ObservabilityRunRecord, ProbeObservationInsert, SchedulerJobClockUpdate, SchedulerOutcomeEntry,
+    InvalidObservabilityJobRecord, MAX_SCHEDULER_LEASE_SECONDS, NodeRecord,
+    ObservabilityJobLoadResult, ObservabilityJobRecord, ObservabilityRunRecord,
+    ProbeObservationInsert, SchedulerJobClaim, SchedulerJobClockUpdate, SchedulerOutcomeEntry,
     SchedulerOutcomeWrite, SchedulerRunFinish, SchedulerRunStart, Store, StoreError,
 };
 
@@ -666,10 +667,19 @@ async fn run_schedule_run_once_command(
     if !once {
         bail!("schedule run currently requires --once");
     }
+    let owner_id = scheduler_owner_id();
     let stats = if let Some(job_id) = job_id {
-        run_target_job_once(store, secret_key_path, actor, job_id, max_concurrency).await?
+        run_target_job_once(
+            store,
+            secret_key_path,
+            actor,
+            &owner_id,
+            job_id,
+            max_concurrency,
+        )
+        .await?
     } else {
-        run_due_jobs_once(store, secret_key_path, actor, max_concurrency).await?
+        run_due_jobs_once(store, secret_key_path, actor, &owner_id, max_concurrency).await?
     };
     let alert_evaluation = evaluate_scheduler_alerts(store);
     write_scheduler_audit(
@@ -770,8 +780,10 @@ async fn run_schedule_daemon_command(
         }),
     )?;
 
+    let owner_id = scheduler_owner_id();
+
     loop {
-        run_due_jobs_once(store, secret_key_path, actor, max_concurrency).await?;
+        run_due_jobs_once(store, secret_key_path, actor, &owner_id, max_concurrency).await?;
         let alert_evaluation = evaluate_scheduler_alerts(store);
         write_scheduler_audit(
             store,
@@ -847,6 +859,7 @@ async fn run_due_jobs_once(
     store: &Store,
     secret_key_path: &Path,
     actor: &str,
+    owner_id: &str,
     max_concurrency: usize,
 ) -> anyhow::Result<RunStats> {
     let limits = SchedulerLimits::from_max_concurrency(max_concurrency)?;
@@ -882,7 +895,15 @@ async fn run_due_jobs_once(
                     continue;
                 }
                 stats.due_jobs += 1;
-                record_invalid_scheduler_job_record_observation(store, actor, &job)?;
+                let Some(claim) = try_claim_due_job(store, &job.job_id, owner_id, actor)? else {
+                    stats.skipped_jobs += 1;
+                    continue;
+                };
+                let write_result =
+                    record_invalid_scheduler_job_record_observation(store, actor, &job);
+                let release_result = release_scheduler_claim(store, &claim, actor);
+                write_result?;
+                release_result?;
                 stats.executed_jobs += 1;
                 stats.observations += 1;
                 stats.failed_observations += 1;
@@ -896,15 +917,22 @@ async fn run_due_jobs_once(
             Ok(due) => due,
             Err(_) => {
                 stats.due_jobs += 1;
+                let Some(claim) = try_claim_due_job(store, &job.job_id, owner_id, actor)? else {
+                    stats.skipped_jobs += 1;
+                    continue;
+                };
                 let finished_at = now_rfc3339();
                 let clock = scheduler_job_clock(&job, &finished_at)?;
-                record_invalid_scheduler_job_observation(
+                let write_result = record_invalid_scheduler_job_observation(
                     store,
                     actor,
                     &job,
                     "INVALID_NEXT_RUN_AT",
                     Some(clock),
-                )?;
+                );
+                let release_result = release_scheduler_claim(store, &claim, actor);
+                write_result?;
+                release_result?;
                 stats.executed_jobs += 1;
                 stats.observations += 1;
                 stats.failed_observations += 1;
@@ -915,26 +943,39 @@ async fn run_due_jobs_once(
             continue;
         }
         stats.due_jobs += 1;
+        let Some(claim) = try_claim_due_job(store, &job.job_id, owner_id, actor)? else {
+            stats.skipped_jobs += 1;
+            continue;
+        };
         let prepared = match prepare_scheduler_job(store, &job) {
             Ok(prepared) => prepared,
-            Err(err) if err.downcast_ref::<StoreError>().is_some() => return Err(err),
+            Err(err) if err.downcast_ref::<StoreError>().is_some() => {
+                release_scheduler_claim(store, &claim, actor)?;
+                return Err(err);
+            }
             Err(_) => {
                 let finished_at = now_rfc3339();
                 let clock = scheduler_job_clock(&job, &finished_at)?;
-                record_invalid_scheduler_job_observation(
+                let write_result = record_invalid_scheduler_job_observation(
                     store,
                     actor,
                     &job,
                     "INVALID_JOB_CONFIGURATION",
                     Some(clock),
-                )?;
+                );
+                let release_result = release_scheduler_claim(store, &claim, actor);
+                write_result?;
+                release_result?;
                 stats.executed_jobs += 1;
                 stats.observations += 1;
                 stats.failed_observations += 1;
                 continue;
             }
         };
-        let job_stats = run_job(&mut tick_context, &job, prepared).await?;
+        let job_result = run_job(&mut tick_context, &job, prepared, &claim).await;
+        let release_result = release_scheduler_claim(store, &claim, actor);
+        let job_stats = job_result?;
+        release_result?;
         stats.executed_jobs += 1;
         stats.observations += job_stats.observations;
         stats.failed_observations += job_stats.failed_observations;
@@ -947,6 +988,7 @@ async fn run_target_job_once(
     store: &Store,
     secret_key_path: &Path,
     actor: &str,
+    owner_id: &str,
     job_id: &str,
     max_concurrency: usize,
 ) -> anyhow::Result<RunStats> {
@@ -979,7 +1021,19 @@ async fn run_target_job_once(
         limits,
         rpc_budget_remaining: &mut rpc_budget_remaining,
     };
-    let job_stats = run_job(&mut tick_context, &job, prepared).await?;
+    let claim = StoreWriter::write_scheduler_claim(
+        store,
+        job_id,
+        owner_id,
+        &now_rfc3339(),
+        MAX_SCHEDULER_LEASE_SECONDS,
+        actor,
+    )?
+    .with_context(|| format!("observability job is already claimed: {job_id}"))?;
+    let job_result = run_job(&mut tick_context, &job, prepared, &claim).await;
+    let release_result = release_scheduler_claim(store, &claim, actor);
+    let job_stats = job_result?;
+    release_result?;
     Ok(RunStats {
         due_jobs: 1,
         executed_jobs: 1,
@@ -995,6 +1049,34 @@ fn invalid_job_due_at_or_before(job: &InvalidObservabilityJobRecord, now: Offset
         .as_deref()
         .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
         .is_none_or(|next_run_at| next_run_at <= now)
+}
+
+fn try_claim_due_job(
+    store: &Store,
+    job_id: &str,
+    owner_id: &str,
+    actor: &str,
+) -> Result<Option<SchedulerJobClaim>, StoreError> {
+    StoreWriter::write_scheduler_claim_due(
+        store,
+        job_id,
+        owner_id,
+        &now_rfc3339(),
+        MAX_SCHEDULER_LEASE_SECONDS,
+        actor,
+    )
+}
+
+fn release_scheduler_claim(
+    store: &Store,
+    claim: &SchedulerJobClaim,
+    actor: &str,
+) -> Result<(), StoreError> {
+    StoreWriter::write_scheduler_claim_release(store, claim, &now_rfc3339(), actor)
+}
+
+fn scheduler_owner_id() -> String {
+    format!("scheduler-{}", Uuid::new_v4().simple())
 }
 
 fn evaluate_scheduler_alerts(store: &Store) -> SchedulerAlertEvaluation {
@@ -1151,16 +1233,18 @@ async fn run_job(
     tick_context: &mut SchedulerTickContext<'_>,
     job: &ObservabilityJobRecord,
     prepared: PreparedSchedulerJob,
+    claim: &SchedulerJobClaim,
 ) -> anyhow::Result<RunStats> {
     let started_at = now_rfc3339();
     let run_id = format!("run-{}", Uuid::new_v4().simple());
-    StoreWriter::write_scheduler_run_start(
+    StoreWriter::write_scheduler_claimed_run_start(
         tick_context.store,
         &SchedulerRunStart {
             run_id: run_id.clone(),
             job_id: job.job_id.clone(),
             started_at,
         },
+        claim,
         tick_context.actor,
     )?;
 

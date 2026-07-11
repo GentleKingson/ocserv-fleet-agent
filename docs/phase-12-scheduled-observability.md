@@ -199,6 +199,14 @@ Rules:
   client IP, session ID, certificate subject/SAN/issuer/serial, or config
   content may be stored.
 
+### `scheduler_job_claims`
+
+Stores schema-v19 controller-local coordination state: job ID, opaque owner ID,
+monotonic fence token, claim/expiry timestamps, optional active run ID, and
+update timestamp. Acquisition is deterministic and immediate-transaction
+serialized. Claim state grants no RPC or trust capability. Expired takeover
+fails the abandoned run atomically and prevents the stale fence from writing.
+
 ### `probe_observations`
 
 Stores typed low-sensitive observations produced by scheduled methods. Current

@@ -92,7 +92,10 @@ LEGACY_SCHEDULER_WRITER_RE = re.compile(
 )
 DIRECT_SCHEDULER_CONFIG_MUTATOR_RE = re.compile(
     r"(?:\.\s*|\bStore\s*::\s*)"
-    r"(insert_observability_job|set_observability_job_enabled)\s*\("
+    r"(insert_observability_job|set_observability_job_enabled|"
+    r"claim_next_due_scheduler_job|claim_scheduler_job|claim_due_scheduler_job|"
+    r"renew_scheduler_job_claim|release_scheduler_job_claim|"
+    r"write_scheduler_claimed_run_start)\s*\("
 )
 DIRECT_NODE_ENDPOINT_MUTATOR_RE = re.compile(
     r"(?:\.\s*|\bStore\s*::\s*)"

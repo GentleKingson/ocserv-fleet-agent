@@ -1,5 +1,6 @@
 use ocfleet_cli::audit::AuditEvent;
 use ocfleet_cli::backend::StoreWriter;
+use ocfleet_cli::storage_payloads::{HealthDegradedMethodsPayloadV1, HealthSummaryPayloadV1};
 use ocfleet_cli::store::{
     AlertEventRecord, HealthSnapshotRecord, HealthSnapshotWrite, ObservabilityRunInsert,
     ProbeObservationInsert, RetentionApplyInput, Store, StoreError,
@@ -74,8 +75,18 @@ fn insert_old_health_and_alert(store: &Store) {
                 last_success_at: None,
                 last_failure_at: Some("2026-01-01T00:00:00Z".to_string()),
                 last_error_code: Some("RPC_TIMEOUT".to_string()),
-                degraded_methods_json: json!(["probe.controller.ping"]),
-                summary_json: json!({"status": "stale"}),
+                degraded_methods_json: HealthDegradedMethodsPayloadV1::new(vec![])
+                    .expect("valid methods")
+                    .to_value(),
+                summary_json: HealthSummaryPayloadV1::new(
+                    None,
+                    None,
+                    "stale".to_string(),
+                    None,
+                    None,
+                )
+                .expect("valid summary")
+                .to_value(),
             }],
         },
         "test-setup",

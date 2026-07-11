@@ -143,6 +143,15 @@ all other contamination after the standard private backup. Other dynamic JSON
 families remain A2 work; the milestone is therefore an implemented slice, not
 operationally mature.
 
+The second A2 slice advances SQLite to migration `0010` and makes health
+degraded-method and derived-summary storage closed and schema-tagged. Exact
+legacy arrays/objects canonicalize transactionally, including empty summaries
+whose missing optional fields remain null. Unsupported methods, unknown fields,
+future schemas, invalid bounds, and disagreement with the relational snapshot
+status fail the migration after backup. CLI alert evaluation and both CLI/API
+read projections validate the payloads and expose only the established fixed
+public fields.
+
 ### Baseline And Production Foundation
 
 | ID | Issue | Status | Depends on | Release target | Acceptance and required evidence |

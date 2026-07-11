@@ -8,7 +8,9 @@ use axum::http::{Method, Request, StatusCode, header};
 use ocfleet_api::{ApiCli, ApiConfig, AppState, RedactionMode, build_router};
 use ocfleet_cli::audit::AuditEvent;
 use ocfleet_cli::backend::StoreWriter;
-use ocfleet_cli::storage_payloads::SchedulerSelectorPayloadV1;
+use ocfleet_cli::storage_payloads::{
+    HealthDegradedMethodsPayloadV1, HealthSummaryPayloadV1, SchedulerSelectorPayloadV1,
+};
 use ocfleet_cli::store::{
     AlertEventRecord, CURRENT_SCHEMA_VERSION, HealthSnapshotRecord, HealthSnapshotWrite,
     NodeInsert, ObservabilityJobRecord, ObservabilityRunInsert, ProbeObservationInsert, Store,
@@ -248,6 +250,23 @@ async fn jobs_route_fails_closed_for_contaminated_versioned_selector() {
         .expect("contaminate selector");
 
     let (status, _, body) = raw_request(fixture.router(None), Method::GET, "/jobs", None).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(!body.contains("10.0.0.2"));
+}
+
+#[tokio::test]
+async fn health_route_fails_closed_for_contaminated_versioned_summary() {
+    let fixture = Fixture::new();
+    Connection::open(&fixture.database)
+        .expect("open fixture")
+        .execute(
+            "UPDATE health_snapshots SET summary_json = ?1 WHERE node_id = 'node-a'",
+            [r#"{"schema":"ocfleet.health.summary.v1","region":null,"role":null,"status":"unreachable","endpoint_status":null,"consecutive_failures":null,"client_address":"10.0.0.2"}"#],
+        )
+        .expect("contaminate health summary");
+
+    let (status, _, body) =
+        raw_request(fixture.router(None), Method::GET, "/health/nodes", None).await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     assert!(!body.contains("10.0.0.2"));
 }
@@ -998,8 +1017,18 @@ fn seed_database(path: &Path) {
                 last_success_at: None,
                 last_failure_at: Some("2026-07-09T00:01:02Z".to_string()),
                 last_error_code: Some("ENDPOINT_NOT_ALLOWED".to_string()),
-                degraded_methods_json: json!(["probe.controller.ping"]),
-                summary_json: json!({"status": "unreachable"}),
+                degraded_methods_json: HealthDegradedMethodsPayloadV1::new(vec![])
+                    .expect("valid methods")
+                    .to_value(),
+                summary_json: HealthSummaryPayloadV1::new(
+                    None,
+                    None,
+                    "unreachable".to_string(),
+                    None,
+                    None,
+                )
+                .expect("valid summary")
+                .to_value(),
             }],
         },
         "api-test",
@@ -1054,11 +1083,6 @@ fn seed_database(path: &Path) {
         .to_string()],
     )
     .expect("pollute observation summary");
-    conn.execute(
-        "UPDATE health_snapshots SET summary_json = ?1 WHERE node_id = 'node-a'",
-        [json!({"status": "unreachable", "raw_body": "hidden"}).to_string()],
-    )
-    .expect("pollute health summary");
     conn.execute(
         "UPDATE alert_events SET detail_json = ?1 WHERE alert_id = 'alert-a'",
         [json!({

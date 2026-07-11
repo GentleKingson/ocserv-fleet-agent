@@ -5,6 +5,7 @@ use ocfleet_cli::alert_webhook::{
 };
 use ocfleet_cli::alerts::deliver_webhook_alerts_with_sender;
 use ocfleet_cli::backend::StoreWriter;
+use ocfleet_cli::storage_payloads::{HealthDegradedMethodsPayloadV1, HealthSummaryPayloadV1};
 use ocfleet_cli::store::{
     AlertEventRecord, AlertWebhookHookRecord, HealthSnapshotRecord, HealthSnapshotWrite,
     NodeInsert, ProbeObservationInsert, Store,
@@ -171,8 +172,18 @@ fn seed_stale_health_snapshot(store: &Store) {
                 last_success_at: Some("2026-07-07T00:00:00Z".to_string()),
                 last_failure_at: None,
                 last_error_code: None,
-                degraded_methods_json: json!(["probe.controller.ping"]),
-                summary_json: json!({"status": "stale"}),
+                degraded_methods_json: HealthDegradedMethodsPayloadV1::new(vec![])
+                    .expect("valid methods")
+                    .to_value(),
+                summary_json: HealthSummaryPayloadV1::new(
+                    None,
+                    None,
+                    "stale".to_string(),
+                    None,
+                    None,
+                )
+                .expect("valid summary")
+                .to_value(),
             }],
         },
         "test-setup",

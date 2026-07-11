@@ -21,6 +21,7 @@ use crate::args::{AlertCommand, AlertHookCommand, AlertSeverity, AlertState};
 use crate::backend::StoreWriter;
 use crate::duration_args::parse_duration_seconds;
 use crate::input_validation::{local_actor, validate_reason};
+use crate::storage_payloads::{HealthDegradedMethodsPayloadV1, HealthSummaryPayloadV1};
 use crate::store::{
     AlertDeliveryAttemptRecord, AlertDeliveryAttemptWrite, AlertDeliveryFinalizeWrite,
     AlertEvaluationEntry, AlertEvaluationWrite, AlertEventRecord, AlertStateTransition,
@@ -668,6 +669,11 @@ fn alert_candidates(
 fn candidates_from_health_snapshots(store: &Store) -> anyhow::Result<Vec<AlertCandidate>> {
     let mut candidates = Vec::new();
     for snapshot in store.list_health_snapshots()? {
+        let summary = HealthSummaryPayloadV1::from_value(&snapshot.summary_json)
+            .map_err(anyhow::Error::msg)?;
+        let degraded_methods =
+            HealthDegradedMethodsPayloadV1::from_value(&snapshot.degraded_methods_json)
+                .map_err(anyhow::Error::msg)?;
         match snapshot.status.as_str() {
             "unreachable" => candidates.push(AlertCandidate {
                 dedupe_key: format!("node:{}:node_unreachable", snapshot.node_id),
@@ -678,7 +684,7 @@ fn candidates_from_health_snapshots(store: &Store) -> anyhow::Result<Vec<AlertCa
                 summary: json!({
                     "status": snapshot.status,
                     "last_error_code": snapshot.last_error_code,
-                    "consecutive_failures": snapshot.summary_json.get("consecutive_failures"),
+                    "consecutive_failures": summary.consecutive_failures,
                 }),
             }),
             "stale" => candidates.push(AlertCandidate {
@@ -693,7 +699,7 @@ fn candidates_from_health_snapshots(store: &Store) -> anyhow::Result<Vec<AlertCa
                 }),
             }),
             "degraded" => {
-                let methods = string_array(&snapshot.degraded_methods_json);
+                let methods = degraded_methods.methods;
                 candidates.push(AlertCandidate {
                     dedupe_key: format!("node:{}:ocserv_degraded", snapshot.node_id),
                     node_id: Some(snapshot.node_id.clone()),
@@ -1010,16 +1016,6 @@ fn object_from_value(value: Value) -> Map<String, Value> {
         Value::Object(map) => map,
         _ => Map::new(),
     }
-}
-
-fn string_array(value: &Value) -> Vec<String> {
-    value
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .map(ToOwned::to_owned)
-        .collect()
 }
 
 fn min_days_remaining(summary: &Value) -> Option<i64> {

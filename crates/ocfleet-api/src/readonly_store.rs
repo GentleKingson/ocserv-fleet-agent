@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 
 use ocfleet_cli::private_file::{self, PrivateFileError};
 use ocfleet_cli::storage_payloads::{
-    SchedulerPairPayloadV1, SchedulerSelectorPayloadV1, validate_scheduler_payload_relationship,
+    HealthDegradedMethodsPayloadV1, HealthSummaryPayloadV1, SchedulerPairPayloadV1,
+    SchedulerSelectorPayloadV1, validate_health_payload_relationship,
+    validate_scheduler_payload_relationship,
 };
 use ocfleet_cli::store::{
     AlertEventRecord, AuditRecord, CURRENT_SCHEMA_VERSION, HealthSnapshotRecord, NodeRecord,
@@ -492,17 +494,43 @@ fn node_health_from_row(row: &Row<'_>) -> rusqlite::Result<NodeHealthRecord> {
             let degraded_methods_json: String = row.get(14)?;
             let summary_json: String = row.get(15)?;
             let freshness_seconds: Option<i64> = row.get(10)?;
+            let degraded_methods_json = parse_json_column(&degraded_methods_json, 14)?;
+            HealthDegradedMethodsPayloadV1::from_value(&degraded_methods_json).map_err(
+                |error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        14,
+                        rusqlite::types::Type::Text,
+                        Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
+                    )
+                },
+            )?;
+            let summary_json = parse_json_column(&summary_json, 15)?;
+            let summary = HealthSummaryPayloadV1::from_value(&summary_json).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    15,
+                    rusqlite::types::Type::Text,
+                    Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
+                )
+            })?;
+            let status: String = row.get(9)?;
+            validate_health_payload_relationship(&status, &summary).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    15,
+                    rusqlite::types::Type::Text,
+                    Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
+                )
+            })?;
             Ok::<HealthSnapshotRecord, rusqlite::Error>(HealthSnapshotRecord {
                 node_id,
                 endpoint_id: row.get(7)?,
                 computed_at: row.get(8)?,
-                status: row.get(9)?,
+                status,
                 freshness_seconds: freshness_seconds.and_then(|value| u64::try_from(value).ok()),
                 last_success_at: row.get(11)?,
                 last_failure_at: row.get(12)?,
                 last_error_code: row.get(13)?,
-                degraded_methods_json: parse_json_column(&degraded_methods_json, 14)?,
-                summary_json: parse_json_column(&summary_json, 15)?,
+                degraded_methods_json,
+                summary_json,
             })
         })
         .transpose()?;

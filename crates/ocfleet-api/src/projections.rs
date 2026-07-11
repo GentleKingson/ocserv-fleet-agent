@@ -1,6 +1,9 @@
 use ocfleet_cli::audit_export::audit_record_payload;
 use ocfleet_cli::observation::observation_to_json;
-use ocfleet_cli::storage_payloads::{SchedulerPairPayloadV1, SchedulerSelectorPayloadV1};
+use ocfleet_cli::storage_payloads::{
+    HealthDegradedMethodsPayloadV1, HealthSummaryPayloadV1, SchedulerPairPayloadV1,
+    SchedulerSelectorPayloadV1,
+};
 use ocfleet_cli::store::{
     AlertEventRecord, AuditRecord, ObservabilityJobRecord, ObservabilityRunRecord,
     ProbeObservationRecord,
@@ -34,8 +37,25 @@ pub fn health_node_to_json(record: &NodeHealthRecord) -> Value {
     let degraded_methods = record
         .snapshot
         .as_ref()
-        .map(|snapshot| safe_method_array(&snapshot.degraded_methods_json))
+        .and_then(|snapshot| {
+            HealthDegradedMethodsPayloadV1::from_value(&snapshot.degraded_methods_json).ok()
+        })
+        .map(|payload| payload.methods)
         .unwrap_or_default();
+    let summary = record
+        .snapshot
+        .as_ref()
+        .and_then(|snapshot| HealthSummaryPayloadV1::from_value(&snapshot.summary_json).ok())
+        .map(|summary| {
+            json!({
+                "region": summary.region,
+                "role": summary.role,
+                "status": summary.status,
+                "endpoint_status": summary.endpoint_status,
+                "consecutive_failures": summary.consecutive_failures,
+            })
+        })
+        .unwrap_or_else(|| json!({}));
     json!({
         "node_id": record.node.node_id,
         "endpoint_id": record.node.endpoint_id,
@@ -50,7 +70,7 @@ pub fn health_node_to_json(record: &NodeHealthRecord) -> Value {
         "last_failure_at": record.snapshot.as_ref().and_then(|snapshot| snapshot.last_failure_at.as_deref()),
         "last_error_code": record.snapshot.as_ref().and_then(|snapshot| snapshot.last_error_code.as_deref()),
         "degraded_methods": degraded_methods,
-        "summary": record.snapshot.as_ref().map(|snapshot| safe_summary(&snapshot.summary_json)).unwrap_or_else(|| json!({})),
+        "summary": summary,
     })
 }
 

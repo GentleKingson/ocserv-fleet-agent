@@ -146,6 +146,13 @@ batch and audit. A concurrent silence or resolve therefore causes the stale
 evaluation to fail instead of restoring an older state. Exact same-actor,
 same-input retries are no-ops; divergent replay fails closed.
 
+Alert silence/resolve uses `alert-action-<uuid>`, verifies the exact persisted
+before-state, and commits the closed transition with actor, reason, and audit.
+Webhook-hook creation commits the validated configuration and redacted audit
+together; the endpoint path and HMAC secret are excluded. File/HTTPS delivery
+I/O remains outside database transactions and requires a separate durable
+attempt/finalization writer model.
+
 - Keep controller audit exports redacted by default.
 - Keep agent audit primary log and spool on monitored storage.
 - Treat `audit_dropped` or repeated audit write failures as operational incidents, because affected RPCs should fail closed when neither primary nor spool can record the event.

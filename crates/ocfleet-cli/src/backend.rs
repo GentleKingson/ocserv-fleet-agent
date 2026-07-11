@@ -1,11 +1,12 @@
 use crate::audit::AuditEvent;
 use crate::store::{
-    AlertEvaluationWrite, AlertEventRecord, ApprovalInput, AuditRecord, EndpointTrustRecord,
-    EnrollmentTokenInsert, EnrollmentTokenRecord, HealthPolicyRecord, HealthSnapshotRecord,
-    HealthSnapshotWrite, JoinRequestInsert, JoinRequestRecord, LegacyEnrollmentClaimInput,
-    NodeInsert, NodeRecord, ObservabilityJobRecord, ObservabilityRunRecord, ProbeObservationRecord,
-    RetentionApplyInput, RetentionApplyResult, RetentionPolicyRecord, SchedulerOutcomeWrite,
-    SchedulerRunFinish, SchedulerRunStart, Store, StoreError,
+    AlertEvaluationWrite, AlertEventRecord, AlertStateTransition, AlertWebhookHookRecord,
+    ApprovalInput, AuditRecord, EndpointTrustRecord, EnrollmentTokenInsert, EnrollmentTokenRecord,
+    HealthPolicyRecord, HealthSnapshotRecord, HealthSnapshotWrite, JoinRequestInsert,
+    JoinRequestRecord, LegacyEnrollmentClaimInput, NodeInsert, NodeRecord, ObservabilityJobRecord,
+    ObservabilityRunRecord, ProbeObservationRecord, RetentionApplyInput, RetentionApplyResult,
+    RetentionPolicyRecord, SchedulerOutcomeWrite, SchedulerRunFinish, SchedulerRunStart, Store,
+    StoreError,
 };
 
 pub const MAX_STORE_READER_ROWS: u64 = 1_000;
@@ -86,6 +87,16 @@ pub trait StoreWriter {
     fn write_alert_evaluation(
         &self,
         write: &AlertEvaluationWrite,
+        actor: &str,
+    ) -> Result<(), Self::Error>;
+    fn write_alert_state_transition(
+        &self,
+        write: &AlertStateTransition,
+        actor: &str,
+    ) -> Result<(), Self::Error>;
+    fn write_alert_webhook_hook_create(
+        &self,
+        hook: &AlertWebhookHookRecord,
         actor: &str,
     ) -> Result<(), Self::Error>;
     fn write_retention_policy(
@@ -335,6 +346,22 @@ impl StoreWriter for Store {
         actor: &str,
     ) -> Result<(), Self::Error> {
         Store::write_alert_evaluation(self, write, actor)
+    }
+
+    fn write_alert_state_transition(
+        &self,
+        write: &AlertStateTransition,
+        actor: &str,
+    ) -> Result<(), Self::Error> {
+        Store::write_alert_state_transition(self, write, actor)
+    }
+
+    fn write_alert_webhook_hook_create(
+        &self,
+        hook: &AlertWebhookHookRecord,
+        actor: &str,
+    ) -> Result<(), Self::Error> {
+        Store::write_alert_webhook_hook_create(self, hook, actor)
     }
 
     fn write_retention_policy(

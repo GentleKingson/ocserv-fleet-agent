@@ -108,8 +108,9 @@ legacy unaudited prune entry points are removed. Health summary/node commands
 commit bounded snapshot batches and audit through replay-safe writers. Alert
 candidate evaluation does the same and compares each persisted before-state in
 the immediate transaction so a concurrent silence or resolve is never
-overwritten. Alert operator actions, delivery, and other legacy mutations are
-not all migrated to the writer trait. Future writer
+overwritten. Alert silence/resolve use a compare-before transition writer, and
+webhook-hook creation commits configuration with redacted audit. Delivery and
+other legacy mutations are not all migrated to the writer trait. Future writer
 interfaces must keep actor/audit input mandatory and must not loosen private
 file checks or redaction. The scheduler writer expansions change no schema,
 protocol, agent capability, or API route; neither does the binding/lifecycle

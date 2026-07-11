@@ -24,7 +24,8 @@ use crate::duration_args::parse_duration_seconds;
 use crate::input_validation::{local_actor, validate_reason};
 use crate::store::{
     AlertDeliveryAttemptRecord, AlertEvaluationEntry, AlertEvaluationWrite, AlertEventRecord,
-    AlertWebhookHookRecord, HealthPolicyRecord, ProbeObservationRecord, Store,
+    AlertStateTransition, AlertWebhookHookRecord, HealthPolicyRecord, ProbeObservationRecord,
+    Store,
 };
 use std::path::Path;
 use std::thread;
@@ -246,8 +247,7 @@ fn run_alert_hook_add_webhook(
         created_at: now.clone(),
         updated_at: now,
     };
-    store.insert_alert_webhook_hook(&hook)?;
-    write_alert_hook_audit(store, "alert.hook.add_webhook", &hook)?;
+    StoreWriter::write_alert_webhook_hook_create(store, &hook, &local_actor())?;
     println!("hook_id={}", hook.hook_id);
     println!("hook_type=webhook");
     println!("name={}", hook.name);
@@ -569,7 +569,8 @@ fn run_alert_silence(
     let until = (OffsetDateTime::now_utc() + parse_duration(for_duration)?)
         .format(&Rfc3339)
         .expect("RFC3339 formatting succeeds");
-    let mut alert = find_alert(store, dedupe_key)?;
+    let before = find_alert(store, dedupe_key)?;
+    let mut alert = before.clone();
     let mut detail = object_from_value(alert.detail_json);
     detail.insert("silenced_until".to_string(), Value::String(until.clone()));
     detail.insert(
@@ -579,16 +580,16 @@ fn run_alert_silence(
     alert.state = "silenced".to_string();
     alert.resolved_at = None;
     alert.detail_json = Value::Object(detail);
-    store.upsert_alert_event(&alert)?;
-    write_alert_audit(
+    StoreWriter::write_alert_state_transition(
         store,
-        "alert.silence",
-        json!({
-            "dedupe_key": dedupe_key,
-            "for_duration": for_duration,
-            "silenced_until": until,
-            "reason": reason,
-        }),
+        &AlertStateTransition {
+            operation_id: format!("alert-action-{}", Uuid::new_v4()),
+            event: "alert.silence".to_string(),
+            before,
+            after: alert,
+            reason: reason.to_string(),
+        },
+        &local_actor(),
     )?;
     println!("dedupe_key={dedupe_key}");
     println!("silenced_until={until}");
@@ -598,7 +599,8 @@ fn run_alert_silence(
 fn run_alert_resolve(store: &Store, dedupe_key: &str, reason: &str) -> anyhow::Result<()> {
     validate_reason(reason).map_err(anyhow::Error::msg)?;
     let now = now_rfc3339();
-    let mut alert = find_alert(store, dedupe_key)?;
+    let before = find_alert(store, dedupe_key)?;
+    let mut alert = before.clone();
     alert.state = "resolved".to_string();
     alert.resolved_at = Some(now.clone());
     alert.last_seen_at = now.clone();
@@ -608,14 +610,16 @@ fn run_alert_resolve(store: &Store, dedupe_key: &str, reason: &str) -> anyhow::R
         Value::String(reason.to_string()),
     );
     alert.detail_json = Value::Object(detail);
-    store.upsert_alert_event(&alert)?;
-    write_alert_audit(
+    StoreWriter::write_alert_state_transition(
         store,
-        "alert.resolve",
-        json!({
-            "dedupe_key": dedupe_key,
-            "reason": reason,
-        }),
+        &AlertStateTransition {
+            operation_id: format!("alert-action-{}", Uuid::new_v4()),
+            event: "alert.resolve".to_string(),
+            before,
+            after: alert,
+            reason: reason.to_string(),
+        },
+        &local_actor(),
     )?;
     println!("dedupe_key={dedupe_key}");
     println!("state=resolved");
@@ -1043,35 +1047,6 @@ fn alert_severity_name(severity: AlertSeverity) -> &'static str {
         AlertSeverity::Warning => "warning",
         AlertSeverity::Critical => "critical",
     }
-}
-
-fn write_alert_audit(store: &Store, event_name: &str, detail_json: Value) -> anyhow::Result<()> {
-    let mut event = AuditEvent::new(local_actor(), event_name);
-    event.ok = Some(true);
-    event.detail_json = detail_json;
-    store.insert_audit(&event)?;
-    Ok(())
-}
-
-fn write_alert_hook_audit(
-    store: &Store,
-    event_name: &str,
-    hook: &AlertWebhookHookRecord,
-) -> anyhow::Result<()> {
-    let mut event = AuditEvent::new(local_actor(), event_name);
-    event.ok = Some(true);
-    event.detail_json = json!({
-        "hook_id": hook.hook_id,
-        "hook_type": hook.hook_type,
-        "name": hook.name,
-        "endpoint_host": hook.endpoint_host,
-        "hmac_key_id": hook.hmac_key_id,
-        "enabled": hook.enabled,
-        "max_attempts": hook.max_attempts,
-        "timeout_ms": hook.timeout_ms,
-    });
-    store.insert_audit(&event)?;
-    Ok(())
 }
 
 fn write_alert_delivery_audit(

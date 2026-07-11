@@ -149,6 +149,12 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         description: "Add fenced, expiring scheduler job claims.",
         apply: apply_0019_scheduler_job_claims,
     },
+    Migration {
+        version: 20,
+        name: "0020_scheduler_maintenance",
+        description: "Add the singleton scheduler maintenance window.",
+        apply: apply_0020_scheduler_maintenance,
+    },
 ];
 
 pub(crate) fn migrate_to_current(
@@ -1390,6 +1396,21 @@ CREATE TABLE scheduler_job_claims (
 );
 CREATE INDEX idx_scheduler_job_claims_expiry
   ON scheduler_job_claims(lease_expires_at, job_id);
+"#,
+    )?;
+    Ok(())
+}
+
+fn apply_0020_scheduler_maintenance(tx: &Transaction<'_>) -> Result<(), StoreError> {
+    tx.execute_batch(
+        r#"
+CREATE TABLE scheduler_maintenance (
+  singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+  starts_at TEXT NOT NULL,
+  ends_at TEXT NOT NULL,
+  reason TEXT NOT NULL CHECK (length(reason) BETWEEN 1 AND 256),
+  updated_at TEXT NOT NULL
+);
 "#,
     )?;
     Ok(())

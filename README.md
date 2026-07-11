@@ -445,6 +445,12 @@ target/debug/ocfleet schedule job enable <job-id>
 target/debug/ocfleet schedule run --once
 target/debug/ocfleet schedule run --once --job-id <job-id> --json
 target/debug/ocfleet schedule run list --limit 50 --json
+target/debug/ocfleet schedule maintenance set \
+  --from 2026-07-12T01:00:00Z \
+  --to 2026-07-12T02:00:00Z \
+  --reason "planned controller maintenance"
+target/debug/ocfleet schedule maintenance show --json
+target/debug/ocfleet schedule maintenance clear
 target/debug/ocfleet schedule status
 target/debug/ocfleet schedule status --json
 target/debug/ocfleet observation list \
@@ -574,6 +580,8 @@ Networking must allow the controller to reach the agent through iroh using the r
   audit details bound to the complete relational record.
 - `docs/adr/ADR-scheduler-job-claims.md`: schema-v19 deterministic scheduler
   claims, fencing, expiry, and abandoned-run recovery.
+- `docs/adr/ADR-scheduler-maintenance-window.md`: schema-v20 audited global
+  maintenance suppression without clock, selector, or trust mutation.
 - `docs/a2-storage-inventory.md`: A2 payload-family closure inventory and
   migration/read-boundary evidence.
 - `docs/trust-policy.md`: trust policy as code schema, validation, and diff behavior.

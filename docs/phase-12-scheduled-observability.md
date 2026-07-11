@@ -207,6 +207,13 @@ update timestamp. Acquisition is deterministic and immediate-transaction
 serialized. Claim state grants no RPC or trust capability. Expired takeover
 fails the abandoned run atomically and prevents the stale fence from writing.
 
+### `scheduler_maintenance`
+
+Stores the optional schema-v20 controller-wide maintenance interval and a
+bounded operator reason. Active maintenance suppresses claims and RPC while
+leaving scheduler clocks, selectors, nodes, endpoint trust, and observations
+unchanged. Expired windows are inert until explicitly replaced or cleared.
+
 ### `probe_observations`
 
 Stores typed low-sensitive observations produced by scheduled methods. Current

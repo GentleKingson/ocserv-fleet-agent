@@ -34,6 +34,7 @@ fn migration_tests_new_database_creates_all_current_tables_and_indexes() {
         "alert_hooks",
         "alert_delivery_attempts",
         "scheduler_job_claims",
+        "scheduler_maintenance",
     ] {
         assert_schema_object_exists(&conn, "table", table);
     }
@@ -891,6 +892,25 @@ fn migration_tests_scheduler_claim_table_upgrades_schema_18() {
     let conn = Connection::open(&db).expect("open migrated db");
     assert_schema_object_exists(&conn, "table", "scheduler_job_claims");
     assert_schema_object_exists(&conn, "index", "idx_scheduler_job_claims_expiry");
+    assert_schema_object_exists(&conn, "table", "scheduler_maintenance");
+    assert_eq!(backup_files(dir.path()).len(), 1);
+    assert_sqlite_checks_pass(&conn);
+}
+
+#[test]
+fn migration_tests_scheduler_maintenance_upgrades_schema_19() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("controller.sqlite");
+    create_legacy_fixture(&db, 19, 1);
+
+    let store = Store::open(&db).expect("migrate v19 scheduler maintenance");
+    assert_eq!(
+        store.current_schema_version().expect("schema version"),
+        CURRENT_SCHEMA_VERSION
+    );
+    drop(store);
+    let conn = Connection::open(&db).expect("open migrated db");
+    assert_schema_object_exists(&conn, "table", "scheduler_maintenance");
     assert_eq!(backup_files(dir.path()).len(), 1);
     assert_sqlite_checks_pass(&conn);
 }

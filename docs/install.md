@@ -349,6 +349,11 @@ rewriting existing scheduler rows. The migration leaves existing jobs unclaimed;
 new scheduler executions acquire fenced claims lazily. Upgrade failure leaves
 the version-18 database unchanged beside its private backup.
 
+Schema version 20 adds the singleton `scheduler_maintenance` table. No window
+is created during migration, so existing schedules continue normally. Set and
+clear operations are actor-bound and atomically audited. Upgrade failure leaves
+the version-19 database unchanged beside its private backup.
+
 Before upgrades, keep an operator-managed backup as well:
 
 ```bash

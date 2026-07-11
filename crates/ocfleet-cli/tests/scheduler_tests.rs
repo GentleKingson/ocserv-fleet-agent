@@ -7,6 +7,7 @@ use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
+use time::format_description::well_known::Rfc3339;
 
 fn run_ocfleet(args: &[&str]) -> Output {
     let output = Command::new(env!("CARGO_BIN_EXE_ocfleet"))
@@ -1194,6 +1195,115 @@ fn scheduler_tests_misfire_audit_failure_releases_claim_without_running() {
         )
         .expect("claim row");
     assert_eq!(owner, None);
+}
+
+#[test]
+fn scheduler_tests_maintenance_suppresses_due_and_targeted_work_until_cleared() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let database_arg = database.to_string_lossy().into_owned();
+    let job_id = add_controller_ping_job(&database_arg, "node_id=missing-maintenance");
+    let now = time::OffsetDateTime::now_utc();
+    let from = (now - time::Duration::minutes(1))
+        .format(&Rfc3339)
+        .expect("format maintenance start");
+    let to = (now + time::Duration::minutes(10))
+        .format(&Rfc3339)
+        .expect("format maintenance end");
+
+    run_ocfleet(&[
+        "--database",
+        &database_arg,
+        "schedule",
+        "maintenance",
+        "set",
+        "--from",
+        &from,
+        "--to",
+        &to,
+        "--reason",
+        "planned controller maintenance",
+    ]);
+    let shown = json_stdout(&run_ocfleet(&[
+        "--database",
+        &database_arg,
+        "schedule",
+        "maintenance",
+        "show",
+        "--json",
+    ]));
+    assert_eq!(shown["active"], true);
+    assert_eq!(shown["window"]["reason"], "planned controller maintenance");
+
+    let output = run_ocfleet(&["--database", &database_arg, "schedule", "run", "--once"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("due_jobs=1"));
+    assert!(stdout.contains("executed_jobs=0"));
+    assert!(stdout.contains("skipped_jobs=1"));
+    assert_eq!(
+        scheduler_audit_count(&database, "scheduler.maintenance.skip"),
+        1
+    );
+    let targeted = run_ocfleet_failure(&[
+        "--database",
+        &database_arg,
+        "schedule",
+        "run",
+        "--once",
+        "--job-id",
+        &job_id,
+    ]);
+    assert!(String::from_utf8_lossy(&targeted.stderr).contains("maintenance window is active"));
+
+    run_ocfleet(&[
+        "--database",
+        &database_arg,
+        "schedule",
+        "maintenance",
+        "clear",
+    ]);
+    let output = run_ocfleet(&["--database", &database_arg, "schedule", "run", "--once"]);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("executed_jobs=1"));
+}
+
+#[test]
+fn scheduler_tests_maintenance_set_rolls_back_when_audit_fails() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let database_arg = database.to_string_lossy().into_owned();
+    let secret = dir.path().join("controller.secret");
+    let secret_arg = secret.to_string_lossy().into_owned();
+    run_ocfleet(&[
+        "--database",
+        &database_arg,
+        "--secret-key",
+        &secret_arg,
+        "init",
+    ]);
+    install_scheduler_audit_failure(&database, "scheduler.maintenance.set");
+
+    run_ocfleet_failure(&[
+        "--database",
+        &database_arg,
+        "schedule",
+        "maintenance",
+        "set",
+        "--from",
+        "2026-01-01T00:00:00Z",
+        "--to",
+        "2026-01-01T01:00:00Z",
+        "--reason",
+        "planned maintenance",
+    ]);
+    assert_eq!(
+        Connection::open(&database)
+            .expect("open database")
+            .query_row("SELECT count(*) FROM scheduler_maintenance", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("maintenance count"),
+        0
+    );
 }
 
 #[test]

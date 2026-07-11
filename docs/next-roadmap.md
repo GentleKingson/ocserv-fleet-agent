@@ -227,6 +227,7 @@ an expired owner cannot persist after takeover. Active execution renews a
 two-minute lease every 30 seconds and fails closed if renewal loses its fence.
 Retry/misfire and maintenance policy, graceful in-flight shutdown, and the remaining A3
 acceptance matrix are still active work.
+The lease-heartbeat follow-up is published in pull request `#81`.
 Published for review in pull request `#80`.
 
 ### Baseline And Production Foundation

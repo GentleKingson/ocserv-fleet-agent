@@ -4,9 +4,9 @@
   "completed_phases": ["A1", "A2"],
   "active_branch": "codex/a3-scheduler-heartbeat",
   "active_issue": 35,
-  "active_pr": null,
+  "active_pr": 81,
   "last_test_result": "passed",
   "last_updated_at": "2026-07-11T17:58:00Z",
   "blockers": [],
-  "next_action": "Validate and publish scheduler lease heartbeats, then add bounded retry and misfire policy for issue #35."
+  "next_action": "Merge pull request #81, then add bounded retry and misfire policy for issue #35."
 }

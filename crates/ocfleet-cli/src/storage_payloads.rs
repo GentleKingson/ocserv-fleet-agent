@@ -9,6 +9,7 @@ pub const SCHEDULER_PAIR_SCHEMA_V1: &str = "ocfleet.scheduler.pair.v1";
 pub const HEALTH_DEGRADED_METHODS_SCHEMA_V1: &str = "ocfleet.health.degraded-methods.v1";
 pub const HEALTH_SUMMARY_SCHEMA_V1: &str = "ocfleet.health.summary.v1";
 pub const OBSERVATION_SUMMARY_SCHEMA_V1: &str = "ocfleet.observation.summary.v1";
+pub const RUN_SUMMARY_SCHEMA_V1: &str = "ocfleet.run.summary.v1";
 
 const HEALTH_DEGRADED_METHODS: [&str; 5] = [
     "ocserv.cert.expiry",
@@ -168,6 +169,228 @@ pub fn validate_health_payload_relationship(
         return Err("health summary status does not match snapshot status".to_string());
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunSummaryPayloadV1 {
+    pub schema: String,
+    pub result_class: String,
+    pub job_id: Option<String>,
+    pub kind: Option<String>,
+    pub status: String,
+    pub triggered_by: String,
+    pub observations: Option<u64>,
+    pub failed_observations: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct LegacyRunSummaryV1 {
+    result_class: Option<String>,
+    job_id: Option<String>,
+    kind: Option<String>,
+    status: Option<String>,
+    triggered_by: Option<String>,
+    observations: Option<u64>,
+    failed_observations: Option<u64>,
+    started: Option<bool>,
+}
+
+impl RunSummaryPayloadV1 {
+    pub fn new(
+        job_id: Option<String>,
+        kind: Option<String>,
+        status: String,
+        triggered_by: String,
+        observations: Option<u64>,
+        failed_observations: Option<u64>,
+    ) -> Result<Self, String> {
+        let payload = Self {
+            schema: RUN_SUMMARY_SCHEMA_V1.to_string(),
+            result_class: "scheduler_summary".to_string(),
+            job_id,
+            kind,
+            status,
+            triggered_by,
+            observations,
+            failed_observations,
+        };
+        payload.validate()?;
+        Ok(payload)
+    }
+
+    pub fn from_legacy(
+        job_id: Option<&str>,
+        kind_hint: Option<&str>,
+        status: &str,
+        triggered_by: &str,
+        value: &Value,
+    ) -> Result<Self, String> {
+        let legacy: LegacyRunSummaryV1 = serde_json::from_value(value.clone())
+            .map_err(|_| "run summary contains unsupported fields or values".to_string())?;
+        if legacy
+            .result_class
+            .as_deref()
+            .is_some_and(|result_class| result_class != "scheduler_summary")
+        {
+            return Err("run summary result class is inconsistent".to_string());
+        }
+        if legacy.job_id.is_some() && legacy.job_id.as_deref() != job_id {
+            return Err("run summary job ID is inconsistent".to_string());
+        }
+        if legacy
+            .status
+            .as_deref()
+            .is_some_and(|stored| stored != status)
+        {
+            return Err("run summary status is inconsistent".to_string());
+        }
+        if legacy
+            .triggered_by
+            .as_deref()
+            .is_some_and(|stored| stored != triggered_by)
+        {
+            return Err("run summary trigger is inconsistent".to_string());
+        }
+        if legacy
+            .started
+            .is_some_and(|started| !started || status != "running")
+        {
+            return Err("legacy run summary started marker is inconsistent".to_string());
+        }
+        if let (Some(kind), Some(hint)) = (legacy.kind.as_deref(), kind_hint)
+            && kind != hint
+        {
+            return Err("run summary job kind is inconsistent".to_string());
+        }
+        Self::new(
+            job_id.map(ToOwned::to_owned),
+            legacy.kind.or_else(|| kind_hint.map(ToOwned::to_owned)),
+            status.to_string(),
+            triggered_by.to_string(),
+            legacy.observations,
+            legacy.failed_observations,
+        )
+    }
+
+    pub fn from_value(value: &Value) -> Result<Self, String> {
+        let payload: Self = serde_json::from_value(value.clone())
+            .map_err(|_| "run summary payload is not closed v1 data".to_string())?;
+        payload.validate()?;
+        Ok(payload)
+    }
+
+    pub fn to_value(&self) -> Value {
+        serde_json::to_value(self).expect("run summary payload serializes")
+    }
+
+    pub fn public_summary(&self) -> Value {
+        let mut value = serde_json::json!({
+            "result_class": self.result_class,
+            "job_id": self.job_id,
+            "kind": self.kind,
+            "status": self.status,
+            "triggered_by": self.triggered_by,
+            "observations": self.observations,
+            "failed_observations": self.failed_observations,
+        });
+        value
+            .as_object_mut()
+            .expect("run public summary is an object")
+            .retain(|_, value| !value.is_null());
+        value
+    }
+
+    pub fn validate_relationship(
+        &self,
+        job_id: Option<&str>,
+        kind: Option<&str>,
+        status: &str,
+        triggered_by: &str,
+    ) -> Result<(), String> {
+        if self.job_id.as_deref() != job_id
+            || self.kind.as_deref() != kind
+            || self.status != status
+            || self.triggered_by != triggered_by
+        {
+            return Err(
+                "run summary does not match relational job, kind, status, or trigger".to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.schema != RUN_SUMMARY_SCHEMA_V1 {
+            return Err("run summary payload schema is unsupported".to_string());
+        }
+        if self.result_class != "scheduler_summary" {
+            return Err("run summary result class is unsupported".to_string());
+        }
+        if let Some(job_id) = &self.job_id {
+            validate_fixed_id(job_id, 128, "run summary job ID")?;
+        }
+        if self.kind.as_deref().is_some_and(|kind| {
+            !matches!(
+                kind,
+                "controller-ping"
+                    | "ocserv-status"
+                    | "ocserv-cert"
+                    | "ocserv-sessions"
+                    | "path-probe"
+            )
+        }) {
+            return Err("run summary job kind is unsupported".to_string());
+        }
+        if !matches!(
+            self.status.as_str(),
+            "running" | "succeeded" | "failed" | "skipped"
+        ) {
+            return Err("run summary status is unsupported".to_string());
+        }
+        if !matches!(self.triggered_by.as_str(), "manual" | "scheduler.run.once") {
+            return Err("run summary trigger is unsupported".to_string());
+        }
+        if self
+            .observations
+            .is_some_and(|observations| observations > 1_000_000)
+            || self
+                .failed_observations
+                .is_some_and(|observations| observations > 1_000_000)
+        {
+            return Err("run summary observation count exceeds limit".to_string());
+        }
+        if let (Some(observations), Some(failed)) = (self.observations, self.failed_observations)
+            && failed > observations
+        {
+            return Err("run summary failed count exceeds observation count".to_string());
+        }
+        if self.failed_observations.is_some() && self.observations.is_none() {
+            return Err("run summary failed count requires an observation count".to_string());
+        }
+        if self.status == "running"
+            && (self.observations.is_some() || self.failed_observations.is_some())
+        {
+            return Err("running run summary cannot contain terminal counts".to_string());
+        }
+        Ok(())
+    }
+}
+
+fn validate_fixed_id(value: &str, max_len: usize, field: &str) -> Result<(), String> {
+    if !value.is_empty()
+        && value.len() <= max_len
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':'))
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "{field} must be 1-{max_len} chars and contain only [a-zA-Z0-9._:-]"
+        ))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -423,8 +646,9 @@ mod tests {
     use super::{
         HEALTH_DEGRADED_METHODS_SCHEMA_V1, HEALTH_SUMMARY_SCHEMA_V1,
         HealthDegradedMethodsPayloadV1, HealthSummaryPayloadV1, OBSERVATION_SUMMARY_SCHEMA_V1,
-        ObservationSummaryPayloadV1, SCHEDULER_PAIR_SCHEMA_V1, SCHEDULER_SELECTOR_SCHEMA_V1,
-        SchedulerPairPayloadV1, SchedulerSelectorPayloadV1, validate_health_payload_relationship,
+        ObservationSummaryPayloadV1, RUN_SUMMARY_SCHEMA_V1, RunSummaryPayloadV1,
+        SCHEDULER_PAIR_SCHEMA_V1, SCHEDULER_SELECTOR_SCHEMA_V1, SchedulerPairPayloadV1,
+        SchedulerSelectorPayloadV1, validate_health_payload_relationship,
         validate_scheduler_payload_relationship,
     };
 
@@ -618,5 +842,71 @@ mod tests {
         let mut contaminated = payload.to_value();
         contaminated["fields"]["token"] = json!("secret");
         assert!(ObservationSummaryPayloadV1::from_value(&contaminated).is_err());
+    }
+
+    #[test]
+    fn run_summary_payload_is_closed_versioned_and_relationally_bound() {
+        let payload = RunSummaryPayloadV1::from_legacy(
+            Some("job-a"),
+            Some("controller-ping"),
+            "succeeded",
+            "scheduler.run.once",
+            &json!({
+                "result_class": "scheduler_summary",
+                "observations": 4,
+                "failed_observations": 1
+            }),
+        )
+        .expect("valid run summary");
+        assert_eq!(payload.schema, RUN_SUMMARY_SCHEMA_V1);
+        assert_eq!(payload.kind.as_deref(), Some("controller-ping"));
+        assert_eq!(
+            RunSummaryPayloadV1::from_value(&payload.to_value()).expect("round trip"),
+            payload
+        );
+        payload
+            .validate_relationship(
+                Some("job-a"),
+                Some("controller-ping"),
+                "succeeded",
+                "scheduler.run.once",
+            )
+            .expect("matching relationship");
+        assert_eq!(payload.public_summary()["observations"], 4);
+
+        let mut contaminated = payload.to_value();
+        contaminated["token"] = json!("secret");
+        assert!(RunSummaryPayloadV1::from_value(&contaminated).is_err());
+        assert!(
+            RunSummaryPayloadV1::from_legacy(
+                Some("job-a"),
+                Some("controller-ping"),
+                "succeeded",
+                "scheduler.run.once",
+                &json!({"client_address": "10.0.0.2"}),
+            )
+            .is_err()
+        );
+        assert!(
+            RunSummaryPayloadV1::new(
+                None,
+                None,
+                "succeeded".to_string(),
+                "manual".to_string(),
+                Some(1),
+                Some(2),
+            )
+            .is_err()
+        );
+        assert!(
+            payload
+                .validate_relationship(
+                    Some("job-b"),
+                    Some("controller-ping"),
+                    "succeeded",
+                    "scheduler.run.once",
+                )
+                .is_err()
+        );
     }
 }

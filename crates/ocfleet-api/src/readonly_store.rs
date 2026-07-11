@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 use ocfleet_cli::private_file::{self, PrivateFileError};
 use ocfleet_cli::storage_payloads::{
     HealthDegradedMethodsPayloadV1, HealthSummaryPayloadV1, ObservationSummaryPayloadV1,
-    SchedulerPairPayloadV1, SchedulerSelectorPayloadV1, validate_health_payload_relationship,
-    validate_scheduler_payload_relationship,
+    RunSummaryPayloadV1, SchedulerPairPayloadV1, SchedulerSelectorPayloadV1,
+    validate_health_payload_relationship, validate_scheduler_payload_relationship,
 };
 use ocfleet_cli::store::{
     AlertEventRecord, AuditRecord, CURRENT_SCHEMA_VERSION, HealthSnapshotRecord, NodeRecord,
@@ -194,13 +194,15 @@ impl ReadOnlyStore {
                     r.triggered_by, r.summary_json,
                     COUNT(o.observation_id) AS observation_count,
                     COALESCE(SUM(CASE WHEN o.ok = 0 THEN 1 ELSE 0 END), 0)
-                      AS failed_observation_count
+                      AS failed_observation_count,
+                    j.kind
              FROM observability_runs r
              LEFT JOIN probe_observations o ON o.run_id = r.run_id
+             LEFT JOIN observability_jobs j ON j.job_id = r.job_id
              WHERE (?1 IS NULL OR r.job_id = ?1)
                AND (?2 IS NULL OR r.status = ?2)
              GROUP BY r.run_id, r.job_id, r.started_at, r.finished_at, r.status,
-                      r.triggered_by, r.summary_json
+                      r.triggered_by, r.summary_json, j.kind
              ORDER BY r.started_at DESC, r.run_id DESC
              LIMIT ?3",
         )?;
@@ -215,12 +217,14 @@ impl ReadOnlyStore {
                     r.triggered_by, r.summary_json,
                     COUNT(o.observation_id) AS observation_count,
                     COALESCE(SUM(CASE WHEN o.ok = 0 THEN 1 ELSE 0 END), 0)
-                      AS failed_observation_count
+                      AS failed_observation_count,
+                    j.kind
              FROM observability_runs r
              LEFT JOIN probe_observations o ON o.run_id = r.run_id
+             LEFT JOIN observability_jobs j ON j.job_id = r.job_id
              WHERE r.run_id = ?1
              GROUP BY r.run_id, r.job_id, r.started_at, r.finished_at, r.status,
-                      r.triggered_by, r.summary_json",
+                      r.triggered_by, r.summary_json, j.kind",
             [run_id],
             observability_run_from_row,
         )
@@ -589,14 +593,35 @@ fn observability_job_from_row(row: &Row<'_>) -> rusqlite::Result<ObservabilityJo
 
 fn observability_run_from_row(row: &Row<'_>) -> rusqlite::Result<ObservabilityRunRecord> {
     let summary_json: String = row.get(6)?;
+    let job_id: Option<String> = row.get(1)?;
+    let status: String = row.get(4)?;
+    let triggered_by: String = row.get(5)?;
+    let kind: Option<String> = row.get(9)?;
+    let summary_json = parse_json_column(&summary_json, 6)?;
+    let payload = RunSummaryPayloadV1::from_value(&summary_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            6,
+            Type::Text,
+            Box::new(io::Error::new(io::ErrorKind::InvalidData, error)),
+        )
+    })?;
+    payload
+        .validate_relationship(job_id.as_deref(), kind.as_deref(), &status, &triggered_by)
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                6,
+                Type::Text,
+                Box::new(io::Error::new(io::ErrorKind::InvalidData, error)),
+            )
+        })?;
     Ok(ObservabilityRunRecord {
         run_id: row.get(0)?,
-        job_id: row.get(1)?,
+        job_id,
         started_at: row.get(2)?,
         finished_at: row.get(3)?,
-        status: row.get(4)?,
-        triggered_by: row.get(5)?,
-        summary_json: parse_json_column(&summary_json, 6)?,
+        status,
+        triggered_by,
+        summary_json: payload.public_summary(),
         observation_count: i64_to_u64(row.get(7)?, 7)?,
         failed_observation_count: i64_to_u64(row.get(8)?, 8)?,
     })

@@ -4,6 +4,8 @@
 
 ### Added
 
+- Schema 21 adds bounded durable health evaluation run metadata keyed by input
+  watermark, policy version, and computation version.
 - A3 scheduler reliability completion inventory mapping every acceptance
   requirement to implementation, test, compatibility, and security evidence.
 - Scheduler lease heartbeats renew active claims every 30 seconds with a

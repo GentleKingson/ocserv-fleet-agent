@@ -155,6 +155,12 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         description: "Add the singleton scheduler maintenance window.",
         apply: apply_0020_scheduler_maintenance,
     },
+    Migration {
+        version: 21,
+        name: "0021_health_evaluation_runs",
+        description: "Add durable, versioned health evaluator run metadata.",
+        apply: apply_0021_health_evaluation_runs,
+    },
 ];
 
 pub(crate) fn migrate_to_current(
@@ -1411,6 +1417,36 @@ CREATE TABLE scheduler_maintenance (
   reason TEXT NOT NULL CHECK (length(reason) BETWEEN 1 AND 256),
   updated_at TEXT NOT NULL
 );
+"#,
+    )?;
+    Ok(())
+}
+
+fn apply_0021_health_evaluation_runs(tx: &Transaction<'_>) -> Result<(), StoreError> {
+    tx.execute_batch(
+        r#"
+CREATE TABLE health_evaluation_runs (
+  evaluation_id TEXT PRIMARY KEY CHECK (length(evaluation_id) BETWEEN 1 AND 96),
+  input_watermark TEXT NOT NULL CHECK (length(input_watermark) = 64),
+  policy_version TEXT NOT NULL CHECK (length(policy_version) = 64),
+  computation_version TEXT NOT NULL CHECK (length(computation_version) BETWEEN 1 AND 64),
+  started_at TEXT NOT NULL,
+  finished_at TEXT,
+  status TEXT NOT NULL CHECK (status IN ('running', 'completed', 'failed')),
+  snapshot_count INTEGER NOT NULL DEFAULT 0 CHECK (snapshot_count >= 0 AND snapshot_count <= 1000),
+  failure_code TEXT CHECK (failure_code IS NULL OR length(failure_code) BETWEEN 1 AND 64),
+  CHECK (
+    (status = 'running' AND finished_at IS NULL AND failure_code IS NULL AND snapshot_count = 0)
+    OR
+    (status = 'completed' AND finished_at IS NOT NULL AND failure_code IS NULL)
+    OR
+    (status = 'failed' AND finished_at IS NOT NULL AND failure_code IS NOT NULL AND snapshot_count = 0)
+  )
+);
+CREATE UNIQUE INDEX idx_health_evaluation_runs_input
+  ON health_evaluation_runs(input_watermark, policy_version, computation_version);
+CREATE INDEX idx_health_evaluation_runs_status_started
+  ON health_evaluation_runs(status, started_at, evaluation_id);
 "#,
     )?;
     Ok(())

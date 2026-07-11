@@ -243,6 +243,14 @@ The bounded misfire policy is published in pull request `#82`.
 The lease-heartbeat follow-up is published in pull request `#81`.
 Published for review in pull request `#80`.
 
+The first A4 slice advances SQLite to migration `0021` and adds bounded durable
+health evaluation run metadata. A unique input-watermark, policy-version, and
+computation-version tuple establishes the replay boundary without storing raw
+observations or expanding evaluator authority. Atomic snapshot completion,
+abandoned-run recovery, and the independent graceful evaluator loop remain
+active A4 work.
+Schema 21 evaluator-run persistence is published in pull request `#88`.
+
 ### Baseline And Production Foundation
 
 | ID | Issue | Status | Depends on | Release target | Acceptance and required evidence |

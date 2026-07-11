@@ -311,8 +311,8 @@ Rules:
   `health-snapshots`, and `alert-events`.
 - retention must not delete node registry rows, endpoint trust rows,
   enrollment rows, current scheduler configuration, or controller audit rows.
-- non-dry-run retention apply runs must write controller audit metadata about row counts,
-  scope, cutoff, and report checksum.
+- non-dry-run retention apply runs atomically write controller audit metadata
+  about operation ID, row counts, scope, cutoff, and report checksum.
 
 ## Current CLI And API Surface
 
@@ -425,7 +425,8 @@ ocfleet retention show
 ocfleet retention set observations --max-age 30d --max-rows 100000
 ocfleet retention explain --scope observations --json
 ocfleet retention apply --dry-run --scope observations --before 2026-07-01T00:00:00Z --json
-ocfleet retention apply --scope observations --batch-size 1000 --limit 10000
+ocfleet retention apply --scope observations --batch-size 1000 --limit 10000 \
+  --operation-id retention-<uuid>
 ```
 
 Retention commands modify retention policy and prune local SQLite history only.
@@ -435,7 +436,12 @@ rows or writing audit. `retention apply --dry-run` likewise performs no delete
 and writes no audit row. A non-dry-run `retention apply` reports
 `matched_count`, cutoff, policy row cap, oldest/newest candidate timestamps,
 deleted rows, batch count, and a SHA-256 report checksum. Actual deletes are
-split into bounded batches; controller audit rows are never deleted by retention.
+split into bounded batches inside one immediate transaction per scope, and that
+transaction also writes the audit. A failed audit rolls back every batch in the
+scope. Exact same-actor operation-ID replay returns the original report without
+another delete; divergent inputs fail closed. Multi-scope retries skip already
+committed scopes and continue from the first missing scope. Controller audit
+rows are never deleted by retention.
 
 ### Alerts
 
@@ -649,7 +655,8 @@ ocfleet retention show
 ocfleet retention set observations --max-age 30d --max-rows 100000
 ocfleet retention explain --scope observations --json
 ocfleet retention apply --dry-run --scope observations --json
-ocfleet retention apply --scope observations --batch-size 1000 --limit 10000
+ocfleet retention apply --scope observations --batch-size 1000 --limit 10000 \
+  --operation-id retention-<uuid>
 
 ocfleet alert list
 ocfleet alert list --json
@@ -679,6 +686,6 @@ Additional acceptance requirements:
 - retention policies prune only approved history tables.
 - controller audit records exist for job mutation, run start/outcome/completion,
   retention apply, alert lifecycle operations, and audit export. Scheduler job,
-  run, observation, RPC-audit, and job-clock transitions are audit-atomic at
-  their declared boundaries; the other listed mutation families are not
-  covered by that atomicity statement.
+  run, observation, RPC-audit, job-clock, and retention transitions are
+  audit-atomic at their declared boundaries; the other listed mutation families
+  are not covered by that atomicity statement.

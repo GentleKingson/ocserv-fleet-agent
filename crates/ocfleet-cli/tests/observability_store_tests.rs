@@ -1600,7 +1600,7 @@ fn observability_store_tests_sets_and_gets_retention_policy() {
             .is_none()
     );
     store
-        .set_retention_policy(&policy)
+        .set_retention_policy(&policy, "store-test")
         .expect("set retention policy");
 
     assert_eq!(

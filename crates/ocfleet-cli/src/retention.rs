@@ -5,10 +5,14 @@ use sha2::{Digest, Sha256};
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::args::{RetentionCommand, RetentionScope};
-use crate::audit::AuditEvent;
+use crate::backend::StoreWriter;
 use crate::duration_args::parse_duration_seconds;
 use crate::input_validation::local_actor;
-use crate::store::{RetentionCandidateReport, RetentionPolicyRecord, Store};
+use crate::store::{
+    MAX_RETENTION_APPLY_LIMIT, MAX_RETENTION_BATCH_SIZE, RetentionApplyInput,
+    RetentionCandidateReport, RetentionPolicyRecord, Store,
+};
+use uuid::Uuid;
 
 const RETENTION_SCOPES: &[&str] = &[
     "observations",
@@ -16,13 +20,11 @@ const RETENTION_SCOPES: &[&str] = &[
     "health-snapshots",
     "alert-events",
 ];
-const MAX_RETENTION_BATCH_SIZE: u64 = 1_000;
-const MAX_RETENTION_APPLY_LIMIT: u64 = 100_000;
-
 #[derive(Debug, Serialize)]
 struct RetentionApplyReport {
     generated_at: String,
     dry_run: bool,
+    operation_id: Option<String>,
     scopes: Vec<RetentionScopeReport>,
 }
 
@@ -62,6 +64,25 @@ struct RetentionScopeReport {
     report_checksum: String,
 }
 
+struct RetentionApplyOptions {
+    dry_run: bool,
+    operation_id: Option<String>,
+    scope: Option<RetentionScope>,
+    before: Option<String>,
+    limit: Option<u64>,
+    json_output: bool,
+    batch_size: u64,
+}
+
+struct RetentionScopeApply<'a> {
+    dry_run: bool,
+    operation_id: Option<&'a str>,
+    actor: &'a str,
+    explicit_cutoff: Option<&'a str>,
+    limit: Option<u64>,
+    batch_size: u64,
+}
+
 pub fn run_retention_command(store: &Store, command: RetentionCommand) -> anyhow::Result<()> {
     match command {
         RetentionCommand::Show => run_retention_show(store),
@@ -72,6 +93,7 @@ pub fn run_retention_command(store: &Store, command: RetentionCommand) -> anyhow
         } => run_retention_set(store, scope, max_age.as_deref(), max_rows),
         RetentionCommand::Apply {
             dry_run,
+            operation_id,
             scope,
             before,
             limit,
@@ -79,12 +101,15 @@ pub fn run_retention_command(store: &Store, command: RetentionCommand) -> anyhow
             batch_size,
         } => run_retention_apply(
             store,
-            dry_run,
-            scope,
-            before.as_deref(),
-            limit,
-            json,
-            batch_size,
+            RetentionApplyOptions {
+                dry_run,
+                operation_id,
+                scope,
+                before,
+                limit,
+                json_output: json,
+                batch_size,
+            },
         ),
         RetentionCommand::Explain { scope, json } => run_retention_explain(store, scope, json),
     }
@@ -111,6 +136,9 @@ fn run_retention_set(
     max_age: Option<&str>,
     max_rows: Option<usize>,
 ) -> anyhow::Result<()> {
+    if max_age.is_none() && max_rows.is_none() {
+        bail!("retention set requires --max-age or --max-rows");
+    }
     let scope_name = retention_scope_name(scope);
     let mut policy = effective_retention_policy(store, scope_name)?;
     if let Some(max_age) = max_age {
@@ -120,62 +148,58 @@ fn run_retention_set(
         if max_rows == 0 {
             bail!("--max-rows must be greater than zero");
         }
-        policy.max_rows = Some(max_rows as u64);
+        policy.max_rows = Some(u64::try_from(max_rows).context("--max-rows is too large")?);
     }
     policy.updated_at = now_rfc3339();
-    store.set_retention_policy(&policy)?;
-    let mut event = AuditEvent::new(local_actor(), "retention.set");
-    event.ok = Some(true);
-    event.detail_json = json!({
-        "scope": policy.scope.as_str(),
-        "max_age_days": policy.max_age_days,
-        "max_rows": policy.max_rows,
-    });
-    store.insert_audit(&event)?;
+    let policy = StoreWriter::write_retention_policy(store, &policy, &local_actor())?;
     println!("scope={}", policy.scope);
     println!("max_age_days={}", optional_u64(policy.max_age_days));
     println!("max_rows={}", optional_u64(policy.max_rows));
     Ok(())
 }
 
-fn run_retention_apply(
-    store: &Store,
-    dry_run: bool,
-    scope: Option<RetentionScope>,
-    before: Option<&str>,
-    limit: Option<u64>,
-    json_output: bool,
-    batch_size: u64,
-) -> anyhow::Result<()> {
-    validate_retention_apply_bounds(limit, batch_size)?;
-    let explicit_cutoff = match before {
+fn run_retention_apply(store: &Store, options: RetentionApplyOptions) -> anyhow::Result<()> {
+    validate_retention_apply_bounds(options.limit, options.batch_size)?;
+    let operation_id = if options.dry_run {
+        None
+    } else {
+        Some(
+            options
+                .operation_id
+                .unwrap_or_else(|| format!("retention-{}", Uuid::new_v4())),
+        )
+    };
+    let actor = local_actor();
+    let explicit_cutoff = match options.before.as_deref() {
         Some(before) => {
             parse_rfc3339(before)?;
             Some(before.to_string())
         }
         None => None,
     };
-    let scopes = selected_retention_scopes(scope);
+    let scopes = selected_retention_scopes(options.scope);
     let mut reports = Vec::new();
     for scope in scopes {
         let report = apply_retention_scope(
             store,
             scope,
-            dry_run,
-            explicit_cutoff.as_deref(),
-            limit,
-            batch_size,
+            &RetentionScopeApply {
+                dry_run: options.dry_run,
+                operation_id: operation_id.as_deref(),
+                actor: &actor,
+                explicit_cutoff: explicit_cutoff.as_deref(),
+                limit: options.limit,
+                batch_size: options.batch_size,
+            },
         )?;
-        if !dry_run {
-            write_retention_apply_audit(store, &report)?;
-        }
         reports.push(report);
     }
 
-    if json_output {
+    if options.json_output {
         let report = RetentionApplyReport {
             generated_at: now_rfc3339(),
-            dry_run,
+            dry_run: options.dry_run,
+            operation_id: operation_id.clone(),
             scopes: reports,
         };
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -196,8 +220,12 @@ fn run_retention_apply(
                 report.report_checksum,
             );
         }
+        if let Some(operation_id) = &operation_id {
+            println!("operation_id={operation_id}");
+        }
         println!(
-            "scope=controller_audit_log retention=never matched_count=0 deleted_count=0 rows_deleted=0 dry_run={dry_run}"
+            "scope=controller_audit_log retention=never matched_count=0 deleted_count=0 rows_deleted=0 dry_run={}",
+            options.dry_run
         );
     }
     Ok(())
@@ -254,71 +282,57 @@ fn run_retention_explain(
 fn apply_retention_scope(
     store: &Store,
     scope: &str,
-    dry_run: bool,
-    explicit_cutoff: Option<&str>,
-    limit: Option<u64>,
-    batch_size: u64,
+    apply: &RetentionScopeApply<'_>,
 ) -> anyhow::Result<RetentionScopeReport> {
     let policy = effective_retention_policy(store, scope)?;
-    let cutoff = explicit_cutoff
-        .map(ToOwned::to_owned)
-        .or(retention_cutoff(&policy)?);
-    let candidate_report =
-        store.retention_candidate_report(scope, cutoff.as_deref(), policy.max_rows)?;
-    let planned_delete_count = limit
-        .map(|limit| candidate_report.matched_count.min(limit))
-        .unwrap_or(candidate_report.matched_count);
-    let (rows_deleted, batch_count) = if dry_run || planned_delete_count == 0 {
-        (0, 0)
-    } else {
-        delete_retention_batches(
-            store,
-            scope,
-            cutoff.as_deref(),
-            policy.max_rows,
-            batch_size,
-            planned_delete_count,
-        )?
-    };
+    let requested_cutoff = apply.explicit_cutoff.map(ToOwned::to_owned);
+    let (cutoff, candidate_report, planned_delete_count, rows_deleted, batch_count) =
+        if apply.dry_run {
+            let cutoff = requested_cutoff.clone().or(retention_cutoff(&policy)?);
+            let candidate_report =
+                store.retention_candidate_report(scope, cutoff.as_deref(), policy.max_rows)?;
+            let planned_delete_count = apply
+                .limit
+                .map(|limit| candidate_report.matched_count.min(limit))
+                .unwrap_or(candidate_report.matched_count);
+            (cutoff, candidate_report, planned_delete_count, 0, 0)
+        } else {
+            let result = StoreWriter::write_retention_apply(
+                store,
+                &RetentionApplyInput {
+                    operation_id: apply
+                        .operation_id
+                        .expect("operation id exists for non-dry-run retention")
+                        .to_string(),
+                    scope: scope.to_string(),
+                    cutoff: requested_cutoff,
+                    max_age_days: policy.max_age_days,
+                    max_rows: policy.max_rows,
+                    limit: apply.limit,
+                    batch_size: apply.batch_size,
+                },
+                apply.actor,
+            )?;
+            (
+                result.cutoff,
+                result.candidate_report,
+                result.planned_delete_count,
+                result.rows_deleted,
+                result.batch_count,
+            )
+        };
     scope_report(
         scope,
-        dry_run,
+        apply.dry_run,
         cutoff,
         policy.max_rows,
         &candidate_report,
         planned_delete_count,
         rows_deleted,
         batch_count,
-        batch_size,
-        limit,
+        apply.batch_size,
+        apply.limit,
     )
-}
-
-fn delete_retention_batches(
-    store: &Store,
-    scope: &str,
-    cutoff: Option<&str>,
-    max_rows: Option<u64>,
-    batch_size: u64,
-    limit: u64,
-) -> anyhow::Result<(u64, u64)> {
-    let mut rows_deleted = 0_u64;
-    let mut batch_count = 0_u64;
-    while rows_deleted < limit {
-        let remaining = limit - rows_deleted;
-        let this_batch = remaining.min(batch_size);
-        let deleted = store.prune_retention_scope_batch(scope, cutoff, max_rows, this_batch)?;
-        if deleted == 0 {
-            break;
-        }
-        rows_deleted = rows_deleted
-            .checked_add(deleted)
-            .context("retention deleted row count overflow")?;
-        batch_count = batch_count
-            .checked_add(1)
-            .context("retention batch count overflow")?;
-    }
-    Ok((rows_deleted, batch_count))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -364,22 +378,6 @@ fn scope_report(
         newest_candidate: candidate_report.newest_timestamp.clone(),
         report_checksum,
     })
-}
-
-fn write_retention_apply_audit(store: &Store, report: &RetentionScopeReport) -> anyhow::Result<()> {
-    let mut event = AuditEvent::new(local_actor(), "retention.apply");
-    event.ok = Some(true);
-    event.detail_json = json!({
-        "dry_run": report.dry_run,
-        "scope": report.scope,
-        "cutoff": report.cutoff,
-        "matched_count": report.matched_count,
-        "deleted_count": report.rows_deleted,
-        "batch_count": report.batch_count,
-        "report_checksum": report.report_checksum,
-    });
-    store.insert_audit(&event)?;
-    Ok(())
 }
 
 fn validate_retention_apply_bounds(limit: Option<u64>, batch_size: u64) -> anyhow::Result<()> {

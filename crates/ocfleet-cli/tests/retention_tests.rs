@@ -1,11 +1,14 @@
 use ocfleet_cli::audit::AuditEvent;
+use ocfleet_cli::backend::StoreWriter;
 use ocfleet_cli::store::{
-    AlertEventRecord, HealthSnapshotRecord, ObservabilityRunInsert, ProbeObservationInsert, Store,
+    AlertEventRecord, HealthSnapshotRecord, ObservabilityRunInsert, ProbeObservationInsert,
+    RetentionApplyInput, Store, StoreError,
 };
 use rusqlite::Connection;
 use serde_json::{Value, json};
 use std::path::Path;
 use std::process::{Command, Output};
+use std::sync::{Arc, Barrier};
 
 fn run_ocfleet(args: &[&str]) -> Output {
     let output = Command::new(env!("CARGO_BIN_EXE_ocfleet"))
@@ -97,6 +100,32 @@ fn audit_count(database: &Path) -> i64 {
         .expect("count audit")
 }
 
+fn audit_event_count(database: &Path, event: &str) -> i64 {
+    Connection::open(database)
+        .expect("open db")
+        .query_row(
+            "SELECT count(*) FROM controller_audit_log WHERE event = ?1",
+            [event],
+            |row| row.get(0),
+        )
+        .expect("count audit event")
+}
+
+fn inject_audit_event_failure(database: &Path, event: &str) {
+    assert!(matches!(event, "retention.set" | "retention.apply"));
+    Connection::open(database)
+        .expect("open db")
+        .execute_batch(&format!(
+            "CREATE TRIGGER fail_retention_audit
+             BEFORE INSERT ON controller_audit_log
+             WHEN NEW.event = '{event}'
+             BEGIN
+               SELECT RAISE(FAIL, 'injected retention audit failure');
+             END;"
+        ))
+        .expect("install audit failure trigger");
+}
+
 fn observation_count(database: &Path) -> i64 {
     Connection::open(database)
         .expect("open db")
@@ -104,6 +133,19 @@ fn observation_count(database: &Path) -> i64 {
             row.get(0)
         })
         .expect("count observations")
+}
+
+fn table_count(database: &Path, table: &str) -> i64 {
+    assert!(matches!(
+        table,
+        "probe_observations" | "observability_runs" | "health_snapshots" | "alert_events"
+    ));
+    Connection::open(database)
+        .expect("open db")
+        .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+            row.get(0)
+        })
+        .expect("count table")
 }
 
 fn run_count(database: &Path) -> i64 {
@@ -195,9 +237,151 @@ fn retention_tests_set_writes_policy() {
 
     let (event, detail) = latest_audit(&database);
     assert_eq!(event, "retention.set");
-    assert_eq!(detail["scope"], "observations");
-    assert_eq!(detail["max_age_days"], 7);
-    assert_eq!(detail["max_rows"], 10);
+    assert_eq!(detail["target_id"], "observations");
+    assert_eq!(detail["after"]["max_age_days"], 7);
+    assert_eq!(detail["after"]["max_rows"], 10);
+
+    let audit_count = audit_event_count(&database, "retention.set");
+    run_ocfleet(&[
+        "--database",
+        &database_arg,
+        "retention",
+        "set",
+        "observations",
+        "--max-age",
+        "7d",
+        "--max-rows",
+        "10",
+    ]);
+    assert_eq!(audit_event_count(&database, "retention.set"), audit_count);
+}
+
+#[test]
+fn retention_tests_policy_and_apply_roll_back_when_audit_fails() {
+    let policy_dir = tempfile::tempdir().expect("temp dir");
+    let policy_database = policy_dir.path().join("controller.sqlite");
+    let policy_arg = policy_database.to_string_lossy().into_owned();
+    Store::open(&policy_database).expect("initialize policy database");
+    inject_audit_event_failure(&policy_database, "retention.set");
+    run_ocfleet_failure(&[
+        "--database",
+        &policy_arg,
+        "retention",
+        "set",
+        "observations",
+        "--max-age",
+        "7d",
+    ]);
+    assert!(
+        Store::open(&policy_database)
+            .expect("reopen policy store")
+            .get_retention_policy("observations")
+            .expect("query policy")
+            .is_none()
+    );
+
+    let apply_dir = tempfile::tempdir().expect("temp dir");
+    let apply_database = apply_dir.path().join("controller.sqlite");
+    let apply_arg = apply_database.to_string_lossy().into_owned();
+    let store = Store::open(&apply_database).expect("open apply store");
+    for index in 0..5 {
+        insert_observation(
+            &store,
+            &format!("obs-rollback-{index}"),
+            "2026-01-01T00:00:00Z",
+        );
+    }
+    drop(store);
+    inject_audit_event_failure(&apply_database, "retention.apply");
+    run_ocfleet_failure(&[
+        "--database",
+        &apply_arg,
+        "retention",
+        "apply",
+        "--scope",
+        "observations",
+        "--before",
+        "2026-06-01T00:00:00Z",
+        "--limit",
+        "5",
+        "--batch-size",
+        "2",
+        "--operation-id",
+        "retention-00000000-0000-4000-8000-000000000010",
+    ]);
+    assert_eq!(observation_count(&apply_database), 5);
+    assert_eq!(audit_event_count(&apply_database, "retention.apply"), 0);
+}
+
+#[test]
+fn retention_tests_multiscope_retry_resumes_after_audited_partial_progress() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let database_arg = database.to_string_lossy().into_owned();
+    let store = Store::open(&database).expect("open store");
+    insert_observation(&store, "obs-multiscope", "2026-01-01T00:00:00Z");
+    store
+        .insert_observability_run(&ObservabilityRunInsert {
+            run_id: "run-multiscope".to_string(),
+            job_id: None,
+            started_at: "2026-01-01T00:00:00Z".to_string(),
+            finished_at: Some("2026-01-01T00:00:00Z".to_string()),
+            status: "succeeded".to_string(),
+            triggered_by: "scheduler.run.once".to_string(),
+            summary_json: json!({"result_class": "scheduler_summary"}),
+        })
+        .expect("insert run");
+    insert_old_health_and_alert(&store);
+    drop(store);
+
+    Connection::open(&database)
+        .expect("open db")
+        .execute_batch(
+            "CREATE TRIGGER fail_health_retention_audit
+             BEFORE INSERT ON controller_audit_log
+             WHEN NEW.event = 'retention.apply'
+              AND json_extract(NEW.detail_json, '$.target_id') = 'health-snapshots'
+             BEGIN
+               SELECT RAISE(FAIL, 'injected scope audit failure');
+             END;",
+        )
+        .expect("install scope failure trigger");
+    let operation_id = "retention-00000000-0000-4000-8000-000000000011";
+    run_ocfleet_failure(&[
+        "--database",
+        &database_arg,
+        "retention",
+        "apply",
+        "--operation-id",
+        operation_id,
+    ]);
+    assert_eq!(table_count(&database, "probe_observations"), 0);
+    assert_eq!(table_count(&database, "observability_runs"), 0);
+    assert_eq!(table_count(&database, "health_snapshots"), 1);
+    assert_eq!(table_count(&database, "alert_events"), 1);
+    assert_eq!(audit_event_count(&database, "retention.apply"), 2);
+
+    Connection::open(&database)
+        .expect("open db")
+        .execute("DROP TRIGGER fail_health_retention_audit", [])
+        .expect("drop failure trigger");
+    run_ocfleet(&[
+        "--database",
+        &database_arg,
+        "retention",
+        "apply",
+        "--operation-id",
+        operation_id,
+    ]);
+    for table in [
+        "probe_observations",
+        "observability_runs",
+        "health_snapshots",
+        "alert_events",
+    ] {
+        assert_eq!(table_count(&database, table), 0);
+    }
+    assert_eq!(audit_event_count(&database, "retention.apply"), 4);
 }
 
 #[test]
@@ -330,12 +514,15 @@ fn retention_tests_explain_is_dry_run_and_does_not_delete_or_audit() {
     insert_observation(&store, "obs-old", "2026-01-01T00:00:00Z");
     insert_observation(&store, "obs-new", "2026-07-08T00:00:00Z");
     store
-        .set_retention_policy(&ocfleet_cli::store::RetentionPolicyRecord {
-            scope: "observations".to_string(),
-            max_age_days: None,
-            max_rows: Some(1),
-            updated_at: "2026-07-09T00:00:00Z".to_string(),
-        })
+        .set_retention_policy(
+            &ocfleet_cli::store::RetentionPolicyRecord {
+                scope: "observations".to_string(),
+                max_age_days: None,
+                max_rows: Some(1),
+                updated_at: "2026-07-09T00:00:00Z".to_string(),
+            },
+            "test-setup",
+        )
         .expect("set policy");
     drop(store);
     let audit_before = audit_count(&database);
@@ -386,6 +573,8 @@ fn retention_tests_apply_deletes_in_batches_and_audits_report() {
         "3",
         "--batch-size",
         "2",
+        "--operation-id",
+        "retention-00000000-0000-4000-8000-000000000020",
     ]);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("matched_count=5"));
@@ -401,7 +590,153 @@ fn retention_tests_apply_deletes_in_batches_and_audits_report() {
     assert_eq!(detail["matched_count"], 5);
     assert_eq!(detail["deleted_count"], 3);
     assert_eq!(detail["batch_count"], 2);
-    assert!(detail["report_checksum"].as_str().expect("checksum").len() >= 64);
+    let audit_checksum = detail["report_checksum"].as_str().expect("checksum");
+    assert!(audit_checksum.len() >= 64);
+    assert!(stdout.contains(audit_checksum));
+    assert_eq!(
+        Connection::open(&database)
+            .expect("open db")
+            .query_row(
+                "SELECT request_id FROM controller_audit_log WHERE event = 'retention.apply'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("retention operation id"),
+        "retention-00000000-0000-4000-8000-000000000020"
+    );
+
+    let audit_count = audit_event_count(&database, "retention.apply");
+    let replay = run_ocfleet(&[
+        "--database",
+        &database_arg,
+        "retention",
+        "apply",
+        "--scope",
+        "observations",
+        "--before",
+        "2026-06-01T00:00:00Z",
+        "--limit",
+        "3",
+        "--batch-size",
+        "2",
+        "--operation-id",
+        "retention-00000000-0000-4000-8000-000000000020",
+    ]);
+    assert!(String::from_utf8_lossy(&replay.stdout).contains("rows_deleted=3"));
+    assert_eq!(observation_count(&database), 2);
+    assert_eq!(audit_event_count(&database, "retention.apply"), audit_count);
+
+    let conflict = run_ocfleet_failure(&[
+        "--database",
+        &database_arg,
+        "retention",
+        "apply",
+        "--scope",
+        "observations",
+        "--before",
+        "2026-05-01T00:00:00Z",
+        "--limit",
+        "3",
+        "--batch-size",
+        "2",
+        "--operation-id",
+        "retention-00000000-0000-4000-8000-000000000020",
+    ]);
+    assert!(String::from_utf8_lossy(&conflict.stderr).contains("retention operation conflict"));
+    assert_eq!(observation_count(&database), 2);
+}
+
+#[test]
+fn retention_writer_rejects_invalid_bounds_and_actor_replay() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let store = Store::open(&database).expect("open store");
+    insert_observation(&store, "obs-writer", "2026-01-01T00:00:00Z");
+    let input = RetentionApplyInput {
+        operation_id: "retention-00000000-0000-4000-8000-000000000030".to_string(),
+        scope: "observations".to_string(),
+        cutoff: Some("2026-06-01T00:00:00Z".to_string()),
+        max_age_days: None,
+        max_rows: None,
+        limit: Some(1),
+        batch_size: 1,
+    };
+    let result = StoreWriter::write_retention_apply(&store, &input, "retention-user")
+        .expect("apply retention");
+    assert_eq!(result.rows_deleted, 1);
+    assert!(matches!(
+        StoreWriter::write_retention_apply(&store, &input, "different-actor"),
+        Err(StoreError::RetentionOperationConflict { .. })
+    ));
+
+    let mut invalid = input;
+    invalid.operation_id = "invalid-operation".to_string();
+    assert!(matches!(
+        StoreWriter::write_retention_apply(&store, &invalid, "retention-user"),
+        Err(StoreError::InvalidInput(_))
+    ));
+
+    insert_observation(&store, "obs-policy-replay", "2026-01-02T00:00:00Z");
+    let policy_derived = RetentionApplyInput {
+        operation_id: "retention-00000000-0000-4000-8000-000000000031".to_string(),
+        scope: "observations".to_string(),
+        cutoff: None,
+        max_age_days: Some(30),
+        max_rows: None,
+        limit: Some(1),
+        batch_size: 1,
+    };
+    let first = StoreWriter::write_retention_apply(&store, &policy_derived, "retention-user")
+        .expect("apply policy-derived retention");
+    let retry = StoreWriter::write_retention_apply(&store, &policy_derived, "retention-user")
+        .expect("replay policy-derived retention");
+    assert_eq!(retry, first);
+    assert!(first.cutoff.is_some());
+    assert_eq!(audit_event_count(&database, "retention.apply"), 2);
+}
+
+#[test]
+fn retention_writer_serializes_concurrent_exact_operation_ids() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let store = Store::open(&database).expect("open store");
+    for index in 0..3 {
+        insert_observation(
+            &store,
+            &format!("obs-concurrent-{index}"),
+            "2026-01-01T00:00:00Z",
+        );
+    }
+    drop(store);
+    let input = RetentionApplyInput {
+        operation_id: "retention-00000000-0000-4000-8000-000000000040".to_string(),
+        scope: "observations".to_string(),
+        cutoff: Some("2026-06-01T00:00:00Z".to_string()),
+        max_age_days: None,
+        max_rows: None,
+        limit: Some(2),
+        batch_size: 1,
+    };
+    let barrier = Arc::new(Barrier::new(2));
+    let mut handles = Vec::new();
+    for _ in 0..2 {
+        let database = database.clone();
+        let input = input.clone();
+        let barrier = Arc::clone(&barrier);
+        handles.push(std::thread::spawn(move || {
+            let store = Store::open(&database).expect("open racing store");
+            barrier.wait();
+            StoreWriter::write_retention_apply(&store, &input, "retention-user")
+        }));
+    }
+    let results = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("racing writer joins").expect("apply"))
+        .collect::<Vec<_>>();
+    assert_eq!(results[0], results[1]);
+    assert_eq!(results[0].rows_deleted, 2);
+    assert_eq!(observation_count(&database), 1);
+    assert_eq!(audit_event_count(&database, "retention.apply"), 1);
 }
 
 #[test]
@@ -412,12 +747,15 @@ fn retention_tests_apply_no_window_policy_is_noop_without_full_delete() {
     let store = Store::open(&database).expect("open store");
     insert_observation(&store, "obs-old", "2026-01-01T00:00:00Z");
     store
-        .set_retention_policy(&ocfleet_cli::store::RetentionPolicyRecord {
-            scope: "observations".to_string(),
-            max_age_days: None,
-            max_rows: None,
-            updated_at: "2026-07-09T00:00:00Z".to_string(),
-        })
+        .set_retention_policy(
+            &ocfleet_cli::store::RetentionPolicyRecord {
+                scope: "observations".to_string(),
+                max_age_days: None,
+                max_rows: None,
+                updated_at: "2026-07-09T00:00:00Z".to_string(),
+            },
+            "test-setup",
+        )
         .expect("set no-op policy");
     drop(store);
 

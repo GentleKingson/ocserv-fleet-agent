@@ -98,14 +98,21 @@ actor-bearing writer migration merged through pull request `#62`
 approval one atomic operator-owned node/request/trust/audit transition and adds
 a strict manual claim for legacy approved-unbound rows. It introduces no schema,
 protocol, API, agent-capability, or default read-only boundary change.
-Enrollment token lifecycle and request-decision transitions are active on branch
-`codex/a1-enrollment-transitions` in pull request `#63`. This slice routes token
+Enrollment token lifecycle and request-decision transitions merged through pull
+request `#63` (`f9f4f83378b8790ffea405b8d8a93f0ee0c4be64`). That slice routes token
 create/revoke and request submit/reject through actor-bearing immediate
 transactions, adds stable
 optional request IDs, serializes the final token use, closes terminal
 transitions, and keeps token/submitted-identity material out of audit and
 `Debug`. It changes no schema, protocol, API route, agent capability, or default
 read-only boundary.
+Retention policy/apply atomicity is active on branch
+`codex/a1-retention-writers` in pull request `#64`. The slice keeps
+dry-run/explain read-only, moves
+each non-dry-run scope deletion and its audit into one immediate transaction,
+and uses stable operation IDs for exact replay across multi-scope partial
+progress. It introduces no schema, protocol, API, agent-capability, or default
+read-only boundary change.
 
 ### Baseline And Production Foundation
 

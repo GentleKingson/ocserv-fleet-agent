@@ -2,11 +2,11 @@
   "baseline_commit": "b3c906a94823b4620dc1a2077a44e7160c0848b2",
   "current_phase": "A1",
   "completed_phases": [],
-  "active_branch": "codex/a1-enrollment-transitions",
+  "active_branch": "codex/a1-retention-writers",
   "active_issue": 33,
-  "active_pr": 63,
+  "active_pr": 64,
   "last_test_result": "passed",
-  "last_updated_at": "2026-07-11T00:35:48Z",
+  "last_updated_at": "2026-07-11T01:13:52Z",
   "blockers": [],
-  "next_action": "Monitor pull request #63 CI, fix any failures, merge when green, then continue the next A1 mutation family."
+  "next_action": "Monitor pull request #64 CI, fix any failures, merge when green, then continue A1 health/alert/delivery writers."
 }

@@ -459,6 +459,8 @@ pub enum RetentionCommand {
     Apply {
         #[arg(long)]
         dry_run: bool,
+        #[arg(long, conflicts_with = "dry_run")]
+        operation_id: Option<String>,
         #[arg(long, value_enum)]
         scope: Option<RetentionScope>,
         #[arg(long)]

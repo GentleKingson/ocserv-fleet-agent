@@ -131,6 +131,13 @@ secret-bearing `Debug` output.
 
 ## Audit And Observability
 
+Use `retention apply --operation-id retention-<uuid>` for a deletion that may
+need retry. All bounded batches for one fixed scope and their low-sensitive
+audit commit in one transaction; exact same-actor retries return the original
+report without deleting again. A changed scope, cutoff intent, policy bounds,
+limit, or batch size fails closed. `retention explain` and `apply --dry-run`
+remain query-only, and `controller_audit_log` is never a retention target.
+
 - Keep controller audit exports redacted by default.
 - Keep agent audit primary log and spool on monitored storage.
 - Treat `audit_dropped` or repeated audit write failures as operational incidents, because affected RPCs should fail closed when neither primary nor spool can record the event.

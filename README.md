@@ -15,10 +15,11 @@ production-complete.
 - Governance foundation work has started: actor identity, trust policy
   validation/diff, and optional signed audit export are implemented.
 - Production hardening is active: enrollment approval/legacy claim, node
-  lifecycle, enrollment token/request transitions, scheduler job configuration, and scheduler
-  run/outcome/observation/job-clock writes use actor-bearing `StoreWriter`
-  transactions for state and audit. Health/alert/delivery, retention, and other
-  legacy controller mutations are still being migrated.
+  lifecycle, enrollment token/request transitions, retention, scheduler job
+  configuration, and scheduler run/outcome/observation/job-clock writes use
+  actor-bearing `StoreWriter` transactions for state and audit.
+  Health/alert/delivery and other legacy controller mutations are still being
+  migrated.
 - Controller dispatch requires an enabled node and one Active trust row bound
   bidirectionally to that node. Active status by itself is not authorization;
   scheduler workers repeat the same binding check after concurrency waits.
@@ -458,6 +459,13 @@ target/debug/ocfleet alert hook list --json
 target/debug/ocfleet alert deliver --hook webhook:<hook-id> --limit 100 --dry-run
 target/debug/ocfleet retention show
 target/debug/ocfleet retention explain --scope observations --json
+target/debug/ocfleet retention apply \
+  --scope observations \
+  --before 2026-07-01T00:00:00Z \
+  --operation-id retention-<uuid> \
+  --limit 10000 \
+  --batch-size 1000 \
+  --json
 target/debug/ocfleet audit export \
   --from 2026-07-01T00:00:00Z \
   --to 2026-07-08T00:00:00Z \
@@ -480,6 +488,11 @@ finishes, and job clocks use actor-bound atomic writer boundaries. No database
 transaction remains open across an RPC or semaphore wait. Health, alerts,
 retention, and audit export use controller SQLite state and bounded
 low-sensitive summaries.
+Retention `explain` and `apply --dry-run` are query-only. Policy changes and
+non-dry-run applies use actor-bound transactions; every scope's bounded batches
+commit with its audit or roll back. Supply a stable `--operation-id` when an
+apply may be retried; exact replays return the original report without deleting
+again. The CLI generates and prints an operation ID when it is omitted.
 Before any manual or scheduled RPC, the controller requires the registry node to
 be enabled, to point to the requested EndpointID, and to have exactly one Active
 trust row pointing back to that node. Source and path-target bindings are checked
@@ -523,6 +536,8 @@ Networking must allow the controller to reach the agent through iroh using the r
   audit transaction decision.
 - `docs/adr/ADR-enrollment-transition-atomicity.md`: enrollment token/request
   transition, idempotency, and audit-provenance decision.
+- `docs/adr/ADR-retention-apply-atomicity.md`: retention transaction, bounded
+  batching, and durable replay decision.
 - `docs/trust-policy.md`: trust policy as code schema, validation, and diff behavior.
 - `docs/backend.md`: SQLite contract and optional Postgres backend plan.
 - `docs/archive-export.md`: long-term history archive and signed audit export guidance.

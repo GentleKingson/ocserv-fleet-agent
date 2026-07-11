@@ -3,8 +3,9 @@ use crate::store::{
     AlertEventRecord, ApprovalInput, AuditRecord, EndpointTrustRecord, EnrollmentTokenInsert,
     EnrollmentTokenRecord, HealthPolicyRecord, HealthSnapshotRecord, JoinRequestInsert,
     JoinRequestRecord, LegacyEnrollmentClaimInput, NodeInsert, NodeRecord, ObservabilityJobRecord,
-    ObservabilityRunRecord, ProbeObservationRecord, SchedulerOutcomeWrite, SchedulerRunFinish,
-    SchedulerRunStart, Store, StoreError,
+    ObservabilityRunRecord, ProbeObservationRecord, RetentionApplyInput, RetentionApplyResult,
+    RetentionPolicyRecord, SchedulerOutcomeWrite, SchedulerRunFinish, SchedulerRunStart, Store,
+    StoreError,
 };
 
 pub const MAX_STORE_READER_ROWS: u64 = 1_000;
@@ -77,6 +78,16 @@ pub trait StoreWriter {
         policy: &HealthPolicyRecord,
         actor: &str,
     ) -> Result<(), Self::Error>;
+    fn write_retention_policy(
+        &self,
+        policy: &RetentionPolicyRecord,
+        actor: &str,
+    ) -> Result<RetentionPolicyRecord, Self::Error>;
+    fn write_retention_apply(
+        &self,
+        input: &RetentionApplyInput,
+        actor: &str,
+    ) -> Result<RetentionApplyResult, Self::Error>;
     fn write_enrollment_token_create(
         &self,
         token: &EnrollmentTokenInsert,
@@ -298,6 +309,22 @@ impl StoreWriter for Store {
         actor: &str,
     ) -> Result<(), Self::Error> {
         Store::set_health_policy(self, policy, actor)
+    }
+
+    fn write_retention_policy(
+        &self,
+        policy: &RetentionPolicyRecord,
+        actor: &str,
+    ) -> Result<RetentionPolicyRecord, Self::Error> {
+        Store::set_retention_policy(self, policy, actor)
+    }
+
+    fn write_retention_apply(
+        &self,
+        input: &RetentionApplyInput,
+        actor: &str,
+    ) -> Result<RetentionApplyResult, Self::Error> {
+        Store::apply_retention(self, input, actor)
     }
 
     fn write_enrollment_token_create(

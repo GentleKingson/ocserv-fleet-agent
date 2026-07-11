@@ -79,9 +79,9 @@ scaffold, implemented slice, operational maturity, and release verification.
 
 ## Execution DAG
 
-The current execution node is **A3** on issue `#35`. A1 and A2 are
-operationally mature for the current production controller mutation and storage
-inventories. The node-lifecycle slice
+The current execution node is **A4** on issue `#36`. A1, A2, and A3 are
+operationally mature for the current production controller mutation, storage,
+and scheduler reliability inventories. The node-lifecycle slice
 merged through pull request `#57`, the scheduler-job configuration slice merged
 through pull request `#58`, and the endpoint-trust fail-closed slice merged
 through pull request `#59`. Atomic scheduler run, outcome, observation, audit,
@@ -232,8 +232,8 @@ per-tick budget. Schema `0020` adds an atomically audited global maintenance
 window that suppresses claims and RPC without advancing clocks. SIGINT/SIGTERM
 closes admission, drains the admitted job and claim, then supports restart with
 a fresh owner. Per-attempt timeouts produce typed audits and observations;
-deterministic bounded jitter spreads post-run clocks. The remaining A3
-acceptance matrix are still active work.
+deterministic bounded jitter spreads post-run clocks. The completed acceptance
+matrix is recorded in `docs/a3-scheduler-reliability-inventory.md`.
 Timeout and jitter enforcement are published in pull request `#86`.
 Graceful daemon drain and restart are published in pull request `#85`.
 The schema-v20 maintenance policy is published in pull request `#84`.
@@ -249,7 +249,7 @@ Published for review in pull request `#80`.
 | N0 Baseline and authoritative roadmap | n/a | operationally mature | none | `v0.2.x` | Baseline commit, versions, schemas, crates, binaries, features, workflows, test results, incomplete code, and documentation drift are recorded. This DAG and progress file exist and contain no secret or host-specific path. |
 | A1 Atomic controller mutation audit | `#33` | operationally mature | N0 | `v0.2.x` | Every production mutation uses an actor-bound transactional writer; injected audit failure and crash-boundary tests prove rollback; direct mutation SQL and mutator bypasses outside approved store/backend boundaries are prevented; API remains read-only. `docs/a1-mutation-inventory.md` enumerates every family and its evidence. |
 | A2 Typed versioned storage | `#34` | operationally mature | A1 | `v0.2.x` | New writes use closed, versioned payload types; legacy rows migrate or fail closed after private backup; contaminated fixtures cover oversize, unknown, secret-like, address, nesting, version, relationship, and method failures; CLI/API never expose raw persisted JSON. `docs/a2-storage-inventory.md` enumerates every requested family and its evidence. |
-| A3 Scheduler reliability | `#35` | implemented slice | A1, A2 | `v0.3.0` | SQLite lease, fencing, deterministic claim, bounded retry/backoff, misfire, jitter, timeout, recovery, maintenance, concurrency, budget, and shutdown semantics pass competing-instance, crash, skew, and duplicate-suppression tests. |
+| A3 Scheduler reliability | `#35` | operationally mature | A1, A2 | `v0.3.0` | SQLite lease, fencing, deterministic claim, bounded retry/backoff, misfire, jitter, timeout, recovery, maintenance, concurrency, budget, and shutdown semantics pass competing-instance, crash, skew, and duplicate-suppression tests. `docs/a3-scheduler-reliability-inventory.md` records the completion evidence. |
 | A4 Independent health evaluator | `#36` | implemented slice | A1, A2, A3 | `v0.3.0` | Idempotent evaluation runs record watermark, policy/computation versions, snapshots, and failures without agent RPC or trust/node/scheduler mutation; recovery and shutdown tests pass; dashboard freshness no longer depends on an interactive health command. |
 | A5 Safe alert delivery worker | `#37` | implemented slice | A1, A2, A3, A4 | `v0.3.0` | Fixed JSONL/HTTPS queues support claim, bounded retry, dead-letter, recovery, grouping, rate limit, idempotency, history, and shutdown. SSRF, HMAC, no-redirect, secret-redaction, and forbidden command/script/template tests pass. |
 | A6 Backup, restore, and disaster recovery | `#38` | implemented slice | A1, A2 | `v0.3.0` | Create/list/verify/inspect and plan/apply workflows use private artifacts, checksums and optional signatures; restore checks schema, integrity, controller identity and WAL/SHM, backs up before overwrite, replaces atomically, rolls back on failure, and passes a restore drill. |

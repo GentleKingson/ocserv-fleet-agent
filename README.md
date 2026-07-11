@@ -22,7 +22,8 @@ production-complete.
   webhook-hook creation also use compare-before or replay-safe atomic writers.
   Webhook attempts each commit with their audit, and successful delivery
   finalization atomically updates all `last_sent_at` values with its summary
-  audit. Other legacy mutations are still being migrated.
+  audit. The A1 production controller-mutation inventory is complete and
+  guarded; fixture-only raw helpers are unreachable from production dispatch.
 - Controller dispatch requires an enabled node and one Active trust row bound
   bidirectionally to that node. Active status by itself is not authorization;
   scheduler workers repeat the same binding check after concurrency waits.
@@ -537,6 +538,8 @@ Networking must allow the controller to reach the agent through iroh using the r
 - `docs/governance.md`: operator identity, RBAC roles, audit model, and trust policy workflow.
 - `docs/next-roadmap.md`: authoritative implementation DAG, milestone issues,
   dependencies, acceptance gates, and completion evidence.
+- `docs/a1-mutation-inventory.md`: A1 controller writer, failure-injection, and
+  static-enforcement completion inventory.
 - `docs/adr/ADR-atomic-audit-writes.md`: fail-closed controller mutation and
   audit transaction decision.
 - `docs/adr/ADR-enrollment-transition-atomicity.md`: enrollment token/request

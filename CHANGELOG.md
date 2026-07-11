@@ -145,11 +145,10 @@
 - The collector normalizes operator-supplied aggregate metadata; it does not
   discover live ocserv state or call administration/log/service tools.
 - SQLite is the only runtime backend; Postgres always returns unavailable.
-- Other remaining legacy controller
-  mutations have not yet all moved to atomic `StoreWriter` actor/audit
-  transactions. Health snapshots and alert candidate evaluation are migrated;
-  recovery of incomplete scheduler `running` rows remains A3
-  scheduler-reliability work.
+- The production controller mutation families in the A1 inventory use atomic
+  `StoreWriter` actor/audit transactions. Fixture-only raw helpers are guarded
+  from production call sites. Recovery of incomplete scheduler `running` rows
+  remains A3 scheduler-reliability work.
 - Legacy approved-unbound enrollment rows require an explicit exact `enroll
   claim`; there is intentionally no automatic discovery or repair.
 - Controlled writes are validation-only scaffolding and have no live code path.

@@ -112,8 +112,8 @@ overwritten. Alert silence/resolve use a compare-before transition writer, and
 webhook-hook creation commits configuration with redacted audit. Each webhook
 attempt commits history and audit together; finalization compare-checks the
 bounded alert set and commits all `last_sent_at` changes with its audit. External
-I/O never occurs inside SQLite transactions. Other legacy mutations are not all
-migrated to the writer trait. Future writer
+I/O never occurs inside SQLite transactions. Legacy raw mutation helpers are
+fixture-only and source-guarded from production use. Future writer
 interfaces must keep actor/audit input mandatory and must not loosen private
 file checks or redaction. The scheduler writer expansions change no schema,
 protocol, agent capability, or API route; neither does the binding/lifecycle

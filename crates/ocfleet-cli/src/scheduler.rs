@@ -60,6 +60,8 @@ const ALERT_EVALUATION_ERROR_MESSAGE: &str = "local alert evaluation failed";
 const SCHEDULER_LEASE_SECONDS: u64 = 120;
 const SCHEDULER_LEASE_RENEW_SECONDS: u64 = 30;
 const MAX_REPORTED_MISSED_INTERVALS: u64 = 10_000;
+const SCHEDULER_RPC_MAX_ATTEMPTS: usize = 3;
+const SCHEDULER_RPC_RETRY_BASE_MS: u64 = 100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StoredJobKind {
@@ -1661,14 +1663,15 @@ fn limit_tasks_by_rpc_budget(
     tasks: &mut Vec<ResolvedSchedulerTask>,
     rpc_budget_remaining: &mut usize,
 ) -> Vec<SchedulerTaskOutcome> {
-    if tasks.len() <= *rpc_budget_remaining {
-        *rpc_budget_remaining -= tasks.len();
+    let task_capacity = *rpc_budget_remaining / SCHEDULER_RPC_MAX_ATTEMPTS;
+    if tasks.len() <= task_capacity {
+        *rpc_budget_remaining -= tasks.len() * SCHEDULER_RPC_MAX_ATTEMPTS;
         return Vec::new();
     }
 
-    let skipped_tasks = tasks.len() - *rpc_budget_remaining;
-    tasks.truncate(*rpc_budget_remaining);
-    *rpc_budget_remaining = 0;
+    let skipped_tasks = tasks.len() - task_capacity;
+    tasks.truncate(task_capacity);
+    *rpc_budget_remaining -= task_capacity * SCHEDULER_RPC_MAX_ATTEMPTS;
     vec![budget_exceeded_outcome(
         job,
         actor,
@@ -1786,7 +1789,7 @@ where
                     return scheduler_task_runtime_failure(task, "SCHEDULER_GLOBAL_LIMIT_CLOSED");
                 }
             };
-            let outcome = executor.execute(task).await;
+            let outcome = execute_scheduler_task_with_retry(executor, task).await;
             drop(global_permit);
             drop(method_permit);
             drop(node_permit);
@@ -1807,6 +1810,45 @@ where
     }
     outcomes.sort_by(|left, right| left.sort_key().cmp(&right.sort_key()));
     outcomes
+}
+
+async fn execute_scheduler_task_with_retry<E>(
+    executor: E,
+    task: ResolvedSchedulerTask,
+) -> SchedulerTaskOutcome
+where
+    E: SchedulerTaskExecutor,
+{
+    let mut prior_audits = Vec::new();
+    for attempt in 1..=SCHEDULER_RPC_MAX_ATTEMPTS {
+        let mut outcome = executor.execute(task.clone()).await;
+        if !scheduler_task_outcome_is_retryable(&outcome) || attempt == SCHEDULER_RPC_MAX_ATTEMPTS {
+            prior_audits.append(&mut outcome.rpc_audits);
+            outcome.rpc_audits = prior_audits;
+            return outcome;
+        }
+        prior_audits.append(&mut outcome.rpc_audits);
+        let shift = u32::try_from(attempt - 1).unwrap_or(0);
+        let backoff_ms = SCHEDULER_RPC_RETRY_BASE_MS.saturating_mul(1_u64 << shift);
+        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+    }
+    unreachable!("bounded retry loop always returns")
+}
+
+fn scheduler_task_outcome_is_retryable(outcome: &SchedulerTaskOutcome) -> bool {
+    !outcome.observations.is_empty()
+        && outcome.observations.iter().all(|observation| {
+            !observation.ok
+                && observation.error_code.as_deref().is_some_and(|code| {
+                    matches!(
+                        code,
+                        "CONNECT_FAILED"
+                            | "RPC_TIMEOUT"
+                            | "SQLITE_BUSY_TIMEOUT"
+                            | "RESOURCE_EXHAUSTED"
+                    )
+                })
+        })
 }
 
 fn scheduler_task_runtime_failure(
@@ -3224,6 +3266,7 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::future::Future;
     use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration as StdDuration;
 
@@ -3242,6 +3285,55 @@ mod tests {
         peak_by_node: HashMap<String, usize>,
         active_by_method: HashMap<String, usize>,
         peak_by_method: HashMap<String, usize>,
+    }
+
+    #[derive(Clone)]
+    struct RetryExecutor {
+        attempts: Arc<AtomicUsize>,
+        succeed_on: Option<usize>,
+        error_code: &'static str,
+    }
+
+    impl SchedulerTaskExecutor for RetryExecutor {
+        fn execute(
+            &self,
+            task: ResolvedSchedulerTask,
+        ) -> Pin<Box<dyn Future<Output = SchedulerTaskOutcome> + Send>> {
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+            let succeed = self.succeed_on.is_some_and(|value| attempt >= value);
+            let error_code = self.error_code;
+            Box::pin(async move {
+                let audit = RpcAuditRecord {
+                    actor: "scheduler-retry-test".to_string(),
+                    node_id: task.node.node_id.clone(),
+                    endpoint_id: None,
+                    method: PROBE_CONTROLLER_PING.to_string(),
+                    request_id: Some(format!("attempt-{attempt}")),
+                    params_hash: "0".repeat(64),
+                    ok: succeed,
+                    error_code: (!succeed).then_some(ErrorCode::ConnectFailed),
+                    duration_ms: 0,
+                    detail_json: json!({"result_class": SCHEDULER_RESULT_CLASS}),
+                };
+                SchedulerTaskOutcome::from_observations(
+                    task,
+                    vec![SchedulerObservationOutcome {
+                        node_id: None,
+                        endpoint_id: None,
+                        method: PROBE_CONTROLLER_PING.to_string(),
+                        ok: succeed,
+                        error_code: (!succeed).then(|| error_code.to_string()),
+                        duration_ms: 0,
+                        result_class: SCHEDULER_RESULT_CLASS.to_string(),
+                        summary_json: json!({
+                            "result_class": SCHEDULER_RESULT_CLASS,
+                            "status": if succeed { "ok" } else { "failed" },
+                        }),
+                    }],
+                    vec![audit],
+                )
+            })
+        }
     }
 
     #[tokio::test]
@@ -3962,7 +4054,7 @@ mod tests {
         let mut tasks = (0..3)
             .map(|index| test_task("job-a", &format!("node-{index}"), PROBE_CONTROLLER_PING))
             .collect::<Vec<_>>();
-        let mut budget = 1;
+        let mut budget = SCHEDULER_RPC_MAX_ATTEMPTS;
 
         let outcomes = limit_tasks_by_rpc_budget(
             &job,
@@ -3981,6 +4073,60 @@ mod tests {
             Some("SCHEDULER_RPC_BUDGET_EXCEEDED")
         );
         assert_eq!(outcomes[0].observations[0].summary_json["skipped_tasks"], 2);
+    }
+
+    #[tokio::test]
+    async fn scheduler_executor_retries_only_transient_failures_with_a_hard_cap() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let eventual = RetryExecutor {
+            attempts: Arc::clone(&attempts),
+            succeed_on: Some(3),
+            error_code: "CONNECT_FAILED",
+        };
+        let outcome = execute_scheduler_task_with_retry(
+            eventual,
+            test_task("job-retry", "node-retry", PROBE_CONTROLLER_PING),
+        )
+        .await;
+        assert!(outcome.all_observations_ok());
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        assert_eq!(outcome.rpc_audits.len(), 3);
+        assert_eq!(
+            outcome.rpc_audits[0].request_id.as_deref(),
+            Some("attempt-1")
+        );
+        assert_eq!(
+            outcome.rpc_audits[2].request_id.as_deref(),
+            Some("attempt-3")
+        );
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let exhausted = RetryExecutor {
+            attempts: Arc::clone(&attempts),
+            succeed_on: None,
+            error_code: "RPC_TIMEOUT",
+        };
+        let outcome = execute_scheduler_task_with_retry(
+            exhausted,
+            test_task("job-retry", "node-retry", PROBE_CONTROLLER_PING),
+        )
+        .await;
+        assert!(!outcome.all_observations_ok());
+        assert_eq!(attempts.load(Ordering::SeqCst), SCHEDULER_RPC_MAX_ATTEMPTS);
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let permanent = RetryExecutor {
+            attempts: Arc::clone(&attempts),
+            succeed_on: None,
+            error_code: "ENDPOINT_TRUST_MISSING",
+        };
+        let outcome = execute_scheduler_task_with_retry(
+            permanent,
+            test_task("job-retry", "node-retry", PROBE_CONTROLLER_PING),
+        )
+        .await;
+        assert!(!outcome.all_observations_ok());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

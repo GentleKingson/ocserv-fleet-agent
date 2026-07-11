@@ -8,6 +8,8 @@
   two-minute expiry and fail closed when fencing is lost.
 - Scheduler misfires coalesce any overdue backlog into one audited execution
   with a bounded omitted-invocation count and no catch-up loop.
+- Transient read-only scheduler RPC failures receive at most three attempts
+  with bounded exponential backoff while permanent and partial failures do not.
 - OpenAPI 3.1.1 contract and drift tests for the 14-route `GET`-only API.
 - Read-only dashboard views for fleet health, nodes, jobs, runs, observations,
   alerts, and bounded audit previews.

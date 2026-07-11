@@ -172,7 +172,8 @@ trust bundles in a closed payload bound to relational endpoint ID, generation,
 and lifecycle status. Exact legacy empty bundles become empty allowlists;
 explicit controller/peer lists and path-probe pairs are bounded and unique.
 Migration, writers, and store readers reject unknown, future, malformed,
-duplicate, self-pair, or mismatched data without creating trust.
+duplicate, self-pair, or mismatched data without creating trust. The slice is
+published in pull request `#73`.
 
 ### Baseline And Production Foundation
 

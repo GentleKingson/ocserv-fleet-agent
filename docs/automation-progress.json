@@ -4,9 +4,9 @@
   "completed_phases": ["A1"],
   "active_branch": "codex/a2-trust-bundle-storage",
   "active_issue": 34,
-  "active_pr": null,
+  "active_pr": 73,
   "last_test_result": "passed",
-  "last_updated_at": "2026-07-11T10:05:31Z",
+  "last_updated_at": "2026-07-11T10:08:54Z",
   "blockers": [],
-  "next_action": "Publish and validate the schema-v13 trust bundle storage slice, then continue the remaining A2 dynamic JSON inventory on issue #34."
+  "next_action": "Monitor pull request #73 CI, merge the schema-v13 trust bundle storage slice when green, then continue the remaining A2 dynamic JSON inventory on issue #34."
 }

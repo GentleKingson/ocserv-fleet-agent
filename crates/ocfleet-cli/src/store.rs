@@ -28,13 +28,13 @@ use crate::input_validation::{
 use crate::migrations;
 use crate::private_file::{self, PrivateFileError};
 use crate::storage_payloads::{
-    AlertDetailPayloadV1, HealthDegradedMethodsPayloadV1, HealthSummaryPayloadV1,
-    ObservationSummaryPayloadV1, RunSummaryPayloadV1, SchedulerPairPayloadV1,
-    SchedulerSelectorPayloadV1, TrustBundlePayloadV1, validate_health_payload_relationship,
-    validate_scheduler_payload_relationship,
+    AlertDetailPayloadV1, AlertHostAllowPayloadV1, HealthDegradedMethodsPayloadV1,
+    HealthSummaryPayloadV1, ObservationSummaryPayloadV1, RunSummaryPayloadV1,
+    SchedulerPairPayloadV1, SchedulerSelectorPayloadV1, TrustBundlePayloadV1,
+    validate_health_payload_relationship, validate_scheduler_payload_relationship,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 14;
+pub const CURRENT_SCHEMA_VERSION: i64 = 15;
 pub const DEFAULT_HEALTH_STALE_WINDOW_SECONDS: u64 = 24 * 60 * 60;
 pub const DEFAULT_HEALTH_UNREACHABLE_FAILURES: u64 = 3;
 pub const DEFAULT_HEALTH_CERT_WARNING_DAYS: u64 = 30;
@@ -5472,15 +5472,32 @@ fn alert_webhook_hook_from_row(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<AlertWebhookHookRecord> {
     let host_allow_json: String = row.get(6)?;
-    let host_allow = parse_string_array_column(&host_allow_json, 6)?;
+    let host_allow_json = parse_json_column(&host_allow_json, 6)?;
+    let payload = AlertHostAllowPayloadV1::from_value(&host_allow_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            6,
+            Type::Text,
+            Box::new(io::Error::new(io::ErrorKind::InvalidData, error)),
+        )
+    })?;
+    let endpoint_host: String = row.get(5)?;
+    payload
+        .validate_relationship(&endpoint_host)
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                6,
+                Type::Text,
+                Box::new(io::Error::new(io::ErrorKind::InvalidData, error)),
+            )
+        })?;
     Ok(AlertWebhookHookRecord {
         hook_id: row.get(0)?,
         name: row.get(1)?,
         hook_type: row.get(2)?,
         endpoint_url: row.get(3)?,
         endpoint_url_redacted: row.get(4)?,
-        endpoint_host: row.get(5)?,
-        host_allow,
+        endpoint_host,
+        host_allow: payload.hosts,
         hmac_key_id: row.get(7)?,
         enabled: i64_to_bool(row.get(8)?, 8)?,
         max_attempts: i64_to_u64(row.get(9)?)?,
@@ -5545,6 +5562,16 @@ fn validate_alert_webhook_hook_record(hook: &AlertWebhookHookRecord) -> Result<(
     for host in &hook.host_allow {
         validate_safe_id("host_allow", host, 253)?;
     }
+    let payload =
+        AlertHostAllowPayloadV1::new(hook.host_allow.clone()).map_err(StoreError::InvalidInput)?;
+    if payload.hosts != hook.host_allow {
+        return Err(StoreError::InvalidInput(
+            "alert webhook host allowlist must be canonical".to_string(),
+        ));
+    }
+    payload
+        .validate_relationship(&hook.endpoint_host)
+        .map_err(StoreError::InvalidInput)?;
     validate_u64_range("max_attempts", hook.max_attempts, 1, 5)?;
     validate_u64_range("timeout_ms", hook.timeout_ms, 1_000, 5_000)?;
     validate_rfc3339(&hook.created_at, "alert hook created_at")?;
@@ -6565,6 +6592,8 @@ fn insert_alert_webhook_hook_tx(
     tx: &Transaction<'_>,
     hook: &AlertWebhookHookRecord,
 ) -> Result<(), StoreError> {
+    let host_allow =
+        AlertHostAllowPayloadV1::new(hook.host_allow.clone()).map_err(StoreError::InvalidInput)?;
     tx.execute(
         "INSERT INTO alert_hooks
          (hook_id, name, hook_type, endpoint_url, endpoint_url_redacted, endpoint_host, host_allow_json, hmac_key_id, enabled, max_attempts, timeout_ms, created_at, updated_at)
@@ -6576,12 +6605,7 @@ fn insert_alert_webhook_hook_tx(
             hook.endpoint_url.as_str(),
             hook.endpoint_url_redacted.as_str(),
             hook.endpoint_host.as_str(),
-            compact_json(&Value::Array(
-                hook.host_allow
-                    .iter()
-                    .map(|host| Value::String(host.clone()))
-                    .collect()
-            )),
+            compact_json(&host_allow.to_value()),
             hook.hmac_key_id.as_str(),
             bool_to_i64(hook.enabled),
             u64_to_i64(hook.max_attempts)?,
@@ -7027,35 +7051,6 @@ fn endpoint_trust_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Endpoint
 fn parse_json_column(value: &str, column: usize) -> rusqlite::Result<Value> {
     serde_json::from_str(value)
         .map_err(|err| rusqlite::Error::FromSqlConversionFailure(column, Type::Text, Box::new(err)))
-}
-
-fn parse_string_array_column(value: &str, column: usize) -> rusqlite::Result<Vec<String>> {
-    let value = parse_json_column(value, column)?;
-    let Some(values) = value.as_array() else {
-        return Err(rusqlite::Error::FromSqlConversionFailure(
-            column,
-            Type::Text,
-            Box::new(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "expected JSON array",
-            )),
-        ));
-    };
-    let mut output = Vec::with_capacity(values.len());
-    for value in values {
-        let Some(text) = value.as_str() else {
-            return Err(rusqlite::Error::FromSqlConversionFailure(
-                column,
-                Type::Text,
-                Box::new(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "expected JSON string array",
-                )),
-            ));
-        };
-        output.push(text.to_string());
-    }
-    Ok(output)
 }
 
 fn compact_json(value: &Value) -> String {

@@ -11,9 +11,9 @@ use time::{OffsetDateTime, macros::format_description};
 
 use crate::private_file::{self, PrivateFileError};
 use crate::storage_payloads::{
-    AlertDetailPayloadV1, HEALTH_SUMMARY_SCHEMA_V1, HealthDegradedMethodsPayloadV1,
-    HealthSummaryPayloadV1, ObservationSummaryPayloadV1, RunSummaryPayloadV1,
-    SchedulerPairPayloadV1, SchedulerSelectorPayloadV1, TrustBundlePayloadV1,
+    AlertDetailPayloadV1, AlertHostAllowPayloadV1, HEALTH_SUMMARY_SCHEMA_V1,
+    HealthDegradedMethodsPayloadV1, HealthSummaryPayloadV1, ObservationSummaryPayloadV1,
+    RunSummaryPayloadV1, SchedulerPairPayloadV1, SchedulerSelectorPayloadV1, TrustBundlePayloadV1,
     validate_health_payload_relationship, validate_scheduler_payload_relationship,
 };
 use crate::store::{CURRENT_SCHEMA_VERSION, StoreError};
@@ -116,6 +116,12 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         name: "0014_versioned_alert_details",
         description: "Migrate alert details to closed versioned v1 payloads.",
         apply: apply_0014_versioned_alert_details,
+    },
+    Migration {
+        version: 15,
+        name: "0015_versioned_alert_host_allowlists",
+        description: "Migrate alert host allowlists to closed versioned v1 payloads.",
+        apply: apply_0015_versioned_alert_host_allowlists,
     },
 ];
 
@@ -989,6 +995,38 @@ fn apply_0014_versioned_alert_details(tx: &Transaction<'_>) -> Result<(), StoreE
         tx.execute(
             "UPDATE alert_events SET detail_json = ?1 WHERE alert_id = ?2",
             (payload.to_value().to_string(), alert_id),
+        )?;
+    }
+    Ok(())
+}
+
+fn apply_0015_versioned_alert_host_allowlists(tx: &Transaction<'_>) -> Result<(), StoreError> {
+    let rows = {
+        let mut stmt = tx.prepare(
+            "SELECT hook_id, endpoint_host, host_allow_json FROM alert_hooks ORDER BY hook_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    for (hook_id, endpoint_host, host_allow_json) in rows {
+        let value: Value = serde_json::from_str(&host_allow_json).map_err(|_| {
+            StoreError::InvalidInput("legacy alert host allowlist JSON is invalid".to_string())
+        })?;
+        let payload = AlertHostAllowPayloadV1::from_value(&value)
+            .or_else(|_| AlertHostAllowPayloadV1::from_legacy(&value))
+            .map_err(StoreError::InvalidInput)?;
+        payload
+            .validate_relationship(&endpoint_host)
+            .map_err(StoreError::InvalidInput)?;
+        tx.execute(
+            "UPDATE alert_hooks SET host_allow_json = ?1 WHERE hook_id = ?2",
+            (payload.to_value().to_string(), hook_id),
         )?;
     }
     Ok(())

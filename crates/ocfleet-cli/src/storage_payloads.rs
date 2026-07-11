@@ -17,6 +17,7 @@ pub const OBSERVATION_SUMMARY_SCHEMA_V1: &str = "ocfleet.observation.summary.v1"
 pub const RUN_SUMMARY_SCHEMA_V1: &str = "ocfleet.run.summary.v1";
 pub const TRUST_BUNDLE_SCHEMA_V1: &str = "ocfleet.trust.bundle.v1";
 pub const ALERT_DETAIL_SCHEMA_V1: &str = "ocfleet.alert.detail.v1";
+pub const ALERT_HOST_ALLOW_SCHEMA_V1: &str = "ocfleet.alert.host-allow.v1";
 
 const HEALTH_DEGRADED_METHODS: [&str; 5] = [
     "ocserv.cert.expiry",
@@ -840,6 +841,62 @@ fn merge_alert_summary_field<T>(
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct AlertHostAllowPayloadV1 {
+    pub schema: String,
+    pub hosts: Vec<String>,
+}
+
+impl AlertHostAllowPayloadV1 {
+    pub fn new(hosts: Vec<String>) -> Result<Self, String> {
+        let normalized = crate::alert_webhook::normalize_host_allow(&hosts)
+            .map_err(|_| "alert host allowlist contains invalid hosts".to_string())?;
+        let payload = Self {
+            schema: ALERT_HOST_ALLOW_SCHEMA_V1.to_string(),
+            hosts: normalized,
+        };
+        payload.validate()?;
+        Ok(payload)
+    }
+
+    pub fn from_legacy(value: &Value) -> Result<Self, String> {
+        let hosts: Vec<String> = serde_json::from_value(value.clone())
+            .map_err(|_| "legacy alert host allowlist is not a string array".to_string())?;
+        Self::new(hosts)
+    }
+
+    pub fn from_value(value: &Value) -> Result<Self, String> {
+        let payload: Self = serde_json::from_value(value.clone())
+            .map_err(|_| "alert host allowlist payload is not closed v1 data".to_string())?;
+        payload.validate()?;
+        Ok(payload)
+    }
+
+    pub fn to_value(&self) -> Value {
+        serde_json::to_value(self).expect("alert host allowlist payload serializes")
+    }
+
+    pub fn validate_relationship(&self, endpoint_host: &str) -> Result<(), String> {
+        if !self.hosts.iter().any(|host| host == endpoint_host) {
+            return Err("alert endpoint host is absent from its allowlist".to_string());
+        }
+        Ok(())
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.schema != ALERT_HOST_ALLOW_SCHEMA_V1 {
+            return Err("alert host allowlist payload schema is unsupported".to_string());
+        }
+        let normalized = crate::alert_webhook::normalize_host_allow(&self.hosts)
+            .map_err(|_| "alert host allowlist contains invalid hosts".to_string())?;
+        if normalized != self.hosts {
+            return Err("alert host allowlist payload is not canonical".to_string());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ObservationSummaryPayloadV1 {
     pub schema: String,
     pub result_class: String,
@@ -1089,13 +1146,13 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ALERT_DETAIL_SCHEMA_V1, AlertDetailPayloadV1, HEALTH_DEGRADED_METHODS_SCHEMA_V1,
-        HEALTH_SUMMARY_SCHEMA_V1, HealthDegradedMethodsPayloadV1, HealthSummaryPayloadV1,
-        OBSERVATION_SUMMARY_SCHEMA_V1, ObservationSummaryPayloadV1, RUN_SUMMARY_SCHEMA_V1,
-        RunSummaryPayloadV1, SCHEDULER_PAIR_SCHEMA_V1, SCHEDULER_SELECTOR_SCHEMA_V1,
-        SchedulerPairPayloadV1, SchedulerSelectorPayloadV1, TRUST_BUNDLE_SCHEMA_V1,
-        TrustBundlePayloadV1, validate_health_payload_relationship,
-        validate_scheduler_payload_relationship,
+        ALERT_DETAIL_SCHEMA_V1, ALERT_HOST_ALLOW_SCHEMA_V1, AlertDetailPayloadV1,
+        AlertHostAllowPayloadV1, HEALTH_DEGRADED_METHODS_SCHEMA_V1, HEALTH_SUMMARY_SCHEMA_V1,
+        HealthDegradedMethodsPayloadV1, HealthSummaryPayloadV1, OBSERVATION_SUMMARY_SCHEMA_V1,
+        ObservationSummaryPayloadV1, RUN_SUMMARY_SCHEMA_V1, RunSummaryPayloadV1,
+        SCHEDULER_PAIR_SCHEMA_V1, SCHEDULER_SELECTOR_SCHEMA_V1, SchedulerPairPayloadV1,
+        SchedulerSelectorPayloadV1, TRUST_BUNDLE_SCHEMA_V1, TrustBundlePayloadV1,
+        validate_health_payload_relationship, validate_scheduler_payload_relationship,
     };
 
     #[test]
@@ -1454,5 +1511,36 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn alert_host_allow_payload_is_closed_versioned_and_canonical() {
+        let payload = AlertHostAllowPayloadV1::from_legacy(&json!([
+            "alerts.example.com.",
+            "93.184.216.34",
+            "ALERTS.EXAMPLE.COM"
+        ]))
+        .expect("valid legacy host allowlist");
+        assert_eq!(payload.schema, ALERT_HOST_ALLOW_SCHEMA_V1);
+        assert_eq!(payload.hosts, vec!["93.184.216.34", "alerts.example.com"]);
+        payload
+            .validate_relationship("alerts.example.com")
+            .expect("endpoint host is allowed");
+        assert_eq!(
+            AlertHostAllowPayloadV1::from_value(&payload.to_value()).expect("round trip"),
+            payload
+        );
+
+        let mut contaminated = payload.to_value();
+        contaminated["client_address"] = json!("10.0.0.2");
+        assert!(AlertHostAllowPayloadV1::from_value(&contaminated).is_err());
+        assert!(
+            AlertHostAllowPayloadV1::from_value(&json!({
+                "schema": ALERT_HOST_ALLOW_SCHEMA_V1,
+                "hosts": ["alerts.example.com", "93.184.216.34"]
+            }))
+            .is_err()
+        );
+        assert!(AlertHostAllowPayloadV1::from_legacy(&json!(["localhost"])).is_err());
     }
 }

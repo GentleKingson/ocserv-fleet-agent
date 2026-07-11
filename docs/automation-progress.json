@@ -2,11 +2,11 @@
   "baseline_commit": "b3c906a94823b4620dc1a2077a44e7160c0848b2",
   "current_phase": "A2",
   "completed_phases": ["A1"],
-  "active_branch": "codex/a2-alert-detail-storage",
+  "active_branch": "codex/a2-alert-hook-storage",
   "active_issue": 34,
-  "active_pr": 74,
+  "active_pr": null,
   "last_test_result": "passed",
-  "last_updated_at": "2026-07-11T11:21:12Z",
+  "last_updated_at": "2026-07-11T11:40:22Z",
   "blockers": [],
-  "next_action": "Monitor pull request #74 CI, merge the schema-v14 alert detail storage slice when green, then continue the remaining A2 dynamic JSON inventory on issue #34."
+  "next_action": "Validate and publish the schema-v15 alert webhook host-allow storage slice, then continue the remaining A2 dynamic JSON inventory on issue #34."
 }

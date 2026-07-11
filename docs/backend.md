@@ -86,6 +86,11 @@ trust bundles over relational endpoint, generation, and lifecycle state plus
 bounded explicit controller, peer, and path-pair allowlists. Store readers
 validate the envelope and expose only the established public bundle fields.
 
+The sixth A2 slice advances SQLite to schema version 14 and closes alert detail
+storage over fixed methods, bounded summary fields, and optional silence or
+resolution metadata. Writers canonicalize before persistence; CLI and API
+readers require the typed envelope and expose only its public projection.
+
 The first production-hardening slice added node add/enable/disable/remove to this
 contract and removed the CLI's post-commit success audits. Audit-trigger failure
 tests prove both `nodes` and `endpoint_trust` changes roll back. The second slice

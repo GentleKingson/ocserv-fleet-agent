@@ -1804,7 +1804,7 @@ fn alert_evaluation_writer_is_atomic_idempotent_and_actor_bound() {
             last_seen_at: "2026-07-11T01:00:00Z".to_string(),
             last_sent_at: None,
             resolved_at: None,
-            detail_json: json!({"methods": ["probe.controller.ping"]}),
+            detail_json: json!({"methods": ["probe.controller.ping"], "summary": {}}),
         },
         AlertEventRecord {
             alert_id: "alert-eval-b".to_string(),
@@ -1817,7 +1817,7 @@ fn alert_evaluation_writer_is_atomic_idempotent_and_actor_bound() {
             last_seen_at: "2026-07-11T01:00:00Z".to_string(),
             last_sent_at: None,
             resolved_at: None,
-            detail_json: json!({"methods": ["probe.controller.ping"]}),
+            detail_json: json!({"methods": ["probe.controller.ping"], "summary": {}}),
         },
     ];
     let write = AlertEvaluationWrite {
@@ -1876,7 +1876,7 @@ fn alert_evaluation_writer_rolls_back_every_row_when_audit_fails() {
                 last_seen_at: "2026-07-11T01:00:00Z".to_string(),
                 last_sent_at: None,
                 resolved_at: None,
-                detail_json: json!({"methods": []}),
+                detail_json: json!({"methods": [], "summary": {}}),
             },
         }],
     };
@@ -1900,7 +1900,7 @@ fn alert_evaluation_writer_rejects_stale_candidate_state() {
         last_seen_at: "2026-07-11T01:00:00Z".to_string(),
         last_sent_at: None,
         resolved_at: None,
-        detail_json: json!({"methods": []}),
+        detail_json: json!({"methods": [], "summary": {}}),
     };
     store.upsert_alert_event(&before).expect("seed alert");
     let mut after = before.clone();
@@ -1909,6 +1909,7 @@ fn alert_evaluation_writer_rejects_stale_candidate_state() {
     concurrently_silenced.state = "silenced".to_string();
     concurrently_silenced.detail_json = json!({
         "methods": [],
+        "summary": {},
         "silenced_until": "2026-07-11T02:00:00Z"
     });
     store
@@ -1953,14 +1954,15 @@ fn alert_state_transition_is_atomic_replay_safe_and_stale_rejecting() {
         last_seen_at: "2026-07-11T01:00:00Z".to_string(),
         last_sent_at: None,
         resolved_at: None,
-        detail_json: json!({"methods": []}),
+        detail_json: json!({"methods": [], "summary": {}}),
     };
     store.upsert_alert_event(&before).expect("seed alert");
     let mut after = before.clone();
     after.state = "resolved".to_string();
     after.last_seen_at = "2026-07-11T01:01:00Z".to_string();
     after.resolved_at = Some(after.last_seen_at.clone());
-    after.detail_json = json!({"methods": [], "resolve_reason": "operator confirmed"});
+    after.detail_json =
+        json!({"methods": [], "summary": {}, "resolve_reason": "operator confirmed"});
     let write = AlertStateTransition {
         operation_id: "alert-action-00000000-0000-4000-8000-000000000001".to_string(),
         event: "alert.resolve".to_string(),
@@ -1995,6 +1997,7 @@ fn alert_state_transition_is_atomic_replay_safe_and_stale_rejecting() {
     silence_after.state = "silenced".to_string();
     silence_after.detail_json = json!({
         "methods": [],
+        "summary": {},
         "silence_reason": "maintenance",
         "silenced_until": "2026-07-11T02:00:00Z"
     });
@@ -2090,7 +2093,7 @@ fn alert_delivery_attempt_and_finalize_writers_are_atomic_and_replay_safe() {
         last_seen_at: "2026-07-11T01:00:00Z".to_string(),
         last_sent_at: None,
         resolved_at: None,
-        detail_json: json!({"methods": []}),
+        detail_json: json!({"methods": [], "summary": {}}),
     };
     store.upsert_alert_event(&alert).expect("seed alert");
     let attempt = AlertDeliveryAttemptWrite {
@@ -2182,7 +2185,7 @@ fn observability_store_tests_upserts_and_lists_alert_event() {
         last_seen_at: "2026-07-08T07:00:00Z".to_string(),
         last_sent_at: None,
         resolved_at: None,
-        detail_json: json!({"days_remaining": 14}),
+        detail_json: json!({"methods": [], "summary": {"days_remaining": 14}}),
     };
     store
         .upsert_alert_event(&initial)
@@ -2192,7 +2195,7 @@ fn observability_store_tests_upserts_and_lists_alert_event() {
         state: "resolved".to_string(),
         last_seen_at: "2026-07-08T08:00:00Z".to_string(),
         resolved_at: Some("2026-07-08T08:00:00Z".to_string()),
-        detail_json: json!({"days_remaining": 30}),
+        detail_json: json!({"methods": [], "summary": {"days_remaining": 30}}),
         ..initial.clone()
     };
     store

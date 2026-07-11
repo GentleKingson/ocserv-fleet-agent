@@ -28,12 +28,13 @@ use crate::input_validation::{
 use crate::migrations;
 use crate::private_file::{self, PrivateFileError};
 use crate::storage_payloads::{
-    HealthDegradedMethodsPayloadV1, HealthSummaryPayloadV1, ObservationSummaryPayloadV1,
-    RunSummaryPayloadV1, SchedulerPairPayloadV1, SchedulerSelectorPayloadV1, TrustBundlePayloadV1,
-    validate_health_payload_relationship, validate_scheduler_payload_relationship,
+    AlertDetailPayloadV1, HealthDegradedMethodsPayloadV1, HealthSummaryPayloadV1,
+    ObservationSummaryPayloadV1, RunSummaryPayloadV1, SchedulerPairPayloadV1,
+    SchedulerSelectorPayloadV1, TrustBundlePayloadV1, validate_health_payload_relationship,
+    validate_scheduler_payload_relationship,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 13;
+pub const CURRENT_SCHEMA_VERSION: i64 = 14;
 pub const DEFAULT_HEALTH_STALE_WINDOW_SECONDS: u64 = 24 * 60 * 60;
 pub const DEFAULT_HEALTH_UNREACHABLE_FAILURES: u64 = 3;
 pub const DEFAULT_HEALTH_CERT_WARNING_DAYS: u64 = 30;
@@ -1632,7 +1633,9 @@ impl Store {
         }
         for entry in &write.entries {
             let current = get_alert_event_tx(&tx, &entry.after.dedupe_key)?;
-            if current != entry.before {
+            if normalize_optional_alert(current.as_ref())?
+                != normalize_optional_alert(entry.before.as_ref())?
+            {
                 return Err(StoreError::AlertEvaluationConflict {
                     evaluation_id: write.evaluation_id.clone(),
                     detail: "alert state changed after candidate evaluation",
@@ -1680,7 +1683,9 @@ impl Store {
             return Ok(());
         }
         let current = get_alert_event_tx(&tx, &write.before.dedupe_key)?;
-        if current.as_ref() != Some(&write.before) {
+        if normalize_optional_alert(current.as_ref())?
+            != normalize_optional_alert(Some(&write.before))?
+        {
             return Err(StoreError::AlertMutationConflict {
                 operation_id: write.operation_id.clone(),
                 detail: "alert state changed before operator transition",
@@ -1884,7 +1889,9 @@ impl Store {
         for entry in &write.entries {
             let current =
                 get_alert_event_tx(&tx, &entry.before.as_ref().expect("validated").dedupe_key)?;
-            if current != entry.before {
+            if normalize_optional_alert(current.as_ref())?
+                != normalize_optional_alert(entry.before.as_ref())?
+            {
                 return Err(StoreError::AlertMutationConflict {
                     operation_id: write.delivery_id.clone(),
                     detail: "alert state changed before delivery finalization",
@@ -5438,6 +5445,14 @@ fn health_snapshot_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HealthS
 
 fn alert_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AlertEventRecord> {
     let detail_json: String = row.get(10)?;
+    let detail_json = parse_json_column(&detail_json, 10)?;
+    let payload = AlertDetailPayloadV1::from_value(&detail_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            10,
+            Type::Text,
+            Box::new(io::Error::new(io::ErrorKind::InvalidData, error)),
+        )
+    })?;
     Ok(AlertEventRecord {
         alert_id: row.get(0)?,
         dedupe_key: row.get(1)?,
@@ -5449,7 +5464,7 @@ fn alert_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AlertEventR
         last_seen_at: row.get(7)?,
         last_sent_at: row.get(8)?,
         resolved_at: row.get(9)?,
-        detail_json: parse_json_column(&detail_json, 10)?,
+        detail_json: payload.public_detail(),
     })
 }
 
@@ -6259,6 +6274,7 @@ fn validate_alert_event_record(alert: &AlertEventRecord) -> Result<(), StoreErro
         }
     }
     validate_low_sensitive_json(&alert.detail_json, "alert detail")?;
+    canonical_alert_detail(&alert.detail_json)?;
     Ok(())
 }
 
@@ -6332,6 +6348,7 @@ fn alert_evaluation_replay_tx(
 }
 
 fn upsert_alert_event_tx(tx: &Transaction<'_>, alert: &AlertEventRecord) -> Result<(), StoreError> {
+    let detail_json = canonical_alert_detail(&alert.detail_json)?;
     tx.execute(
         "INSERT INTO alert_events
          (alert_id, dedupe_key, node_id, severity, state, reason_code, first_seen_at, last_seen_at, last_sent_at, resolved_at, detail_json)
@@ -6358,10 +6375,32 @@ fn upsert_alert_event_tx(tx: &Transaction<'_>, alert: &AlertEventRecord) -> Resu
             alert.last_seen_at.as_str(),
             alert.last_sent_at.as_deref(),
             alert.resolved_at.as_deref(),
-            compact_json(&alert.detail_json),
+            compact_json(&detail_json),
         ],
     )?;
     Ok(())
+}
+
+fn canonical_alert_detail(value: &Value) -> Result<Value, StoreError> {
+    let payload = AlertDetailPayloadV1::from_value(value)
+        .or_else(|_| AlertDetailPayloadV1::from_legacy(value))
+        .map_err(StoreError::InvalidInput)?;
+    Ok(payload.to_value())
+}
+
+fn normalize_optional_alert(
+    alert: Option<&AlertEventRecord>,
+) -> Result<Option<AlertEventRecord>, StoreError> {
+    alert
+        .map(|alert| {
+            let mut normalized = alert.clone();
+            let payload = AlertDetailPayloadV1::from_value(&alert.detail_json)
+                .or_else(|_| AlertDetailPayloadV1::from_legacy(&alert.detail_json))
+                .map_err(StoreError::InvalidInput)?;
+            normalized.detail_json = payload.public_detail();
+            Ok(normalized)
+        })
+        .transpose()
 }
 
 fn get_alert_event_tx(

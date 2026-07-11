@@ -310,6 +310,23 @@ async fn runs_route_fails_closed_for_contaminated_versioned_summary() {
 }
 
 #[tokio::test]
+async fn alerts_route_fails_closed_for_contaminated_versioned_detail() {
+    let fixture = Fixture::new();
+    Connection::open(&fixture.database)
+        .expect("open fixture")
+        .execute(
+            "UPDATE alert_events SET detail_json = ?1 WHERE alert_id = 'alert-a'",
+            [r#"{"schema":"ocfleet.alert.detail.v1","methods":["probe.controller.ping"],"summary":{"status":"unreachable","client_address":"10.0.0.2"},"silenced_until":null,"silence_reason":null,"resolve_reason":null}"#],
+        )
+        .expect("contaminate alert detail");
+
+    let (status, _, body) =
+        raw_request(fixture.router(None), Method::GET, "/alerts?limit=10", None).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(!body.contains("10.0.0.2"));
+}
+
+#[tokio::test]
 async fn forbidden_methods_do_not_write() {
     let fixture = Fixture::new();
     let before = table_counts(&fixture.database);
@@ -1108,22 +1125,9 @@ fn seed_database(path: &Path) {
     store.insert_audit(&event).expect("insert audit");
     drop(store);
 
-    // Model an externally polluted database so API fail-closed projection is
-    // tested independently from the controller's write-time validation.
+    // Model externally polluted audit data so projection is tested independently
+    // from the controller's write-time validation.
     let conn = Connection::open(path).expect("open db for pollution fixture");
-    conn.execute(
-        "UPDATE alert_events SET detail_json = ?1 WHERE alert_id = 'alert-a'",
-        [json!({
-            "methods": ["probe.controller.ping"],
-            "summary": {
-                "status": "unreachable",
-                "username": "alice",
-                "last_error_code": "ENDPOINT_NOT_ALLOWED"
-            }
-        })
-        .to_string()],
-    )
-    .expect("pollute alert detail");
     conn.execute(
         "UPDATE controller_audit_log SET detail_json = ?1 WHERE event = 'test.event'",
         [json!({

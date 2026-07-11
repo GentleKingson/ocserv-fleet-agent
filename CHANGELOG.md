@@ -41,6 +41,10 @@
   bound to relational endpoint identity, generation, and lifecycle status.
   Allowlists and explicit path pairs are bounded and unique; contaminated or
   mismatched rows fail closed without creating trust.
+- SQLite schema version 14 stores alert details in a closed payload with fixed
+  methods, bounded low-sensitive summary fields, and typed transition metadata.
+  Migration canonicalizes exact legacy rows; writers and CLI/API readers reject
+  unknown, contaminated, malformed, or future-version data.
 - Node add, enable, disable, and remove now take an explicit resolved actor and
   commit their registry/trust change and success audit in one SQLite
   transaction through `StoreWriter`.

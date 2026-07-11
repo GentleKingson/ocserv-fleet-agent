@@ -175,6 +175,13 @@ Migration, writers, and store readers reject unknown, future, malformed,
 duplicate, self-pair, or mismatched data without creating trust. The slice is
 published in pull request `#73`.
 
+The sixth A2 slice advances SQLite to migration `0014` and stores alert details
+in a closed payload containing fixed methods, bounded low-sensitive summary
+fields, and typed silence or resolution metadata. Exact legacy rows migrate;
+writers and CLI/API readers reject unknown, nested, sensitive, malformed,
+future-version, or relationally unsafe data. Current-schema contamination fails
+closed without delivery or output. The slice is published in pull request `#74`.
+
 ### Baseline And Production Foundation
 
 | ID | Issue | Status | Depends on | Release target | Acceptance and required evidence |

@@ -628,6 +628,50 @@ fn migration_tests_trust_bundle_v1_migrates_or_fails_closed() {
     assert_eq!(backup_files(bad_dir.path()).len(), 1);
 }
 
+#[test]
+fn migration_tests_alert_detail_v1_migrates_or_fails_closed() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("controller.sqlite");
+    create_legacy_fixture(&db, 13, 1);
+    let conn = Connection::open(&db).expect("open v13 db");
+    conn.execute(
+        "UPDATE alert_events SET detail_json = ?1 WHERE alert_id = 'alert-0000'",
+        [r#"{"methods":["ocserv.cert.expiry"],"days_remaining":12,"status":"warning"}"#],
+    )
+    .expect("seed legacy alert detail");
+    drop(conn);
+    let store = Store::open(&db).expect("migrate v13 alert detail");
+    drop(store);
+    let conn = Connection::open(&db).expect("open migrated db");
+    let detail: String = conn
+        .query_row(
+            "SELECT detail_json FROM alert_events WHERE alert_id = 'alert-0000'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read migrated alert detail");
+    let detail: serde_json::Value = serde_json::from_str(&detail).expect("detail json");
+    assert_eq!(detail["schema"], "ocfleet.alert.detail.v1");
+    assert_eq!(detail["methods"], serde_json::json!(["ocserv.cert.expiry"]));
+    assert_eq!(detail["summary"]["days_remaining"], 12);
+    assert_eq!(detail["summary"]["status"], "warning");
+    drop(conn);
+
+    let bad_dir = tempfile::tempdir().expect("bad temp dir");
+    let bad_db = bad_dir.path().join("controller.sqlite");
+    create_legacy_fixture(&bad_db, 13, 1);
+    let conn = Connection::open(&bad_db).expect("open contaminated v13 db");
+    conn.execute(
+        "UPDATE alert_events SET detail_json = ?1",
+        [r#"{"methods":[],"summary":{},"client_address":"10.0.0.2"}"#],
+    )
+    .expect("contaminate alert detail");
+    drop(conn);
+    make_private_database_file(&bad_db);
+    assert!(Store::open(&bad_db).is_err());
+    assert_eq!(backup_files(bad_dir.path()).len(), 1);
+}
+
 fn create_legacy_fixture(path: &Path, version: i64, rows: usize) {
     assert!((1..=CURRENT_SCHEMA_VERSION).contains(&version));
     let conn = Connection::open(path).expect("create fixture db");
@@ -799,15 +843,21 @@ fn insert_observability_rows(
         ),
     )
     .expect("insert health snapshot");
+    let alert_detail_json = if version >= 14 {
+        r#"{"schema":"ocfleet.alert.detail.v1","methods":[],"summary":{},"silenced_until":null,"silence_reason":null,"resolve_reason":null}"#
+    } else {
+        "{}"
+    };
     conn.execute(
         "INSERT INTO alert_events
          (alert_id, dedupe_key, node_id, severity, state, reason_code, first_seen_at, last_seen_at, last_sent_at, resolved_at, detail_json)
-         VALUES (?1, ?2, ?3, 'warning', 'open', 'NODE_STALE', ?4, ?4, NULL, NULL, '{}')",
+         VALUES (?1, ?2, ?3, 'warning', 'open', 'NODE_STALE', ?4, ?4, NULL, NULL, ?5)",
         (
             format!("alert-{idx:04}"),
             format!("alert:{idx:04}"),
             node_id,
             NOW,
+            alert_detail_json,
         ),
     )
     .expect("insert alert event");

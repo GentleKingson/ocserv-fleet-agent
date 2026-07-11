@@ -315,6 +315,12 @@ remain bounded and unique. Unknown fields, unsupported versions, malformed or
 duplicate entries, self-pairs, and relational mismatches stop the upgrade and
 leave the version-12 database unchanged beside its private backup.
 
+Schema version 14 canonicalizes alert details into closed payloads with fixed
+methods, bounded low-sensitive summary fields, and typed silence or resolution
+metadata. Unknown or nested fields, unsupported methods or versions, invalid
+bounds, malformed deadlines, and sensitive or address content stop the upgrade
+and leave the version-13 database unchanged beside its private backup.
+
 Before upgrades, keep an operator-managed backup as well:
 
 ```bash

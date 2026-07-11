@@ -1,8 +1,13 @@
 use ocfleet_config::validation::{validate_node_id, validate_region, validate_role};
+use ocfleet_protocol::method::{
+    OCSERV_CERT_EXPIRY, OCSERV_CONFIG_FINGERPRINT, OCSERV_SERVICE_SUMMARY, OCSERV_SESSIONS_SUMMARY,
+    OCSERV_VERSION, PROBE_CONTROLLER_PING, PROBE_PATH_ECHO,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
-use crate::input_validation::validate_description;
+use crate::input_validation::{validate_description, validate_reason};
 
 pub const SCHEDULER_SELECTOR_SCHEMA_V1: &str = "ocfleet.scheduler.selector.v1";
 pub const SCHEDULER_PAIR_SCHEMA_V1: &str = "ocfleet.scheduler.pair.v1";
@@ -11,6 +16,7 @@ pub const HEALTH_SUMMARY_SCHEMA_V1: &str = "ocfleet.health.summary.v1";
 pub const OBSERVATION_SUMMARY_SCHEMA_V1: &str = "ocfleet.observation.summary.v1";
 pub const RUN_SUMMARY_SCHEMA_V1: &str = "ocfleet.run.summary.v1";
 pub const TRUST_BUNDLE_SCHEMA_V1: &str = "ocfleet.trust.bundle.v1";
+pub const ALERT_DETAIL_SCHEMA_V1: &str = "ocfleet.alert.detail.v1";
 
 const HEALTH_DEGRADED_METHODS: [&str; 5] = [
     "ocserv.cert.expiry",
@@ -575,6 +581,265 @@ fn validate_trust_id_list(values: &[String], field: &str) -> Result<(), String> 
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct AlertDetailPayloadV1 {
+    pub schema: String,
+    pub methods: Vec<String>,
+    pub summary: AlertSummaryFieldsV1,
+    pub silenced_until: Option<String>,
+    pub silence_reason: Option<String>,
+    pub resolve_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AlertSummaryFieldsV1 {
+    pub freshness_seconds: Option<u64>,
+    pub consecutive_failures: Option<u64>,
+    pub days_remaining: Option<i64>,
+    pub endpoint_id: Option<String>,
+    pub status: Option<String>,
+    pub last_error_code: Option<String>,
+    pub endpoint_status: Option<String>,
+    pub result_class: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct LegacyAlertDetailV1 {
+    methods: Vec<String>,
+    summary: Option<AlertSummaryFieldsV1>,
+    silenced_until: Option<String>,
+    silence_reason: Option<String>,
+    resolve_reason: Option<String>,
+    freshness_seconds: Option<u64>,
+    consecutive_failures: Option<u64>,
+    days_remaining: Option<i64>,
+    endpoint_id: Option<String>,
+    status: Option<String>,
+    last_error_code: Option<String>,
+    endpoint_status: Option<String>,
+    result_class: Option<String>,
+}
+
+impl AlertDetailPayloadV1 {
+    pub fn new(
+        methods: Vec<String>,
+        summary: AlertSummaryFieldsV1,
+        silenced_until: Option<String>,
+        silence_reason: Option<String>,
+        resolve_reason: Option<String>,
+    ) -> Result<Self, String> {
+        let payload = Self {
+            schema: ALERT_DETAIL_SCHEMA_V1.to_string(),
+            methods,
+            summary,
+            silenced_until,
+            silence_reason,
+            resolve_reason,
+        };
+        payload.validate()?;
+        Ok(payload)
+    }
+
+    pub fn from_legacy(value: &Value) -> Result<Self, String> {
+        let legacy: LegacyAlertDetailV1 = serde_json::from_value(value.clone())
+            .map_err(|_| "alert detail contains unsupported fields or values".to_string())?;
+        let mut summary = legacy.summary.unwrap_or_default();
+        merge_alert_summary_field(
+            &mut summary.freshness_seconds,
+            legacy.freshness_seconds,
+            "freshness_seconds",
+        )?;
+        merge_alert_summary_field(
+            &mut summary.consecutive_failures,
+            legacy.consecutive_failures,
+            "consecutive_failures",
+        )?;
+        merge_alert_summary_field(
+            &mut summary.days_remaining,
+            legacy.days_remaining,
+            "days_remaining",
+        )?;
+        merge_alert_summary_field(&mut summary.endpoint_id, legacy.endpoint_id, "endpoint_id")?;
+        merge_alert_summary_field(&mut summary.status, legacy.status, "status")?;
+        merge_alert_summary_field(
+            &mut summary.last_error_code,
+            legacy.last_error_code,
+            "last_error_code",
+        )?;
+        merge_alert_summary_field(
+            &mut summary.endpoint_status,
+            legacy.endpoint_status,
+            "endpoint_status",
+        )?;
+        merge_alert_summary_field(
+            &mut summary.result_class,
+            legacy.result_class,
+            "result_class",
+        )?;
+        Self::new(
+            legacy.methods,
+            summary,
+            legacy.silenced_until,
+            legacy.silence_reason,
+            legacy.resolve_reason,
+        )
+    }
+
+    pub fn from_value(value: &Value) -> Result<Self, String> {
+        let payload: Self = serde_json::from_value(value.clone())
+            .map_err(|_| "alert detail payload is not closed v1 data".to_string())?;
+        payload.validate()?;
+        Ok(payload)
+    }
+
+    pub fn to_value(&self) -> Value {
+        serde_json::to_value(self).expect("alert detail payload serializes")
+    }
+
+    pub fn public_detail(&self) -> Value {
+        let mut summary = serde_json::to_value(&self.summary).expect("alert summary serializes");
+        summary
+            .as_object_mut()
+            .expect("alert summary is an object")
+            .retain(|_, value| !value.is_null());
+        let mut detail = serde_json::json!({
+            "methods": self.methods,
+            "summary": summary,
+            "silenced_until": self.silenced_until,
+            "silence_reason": self.silence_reason,
+            "resolve_reason": self.resolve_reason,
+        });
+        detail
+            .as_object_mut()
+            .expect("alert detail is an object")
+            .retain(|_, value| !value.is_null());
+        detail
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.schema != ALERT_DETAIL_SCHEMA_V1 {
+            return Err("alert detail payload schema is unsupported".to_string());
+        }
+        if self.methods.len() > 8 {
+            return Err("alert detail has too many methods".to_string());
+        }
+        let mut methods = std::collections::BTreeSet::new();
+        for method in &self.methods {
+            if !matches!(
+                method.as_str(),
+                PROBE_CONTROLLER_PING
+                    | PROBE_PATH_ECHO
+                    | OCSERV_SERVICE_SUMMARY
+                    | OCSERV_VERSION
+                    | OCSERV_SESSIONS_SUMMARY
+                    | OCSERV_CERT_EXPIRY
+                    | OCSERV_CONFIG_FINGERPRINT
+            ) {
+                return Err("alert detail contains an unsupported method".to_string());
+            }
+            if !methods.insert(method) {
+                return Err("alert detail methods must be unique".to_string());
+            }
+        }
+        self.summary.validate()?;
+        if let Some(until) = &self.silenced_until
+            && (until.len() > 64 || OffsetDateTime::parse(until, &Rfc3339).is_err())
+        {
+            return Err("alert silence deadline must be bounded RFC3339".to_string());
+        }
+        self.silence_reason
+            .as_deref()
+            .map(validate_reason)
+            .transpose()?;
+        self.resolve_reason
+            .as_deref()
+            .map(validate_reason)
+            .transpose()?;
+        crate::store::validate_low_sensitive_json(&self.to_value(), "alert detail payload")
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+}
+
+impl AlertSummaryFieldsV1 {
+    fn validate(&self) -> Result<(), String> {
+        if self
+            .freshness_seconds
+            .is_some_and(|value| value > u32::MAX.into())
+            || self
+                .consecutive_failures
+                .is_some_and(|value| value > u32::MAX.into())
+        {
+            return Err("alert summary count is out of range".to_string());
+        }
+        if self
+            .days_remaining
+            .is_some_and(|value| !(-365_000..=365_000).contains(&value))
+        {
+            return Err("alert summary days remaining is out of range".to_string());
+        }
+        if let Some(endpoint_id) = &self.endpoint_id {
+            validate_fixed_id(endpoint_id, 128, "alert summary endpoint ID")?;
+        }
+        if self.status.as_deref().is_some_and(|status| {
+            !matches!(
+                status,
+                "healthy"
+                    | "degraded"
+                    | "unreachable"
+                    | "stale"
+                    | "disabled"
+                    | "unknown"
+                    | "ok"
+                    | "warning"
+                    | "critical"
+                    | "expired"
+                    | "expiring_soon"
+                    | "unreadable"
+                    | "valid"
+                    | "invalid"
+                    | "unavailable"
+            )
+        }) {
+            return Err("alert summary status is unsupported".to_string());
+        }
+        if let Some(error_code) = &self.last_error_code {
+            validate_fixed_id(error_code, 128, "alert summary error code")?;
+        }
+        if self.endpoint_status.as_deref().is_some_and(|status| {
+            !matches!(status, "active" | "rotated" | "revoked" | "quarantined")
+        }) {
+            return Err("alert summary endpoint status is unsupported".to_string());
+        }
+        if self.result_class.as_deref().is_some_and(|result_class| {
+            !matches!(
+                result_class,
+                "controller_rpc_summary" | "low_sensitive_summary" | "scheduler_summary"
+            )
+        }) {
+            return Err("alert summary result class is unsupported".to_string());
+        }
+        Ok(())
+    }
+}
+
+fn merge_alert_summary_field<T>(
+    nested: &mut Option<T>,
+    legacy: Option<T>,
+    field: &str,
+) -> Result<(), String> {
+    if nested.is_some() && legacy.is_some() {
+        return Err(format!("alert detail has duplicate {field}"));
+    }
+    if legacy.is_some() {
+        *nested = legacy;
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ObservationSummaryPayloadV1 {
     pub schema: String,
     pub result_class: String,
@@ -824,12 +1089,13 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        HEALTH_DEGRADED_METHODS_SCHEMA_V1, HEALTH_SUMMARY_SCHEMA_V1,
-        HealthDegradedMethodsPayloadV1, HealthSummaryPayloadV1, OBSERVATION_SUMMARY_SCHEMA_V1,
-        ObservationSummaryPayloadV1, RUN_SUMMARY_SCHEMA_V1, RunSummaryPayloadV1,
-        SCHEDULER_PAIR_SCHEMA_V1, SCHEDULER_SELECTOR_SCHEMA_V1, SchedulerPairPayloadV1,
-        SchedulerSelectorPayloadV1, TRUST_BUNDLE_SCHEMA_V1, TrustBundlePayloadV1,
-        validate_health_payload_relationship, validate_scheduler_payload_relationship,
+        ALERT_DETAIL_SCHEMA_V1, AlertDetailPayloadV1, HEALTH_DEGRADED_METHODS_SCHEMA_V1,
+        HEALTH_SUMMARY_SCHEMA_V1, HealthDegradedMethodsPayloadV1, HealthSummaryPayloadV1,
+        OBSERVATION_SUMMARY_SCHEMA_V1, ObservationSummaryPayloadV1, RUN_SUMMARY_SCHEMA_V1,
+        RunSummaryPayloadV1, SCHEDULER_PAIR_SCHEMA_V1, SCHEDULER_SELECTOR_SCHEMA_V1,
+        SchedulerPairPayloadV1, SchedulerSelectorPayloadV1, TRUST_BUNDLE_SCHEMA_V1,
+        TrustBundlePayloadV1, validate_health_payload_relationship,
+        validate_scheduler_payload_relationship,
     };
 
     #[test]
@@ -1143,6 +1409,50 @@ mod tests {
             payload
                 .validate_relationship("endpoint-a", 3, "active")
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn alert_detail_payload_is_closed_versioned_and_bounded() {
+        let payload = AlertDetailPayloadV1::from_legacy(&json!({
+            "methods": ["ocserv.cert.expiry"],
+            "days_remaining": 12,
+            "status": "warning",
+            "silenced_until": "2026-07-12T00:00:00Z",
+            "silence_reason": "maintenance"
+        }))
+        .expect("valid alert detail");
+        assert_eq!(payload.schema, ALERT_DETAIL_SCHEMA_V1);
+        assert_eq!(
+            AlertDetailPayloadV1::from_value(&payload.to_value()).expect("round trip"),
+            payload
+        );
+        assert_eq!(payload.public_detail()["summary"]["days_remaining"], 12);
+
+        let mut contaminated = payload.to_value();
+        contaminated["token"] = json!("secret");
+        assert!(AlertDetailPayloadV1::from_value(&contaminated).is_err());
+        assert!(
+            AlertDetailPayloadV1::from_legacy(&json!({
+                "methods": ["shell.exec"],
+                "summary": {}
+            }))
+            .is_err()
+        );
+        assert!(
+            AlertDetailPayloadV1::from_legacy(&json!({
+                "summary": {"status": "stale"},
+                "status": "stale"
+            }))
+            .is_err()
+        );
+        assert!(
+            AlertDetailPayloadV1::from_legacy(&json!({
+                "methods": [],
+                "summary": {},
+                "client_address": "10.0.0.2"
+            }))
+            .is_err()
         );
     }
 }

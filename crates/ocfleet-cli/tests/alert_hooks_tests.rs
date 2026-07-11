@@ -923,7 +923,7 @@ fn alert_hooks_tests_jsonl_file_directory_target_is_rejected() {
 
 #[test]
 #[cfg(unix)]
-fn alert_hooks_tests_jsonl_file_projects_oversized_legacy_payload_before_delivery() {
+fn alert_hooks_tests_jsonl_file_rejects_oversized_legacy_payload_before_delivery() {
     let dir = tempfile::tempdir().expect("temp dir");
     let database = dir.path().join("controller.sqlite");
     let database_arg = database.to_string_lossy().into_owned();
@@ -961,7 +961,7 @@ fn alert_hooks_tests_jsonl_file_projects_oversized_legacy_payload_before_deliver
         )
         .expect("seed oversized legacy alert detail");
 
-    let output = run_ocfleet(&[
+    let output = run_ocfleet_failure(&[
         "--database",
         &database_arg,
         "alert",
@@ -970,8 +970,9 @@ fn alert_hooks_tests_jsonl_file_projects_oversized_legacy_payload_before_deliver
         &hook,
         "--dry-run",
     ]);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("status=ok"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("alert detail"));
+    assert!(!stderr.contains(&"x".repeat(256)));
     assert!(!output_path.exists());
 }
 
@@ -1275,7 +1276,7 @@ fn alert_hooks_tests_webhook_dry_run_writes_attempt_without_network_request() {
 }
 
 #[test]
-fn alert_hooks_tests_webhook_projects_oversized_legacy_payload_before_request() {
+fn alert_hooks_tests_webhook_rejects_oversized_legacy_payload_before_request() {
     let dir = tempfile::tempdir().expect("temp dir");
     let database = dir.path().join("controller.sqlite");
     let store = Store::open(&database).expect("open store");
@@ -1308,32 +1309,30 @@ fn alert_hooks_tests_webhook_projects_oversized_legacy_payload_before_request() 
             .to_string()],
         )
         .expect("seed oversized legacy alert detail");
-    let hook = seed_webhook_hook(
+    let _hook = seed_webhook_hook(
         &store,
         "webhook-large",
         "https://93.184.216.34/alerts",
         b"0123456789abcdef",
     );
-    let alerts = store.list_alert_events().expect("list alerts");
+    let error = store
+        .list_alert_events()
+        .expect_err("legacy alert payload must fail closed");
+    assert!(error.to_string().contains("alert detail"));
+    assert!(!error.to_string().contains(&"x".repeat(256)));
     let sender = FakeWebhookSender::new(WebhookHttpResult::Completed(WebhookHttpResponse {
         status_code: 200,
         status_class: "2xx".to_string(),
         response_bytes: 0,
     }));
 
-    let summary =
-        deliver_webhook_alerts_with_sender(&store, &hook.hook_id, &alerts, true, None, &sender)
-            .expect("legacy payload must be projected before request");
-
-    assert_eq!(summary.record_count, 1);
-    assert!(summary.bytes_written < 4 * 1024);
     assert_eq!(sender.request_count(), 0);
     assert_eq!(
         store
             .list_alert_delivery_attempts()
             .expect("list delivery attempts")
             .len(),
-        1
+        0
     );
 }
 
@@ -1494,7 +1493,7 @@ fn alert_hooks_tests_payload_does_not_contain_forbidden_keys() {
 }
 
 #[test]
-fn alert_hooks_tests_payload_uses_summary_allowlist() {
+fn alert_hooks_tests_payload_rejects_non_schema_detail() {
     let dir = tempfile::tempdir().expect("temp dir");
     let database = dir.path().join("controller.sqlite");
     let database_arg = database.to_string_lossy().into_owned();
@@ -1534,17 +1533,9 @@ fn alert_hooks_tests_payload_uses_summary_allowlist() {
         )
         .expect("seed contaminated alert detail");
 
-    let output = run_ocfleet(&["--database", &database_arg, "alert", "list", "--json"]);
-    let payload: Value = serde_json::from_slice(&output.stdout).expect("valid payload");
-    assert_eq!(payload["alerts"][0]["summary"]["status"], "stale");
-    assert!(payload["alerts"][0]["summary"].get("message").is_none());
-    assert!(
-        payload["alerts"][0]["summary"]
-            .get("result_class")
-            .is_none()
-    );
-    assert_eq!(
-        payload["alerts"][0]["methods"],
-        json!(["probe.controller.ping"])
-    );
+    let output = run_ocfleet_failure(&["--database", &database_arg, "alert", "list", "--json"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("alert detail"));
+    assert!(!stderr.contains("client_ip"));
+    assert!(!stderr.contains("session_id"));
 }

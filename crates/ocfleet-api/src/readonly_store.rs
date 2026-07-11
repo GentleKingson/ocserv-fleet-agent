@@ -3,9 +3,10 @@ use std::path::{Path, PathBuf};
 
 use ocfleet_cli::private_file::{self, PrivateFileError};
 use ocfleet_cli::storage_payloads::{
-    HealthDegradedMethodsPayloadV1, HealthSummaryPayloadV1, ObservationSummaryPayloadV1,
-    RunSummaryPayloadV1, SchedulerPairPayloadV1, SchedulerSelectorPayloadV1,
-    validate_health_payload_relationship, validate_scheduler_payload_relationship,
+    AlertDetailPayloadV1, HealthDegradedMethodsPayloadV1, HealthSummaryPayloadV1,
+    ObservationSummaryPayloadV1, RunSummaryPayloadV1, SchedulerPairPayloadV1,
+    SchedulerSelectorPayloadV1, validate_health_payload_relationship,
+    validate_scheduler_payload_relationship,
 };
 use ocfleet_cli::store::{
     AlertEventRecord, AuditRecord, CURRENT_SCHEMA_VERSION, HealthSnapshotRecord, NodeRecord,
@@ -669,6 +670,14 @@ fn probe_observation_from_row(row: &Row<'_>) -> rusqlite::Result<ProbeObservatio
 
 fn alert_event_from_row(row: &Row<'_>) -> rusqlite::Result<AlertEventRecord> {
     let detail_json: String = row.get(10)?;
+    let detail_json = parse_json_column(&detail_json, 10)?;
+    let payload = AlertDetailPayloadV1::from_value(&detail_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            10,
+            Type::Text,
+            Box::new(io::Error::new(io::ErrorKind::InvalidData, error)),
+        )
+    })?;
     Ok(AlertEventRecord {
         alert_id: row.get(0)?,
         dedupe_key: row.get(1)?,
@@ -680,7 +689,7 @@ fn alert_event_from_row(row: &Row<'_>) -> rusqlite::Result<AlertEventRecord> {
         last_seen_at: row.get(7)?,
         last_sent_at: row.get(8)?,
         resolved_at: row.get(9)?,
-        detail_json: parse_json_column(&detail_json, 10)?,
+        detail_json: payload.public_detail(),
     })
 }
 

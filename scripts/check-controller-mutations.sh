@@ -90,6 +90,10 @@ LEGACY_SCHEDULER_WRITER_RE = re.compile(
     r"(insert_observability_run|finish_observability_run|"
     r"insert_probe_observation|update_observability_job_run_times)\s*\("
 )
+DIRECT_SCHEDULER_CONFIG_MUTATOR_RE = re.compile(
+    r"(?:\.\s*|\bStore\s*::\s*)"
+    r"(insert_observability_job|set_observability_job_enabled)\s*\("
+)
 DIRECT_NODE_ENDPOINT_MUTATOR_RE = re.compile(
     r"(?:\.\s*|\bStore\s*::\s*)"
     r"(add_node|enable_node|disable_node|remove_node|rotate_endpoint|"
@@ -115,6 +119,10 @@ DIRECT_ALERT_ACTION_MUTATOR_RE = re.compile(
 DIRECT_RPC_AUDIT_RE = re.compile(r"\bwrite_rpc_audit\s*\(")
 LEGACY_SCHEDULER_WRITER_ALLOWED_FILES = {
     ("crates", "ocfleet-cli", "src", "store.rs"),
+}
+DIRECT_SCHEDULER_CONFIG_MUTATOR_ALLOWED_FILES = {
+    ("crates", "ocfleet-cli", "src", "store.rs"),
+    ("crates", "ocfleet-cli", "src", "backend.rs"),
 }
 DIRECT_NODE_ENDPOINT_MUTATOR_ALLOWED_FILES = {
     ("crates", "ocfleet-cli", "src", "store.rs"),
@@ -360,6 +368,17 @@ for path in files:
                     display_path(path),
                     line,
                     "legacy scheduler persistence call outside transactional writer boundary",
+                    match.group(1),
+                )
+            )
+    if parts not in DIRECT_SCHEDULER_CONFIG_MUTATOR_ALLOWED_FILES:
+        for match in DIRECT_SCHEDULER_CONFIG_MUTATOR_RE.finditer(code):
+            line = source.count("\n", 0, match.start()) + 1
+            violations.append(
+                (
+                    display_path(path),
+                    line,
+                    "direct scheduler config mutator call outside reviewed store/backend boundary",
                     match.group(1),
                 )
             )

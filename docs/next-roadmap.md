@@ -79,7 +79,8 @@ scaffold, implemented slice, operational maturity, and release verification.
 
 ## Execution DAG
 
-The current execution node is **A1** on issue `#33`. The node-lifecycle slice
+The current execution node is **A2** on issue `#34`. A1 is operationally mature
+for the current production controller mutation inventory. The node-lifecycle slice
 merged through pull request `#57`, the scheduler-job configuration slice merged
 through pull request `#58`, and the endpoint-trust fail-closed slice merged
 through pull request `#59`. Atomic scheduler run, outcome, observation, audit,
@@ -126,14 +127,18 @@ redacted audit together. Alert delivery persistence is active on branch
 `codex/a1-alert-delivery-writers` in pull request `#67`. Each webhook attempt commits with audit, and
 finalization compare-checks the complete bounded alert set before committing
 `last_sent_at` changes with the summary audit. External file/HTTPS I/O remains
-outside database transactions.
+outside database transactions. The final inventory and guard audit are recorded
+in `docs/a1-mutation-inventory.md`; fixture-only raw helpers are rejected from
+production call sites. A1 changes no schema, protocol, API route, agent
+capability, feature default, or network read-only boundary. The completion audit
+is published in pull request `#68`.
 
 ### Baseline And Production Foundation
 
 | ID | Issue | Status | Depends on | Release target | Acceptance and required evidence |
 | --- | --- | --- | --- | --- | --- |
 | N0 Baseline and authoritative roadmap | n/a | operationally mature | none | `v0.2.x` | Baseline commit, versions, schemas, crates, binaries, features, workflows, test results, incomplete code, and documentation drift are recorded. This DAG and progress file exist and contain no secret or host-specific path. |
-| A1 Atomic controller mutation audit | `#33` | in progress | N0 | `v0.2.x` | Every existing mutation uses an actor-bound transactional writer; injected audit failure and crash-boundary tests prove rollback; direct mutation SQL outside approved store boundaries is prevented; API remains read-only. Evidence must enumerate every mutation and its atomicity test. |
+| A1 Atomic controller mutation audit | `#33` | operationally mature | N0 | `v0.2.x` | Every production mutation uses an actor-bound transactional writer; injected audit failure and crash-boundary tests prove rollback; direct mutation SQL and mutator bypasses outside approved store/backend boundaries are prevented; API remains read-only. `docs/a1-mutation-inventory.md` enumerates every family and its evidence. |
 | A2 Typed versioned storage | `#34` | scaffold | A1 | `v0.2.x` | New writes use closed, versioned payload types; legacy rows migrate or are quarantined/fail closed; contaminated fixtures cover oversize, unknown, secret-like, address, nesting, and method failures; CLI/API never expose raw persisted JSON. |
 | A3 Scheduler reliability | `#35` | implemented slice | A1, A2 | `v0.3.0` | SQLite lease, fencing, deterministic claim, bounded retry/backoff, misfire, jitter, timeout, recovery, maintenance, concurrency, budget, and shutdown semantics pass competing-instance, crash, skew, and duplicate-suppression tests. |
 | A4 Independent health evaluator | `#36` | implemented slice | A1, A2, A3 | `v0.3.0` | Idempotent evaluation runs record watermark, policy/computation versions, snapshots, and failures without agent RPC or trust/node/scheduler mutation; recovery and shutdown tests pass; dashboard freshness no longer depends on an interactive health command. |

@@ -78,10 +78,9 @@ alert evaluation uses persisted before-state checks to preserve concurrent
 operator decisions. Silence/resolve and webhook-hook creation also use atomic
 writers with compare-before or audit-backed replay. Webhook attempt history and
 delivery finalization now use separate atomic boundaries around external I/O.
-Other call sites remain to migrate.
-Completing those families is required before claiming fully fail-closed
-controller mutation audit. The API remains read-only while that work is
-incomplete. The governing decision is recorded in
+The production mutation inventory is fully covered; legacy raw fixture helpers
+are rejected from production call sites by the source guard. The API remains
+read-only. The governing decision and evidence are recorded in
 [ADR-atomic-audit-writes](adr/ADR-atomic-audit-writes.md).
 
 Enrollment token/request/approval/claim, retention, health evaluation, alert

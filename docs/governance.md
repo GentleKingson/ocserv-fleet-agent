@@ -63,24 +63,25 @@ bodies, raw stdout/stderr, raw logs, raw config, certificate material, usernames
 client IPs, or session IDs. Retention policies do not delete
 `controller_audit_log`; long-term audit handling is export/archive based.
 
-Current enforcement is partial and must not be overstated. Node lifecycle,
-scheduler job configuration, and scheduler run start/outcome/finish transitions
-join health policy, enrollment approval, and endpoint lifecycle as actor-bound
-`StoreWriter` operations audited in their SQLite transaction. Failure-injection
-tests prove that node, endpoint-trust, scheduler job configuration, observation,
-RPC audit, run state, and job-clock changes roll back at their declared
-boundaries. Health/alert/delivery, retention, and other call sites still include
-business and audit writes in separate transactions. Migrating those remaining
-families is required before claiming fully fail-closed controller mutation
-audit. The API remains read-only while that work is incomplete. The governing
-decision is recorded in
+Current enforcement is partial and must not be overstated. Enrollment approval
+and legacy claim, node/endpoint lifecycle, scheduler job configuration, and
+scheduler run start/outcome/finish transitions are actor-bound `StoreWriter`
+operations audited in their SQLite transaction. Failure-injection tests prove
+that enrollment request/node/trust, endpoint lifecycle, scheduler job
+configuration, observation, RPC audit, run state, and job-clock changes roll
+back at their declared boundaries. Enrollment token/request transitions,
+health/alert/delivery, retention, and other call sites remain to migrate.
+Completing those families is required before claiming fully fail-closed
+controller mutation audit. The API remains read-only while that work is
+incomplete. The governing decision is recorded in
 [ADR-atomic-audit-writes](adr/ADR-atomic-audit-writes.md).
 
-Endpoint lifecycle CLI calls are routed through `StoreWriter`. A static source
-guard rejects direct production calls to node add/enable/disable/remove and
-endpoint rotate/revoke/quarantine outside the reviewed SQLite store and backend
-adapter. This guard is a review backstop, not RBAC; the resolved actor and
-transactional audit remain the authority record.
+Enrollment approval/claim and endpoint lifecycle CLI calls are routed through
+`StoreWriter`. A static source guard rejects direct production calls to those
+enrollment writers, node add/enable/disable/remove, and endpoint
+rotate/revoke/quarantine outside the reviewed SQLite store and backend adapter.
+This guard is a review backstop, not RBAC; the resolved actor and transactional
+audit remain the authority record.
 
 ## Endpoint Authority
 
@@ -93,9 +94,12 @@ snapshot after concurrency waits. A mismatch retains protocol-level
 unbound and binding-mismatch cases.
 
 The controller never derives this binding from agent-supplied hostname or
-labels. Existing enrollment approvals can contain Active unbound trust and remain
-rejected until a separate, explicit operator reconciliation workflow is added.
-There is no startup repair or trust-on-first-use fallback.
+labels. New approval atomically binds explicit operator node metadata. Existing
+approved-unbound rows remain rejected until `enroll claim` verifies the exact
+legacy approval shape and binds it in one audited transaction. There is no scan,
+startup repair, implicit `node add` adoption, or trust-on-first-use fallback.
+See
+[ADR-enrollment-binding-ownership](adr/ADR-enrollment-binding-ownership.md).
 
 ## Trust Policy Workflow
 

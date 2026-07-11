@@ -84,15 +84,21 @@ merged through pull request `#57`, the scheduler-job configuration slice merged
 through pull request `#58`, and the endpoint-trust fail-closed slice merged
 through pull request `#59`. Atomic scheduler run, outcome, observation, audit,
 and job-clock transitions merged through pull request `#60`. Endpoint binding
-and lifecycle state-machine hardening are published in pull request `#61` from
-branch `codex/a1-endpoint-binding-state-machine`; CI and merge evidence are
-pending. This slice requires bidirectional unique Active bindings at every
+and lifecycle state-machine hardening merged through pull request `#61`
+(`982d948b7a4fa6d152843dd58a7a9e1b3c47eb03`). This slice requires
+bidirectional unique Active bindings at every
 dispatch boundary, closes and audits effective lifecycle transitions, moves the
 node registry pointer during rotation, terminalizes trust during removal, and
 adds aggregate-only doctor diagnostics plus a production bypass guard. It does
 not change schema, protocol, API routes, agent capabilities, or the default
 read-only boundary. Statuses describe the milestone, not just the amount of
-supporting code already in the repository.
+supporting code already in the repository. Explicit enrollment binding and its
+actor-bearing writer migration are active on branch
+`codex/a1-enrollment-binding-writers` in pull request `#62`. The active slice
+makes new approval one atomic operator-owned node/request/trust/audit transition
+and adds a strict
+manual claim for legacy approved-unbound rows. It introduces no schema,
+protocol, API, agent-capability, or default read-only boundary change.
 
 ### Baseline And Production Foundation
 

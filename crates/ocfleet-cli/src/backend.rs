@@ -1,9 +1,9 @@
 use crate::audit::AuditEvent;
 use crate::store::{
     AlertEventRecord, ApprovalInput, AuditRecord, EndpointTrustRecord, HealthPolicyRecord,
-    HealthSnapshotRecord, NodeInsert, NodeRecord, ObservabilityJobRecord, ObservabilityRunRecord,
-    ProbeObservationRecord, SchedulerOutcomeWrite, SchedulerRunFinish, SchedulerRunStart, Store,
-    StoreError,
+    HealthSnapshotRecord, LegacyEnrollmentClaimInput, NodeInsert, NodeRecord,
+    ObservabilityJobRecord, ObservabilityRunRecord, ProbeObservationRecord, SchedulerOutcomeWrite,
+    SchedulerRunFinish, SchedulerRunStart, Store, StoreError,
 };
 
 pub const MAX_STORE_READER_ROWS: u64 = 1_000;
@@ -79,6 +79,12 @@ pub trait StoreWriter {
     fn write_enrollment_approval(
         &self,
         approval: &ApprovalInput,
+        actor: &str,
+    ) -> Result<crate::store::JoinRequestRecord, Self::Error>;
+    fn write_legacy_enrollment_claim(
+        &self,
+        claim: &LegacyEnrollmentClaimInput,
+        actor: &str,
     ) -> Result<crate::store::JoinRequestRecord, Self::Error>;
     fn write_endpoint_rotation(
         &self,
@@ -274,8 +280,17 @@ impl StoreWriter for Store {
     fn write_enrollment_approval(
         &self,
         approval: &ApprovalInput,
+        actor: &str,
     ) -> Result<crate::store::JoinRequestRecord, Self::Error> {
-        Store::approve_join_request(self, approval)
+        Store::approve_join_request(self, approval, actor)
+    }
+
+    fn write_legacy_enrollment_claim(
+        &self,
+        claim: &LegacyEnrollmentClaimInput,
+        actor: &str,
+    ) -> Result<crate::store::JoinRequestRecord, Self::Error> {
+        Store::claim_legacy_enrollment(self, claim, actor)
     }
 
     fn write_endpoint_rotation(

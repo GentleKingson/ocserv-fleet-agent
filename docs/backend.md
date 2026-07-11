@@ -69,7 +69,12 @@ owning job clock and audit. The writer rejects mixed actors, jobs, run IDs,
 terminal runs, and unbounded batches. Endpoint rotation, revocation, and
 quarantine also route through `StoreWriter`; a source guard rejects direct
 production calls to inherent node/endpoint lifecycle mutators outside
-`store.rs` and the reviewed backend adapter.
+`store.rs` and the reviewed backend adapter. Enrollment approval now uses an
+immediate actor-bearing writer transaction to insert the explicit operator node,
+bound generation-1 trust, request decision, and audit together. A separate
+writer claims only the strict legacy approved-unbound shape. Exact retries do
+not change enabled state, timestamps, trust data, or audit count, and the source
+guard rejects production bypasses of both enrollment writers.
 
 The API retains a narrower `ApiReadStore` adapter for API projections;
 `ReadOnlyStore` opens SQLite with read-only/query-only flags, validates private
@@ -90,8 +95,9 @@ authorization database.
 Scheduler RPC work occurs outside database transactions. A committed start row
 is followed by short bounded outcome transactions and one finish transaction;
 an outcome or finish persistence failure leaves the run `running` and does not
-advance the job clock. Health/alert/delivery, retention, and some enrollment
-lifecycle flows are not all migrated to the writer trait. Future writer
+advance the job clock. Health/alert/delivery, retention, and enrollment
+token/request lifecycle transitions are not all migrated to the writer trait.
+Future writer
 interfaces must keep actor/audit input mandatory and must not loosen private
 file checks or redaction. The scheduler writer expansions change no schema,
 protocol, agent capability, or API route; neither does the binding/lifecycle

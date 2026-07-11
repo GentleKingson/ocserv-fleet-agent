@@ -130,7 +130,8 @@ finalization compare-checks the complete bounded alert set before committing
 outside database transactions. The final inventory and guard audit are recorded
 in `docs/a1-mutation-inventory.md`; fixture-only raw helpers are rejected from
 production call sites. A1 changes no schema, protocol, API route, agent
-capability, feature default, or network read-only boundary.
+capability, feature default, or network read-only boundary. The completion audit
+is published in pull request `#68`.
 
 ### Baseline And Production Foundation
 

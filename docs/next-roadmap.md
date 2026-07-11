@@ -255,6 +255,7 @@ The final A4 acceptance inventory remains active work.
 Schema 21 evaluator-run persistence is published in pull request `#88`.
 Atomic evaluator lifecycle and recovery are published in pull request `#89`.
 The independent graceful evaluator daemon is published in pull request `#90`.
+The A4 completion audit is published in pull request `#91`.
 
 ### Baseline And Production Foundation
 

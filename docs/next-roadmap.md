@@ -208,7 +208,7 @@ record is bound to every relational audit column, while a finite top-level
 detail vocabulary rejects unknown legacy data. Migration rebuilds the table;
 writers and controller/API readers fail closed on unsafe, malformed,
 future-version, or mismatched data and never expose the storage envelope.
-Implementation and validation are in progress.
+Published for review in pull request `#78`.
 
 ### Baseline And Production Foundation
 

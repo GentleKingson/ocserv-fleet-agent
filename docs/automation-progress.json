@@ -4,9 +4,9 @@
   "completed_phases": ["A1"],
   "active_branch": "codex/a2-audit-detail-storage",
   "active_issue": 34,
-  "active_pr": null,
+  "active_pr": 78,
   "last_test_result": "passed",
-  "last_updated_at": "2026-07-11T15:58:10Z",
+  "last_updated_at": "2026-07-11T15:59:25Z",
   "blockers": [],
-  "next_action": "Complete validation and publish the schema-v18 AuditDetailV1 slice, then close the issue #34 typed-storage inventory."
+  "next_action": "Monitor and merge pull request #78, then close the issue #34 typed-storage inventory."
 }

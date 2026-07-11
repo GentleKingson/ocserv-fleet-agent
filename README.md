@@ -554,6 +554,8 @@ Networking must allow the controller to reach the agent through iroh using the r
   attempt and finalization boundaries around external I/O.
 - `docs/adr/ADR-versioned-scheduler-storage.md`: schema-v9 scheduler selector
   and explicit-pair storage, migration, quarantine, and fail-closed decision.
+- `docs/adr/ADR-versioned-health-snapshot-storage.md`: schema-v10 health
+  snapshot storage, legacy canonicalization, and fail-closed reader decision.
 - `docs/trust-policy.md`: trust policy as code schema, validation, and diff behavior.
 - `docs/backend.md`: SQLite contract and optional Postgres backend plan.
 - `docs/archive-export.md`: long-term history archive and signed audit export guidance.

@@ -1,6 +1,8 @@
 use ocfleet_cli::audit::AuditEvent;
 use ocfleet_cli::backend::StoreWriter;
-use ocfleet_cli::storage_payloads::SchedulerSelectorPayloadV1;
+use ocfleet_cli::storage_payloads::{
+    HealthDegradedMethodsPayloadV1, HealthSummaryPayloadV1, SchedulerSelectorPayloadV1,
+};
 use ocfleet_cli::store::{
     AlertDeliveryAttemptRecord, AlertDeliveryAttemptWrite, AlertDeliveryFinalizeWrite,
     AlertEvaluationEntry, AlertEvaluationWrite, AlertEventRecord, AlertStateTransition,
@@ -17,6 +19,18 @@ use rusqlite::Connection;
 use serde_json::{Value, json};
 
 const TEST_ACTOR: &str = "observability-store-test";
+
+fn health_methods(methods: &[&str]) -> Value {
+    HealthDegradedMethodsPayloadV1::new(methods.iter().map(|value| (*value).to_string()).collect())
+        .expect("valid health methods")
+        .to_value()
+}
+
+fn health_summary(status: &str) -> Value {
+    HealthSummaryPayloadV1::new(None, None, status.to_string(), None, None)
+        .expect("valid health summary")
+        .to_value()
+}
 
 fn open_temp_store() -> (tempfile::TempDir, Store, std::path::PathBuf) {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -1557,8 +1571,8 @@ fn observability_store_tests_upserts_health_snapshot() {
         last_success_at: Some("2026-07-08T07:00:00Z".to_string()),
         last_failure_at: None,
         last_error_code: None,
-        degraded_methods_json: json!([]),
-        summary_json: json!({"state": "running"}),
+        degraded_methods_json: health_methods(&[]),
+        summary_json: health_summary("healthy"),
     };
     StoreWriter::write_health_snapshots(
         &store,
@@ -1576,8 +1590,8 @@ fn observability_store_tests_upserts_health_snapshot() {
         freshness_seconds: Some(90),
         last_failure_at: Some("2026-07-08T07:05:00Z".to_string()),
         last_error_code: Some("RPC_UNAVAILABLE".to_string()),
-        degraded_methods_json: json!(["ocserv.version"]),
-        summary_json: json!({"state": "running", "version_status": "unavailable"}),
+        degraded_methods_json: health_methods(&["ocserv.version"]),
+        summary_json: health_summary("degraded"),
         ..initial.clone()
     };
     StoreWriter::write_health_snapshots(
@@ -1610,8 +1624,8 @@ fn health_snapshot_writer_is_atomic_idempotent_and_actor_bound() {
             last_success_at: Some("2026-07-11T01:00:00Z".to_string()),
             last_failure_at: None,
             last_error_code: None,
-            degraded_methods_json: json!([]),
-            summary_json: json!({"status": "healthy"}),
+            degraded_methods_json: health_methods(&[]),
+            summary_json: health_summary("healthy"),
         },
         HealthSnapshotRecord {
             node_id: "health-batch-b".to_string(),
@@ -1622,8 +1636,8 @@ fn health_snapshot_writer_is_atomic_idempotent_and_actor_bound() {
             last_success_at: None,
             last_failure_at: Some("2026-07-11T00:59:00Z".to_string()),
             last_error_code: Some("RPC_TIMEOUT".to_string()),
-            degraded_methods_json: json!(["probe.controller.ping"]),
-            summary_json: json!({"status": "degraded"}),
+            degraded_methods_json: health_methods(&[]),
+            summary_json: health_summary("degraded"),
         },
     ];
     let write = HealthSnapshotWrite {
@@ -1642,6 +1656,7 @@ fn health_snapshot_writer_is_atomic_idempotent_and_actor_bound() {
     ));
     let mut divergent = write.clone();
     divergent.snapshots[0].status = "degraded".to_string();
+    divergent.snapshots[0].summary_json = health_summary("degraded");
     assert!(matches!(
         StoreWriter::write_health_snapshots(&store, &divergent, TEST_ACTOR),
         Err(StoreError::HealthEvaluationConflict { .. })
@@ -1671,14 +1686,57 @@ fn health_snapshot_writer_rolls_back_every_row_when_audit_fails() {
             last_success_at: None,
             last_failure_at: None,
             last_error_code: None,
-            degraded_methods_json: json!([]),
-            summary_json: json!({"status": "unknown"}),
+            degraded_methods_json: health_methods(&[]),
+            summary_json: health_summary("unknown"),
         }],
     };
     assert_injected_job_audit_failure(StoreWriter::write_health_snapshots(
         &store, &write, TEST_ACTOR,
     ));
     assert!(store.list_health_snapshots().expect("snapshots").is_empty());
+}
+
+#[test]
+fn health_snapshot_writer_rejects_unversioned_and_contaminated_payloads() {
+    let (_dir, store, _db) = open_temp_store();
+    let base = HealthSnapshotRecord {
+        node_id: "health-closed-payload".to_string(),
+        endpoint_id: None,
+        computed_at: "2026-07-11T01:00:00Z".to_string(),
+        status: "healthy".to_string(),
+        freshness_seconds: None,
+        last_success_at: None,
+        last_failure_at: None,
+        last_error_code: None,
+        degraded_methods_json: health_methods(&[]),
+        summary_json: health_summary("healthy"),
+    };
+    for (evaluation_id, summary) in [
+        ("health-eval-unversioned", json!({"status": "healthy"})),
+        (
+            "health-eval-contaminated",
+            json!({
+                "schema": "ocfleet.health.summary.v1",
+                "region": null,
+                "role": null,
+                "status": "healthy",
+                "endpoint_status": null,
+                "consecutive_failures": null,
+                "token": "secret"
+            }),
+        ),
+    ] {
+        let mut snapshot = base.clone();
+        snapshot.summary_json = summary;
+        let write = HealthSnapshotWrite {
+            evaluation_id: evaluation_id.to_string(),
+            event: "health.node".to_string(),
+            snapshots: vec![snapshot],
+        };
+        assert!(StoreWriter::write_health_snapshots(&store, &write, TEST_ACTOR).is_err());
+    }
+    assert!(store.list_health_snapshots().expect("snapshots").is_empty());
+    assert_eq!(store.audit_count().expect("audit count"), 0);
 }
 
 #[test]

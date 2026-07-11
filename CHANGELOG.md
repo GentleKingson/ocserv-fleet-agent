@@ -26,6 +26,10 @@
   disables ambiguous empty selectors, and rejects unknown or contaminated data
   after creating the normal private backup. CLI/API readers fail closed and do
   not expose the raw stored objects.
+- SQLite schema version 10 stores health degraded methods and derived summaries
+  as closed schema-tagged v1 payloads. Migration preserves exact legacy meaning,
+  while unsupported methods, unknown fields, invalid bounds, future versions,
+  and relational-status mismatches fail closed after private backup.
 - Node add, enable, disable, and remove now take an explicit resolved actor and
   commit their registry/trust change and success audit in one SQLite
   transaction through `StoreWriter`.

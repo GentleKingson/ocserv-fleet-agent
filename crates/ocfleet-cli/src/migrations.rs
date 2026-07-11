@@ -11,7 +11,9 @@ use time::{OffsetDateTime, macros::format_description};
 
 use crate::private_file::{self, PrivateFileError};
 use crate::storage_payloads::{
-    SchedulerPairPayloadV1, SchedulerSelectorPayloadV1, validate_scheduler_payload_relationship,
+    HEALTH_SUMMARY_SCHEMA_V1, HealthDegradedMethodsPayloadV1, HealthSummaryPayloadV1,
+    SchedulerPairPayloadV1, SchedulerSelectorPayloadV1, validate_health_payload_relationship,
+    validate_scheduler_payload_relationship,
 };
 use crate::store::{CURRENT_SCHEMA_VERSION, StoreError};
 
@@ -83,6 +85,12 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         name: "0009_versioned_scheduler_selectors",
         description: "Migrate scheduler selector JSON to closed versioned v1 payloads.",
         apply: apply_0009_versioned_scheduler_selectors,
+    },
+    Migration {
+        version: 10,
+        name: "0010_versioned_health_snapshots",
+        description: "Migrate health snapshot JSON to closed versioned v1 payloads.",
+        apply: apply_0010_versioned_health_snapshots,
     },
 ];
 
@@ -724,6 +732,96 @@ fn migrate_scheduler_pair_payload(
     let encoded = serde_json::to_string(&payload)
         .map_err(|error| StoreError::InvalidInput(error.to_string()))?;
     Ok((encoded, payload))
+}
+
+fn apply_0010_versioned_health_snapshots(tx: &Transaction<'_>) -> Result<(), StoreError> {
+    let rows = {
+        let mut stmt = tx.prepare(
+            "SELECT node_id, status, degraded_methods_json, summary_json
+             FROM health_snapshots ORDER BY node_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    for (node_id, status, degraded_methods_json, summary_json) in rows {
+        let degraded_methods = migrate_health_degraded_methods_payload(&degraded_methods_json)?;
+        let summary = migrate_health_summary_payload(&summary_json, &status)?;
+        tx.execute(
+            "UPDATE health_snapshots
+             SET degraded_methods_json = ?1, summary_json = ?2
+             WHERE node_id = ?3",
+            (&degraded_methods, &summary, &node_id),
+        )?;
+    }
+    Ok(())
+}
+
+fn migrate_health_degraded_methods_payload(raw: &str) -> Result<String, StoreError> {
+    let value: Value = serde_json::from_str(raw).map_err(|_| {
+        StoreError::InvalidInput("legacy health degraded methods JSON is invalid".to_string())
+    })?;
+    let payload = if let Some(methods) = value.as_array() {
+        let methods = methods
+            .iter()
+            .map(|method| {
+                method.as_str().map(ToOwned::to_owned).ok_or_else(|| {
+                    StoreError::InvalidInput(
+                        "legacy health degraded methods must contain strings".to_string(),
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        HealthDegradedMethodsPayloadV1::new(methods).map_err(StoreError::InvalidInput)?
+    } else {
+        HealthDegradedMethodsPayloadV1::from_value(&value).map_err(StoreError::InvalidInput)?
+    };
+    serde_json::to_string(&payload).map_err(|error| StoreError::InvalidInput(error.to_string()))
+}
+
+fn migrate_health_summary_payload(raw: &str, status: &str) -> Result<String, StoreError> {
+    let mut value: Value = serde_json::from_str(raw).map_err(|_| {
+        StoreError::InvalidInput("legacy health summary JSON is invalid".to_string())
+    })?;
+    let object = value.as_object_mut().ok_or_else(|| {
+        StoreError::InvalidInput("legacy health summary must be an object".to_string())
+    })?;
+    if !object.contains_key("schema") {
+        if object.keys().any(|key| {
+            !matches!(
+                key.as_str(),
+                "region" | "role" | "status" | "endpoint_status" | "consecutive_failures"
+            )
+        }) {
+            return Err(StoreError::InvalidInput(
+                "legacy health summary contains unknown fields".to_string(),
+            ));
+        }
+        object.insert(
+            "schema".to_string(),
+            Value::String(HEALTH_SUMMARY_SCHEMA_V1.to_string()),
+        );
+        object.entry("region".to_string()).or_insert(Value::Null);
+        object.entry("role".to_string()).or_insert(Value::Null);
+        object
+            .entry("status".to_string())
+            .or_insert_with(|| Value::String(status.to_string()));
+        object
+            .entry("endpoint_status".to_string())
+            .or_insert(Value::Null);
+        object
+            .entry("consecutive_failures".to_string())
+            .or_insert(Value::Null);
+    }
+    let payload = HealthSummaryPayloadV1::from_value(&value).map_err(StoreError::InvalidInput)?;
+    validate_health_payload_relationship(status, &payload).map_err(StoreError::InvalidInput)?;
+    serde_json::to_string(&payload).map_err(|error| StoreError::InvalidInput(error.to_string()))
 }
 
 fn observability_tables_have_current_constraints(tx: &Transaction<'_>) -> Result<bool, StoreError> {

@@ -289,6 +289,13 @@ review; it is never silently re-enabled. Unknown fields, unsupported schemas,
 malformed JSON, or invalid selector/pair values stop the upgrade and leave the
 version-8 database unchanged beside its private pre-migration backup.
 
+Schema version 10 canonicalizes health degraded-method arrays and derived
+summary objects into closed versioned payloads. Exact empty legacy summaries
+keep their relational status and null optional metadata. Unknown fields,
+unsupported methods or versions, invalid bounds, malformed JSON, and status
+mismatches stop the upgrade and leave the version-9 database unchanged beside
+its private pre-migration backup.
+
 Before upgrades, keep an operator-managed backup as well:
 
 ```bash

@@ -12,6 +12,7 @@ use crate::args::{HealthCommand, HealthPolicyCommand, HealthSnapshotCommand};
 use crate::backend::StoreWriter;
 use crate::duration_args::parse_duration_seconds;
 use crate::input_validation::local_actor;
+use crate::storage_payloads::{HealthDegradedMethodsPayloadV1, HealthSummaryPayloadV1};
 use crate::store::{
     HealthPolicyRecord, HealthSnapshotRecord, HealthSnapshotWrite, NodeRecord,
     ProbeObservationRecord, Store,
@@ -142,7 +143,7 @@ fn run_health_summary(store: &Store, json_output: bool) -> anyhow::Result<()> {
             snapshots: rows
                 .iter()
                 .map(|row| health_snapshot(row, &generated_at))
-                .collect(),
+                .collect::<anyhow::Result<Vec<_>>>()?,
         },
         &local_actor(),
     )?;
@@ -165,7 +166,7 @@ fn run_health_node(store: &Store, node_id: &str, json_output: bool) -> anyhow::R
         &HealthSnapshotWrite {
             evaluation_id: format!("health-eval-{}", Uuid::new_v4()),
             event: "health.node".to_string(),
-            snapshots: vec![health_snapshot(&rows[0], &generated_at)],
+            snapshots: vec![health_snapshot(&rows[0], &generated_at)?],
         },
         &local_actor(),
     )?;
@@ -520,8 +521,8 @@ fn health_counts(rows: &[NodeHealth]) -> HealthCounts {
     counts
 }
 
-fn health_snapshot(row: &NodeHealth, generated_at: &str) -> HealthSnapshotRecord {
-    HealthSnapshotRecord {
+fn health_snapshot(row: &NodeHealth, generated_at: &str) -> anyhow::Result<HealthSnapshotRecord> {
+    Ok(HealthSnapshotRecord {
         node_id: row.node_id.clone(),
         endpoint_id: Some(row.endpoint_id.clone()),
         computed_at: generated_at.to_string(),
@@ -530,15 +531,19 @@ fn health_snapshot(row: &NodeHealth, generated_at: &str) -> HealthSnapshotRecord
         last_success_at: row.last_success_at.clone(),
         last_failure_at: row.last_failure_at.clone(),
         last_error_code: row.last_error_code.clone(),
-        degraded_methods_json: json!(row.degraded_methods),
-        summary_json: json!({
-            "region": row.region,
-            "role": row.role,
-            "status": row.status.as_str(),
-            "endpoint_status": row.endpoint_status,
-            "consecutive_failures": row.consecutive_unreachable_failures,
-        }),
-    }
+        degraded_methods_json: HealthDegradedMethodsPayloadV1::new(row.degraded_methods.clone())
+            .map_err(anyhow::Error::msg)?
+            .to_value(),
+        summary_json: HealthSummaryPayloadV1::new(
+            Some(row.region.clone()),
+            Some(row.role.clone()),
+            row.status.as_str().to_string(),
+            row.endpoint_status.clone(),
+            Some(row.consecutive_unreachable_failures),
+        )
+        .map_err(anyhow::Error::msg)?
+        .to_value(),
+    })
 }
 
 fn print_health_output(
@@ -600,6 +605,10 @@ fn option_u64(value: Option<u64>) -> String {
 }
 
 fn snapshot_to_json(snapshot: &HealthSnapshotRecord) -> Value {
+    let methods = HealthDegradedMethodsPayloadV1::from_value(&snapshot.degraded_methods_json)
+        .expect("store validates health degraded methods");
+    let summary = HealthSummaryPayloadV1::from_value(&snapshot.summary_json)
+        .expect("store validates health summary");
     json!({
         "node_id": snapshot.node_id,
         "endpoint_id": snapshot.endpoint_id,
@@ -609,8 +618,14 @@ fn snapshot_to_json(snapshot: &HealthSnapshotRecord) -> Value {
         "last_success_at": snapshot.last_success_at,
         "last_failure_at": snapshot.last_failure_at,
         "last_error_code": snapshot.last_error_code,
-        "degraded_methods": snapshot.degraded_methods_json,
-        "summary": snapshot.summary_json,
+        "degraded_methods": methods.methods,
+        "summary": {
+            "region": summary.region,
+            "role": summary.role,
+            "status": summary.status,
+            "endpoint_status": summary.endpoint_status,
+            "consecutive_failures": summary.consecutive_failures,
+        },
     })
 }
 

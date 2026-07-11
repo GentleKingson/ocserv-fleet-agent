@@ -28,10 +28,12 @@ use crate::input_validation::{
 use crate::migrations;
 use crate::private_file::{self, PrivateFileError};
 use crate::storage_payloads::{
-    SchedulerPairPayloadV1, SchedulerSelectorPayloadV1, validate_scheduler_payload_relationship,
+    HealthDegradedMethodsPayloadV1, HealthSummaryPayloadV1, SchedulerPairPayloadV1,
+    SchedulerSelectorPayloadV1, validate_health_payload_relationship,
+    validate_scheduler_payload_relationship,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 9;
+pub const CURRENT_SCHEMA_VERSION: i64 = 10;
 pub const DEFAULT_HEALTH_STALE_WINDOW_SECONDS: u64 = 24 * 60 * 60;
 pub const DEFAULT_HEALTH_UNREACHABLE_FAILURES: u64 = 3;
 pub const DEFAULT_HEALTH_CERT_WARNING_DAYS: u64 = 30;
@@ -5219,17 +5221,41 @@ fn health_snapshot_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HealthS
     let freshness_seconds: Option<i64> = row.get(4)?;
     let degraded_methods_json: String = row.get(8)?;
     let summary_json: String = row.get(9)?;
+    let degraded_methods_json = parse_json_column(&degraded_methods_json, 8)?;
+    HealthDegradedMethodsPayloadV1::from_value(&degraded_methods_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            8,
+            Type::Text,
+            Box::new(io::Error::new(io::ErrorKind::InvalidData, error)),
+        )
+    })?;
+    let summary_json = parse_json_column(&summary_json, 9)?;
+    let summary = HealthSummaryPayloadV1::from_value(&summary_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            9,
+            Type::Text,
+            Box::new(io::Error::new(io::ErrorKind::InvalidData, error)),
+        )
+    })?;
+    let status: String = row.get(3)?;
+    validate_health_payload_relationship(&status, &summary).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            9,
+            Type::Text,
+            Box::new(io::Error::new(io::ErrorKind::InvalidData, error)),
+        )
+    })?;
     Ok(HealthSnapshotRecord {
         node_id: row.get(0)?,
         endpoint_id: row.get(1)?,
         computed_at: row.get(2)?,
-        status: row.get(3)?,
+        status,
         freshness_seconds: freshness_seconds.map(i64_to_u64).transpose()?,
         last_success_at: row.get(5)?,
         last_failure_at: row.get(6)?,
         last_error_code: row.get(7)?,
-        degraded_methods_json: parse_json_column(&degraded_methods_json, 8)?,
-        summary_json: parse_json_column(&summary_json, 9)?,
+        degraded_methods_json,
+        summary_json,
     })
 }
 
@@ -5870,8 +5896,12 @@ fn validate_health_snapshot_write(write: &HealthSnapshotWrite) -> Result<(), Sto
         if let Some(error_code) = &snapshot.last_error_code {
             validate_audit_text(error_code, "health last_error_code", 64)?;
         }
-        validate_low_sensitive_json(&snapshot.degraded_methods_json, "health degraded methods")?;
-        validate_low_sensitive_json(&snapshot.summary_json, "health summary")?;
+        HealthDegradedMethodsPayloadV1::from_value(&snapshot.degraded_methods_json)
+            .map_err(StoreError::InvalidInput)?;
+        let summary = HealthSummaryPayloadV1::from_value(&snapshot.summary_json)
+            .map_err(StoreError::InvalidInput)?;
+        validate_health_payload_relationship(&snapshot.status, &summary)
+            .map_err(StoreError::InvalidInput)?;
     }
     Ok(())
 }

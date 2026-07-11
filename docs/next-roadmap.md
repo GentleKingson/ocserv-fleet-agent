@@ -200,7 +200,7 @@ The ninth A2 slice advances SQLite to migration `0017` and adds closed delivery
 attempt detail payloads bound to every relational attempt field. Migration
 rebuilds the table and recreates its index and foreign keys; writers and readers
 reject unknown, malformed, future-version, out-of-range, or mismatched data.
-Publication is in progress.
+Published for review in pull request `#77`.
 
 ### Baseline And Production Foundation
 

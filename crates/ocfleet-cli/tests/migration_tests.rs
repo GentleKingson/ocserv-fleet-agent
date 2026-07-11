@@ -36,6 +36,7 @@ fn migration_tests_new_database_creates_all_current_tables_and_indexes() {
         "scheduler_job_claims",
         "scheduler_maintenance",
         "health_evaluation_runs",
+        "alert_delivery_queue",
     ] {
         assert_schema_object_exists(&conn, "table", table);
     }
@@ -49,6 +50,9 @@ fn migration_tests_new_database_creates_all_current_tables_and_indexes() {
         "idx_scheduler_job_claims_expiry",
         "idx_health_evaluation_runs_input",
         "idx_health_evaluation_runs_status_started",
+        "idx_alert_delivery_queue_alert_hook_key",
+        "idx_alert_delivery_queue_due",
+        "idx_alert_delivery_queue_lease",
     ] {
         assert_schema_object_exists(&conn, "index", index);
     }
@@ -954,6 +958,31 @@ fn migration_tests_health_evaluation_runs_upgrade_schema_20() {
         .is_err(),
         "failed runs must include a bounded failure code"
     );
+    assert_eq!(backup_files(dir.path()).len(), 1);
+    assert_sqlite_checks_pass(&conn);
+}
+
+#[test]
+fn migration_tests_alert_delivery_queue_upgrades_schema_21() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("controller.sqlite");
+    create_legacy_fixture(&db, 21, 1);
+
+    let store = Store::open(&db).expect("migrate v21 alert delivery queue");
+    assert_eq!(
+        store.current_schema_version().expect("schema version"),
+        CURRENT_SCHEMA_VERSION
+    );
+    drop(store);
+    let conn = Connection::open(&db).expect("open migrated db");
+    assert_schema_object_exists(&conn, "table", "alert_delivery_queue");
+    for index in [
+        "idx_alert_delivery_queue_alert_hook_key",
+        "idx_alert_delivery_queue_due",
+        "idx_alert_delivery_queue_lease",
+    ] {
+        assert_schema_object_exists(&conn, "index", index);
+    }
     assert_eq!(backup_files(dir.path()).len(), 1);
     assert_sqlite_checks_pass(&conn);
 }

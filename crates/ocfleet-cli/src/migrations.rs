@@ -161,6 +161,12 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         description: "Add durable, versioned health evaluator run metadata.",
         apply: apply_0021_health_evaluation_runs,
     },
+    Migration {
+        version: 22,
+        name: "0022_alert_delivery_queue",
+        description: "Add the fenced automatic alert delivery queue.",
+        apply: apply_0022_alert_delivery_queue,
+    },
 ];
 
 pub(crate) fn migrate_to_current(
@@ -1447,6 +1453,47 @@ CREATE UNIQUE INDEX idx_health_evaluation_runs_input
   ON health_evaluation_runs(input_watermark, policy_version, computation_version);
 CREATE INDEX idx_health_evaluation_runs_status_started
   ON health_evaluation_runs(status, started_at, evaluation_id);
+"#,
+    )?;
+    Ok(())
+}
+
+fn apply_0022_alert_delivery_queue(tx: &Transaction<'_>) -> Result<(), StoreError> {
+    tx.execute_batch(
+        r#"
+CREATE TABLE alert_delivery_queue (
+  queue_id TEXT PRIMARY KEY CHECK (length(queue_id) BETWEEN 1 AND 96),
+  alert_id TEXT NOT NULL,
+  hook_id TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL UNIQUE CHECK (length(idempotency_key) = 64),
+  group_key TEXT NOT NULL CHECK (length(group_key) BETWEEN 1 AND 128),
+  status TEXT NOT NULL CHECK (status IN ('pending', 'claimed', 'retry', 'dead_letter', 'succeeded')),
+  attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count BETWEEN 0 AND 5),
+  next_attempt_at TEXT NOT NULL,
+  owner_id TEXT,
+  fence_token INTEGER NOT NULL DEFAULT 0 CHECK (fence_token >= 0),
+  claimed_at TEXT,
+  lease_expires_at TEXT,
+  last_error_code TEXT CHECK (last_error_code IS NULL OR length(last_error_code) BETWEEN 1 AND 64),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  delivered_at TEXT,
+  CHECK (
+    (status = 'claimed' AND owner_id IS NOT NULL AND claimed_at IS NOT NULL AND lease_expires_at IS NOT NULL AND fence_token > 0)
+    OR
+    (status != 'claimed' AND owner_id IS NULL AND claimed_at IS NULL AND lease_expires_at IS NULL)
+  ),
+  CHECK ((status = 'succeeded') = (delivered_at IS NOT NULL)),
+  CHECK (status != 'dead_letter' OR last_error_code IS NOT NULL),
+  FOREIGN KEY(alert_id) REFERENCES alert_events(alert_id) ON DELETE CASCADE,
+  FOREIGN KEY(hook_id) REFERENCES alert_hooks(hook_id) ON DELETE CASCADE
+);
+CREATE UNIQUE INDEX idx_alert_delivery_queue_alert_hook_key
+  ON alert_delivery_queue(alert_id, hook_id, idempotency_key);
+CREATE INDEX idx_alert_delivery_queue_due
+  ON alert_delivery_queue(status, next_attempt_at, queue_id);
+CREATE INDEX idx_alert_delivery_queue_lease
+  ON alert_delivery_queue(lease_expires_at, queue_id);
 "#,
     )?;
     Ok(())

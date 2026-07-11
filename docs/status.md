@@ -7,7 +7,7 @@ claim, and planned items are not available unless marked implemented.
 
 | Contract | Current source-of-truth state |
 | --- | --- |
-| Controller schema | SQLite schema version `21`, migrations `1` through `21`: core registry/audit, enrollment, endpoint trust, observability, strict constraints, retention indexes, health policy, alert webhooks, closed versioned payloads, fenced scheduler job claims, scheduler maintenance, and durable health evaluation runs. |
+| Controller schema | SQLite schema version `22`, migrations `1` through `22`: core registry/audit, enrollment, endpoint trust, observability, strict constraints, retention indexes, health policy, alert webhooks, closed versioned payloads, fenced scheduler job claims, scheduler maintenance, durable health evaluation runs, and a fenced alert delivery queue. |
 | Generic allowed RPC methods | `node.ping`, `node.info`, `probe.controller.ping`, `ocserv.service.summary`, `ocserv.version`, `ocserv.sessions.summary`, `ocserv.cert.expiry`, `ocserv.config.fingerprint`. Authorization also admits controller-only `probe.path.echo` and peer-only `probe.peer.echo`; neither is a generic caller capability. |
 | Known but not allowed | `ocserv.service.status`, `ocserv.status`, `ocserv.reload`, `ocserv.restart`, `ocserv.config.apply`, `ocserv.config.rollback`, `ocserv.session.disconnect`, `ocserv.users.list`, `ocserv.users.get`, `ocserv.logs.recent`, `ocserv.cert.status`, `ocserv.config.summary`. |
 | API | Fourteen declared `GET` paths only. Non-loopback startup requires a private bearer token file and a TLS-terminating deployment boundary; the API itself does not terminate TLS. |

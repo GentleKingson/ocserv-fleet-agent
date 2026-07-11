@@ -592,6 +592,8 @@ Networking must allow the controller to reach the agent through iroh using the r
   deterministic post-run schedule spreading.
 - `docs/adr/ADR-health-evaluator-runs.md`: schema-v21 durable evaluator run,
   watermark idempotency, lifecycle consistency, and authority boundaries.
+- `docs/adr/ADR-alert-delivery-queue.md`: schema-v22 fenced automatic delivery
+  queue, idempotency, retry/DLQ lifecycle, and filesystem authority boundary.
 - `docs/a3-scheduler-reliability-inventory.md`: A3 acceptance requirements,
   implementation evidence, tests, and security-boundary completion gate.
 - `docs/a4-health-evaluator-inventory.md`: A4 independent evaluation,

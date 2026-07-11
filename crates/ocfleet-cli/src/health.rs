@@ -8,28 +8,284 @@ use ocfleet_protocol::method::{
 use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
-use crate::args::{HealthCommand, HealthPolicyCommand, HealthSnapshotCommand};
+use crate::args::{
+    HealthCommand, HealthEvaluatorCommand, HealthPolicyCommand, HealthSnapshotCommand,
+};
 use crate::backend::StoreWriter;
 use crate::duration_args::parse_duration_seconds;
 use crate::input_validation::local_actor;
 use crate::observation::safe_observation_summary;
 use crate::storage_payloads::{HealthDegradedMethodsPayloadV1, HealthSummaryPayloadV1};
 use crate::store::{
-    HealthPolicyRecord, HealthSnapshotRecord, HealthSnapshotWrite, NodeRecord,
-    ProbeObservationRecord, Store,
+    HealthEvaluationFailure, HealthEvaluationFinish, HealthEvaluationStart, HealthPolicyRecord,
+    HealthSnapshotRecord, HealthSnapshotWrite, NodeRecord, ProbeObservationRecord, Store,
 };
 use uuid::Uuid;
 
 const OBSERVATION_READ_LIMIT: u64 = 1_000;
 const MAX_HEALTH_SNAPSHOT_LIMIT: u64 = 1_000;
 
-pub fn run_health_command(store: &Store, command: HealthCommand) -> anyhow::Result<()> {
+pub async fn run_health_command(store: &Store, command: HealthCommand) -> anyhow::Result<()> {
     match command {
         HealthCommand::Summary { json } => run_health_summary(store, json),
         HealthCommand::Node { node_id, json } => run_health_node(store, &node_id, json),
         HealthCommand::Policy { command } => run_health_policy_command(store, command),
         HealthCommand::Snapshot { command } => run_health_snapshot_command(store, command),
+        HealthCommand::Evaluator { command } => run_health_evaluator_command(store, command).await,
     }
+}
+
+const HEALTH_COMPUTATION_VERSION: &str = "health-v1";
+const HEALTH_EVALUATION_BUCKET_SECONDS: i64 = 60;
+const HEALTH_EVALUATION_RECOVERY_SECONDS: i64 = 300;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HealthEvaluationOutcome {
+    Completed,
+    Replayed,
+    InProgress,
+    Failed,
+}
+
+impl HealthEvaluationOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Replayed => "replayed",
+            Self::InProgress => "in_progress",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+async fn run_health_evaluator_command(
+    store: &Store,
+    command: HealthEvaluatorCommand,
+) -> anyhow::Result<()> {
+    match command {
+        HealthEvaluatorCommand::Run { json } => {
+            let outcome = run_health_evaluation_once(store)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "schema": "ocfleet.health_evaluator.v1",
+                        "status": outcome.as_str(),
+                    }))?
+                );
+            } else {
+                println!("status={}", outcome.as_str());
+            }
+            Ok(())
+        }
+        HealthEvaluatorCommand::Daemon { interval_seconds } => {
+            if !(10..=3_600).contains(&interval_seconds) {
+                bail!("--interval-seconds must be between 10 and 3600");
+            }
+            let shutdown = health_shutdown_signal();
+            tokio::pin!(shutdown);
+            loop {
+                run_health_evaluation_once(store)?;
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(interval_seconds)) => {}
+                    _ = &mut shutdown => break,
+                }
+            }
+            println!("status=stopped");
+            Ok(())
+        }
+    }
+}
+
+fn run_health_evaluation_once(store: &Store) -> anyhow::Result<HealthEvaluationOutcome> {
+    let now = OffsetDateTime::now_utc();
+    let evaluation_at = OffsetDateTime::from_unix_timestamp(
+        now.unix_timestamp()
+            .div_euclid(HEALTH_EVALUATION_BUCKET_SECONDS)
+            * HEALTH_EVALUATION_BUCKET_SECONDS,
+    )?;
+    let generated_at = evaluation_at.format(&Rfc3339)?;
+    let recovered_at = now.format(&Rfc3339)?;
+    let recovery_cutoff =
+        (now - time::Duration::seconds(HEALTH_EVALUATION_RECOVERY_SECONDS)).format(&Rfc3339)?;
+    StoreWriter::write_health_evaluation_recovery(
+        store,
+        &recovery_cutoff,
+        &recovered_at,
+        &local_actor(),
+    )?;
+
+    let policy = store.get_health_policy()?;
+    let nodes = store.list_nodes()?;
+    let policy_version = health_policy_version(&policy);
+    let mut rows = Vec::with_capacity(nodes.len());
+    for node in &nodes {
+        match compute_node_health(store, node, &generated_at, &policy) {
+            Ok(row) => rows.push(row),
+            Err(_) => {
+                return persist_health_evaluation_failure(
+                    store,
+                    &nodes,
+                    &generated_at,
+                    &recovered_at,
+                    &policy_version,
+                );
+            }
+        }
+    }
+    let snapshots = rows
+        .iter()
+        .map(|row| health_snapshot(row, &generated_at))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let input_watermark = health_input_watermark(&snapshots);
+    let evaluation_id = health_evaluation_id(&input_watermark, &policy_version);
+    let start = HealthEvaluationStart {
+        evaluation_id: evaluation_id.clone(),
+        input_watermark,
+        policy_version,
+        computation_version: HEALTH_COMPUTATION_VERSION.to_string(),
+        started_at: generated_at.clone(),
+    };
+    StoreWriter::write_health_evaluation_start(store, &start, &local_actor())?;
+    if let Some(existing) = store.get_health_evaluation_run(&evaluation_id)? {
+        match existing.status.as_str() {
+            "completed" => return Ok(HealthEvaluationOutcome::Replayed),
+            "failed" => return Ok(HealthEvaluationOutcome::Replayed),
+            "running" if existing.started_at != generated_at => {
+                return Ok(HealthEvaluationOutcome::InProgress);
+            }
+            "running" => {}
+            _ => bail!("stored health evaluation status is invalid"),
+        }
+    }
+    StoreWriter::write_health_evaluation_finish(
+        store,
+        &HealthEvaluationFinish {
+            evaluation_id,
+            finished_at: recovered_at,
+            snapshots,
+        },
+        &local_actor(),
+    )?;
+    Ok(HealthEvaluationOutcome::Completed)
+}
+
+fn persist_health_evaluation_failure(
+    store: &Store,
+    nodes: &[NodeRecord],
+    generated_at: &str,
+    finished_at: &str,
+    policy_version: &str,
+) -> anyhow::Result<HealthEvaluationOutcome> {
+    let input_watermark = blake3::hash(
+        &serde_json::to_vec(&json!({
+            "evaluation_at": generated_at,
+            "nodes": nodes.iter().map(|node| json!({
+                "node_id": node.node_id,
+                "endpoint_id": node.endpoint_id,
+                "enabled": node.enabled,
+            })).collect::<Vec<_>>(),
+            "input_state": "invalid",
+        }))
+        .expect("health failure input JSON serializes"),
+    )
+    .to_hex()
+    .to_string();
+    let evaluation_id = health_evaluation_id(&input_watermark, policy_version);
+    StoreWriter::write_health_evaluation_start(
+        store,
+        &HealthEvaluationStart {
+            evaluation_id: evaluation_id.clone(),
+            input_watermark,
+            policy_version: policy_version.to_string(),
+            computation_version: HEALTH_COMPUTATION_VERSION.to_string(),
+            started_at: generated_at.to_string(),
+        },
+        &local_actor(),
+    )?;
+    let run = store
+        .get_health_evaluation_run(&evaluation_id)?
+        .context("health evaluation run disappeared after start")?;
+    if run.status != "running" {
+        return Ok(HealthEvaluationOutcome::Replayed);
+    }
+    StoreWriter::write_health_evaluation_failure(
+        store,
+        &HealthEvaluationFailure {
+            evaluation_id,
+            finished_at: finished_at.to_string(),
+            failure_code: "HEALTH_EVALUATION_FAILED".to_string(),
+        },
+        &local_actor(),
+    )?;
+    Ok(HealthEvaluationOutcome::Failed)
+}
+
+fn health_policy_version(policy: &HealthPolicyRecord) -> String {
+    blake3::hash(
+        &serde_json::to_vec(&json!({
+            "stale_window_seconds": policy.stale_window_seconds,
+            "unreachable_consecutive_failures": policy.unreachable_consecutive_failures,
+            "cert_warning_days": policy.cert_warning_days,
+            "cert_critical_days": policy.cert_critical_days,
+        }))
+        .expect("health policy JSON serializes"),
+    )
+    .to_hex()
+    .to_string()
+}
+
+fn health_input_watermark(snapshots: &[HealthSnapshotRecord]) -> String {
+    let inputs = snapshots
+        .iter()
+        .map(|snapshot| {
+            json!({
+                "node_id": snapshot.node_id,
+                "endpoint_id": snapshot.endpoint_id,
+                "computed_at": snapshot.computed_at,
+                "status": snapshot.status,
+                "freshness_seconds": snapshot.freshness_seconds,
+                "last_success_at": snapshot.last_success_at,
+                "last_failure_at": snapshot.last_failure_at,
+                "last_error_code": snapshot.last_error_code,
+                "degraded_methods": snapshot.degraded_methods_json,
+                "summary": snapshot.summary_json,
+            })
+        })
+        .collect::<Vec<_>>();
+    blake3::hash(&serde_json::to_vec(&inputs).expect("health input JSON serializes"))
+        .to_hex()
+        .to_string()
+}
+
+fn health_evaluation_id(input_watermark: &str, policy_version: &str) -> String {
+    let digest = blake3::hash(
+        format!("{input_watermark}:{policy_version}:{HEALTH_COMPUTATION_VERSION}").as_bytes(),
+    );
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest.as_bytes()[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    format!("health-eval-{}", Uuid::from_bytes(bytes))
+}
+
+#[cfg(unix)]
+fn health_shutdown_signal() -> impl std::future::Future<Output = ()> {
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        .expect("install SIGINT handler");
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("install SIGTERM handler");
+    async move {
+        tokio::select! {
+            _ = interrupt.recv() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn health_shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

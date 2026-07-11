@@ -8,6 +8,9 @@
   watermark, policy version, and computation version.
 - Health evaluation lifecycle writers atomically persist audited starts,
   snapshot completion, typed failures, and bounded abandoned-run recovery.
+- An independent observation-only health evaluator supports one-shot and daemon
+  execution, deterministic minute-bucket replay, typed input failures, and
+  SIGINT/SIGTERM drain and restart.
 - A3 scheduler reliability completion inventory mapping every acceptance
   requirement to implementation, test, compatibility, and security evidence.
 - Scheduler lease heartbeats renew active claims every 30 seconds with a

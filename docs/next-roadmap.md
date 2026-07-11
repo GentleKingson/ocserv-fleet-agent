@@ -248,8 +248,10 @@ health evaluation run metadata. A unique input-watermark, policy-version, and
 computation-version tuple establishes the replay boundary without storing raw
 observations or expanding evaluator authority. Actor-bound atomic start,
 snapshot completion, typed failure, audit rollback, and bounded abandoned-run
-recovery are implemented. The independent graceful evaluator loop remains
-active A4 work.
+recovery are implemented. One-shot and daemon evaluator commands now refresh
+snapshots independently of dashboard reads, coalesce deterministic minute
+buckets, persist bounded invalid-input failures, and drain/restart on signals.
+The final A4 acceptance inventory remains active work.
 Schema 21 evaluator-run persistence is published in pull request `#88`.
 Atomic evaluator lifecycle and recovery are published in pull request `#89`.
 

@@ -2,10 +2,10 @@ use clap::{CommandFactory, Parser};
 use ocfleet_cli::args::{
     AlertCommand, AlertHookCommand, AlertSeverity, AlertState, AuditCommand, AuditExportFormat,
     Cli, Command, EndpointCommand, EnrollCommand, EnrollRequestCommand, EnrollTokenCommand,
-    HealthCommand, HealthPolicyCommand, HealthSnapshotCommand, NodeCommand, ObservationCommand,
-    OcservCommand, OcservSessionsCommand, ProbeCommand, RedactionMode, RetentionCommand,
-    RetentionScope, ScheduleCommand, ScheduleJobCommand, ScheduleJobKind, ScheduleRunCommand,
-    TrustCommand, TrustDiffFormat, TrustPolicyDiffFormat,
+    HealthCommand, HealthEvaluatorCommand, HealthPolicyCommand, HealthSnapshotCommand, NodeCommand,
+    ObservationCommand, OcservCommand, OcservSessionsCommand, ProbeCommand, RedactionMode,
+    RetentionCommand, RetentionScope, ScheduleCommand, ScheduleJobCommand, ScheduleJobKind,
+    ScheduleRunCommand, TrustCommand, TrustDiffFormat, TrustPolicyDiffFormat,
 };
 use std::path::PathBuf;
 
@@ -596,6 +596,38 @@ fn parses_observation_and_health_snapshot_queries() {
                 command: HealthSnapshotCommand::List {
                     limit: 25,
                     json: true
+                }
+            }
+        }
+    ));
+}
+
+#[test]
+fn parses_independent_health_evaluator_commands() {
+    let cli = Cli::parse_from(["ocfleet", "health", "evaluator", "run", "--json"]);
+    assert!(matches!(
+        cli.command,
+        Command::Health {
+            command: HealthCommand::Evaluator {
+                command: HealthEvaluatorCommand::Run { json: true }
+            }
+        }
+    ));
+
+    let cli = Cli::parse_from([
+        "ocfleet",
+        "health",
+        "evaluator",
+        "daemon",
+        "--interval-seconds",
+        "90",
+    ]);
+    assert!(matches!(
+        cli.command,
+        Command::Health {
+            command: HealthCommand::Evaluator {
+                command: HealthEvaluatorCommand::Daemon {
+                    interval_seconds: 90
                 }
             }
         }

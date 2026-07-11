@@ -450,6 +450,8 @@ ocfleet health node hk-ocserv-01
 ocfleet health node hk-ocserv-01 --json
 ocfleet health snapshot list --limit 50
 ocfleet health snapshot list --limit 50 --json
+ocfleet health evaluator run --json
+ocfleet health evaluator daemon --interval-seconds 60
 ocfleet health policy show
 ocfleet health policy set --stale-window 24h --unreachable-failures 3 --cert-warning-days 30 --cert-critical-days 7
 ```
@@ -459,6 +461,13 @@ derived health view, and upsert the latest per-node snapshot. They do not run
 probes. `health snapshot list` shows the current latest snapshot per node
 because the current schema stores one health snapshot row per node, not a full
 snapshot history.
+`health evaluator run` performs the same observation-only computation through a
+durable watermark-bound evaluation run. `health evaluator daemon` repeats that
+work independently of dashboard or interactive health reads, coalesces repeated
+work within a one-minute evaluation bucket, recovers abandoned runs after five
+minutes, records bounded failures, and drains cleanly on SIGINT or SIGTERM. Its
+interval is restricted to 10 through 3,600 seconds. It performs no agent RPC and
+cannot mutate nodes, endpoint trust, scheduler configuration, or maintenance.
 Health policy commands update only controller-local SQLite thresholds for stale
 health windows, consecutive unreachable failures, and certificate warning or
 critical alert windows. Each policy update writes a controller audit record with

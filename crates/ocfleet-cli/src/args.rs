@@ -569,6 +569,22 @@ pub enum HealthCommand {
         #[command(subcommand)]
         command: HealthSnapshotCommand,
     },
+    Evaluator {
+        #[command(subcommand)]
+        command: HealthEvaluatorCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum HealthEvaluatorCommand {
+    Run {
+        #[arg(long)]
+        json: bool,
+    },
+    Daemon {
+        #[arg(long, default_value_t = 60)]
+        interval_seconds: u64,
+    },
 }
 
 #[derive(Debug, Subcommand)]

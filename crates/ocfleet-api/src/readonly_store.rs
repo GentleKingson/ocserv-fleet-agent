@@ -2,6 +2,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use ocfleet_cli::private_file::{self, PrivateFileError};
+use ocfleet_cli::storage_payloads::{
+    SchedulerPairPayloadV1, SchedulerSelectorPayloadV1, validate_scheduler_payload_relationship,
+};
 use ocfleet_cli::store::{
     AlertEventRecord, AuditRecord, CURRENT_SCHEMA_VERSION, HealthSnapshotRecord, NodeRecord,
     ObservabilityJobRecord, ObservabilityRunRecord, ProbeObservationRecord,
@@ -509,14 +512,42 @@ fn node_health_from_row(row: &Row<'_>) -> rusqlite::Result<NodeHealthRecord> {
 fn observability_job_from_row(row: &Row<'_>) -> rusqlite::Result<ObservabilityJobRecord> {
     let selector_json: String = row.get(2)?;
     let pair_selector_json: Option<String> = row.get(3)?;
+    let selector_json = parse_json_column(&selector_json, 2)?;
+    let selector = SchedulerSelectorPayloadV1::from_value(&selector_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            2,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
+        )
+    })?;
+    let pair_selector_json = pair_selector_json
+        .as_deref()
+        .map(|value| parse_json_column(value, 3))
+        .transpose()?;
+    let pair = pair_selector_json
+        .as_ref()
+        .map(SchedulerPairPayloadV1::from_value)
+        .transpose()
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                3,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
+            )
+        })?;
+    let kind: String = row.get(1)?;
+    validate_scheduler_payload_relationship(&kind, &selector, pair.as_ref()).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            2,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
+        )
+    })?;
     Ok(ObservabilityJobRecord {
         job_id: row.get(0)?,
-        kind: row.get(1)?,
-        selector_json: parse_json_column(&selector_json, 2)?,
-        pair_selector_json: pair_selector_json
-            .as_deref()
-            .map(|value| parse_json_column(value, 3))
-            .transpose()?,
+        kind,
+        selector_json,
+        pair_selector_json,
         interval_seconds: i64_to_u64(row.get(4)?, 4)?,
         jitter_seconds: i64_to_u64(row.get(5)?, 5)?,
         timeout_ms: i64_to_u64(row.get(6)?, 6)?,

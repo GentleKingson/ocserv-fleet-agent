@@ -58,7 +58,14 @@ legacy rows does not satisfy the bounded low-sensitive validator. The returned
 records are internal store records, not presentation DTOs; every CLI/API output
 consumer must still use its typed projection. `StoreWriter` deliberately
 exposes only mutation methods that bind actor and audit in one transaction. The
-first production-hardening slice added node add/enable/disable/remove to this
+first A2 storage slice advances SQLite to schema version 9 and replaces open
+scheduler selector/pair objects with closed schema-tagged v1 payloads. Migration
+9 canonicalizes exact legacy objects, disables ambiguous empty selectors, and
+fails on unknown or contaminated data. Both the CLI store and independent API
+read adapter deserialize these types before projection, so raw persisted job
+JSON is never an output contract.
+
+The first production-hardening slice added node add/enable/disable/remove to this
 contract and removed the CLI's post-commit success audits. Audit-trigger failure
 tests prove both `nodes` and `endpoint_trust` changes roll back. The second slice
 added scheduler job add/enable/disable to the same contract; audit-trigger

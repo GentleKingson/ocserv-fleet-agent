@@ -1,5 +1,6 @@
 use ocfleet_cli::audit_export::audit_record_payload;
 use ocfleet_cli::observation::observation_to_json;
+use ocfleet_cli::storage_payloads::{SchedulerPairPayloadV1, SchedulerSelectorPayloadV1};
 use ocfleet_cli::store::{
     AlertEventRecord, AuditRecord, ObservabilityJobRecord, ObservabilityRunRecord,
     ProbeObservationRecord,
@@ -79,15 +80,16 @@ pub fn health_summary_to_json(records: &[NodeHealthRecord]) -> Value {
 
 pub fn job_to_json(job: &ObservabilityJobRecord) -> Value {
     let pair = explicit_pair(job);
+    let selector = SchedulerSelectorPayloadV1::from_value(&job.selector_json).ok();
     json!({
         "job_id": job.job_id,
-        "name": job.selector_json.get("name").and_then(Value::as_str),
+        "name": selector.as_ref().and_then(|value| value.name.as_deref()),
         "kind": job.kind,
         "enabled": job.enabled,
         "interval_seconds": job.interval_seconds,
         "jitter_seconds": job.jitter_seconds,
         "timeout_ms": job.timeout_ms,
-        "selector": selector_label(job).unwrap_or("<invalid>"),
+        "selector": selector_label(job).unwrap_or_else(|| "<invalid>".to_string()),
         "source_node_id": pair.as_ref().and_then(|(source, _)| source.as_deref()),
         "target_node_id": pair.as_ref().and_then(|(_, target)| target.as_deref()),
         "next_run_at": job.next_run_at,
@@ -161,8 +163,10 @@ pub fn audit_to_json(row: &AuditRecord, redact: RedactionMode) -> Value {
     payload
 }
 
-fn selector_label(job: &ObservabilityJobRecord) -> Option<&str> {
-    job.selector_json.get("selector").and_then(Value::as_str)
+fn selector_label(job: &ObservabilityJobRecord) -> Option<String> {
+    SchedulerSelectorPayloadV1::from_value(&job.selector_json)
+        .ok()
+        .map(|value| value.selector)
 }
 
 fn safe_health_status(status: &str) -> &str {
@@ -173,15 +177,8 @@ fn safe_health_status(status: &str) -> &str {
 }
 
 fn explicit_pair(job: &ObservabilityJobRecord) -> Option<(Option<String>, Option<String>)> {
-    let pair = job.pair_selector_json.as_ref()?;
-    Some((
-        pair.get("source_node_id")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned),
-        pair.get("target_node_id")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned),
-    ))
+    let pair = SchedulerPairPayloadV1::from_value(job.pair_selector_json.as_ref()?).ok()?;
+    Some((Some(pair.source_node_id), Some(pair.target_node_id)))
 }
 
 #[derive(Default)]

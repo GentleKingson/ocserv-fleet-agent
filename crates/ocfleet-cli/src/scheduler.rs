@@ -35,6 +35,7 @@ use crate::controller_rpc::{
     ocserv_failure_detail, rpc_audit_event,
 };
 use crate::input_validation::{validate_description, validate_selector};
+use crate::storage_payloads::{SchedulerPairPayloadV1, SchedulerSelectorPayloadV1};
 use crate::store::{
     InvalidObservabilityJobRecord, NodeRecord, ObservabilityJobLoadResult, ObservabilityJobRecord,
     ObservabilityRunRecord, ProbeObservationInsert, SchedulerJobClockUpdate, SchedulerOutcomeEntry,
@@ -415,10 +416,9 @@ fn add_job(store: &Store, actor: &str, input: AddJobInput) -> anyhow::Result<()>
     let job = ObservabilityJobRecord {
         job_id: format!("job-{}", Uuid::new_v4().simple()),
         kind: schedule_kind_name(input.kind).to_string(),
-        selector_json: json!({
-            "selector": selector_value,
-            "name": input.name,
-        }),
+        selector_json: SchedulerSelectorPayloadV1::new(selector_value.clone(), input.name)
+            .map_err(anyhow::Error::msg)?
+            .to_value(),
         pair_selector_json,
         interval_seconds,
         jitter_seconds: 0,
@@ -2508,10 +2508,11 @@ fn build_selectors(
             validate_node_id(&target_node_id)?;
             Ok((
                 EXPLICIT_PAIR_SELECTOR.to_string(),
-                Some(json!({
-                    "source_node_id": source_node_id,
-                    "target_node_id": target_node_id,
-                })),
+                Some(
+                    SchedulerPairPayloadV1::new(source_node_id, target_node_id)
+                        .map_err(anyhow::Error::msg)?
+                        .to_value(),
+                ),
             ))
         }
         _ => {
@@ -3272,7 +3273,9 @@ mod tests {
         ObservabilityJobRecord {
             job_id: job_id.to_string(),
             kind: "controller-ping".to_string(),
-            selector_json: json!({"selector": "role=ocserv"}),
+            selector_json: SchedulerSelectorPayloadV1::new("role=ocserv".to_string(), None)
+                .expect("valid selector")
+                .to_value(),
             pair_selector_json: None,
             interval_seconds: 60,
             jitter_seconds: 0,

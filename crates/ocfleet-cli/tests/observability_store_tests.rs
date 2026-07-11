@@ -1,5 +1,6 @@
 use ocfleet_cli::audit::AuditEvent;
 use ocfleet_cli::backend::StoreWriter;
+use ocfleet_cli::storage_payloads::SchedulerSelectorPayloadV1;
 use ocfleet_cli::store::{
     AlertDeliveryAttemptRecord, AlertDeliveryAttemptWrite, AlertDeliveryFinalizeWrite,
     AlertEvaluationEntry, AlertEvaluationWrite, AlertEventRecord, AlertStateTransition,
@@ -28,10 +29,12 @@ fn sample_job(job_id: &str, enabled: bool) -> ObservabilityJobRecord {
     ObservabilityJobRecord {
         job_id: job_id.to_string(),
         kind: "controller-ping".to_string(),
-        selector_json: json!({
-            "selector": "node_id=hk-ocserv-01",
-            "name": "HK controller ping",
-        }),
+        selector_json: SchedulerSelectorPayloadV1::new(
+            "node_id=hk-ocserv-01".to_string(),
+            Some("HK controller ping".to_string()),
+        )
+        .expect("valid selector")
+        .to_value(),
         pair_selector_json: None,
         interval_seconds: 60,
         jitter_seconds: 5,
@@ -384,13 +387,45 @@ fn observability_store_tests_scheduler_job_add_rolls_back_when_audit_fails() {
 }
 
 #[test]
+fn observability_store_tests_scheduler_job_add_requires_versioned_closed_payloads() {
+    let (_dir, store, _db) = open_temp_store();
+
+    for (job_id, selector) in [
+        ("job-unversioned", json!({"selector": "role=ocserv"})),
+        (
+            "job-future-schema",
+            json!({
+                "schema": "ocfleet.scheduler.selector.v2",
+                "selector": "role=ocserv",
+                "name": null
+            }),
+        ),
+        (
+            "job-contaminated",
+            json!({
+                "schema": "ocfleet.scheduler.selector.v1",
+                "selector": "role=ocserv",
+                "name": null,
+                "client_address": "10.0.0.2"
+            }),
+        ),
+    ] {
+        let mut job = sample_job(job_id, true);
+        job.selector_json = selector;
+        assert!(StoreWriter::write_scheduler_job_add(&store, &job, TEST_ACTOR).is_err());
+    }
+
+    assert_eq!(store.audit_count().expect("audit count"), 0);
+}
+
+#[test]
 fn observability_store_tests_scheduler_job_state_rolls_back_exact_row_when_audit_fails() {
     assert_job_state_rolls_back_when_audit_fails(true, false);
     assert_job_state_rolls_back_when_audit_fails(false, true);
 }
 
 #[test]
-fn observability_store_tests_scheduler_job_state_audit_uses_closed_projection() {
+fn observability_store_tests_scheduler_job_state_rejects_contaminated_selector_payload() {
     let (_dir, store, db) = open_temp_store();
     let job = sample_job("job-closed-audit", true);
     StoreWriter::write_scheduler_job_add(&store, &job, TEST_ACTOR).expect("seed job");
@@ -405,24 +440,17 @@ fn observability_store_tests_scheduler_job_state_audit_uses_closed_projection() 
         )
         .expect("contaminate stored job selector");
 
-    StoreWriter::write_scheduler_job_disable(&store, &job.job_id, TEST_ACTOR)
-        .expect("closed audit projection permits safe disable");
-    assert!(
-        !store
-            .get_observability_job(&job.job_id)
-            .expect("load disabled job")
-            .expect("job exists")
-            .enabled
-    );
-    let (_, event, detail) = latest_job_audit(&db);
-    assert_eq!(event, "scheduler.job.disable");
-    assert_eq!(detail["before"]["selector_class"], "role");
-    assert_eq!(detail["after"]["selector_class"], "role");
-    let encoded = serde_json::to_string(&detail).expect("encode audit detail");
-    assert!(!encoded.contains("/etc/ops"));
-    assert!(!encoded.contains("credential alpha"));
-    assert!(!encoded.contains("selector_json"));
-    assert!(!encoded.contains("updated_at"));
+    assert!(StoreWriter::write_scheduler_job_disable(&store, &job.job_id, TEST_ACTOR).is_err());
+    let conn = Connection::open(&db).expect("open db");
+    let enabled: i64 = conn
+        .query_row(
+            "SELECT enabled FROM observability_jobs WHERE job_id = ?1",
+            [job.job_id],
+            |row| row.get(0),
+        )
+        .expect("read enabled");
+    assert_eq!(enabled, 1);
+    assert_eq!(store.audit_count().expect("audit count"), 1);
 }
 
 #[test]

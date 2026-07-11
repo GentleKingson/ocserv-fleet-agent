@@ -353,6 +353,42 @@ pub struct HealthSnapshotWrite {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HealthEvaluationRunRecord {
+    pub evaluation_id: String,
+    pub input_watermark: String,
+    pub policy_version: String,
+    pub computation_version: String,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+    pub status: String,
+    pub snapshot_count: u64,
+    pub failure_code: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HealthEvaluationStart {
+    pub evaluation_id: String,
+    pub input_watermark: String,
+    pub policy_version: String,
+    pub computation_version: String,
+    pub started_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HealthEvaluationFinish {
+    pub evaluation_id: String,
+    pub finished_at: String,
+    pub snapshots: Vec<HealthSnapshotRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HealthEvaluationFailure {
+    pub evaluation_id: String,
+    pub finished_at: String,
+    pub failure_code: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AlertEventRecord {
     pub alert_id: String,
     pub dedupe_key: String,
@@ -1958,6 +1994,265 @@ impl Store {
         let rows = stmt.query_map([limit], health_snapshot_from_row)?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(StoreError::from)
+    }
+
+    pub fn get_health_evaluation_run(
+        &self,
+        evaluation_id: &str,
+    ) -> Result<Option<HealthEvaluationRunRecord>, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT evaluation_id, input_watermark, policy_version, computation_version,
+                        started_at, finished_at, status, snapshot_count, failure_code
+                 FROM health_evaluation_runs WHERE evaluation_id = ?1",
+                [evaluation_id],
+                health_evaluation_run_from_row,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    pub fn write_health_evaluation_start(
+        &self,
+        start: &HealthEvaluationStart,
+        actor: &str,
+    ) -> Result<(), StoreError> {
+        validate_actor(actor).map_err(StoreError::InvalidInput)?;
+        validate_health_evaluation_start(start)?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let existing = tx
+            .query_row(
+                "SELECT evaluation_id, input_watermark, policy_version, computation_version,
+                        started_at, finished_at, status, snapshot_count, failure_code
+                 FROM health_evaluation_runs
+                 WHERE evaluation_id = ?1
+                    OR (input_watermark = ?2 AND policy_version = ?3 AND computation_version = ?4)",
+                params![
+                    start.evaluation_id,
+                    start.input_watermark,
+                    start.policy_version,
+                    start.computation_version,
+                ],
+                health_evaluation_run_from_row,
+            )
+            .optional()?;
+        if let Some(existing) = existing {
+            if existing.evaluation_id == start.evaluation_id
+                && existing.input_watermark == start.input_watermark
+                && existing.policy_version == start.policy_version
+                && existing.computation_version == start.computation_version
+                && existing.started_at == start.started_at
+            {
+                let audit_actor = tx
+                    .query_row(
+                        "SELECT actor FROM controller_audit_log
+                         WHERE request_id = ?1 AND event = 'health.evaluation.start'",
+                        [start.evaluation_id.as_str()],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?;
+                if audit_actor.as_deref() != Some(actor) {
+                    return Err(StoreError::HealthEvaluationConflict {
+                        evaluation_id: start.evaluation_id.clone(),
+                        detail: "evaluation audit provenance is mismatched or missing",
+                    });
+                }
+                tx.commit()?;
+                return Ok(());
+            }
+            return Err(StoreError::HealthEvaluationConflict {
+                evaluation_id: start.evaluation_id.clone(),
+                detail: "evaluation identity or replay key is already bound",
+            });
+        }
+        tx.execute(
+            "INSERT INTO health_evaluation_runs
+             (evaluation_id, input_watermark, policy_version, computation_version, started_at, status)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'running')",
+            params![
+                start.evaluation_id,
+                start.input_watermark,
+                start.policy_version,
+                start.computation_version,
+                start.started_at,
+            ],
+        )?;
+        insert_health_evaluation_audit_tx(
+            &tx,
+            actor,
+            "health.evaluation.start",
+            &start.evaluation_id,
+            true,
+            None,
+            0,
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn write_health_evaluation_finish(
+        &self,
+        finish: &HealthEvaluationFinish,
+        actor: &str,
+    ) -> Result<(), StoreError> {
+        validate_actor(actor).map_err(StoreError::InvalidInput)?;
+        validate_health_evaluation_finish(finish)?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        validate_health_evaluation_finish_order_tx(
+            &tx,
+            &finish.evaluation_id,
+            &finish.finished_at,
+        )?;
+        let changed = tx.execute(
+            "UPDATE health_evaluation_runs
+             SET finished_at = ?2, status = 'completed', snapshot_count = ?3
+             WHERE evaluation_id = ?1 AND status = 'running' AND finished_at IS NULL",
+            params![
+                finish.evaluation_id,
+                finish.finished_at,
+                finish.snapshots.len()
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::HealthEvaluationConflict {
+                evaluation_id: finish.evaluation_id.clone(),
+                detail: "evaluation is missing or is not running",
+            });
+        }
+        for snapshot in &finish.snapshots {
+            upsert_health_snapshot_tx(&tx, snapshot)?;
+        }
+        insert_health_evaluation_audit_tx(
+            &tx,
+            actor,
+            "health.evaluation.finish",
+            &finish.evaluation_id,
+            true,
+            None,
+            finish.snapshots.len(),
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn write_health_evaluation_failure(
+        &self,
+        failure: &HealthEvaluationFailure,
+        actor: &str,
+    ) -> Result<(), StoreError> {
+        validate_actor(actor).map_err(StoreError::InvalidInput)?;
+        validate_health_evaluation_failure(failure)?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        validate_health_evaluation_finish_order_tx(
+            &tx,
+            &failure.evaluation_id,
+            &failure.finished_at,
+        )?;
+        let changed = tx.execute(
+            "UPDATE health_evaluation_runs
+             SET finished_at = ?2, status = 'failed', failure_code = ?3
+             WHERE evaluation_id = ?1 AND status = 'running' AND finished_at IS NULL",
+            params![
+                failure.evaluation_id,
+                failure.finished_at,
+                failure.failure_code
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::HealthEvaluationConflict {
+                evaluation_id: failure.evaluation_id.clone(),
+                detail: "evaluation is missing or is not running",
+            });
+        }
+        insert_health_evaluation_audit_tx(
+            &tx,
+            actor,
+            "health.evaluation.fail",
+            &failure.evaluation_id,
+            false,
+            Some(&failure.failure_code),
+            0,
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn write_health_evaluation_recovery(
+        &self,
+        cutoff: &str,
+        recovered_at: &str,
+        actor: &str,
+    ) -> Result<usize, StoreError> {
+        validate_actor(actor).map_err(StoreError::InvalidInput)?;
+        validate_rfc3339(cutoff, "health evaluation recovery cutoff")?;
+        validate_rfc3339(recovered_at, "health evaluation recovered_at")?;
+        let cutoff_instant = OffsetDateTime::parse(cutoff, &Rfc3339).map_err(|_| {
+            StoreError::InvalidInput("health evaluation recovery cutoff is invalid".to_string())
+        })?;
+        let recovered_instant = OffsetDateTime::parse(recovered_at, &Rfc3339).map_err(|_| {
+            StoreError::InvalidInput("health evaluation recovered_at is invalid".to_string())
+        })?;
+        if recovered_instant < cutoff_instant {
+            return Err(StoreError::InvalidInput(
+                "health evaluation recovered_at precedes cutoff".to_string(),
+            ));
+        }
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let mut candidates = {
+            let mut stmt = tx.prepare(
+                "SELECT evaluation_id, started_at FROM health_evaluation_runs
+                 WHERE status = 'running'
+                 ORDER BY evaluation_id LIMIT 1000",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let mut candidates = candidates
+            .drain(..)
+            .map(|(evaluation_id, started_at)| {
+                OffsetDateTime::parse(&started_at, &Rfc3339)
+                    .map(|instant| (evaluation_id, instant))
+                    .map_err(|_| {
+                        StoreError::InvalidInput(
+                            "stored health evaluation started_at is invalid".to_string(),
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        candidates.retain(|(_, started_at)| *started_at < cutoff_instant);
+        candidates.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
+        let evaluation_ids = candidates
+            .into_iter()
+            .take(100)
+            .map(|(evaluation_id, _)| evaluation_id)
+            .collect::<Vec<_>>();
+        for evaluation_id in &evaluation_ids {
+            let changed = tx.execute(
+                "UPDATE health_evaluation_runs
+                 SET finished_at = ?2, status = 'failed', failure_code = 'HEALTH_EVALUATION_ABANDONED'
+                 WHERE evaluation_id = ?1 AND status = 'running'",
+                params![evaluation_id, recovered_at],
+            )?;
+            if changed != 1 {
+                return Err(StoreError::HealthEvaluationConflict {
+                    evaluation_id: evaluation_id.clone(),
+                    detail: "evaluation changed during recovery",
+                });
+            }
+            insert_health_evaluation_audit_tx(
+                &tx,
+                actor,
+                "health.evaluation.recover",
+                evaluation_id,
+                false,
+                Some("HEALTH_EVALUATION_ABANDONED"),
+                0,
+            )?;
+        }
+        tx.commit()?;
+        Ok(evaluation_ids.len())
     }
 
     pub fn upsert_alert_event(&self, alert: &AlertEventRecord) -> Result<(), StoreError> {
@@ -6179,6 +6474,32 @@ fn health_snapshot_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HealthS
     })
 }
 
+fn health_evaluation_run_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<HealthEvaluationRunRecord> {
+    let snapshot_count = row.get::<_, i64>(7)?;
+    Ok(HealthEvaluationRunRecord {
+        evaluation_id: row.get(0)?,
+        input_watermark: row.get(1)?,
+        policy_version: row.get(2)?,
+        computation_version: row.get(3)?,
+        started_at: row.get(4)?,
+        finished_at: row.get(5)?,
+        status: row.get(6)?,
+        snapshot_count: u64::try_from(snapshot_count).map_err(|_| {
+            rusqlite::Error::FromSqlConversionFailure(
+                7,
+                Type::Integer,
+                Box::new(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "health evaluation snapshot_count must be non-negative",
+                )),
+            )
+        })?,
+        failure_code: row.get(8)?,
+    })
+}
+
 fn alert_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AlertEventRecord> {
     let detail_json: String = row.get(10)?;
     let detail_json = parse_json_column(&detail_json, 10)?;
@@ -6906,6 +7227,107 @@ fn validate_health_snapshot_write(write: &HealthSnapshotWrite) -> Result<(), Sto
             .map_err(StoreError::InvalidInput)?;
         validate_health_payload_relationship(&snapshot.status, &summary)
             .map_err(StoreError::InvalidInput)?;
+    }
+    Ok(())
+}
+
+fn validate_health_evaluation_id(evaluation_id: &str) -> Result<(), StoreError> {
+    validate_audit_text(evaluation_id, "health evaluation_id", 96)?;
+    let Some(uuid) = evaluation_id.strip_prefix("health-eval-") else {
+        return Err(StoreError::InvalidInput(
+            "health evaluation_id must use health-eval-<uuid> format".to_string(),
+        ));
+    };
+    Uuid::parse_str(uuid).map_err(|_| {
+        StoreError::InvalidInput("health evaluation_id must contain a UUID".to_string())
+    })?;
+    Ok(())
+}
+
+fn validate_sha256_hex(value: &str, field: &str) -> Result<(), StoreError> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(StoreError::InvalidInput(format!(
+            "{field} must be a 64-character hexadecimal digest"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_health_evaluation_start(start: &HealthEvaluationStart) -> Result<(), StoreError> {
+    validate_health_evaluation_id(&start.evaluation_id)?;
+    validate_sha256_hex(&start.input_watermark, "health input watermark")?;
+    validate_sha256_hex(&start.policy_version, "health policy version")?;
+    validate_audit_text(&start.computation_version, "health computation version", 64)?;
+    validate_rfc3339(&start.started_at, "health evaluation started_at")
+}
+
+fn validate_health_evaluation_finish(finish: &HealthEvaluationFinish) -> Result<(), StoreError> {
+    validate_health_evaluation_id(&finish.evaluation_id)?;
+    validate_rfc3339(&finish.finished_at, "health evaluation finished_at")?;
+    validate_health_snapshot_write(&HealthSnapshotWrite {
+        evaluation_id: finish.evaluation_id.clone(),
+        event: "health.summary".to_string(),
+        snapshots: finish.snapshots.clone(),
+    })
+}
+
+fn validate_health_evaluation_failure(failure: &HealthEvaluationFailure) -> Result<(), StoreError> {
+    validate_health_evaluation_id(&failure.evaluation_id)?;
+    validate_rfc3339(&failure.finished_at, "health evaluation finished_at")?;
+    validate_audit_text(&failure.failure_code, "health evaluation failure_code", 64)
+}
+
+fn insert_health_evaluation_audit_tx(
+    tx: &Transaction<'_>,
+    actor: &str,
+    event_name: &str,
+    evaluation_id: &str,
+    ok: bool,
+    failure_code: Option<&str>,
+    snapshot_count: usize,
+) -> Result<(), StoreError> {
+    let mut event = AuditEvent::new(actor, event_name);
+    event.ok = Some(ok);
+    event.request_id = Some(evaluation_id.to_string());
+    event.error_code = failure_code.map(str::to_string);
+    event.detail_json = json!({
+        "actor_type": "system",
+        "target_type": "health_evaluation",
+        "target_id": evaluation_id,
+        "batch_count": snapshot_count,
+        "reason": Value::Null,
+    });
+    insert_audit_tx(tx, &event)
+}
+
+fn validate_health_evaluation_finish_order_tx(
+    tx: &Transaction<'_>,
+    evaluation_id: &str,
+    finished_at: &str,
+) -> Result<(), StoreError> {
+    let started_at = tx
+        .query_row(
+            "SELECT started_at FROM health_evaluation_runs WHERE evaluation_id = ?1",
+            [evaluation_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let Some(started_at) = started_at else {
+        return Err(StoreError::HealthEvaluationConflict {
+            evaluation_id: evaluation_id.to_string(),
+            detail: "evaluation is missing or is not running",
+        });
+    };
+    let started_at = OffsetDateTime::parse(&started_at, &Rfc3339).map_err(|_| {
+        StoreError::InvalidInput("stored health evaluation started_at is invalid".to_string())
+    })?;
+    let finished_at = OffsetDateTime::parse(finished_at, &Rfc3339).map_err(|_| {
+        StoreError::InvalidInput("health evaluation finished_at is invalid".to_string())
+    })?;
+    if finished_at < started_at {
+        return Err(StoreError::InvalidInput(
+            "health evaluation finished_at precedes started_at".to_string(),
+        ));
     }
     Ok(())
 }

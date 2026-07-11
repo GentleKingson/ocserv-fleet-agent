@@ -2,11 +2,11 @@
   "baseline_commit": "b3c906a94823b4620dc1a2077a44e7160c0848b2",
   "current_phase": "A4",
   "completed_phases": ["A1", "A2", "A3"],
-  "active_branch": "codex/a4-health-evaluator",
+  "active_branch": "codex/a4-health-evaluator-lifecycle",
   "active_issue": 36,
-  "active_pr": 88,
+  "active_pr": 89,
   "last_test_result": "passed",
-  "last_updated_at": "2026-07-11T21:04:00Z",
+  "last_updated_at": "2026-07-11T22:02:00Z",
   "blockers": [],
-  "next_action": "Publish schema 21 health evaluation run persistence, then implement atomic completion, recovery, and the independent evaluator loop."
+  "next_action": "Publish atomic health evaluation lifecycle and recovery, then implement the independent graceful evaluator loop."
 }

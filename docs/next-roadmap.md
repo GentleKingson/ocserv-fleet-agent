@@ -246,10 +246,12 @@ Published for review in pull request `#80`.
 The first A4 slice advances SQLite to migration `0021` and adds bounded durable
 health evaluation run metadata. A unique input-watermark, policy-version, and
 computation-version tuple establishes the replay boundary without storing raw
-observations or expanding evaluator authority. Atomic snapshot completion,
-abandoned-run recovery, and the independent graceful evaluator loop remain
+observations or expanding evaluator authority. Actor-bound atomic start,
+snapshot completion, typed failure, audit rollback, and bounded abandoned-run
+recovery are implemented. The independent graceful evaluator loop remains
 active A4 work.
 Schema 21 evaluator-run persistence is published in pull request `#88`.
+Atomic evaluator lifecycle and recovery are published in pull request `#89`.
 
 ### Baseline And Production Foundation
 

@@ -54,6 +54,37 @@ fn initializes_schema_and_migration_version() {
 }
 
 #[test]
+fn endpoint_trust_writes_versioned_bundle_and_reader_rejects_contamination() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("controller.sqlite");
+    let store = Store::open(&db).expect("store opens");
+    let node = seed_generated_node(&store, "typed-trust-bundle-node");
+    let conn = Connection::open(&db).expect("open database");
+    let raw: String = conn
+        .query_row(
+            "SELECT trust_bundle_json FROM endpoint_trust WHERE endpoint_id = ?1",
+            [node.endpoint_id.as_str()],
+            |row| row.get(0),
+        )
+        .expect("read stored trust bundle");
+    let mut raw: serde_json::Value = serde_json::from_str(&raw).expect("typed trust bundle");
+    assert_eq!(raw["schema"], "ocfleet.trust.bundle.v1");
+    assert_eq!(raw["endpoint_id"], node.endpoint_id);
+    raw["client_address"] = serde_json::json!("10.0.0.2");
+    conn.execute(
+        "UPDATE endpoint_trust SET trust_bundle_json = ?1 WHERE endpoint_id = ?2",
+        rusqlite::params![raw.to_string(), node.endpoint_id],
+    )
+    .expect("contaminate trust bundle");
+
+    let error = store
+        .get_endpoint_trust(&node.endpoint_id)
+        .expect_err("contaminated trust bundle must fail closed");
+    assert!(error.to_string().contains("trust bundle"));
+    assert!(!error.to_string().contains("10.0.0.2"));
+}
+
+#[test]
 fn open_with_status_reports_database_creation() {
     let dir = tempfile::tempdir().expect("temp dir");
     let db = dir.path().join("controller.sqlite");
@@ -488,6 +519,7 @@ fn seed_generated_node(store: &Store, node_id: &str) -> NodeInsert {
 
 fn trust_bundle_fixture(endpoint_id: &str, generation: u64, status: EndpointStatus) -> String {
     serde_json::json!({
+        "schema": "ocfleet.trust.bundle.v1",
         "endpoint_id": endpoint_id,
         "generation": generation,
         "status": status.as_str(),
@@ -1819,8 +1851,13 @@ fn legacy_enrollment_claim_rejects_status_lineage_and_bundle_contamination() {
         match contamination {
             "status" => {
                 conn.execute(
-                    "UPDATE endpoint_trust SET status = 'quarantined' WHERE endpoint_id = ?1",
-                    [&endpoint_id],
+                    "UPDATE endpoint_trust
+                     SET status = 'quarantined', trust_bundle_json = ?1
+                     WHERE endpoint_id = ?2",
+                    rusqlite::params![
+                        trust_bundle_fixture(&endpoint_id, 1, EndpointStatus::Quarantined,),
+                        endpoint_id,
+                    ],
                 )
                 .expect("contaminate status");
             }
@@ -1851,6 +1888,7 @@ fn legacy_enrollment_claim_rejects_status_lineage_and_bundle_contamination() {
             }
             "bundle_authority" => {
                 let bundle = serde_json::json!({
+                    "schema": "ocfleet.trust.bundle.v1",
                     "endpoint_id": endpoint_id.clone(),
                     "generation": 1,
                     "status": "active",

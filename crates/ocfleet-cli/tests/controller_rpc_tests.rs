@@ -283,7 +283,10 @@ async fn controller_rpc_preserves_active_and_inactive_endpoint_behavior() {
     Connection::open(&inactive_db)
         .expect("open inactive fixture database")
         .execute(
-            "UPDATE endpoint_trust SET status = 'revoked' WHERE endpoint_id = ?1",
+            "UPDATE endpoint_trust
+             SET status = 'revoked',
+                 trust_bundle_json = json_set(trust_bundle_json, '$.status', 'revoked')
+             WHERE endpoint_id = ?1",
             [&inactive_endpoint_id],
         )
         .expect("mark endpoint inactive without changing node state");

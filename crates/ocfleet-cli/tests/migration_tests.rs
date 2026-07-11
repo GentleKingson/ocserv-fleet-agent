@@ -590,6 +590,44 @@ fn migration_tests_run_summary_v1_migrates_or_fails_closed() {
     assert_eq!(backup_files(bad_dir.path()).len(), 1);
 }
 
+#[test]
+fn migration_tests_trust_bundle_v1_migrates_or_fails_closed() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("controller.sqlite");
+    create_legacy_fixture(&db, 12, 1);
+    let store = Store::open(&db).expect("migrate v12 trust bundle");
+    drop(store);
+    let conn = Connection::open(&db).expect("open migrated db");
+    let bundle: String = conn
+        .query_row(
+            "SELECT trust_bundle_json FROM endpoint_trust WHERE endpoint_id = 'endpoint-0000'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read migrated trust bundle");
+    let bundle: serde_json::Value = serde_json::from_str(&bundle).expect("bundle json");
+    assert_eq!(bundle["schema"], "ocfleet.trust.bundle.v1");
+    assert_eq!(bundle["endpoint_id"], "endpoint-0000");
+    assert_eq!(bundle["generation"], 1);
+    assert_eq!(bundle["status"], "active");
+    assert_eq!(bundle["trusted_controllers"], serde_json::json!([]));
+    drop(conn);
+
+    let bad_dir = tempfile::tempdir().expect("bad temp dir");
+    let bad_db = bad_dir.path().join("controller.sqlite");
+    create_legacy_fixture(&bad_db, 12, 1);
+    let conn = Connection::open(&bad_db).expect("open contaminated v12 db");
+    conn.execute(
+        "UPDATE endpoint_trust SET trust_bundle_json = ?1",
+        [r#"{"endpoint_id":"endpoint-0000","generation":1,"status":"active","trusted_controllers":[],"trusted_peers":[],"authorized_path_probes":[],"client_address":"10.0.0.2"}"#],
+    )
+    .expect("contaminate trust bundle");
+    drop(conn);
+    make_private_database_file(&bad_db);
+    assert!(Store::open(&bad_db).is_err());
+    assert_eq!(backup_files(bad_dir.path()).len(), 1);
+}
+
 fn create_legacy_fixture(path: &Path, version: i64, rows: usize) {
     assert!((1..=CURRENT_SCHEMA_VERSION).contains(&version));
     let conn = Connection::open(path).expect("create fixture db");
@@ -664,11 +702,18 @@ fn insert_legacy_rows(conn: &Connection, version: i64, rows: usize) {
             .expect("insert enrollment token");
         }
         if version >= 3 {
+            let trust_bundle_json = if version >= 13 {
+                format!(
+                    r#"{{"schema":"ocfleet.trust.bundle.v1","endpoint_id":"{endpoint_id}","generation":1,"status":"active","trusted_controllers":[],"trusted_peers":[],"authorized_path_probes":[]}}"#
+                )
+            } else {
+                "{}".to_string()
+            };
             conn.execute(
                 "INSERT INTO endpoint_trust
                  (endpoint_id, node_id, fingerprint, status, generation, previous_endpoint_id, rotated_to, trust_bundle_json, created_at, updated_at)
-                 VALUES (?1, ?2, NULL, 'active', 1, NULL, NULL, '{}', ?3, ?3)",
-                (&endpoint_id, &node_id, NOW),
+                 VALUES (?1, ?2, NULL, 'active', 1, NULL, NULL, ?3, ?4, ?4)",
+                (&endpoint_id, &node_id, &trust_bundle_json, NOW),
             )
             .expect("insert endpoint trust");
         }

@@ -186,7 +186,10 @@ fn health_summary_tests_inactive_endpoint_overrides_recent_success() {
         Connection::open(&database)
             .expect("open database")
             .execute(
-                "UPDATE endpoint_trust SET status = ?1 WHERE endpoint_id = ?2",
+                "UPDATE endpoint_trust
+                 SET status = ?1,
+                     trust_bundle_json = json_set(trust_bundle_json, '$.status', ?1)
+                 WHERE endpoint_id = ?2",
                 rusqlite::params![status.as_str(), endpoint_id],
             )
             .expect("mark current endpoint inactive");

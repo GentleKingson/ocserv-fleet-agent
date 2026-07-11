@@ -29,11 +29,11 @@ use crate::migrations;
 use crate::private_file::{self, PrivateFileError};
 use crate::storage_payloads::{
     HealthDegradedMethodsPayloadV1, HealthSummaryPayloadV1, ObservationSummaryPayloadV1,
-    RunSummaryPayloadV1, SchedulerPairPayloadV1, SchedulerSelectorPayloadV1,
+    RunSummaryPayloadV1, SchedulerPairPayloadV1, SchedulerSelectorPayloadV1, TrustBundlePayloadV1,
     validate_health_payload_relationship, validate_scheduler_payload_relationship,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 12;
+pub const CURRENT_SCHEMA_VERSION: i64 = 13;
 pub const DEFAULT_HEALTH_STALE_WINDOW_SECONDS: u64 = 24 * 60 * 60;
 pub const DEFAULT_HEALTH_UNREACHABLE_FAILURES: u64 = 3;
 pub const DEFAULT_HEALTH_CERT_WARNING_DAYS: u64 = 30;
@@ -3096,8 +3096,13 @@ impl Store {
                 EndpointStatus::Rotated.as_str(),
                 endpoint_generation_to_i64(&old_endpoint_id, new_generation)?,
                 new_endpoint_id.as_str(),
-                trust_bundle_json(&old_endpoint_id, new_generation, EndpointStatus::Rotated)
-                    .to_string(),
+                canonical_trust_bundle(
+                    &old_endpoint_id,
+                    new_generation,
+                    EndpointStatus::Rotated,
+                    &trust_bundle_json(&old_endpoint_id, new_generation, EndpointStatus::Rotated,),
+                )?
+                .to_string(),
                 old_endpoint_id.as_str(),
             ],
         )?;
@@ -3830,6 +3835,12 @@ fn insert_endpoint_trust_tx(
     endpoint: &EndpointTrustRecord,
 ) -> Result<(), StoreError> {
     let generation = endpoint_generation_to_i64(&endpoint.endpoint_id, endpoint.generation)?;
+    let trust_bundle_json = canonical_trust_bundle(
+        &endpoint.endpoint_id,
+        endpoint.generation,
+        endpoint.status,
+        &endpoint.trust_bundle_json,
+    )?;
     tx.execute(
         "INSERT INTO endpoint_trust
          (endpoint_id, node_id, fingerprint, status, generation, previous_endpoint_id, rotated_to, trust_bundle_json, created_at, updated_at)
@@ -3842,7 +3853,7 @@ fn insert_endpoint_trust_tx(
             generation,
             endpoint.previous_endpoint_id.as_deref(),
             endpoint.rotated_to.as_deref(),
-            endpoint.trust_bundle_json.to_string(),
+            trust_bundle_json.to_string(),
         ],
     )?;
     Ok(())
@@ -4678,7 +4689,13 @@ fn transition_endpoint_status_tx(
         params![
             status.as_str(),
             endpoint_generation_to_i64(&before.endpoint_id, generation)?,
-            trust_bundle_json(&before.endpoint_id, generation, status).to_string(),
+            canonical_trust_bundle(
+                &before.endpoint_id,
+                generation,
+                status,
+                &trust_bundle_json(&before.endpoint_id, generation, status),
+            )?
+            .to_string(),
             before.endpoint_id.as_str(),
             before.status.as_str(),
             endpoint_generation_to_i64(&before.endpoint_id, before.generation)?,
@@ -5028,6 +5045,23 @@ fn trust_bundle_json(endpoint_id: &str, generation: u64, status: EndpointStatus)
         authorized_path_probes: Vec::new(),
     })
     .expect("trust bundle serialization succeeds")
+}
+
+fn canonical_trust_bundle(
+    endpoint_id: &str,
+    generation: u64,
+    status: EndpointStatus,
+    value: &Value,
+) -> Result<Value, StoreError> {
+    let payload = TrustBundlePayloadV1::from_value(value)
+        .or_else(|_| {
+            TrustBundlePayloadV1::from_legacy(endpoint_id, generation, status.as_str(), value)
+        })
+        .map_err(StoreError::InvalidInput)?;
+    payload
+        .validate_relationship(endpoint_id, generation, status.as_str())
+        .map_err(StoreError::InvalidInput)?;
+    Ok(payload.to_value())
 }
 
 fn token_is_expired(expires_at: &str) -> bool {
@@ -6918,15 +6952,34 @@ fn join_request_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JoinReques
 fn endpoint_trust_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EndpointTrustRecord> {
     let status: String = row.get(3)?;
     let trust_bundle_json: String = row.get(7)?;
+    let endpoint_id: String = row.get(0)?;
+    let generation = i64_to_u64(row.get(4)?)?;
+    let trust_bundle_json = parse_json_column(&trust_bundle_json, 7)?;
+    let payload = TrustBundlePayloadV1::from_value(&trust_bundle_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            7,
+            Type::Text,
+            Box::new(io::Error::new(io::ErrorKind::InvalidData, error)),
+        )
+    })?;
+    payload
+        .validate_relationship(&endpoint_id, generation, &status)
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                7,
+                Type::Text,
+                Box::new(io::Error::new(io::ErrorKind::InvalidData, error)),
+            )
+        })?;
     Ok(EndpointTrustRecord {
-        endpoint_id: row.get(0)?,
+        endpoint_id,
         node_id: row.get(1)?,
         fingerprint: row.get(2)?,
         status: parse_status(&status, 3)?,
-        generation: i64_to_u64(row.get(4)?)?,
+        generation,
         previous_endpoint_id: row.get(5)?,
         rotated_to: row.get(6)?,
-        trust_bundle_json: parse_json_column(&trust_bundle_json, 7)?,
+        trust_bundle_json: payload.public_bundle(),
         created_at: row.get(8)?,
         updated_at: row.get(9)?,
     })

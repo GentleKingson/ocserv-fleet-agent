@@ -446,7 +446,10 @@ fn compute_policy_diff(
     report: TrustPolicyValidationReport,
 ) -> anyhow::Result<TrustPolicyDiffReport> {
     let nodes = store.list_nodes()?;
-    let endpoints = store.trust_snapshot(None)?.endpoints;
+    let endpoints = store
+        .trust_snapshot(None)
+        .map_err(|_| anyhow::anyhow!("controller trust bundle projection is invalid"))?
+        .endpoints;
     let node_map = nodes
         .iter()
         .map(|node| (node.node_id.as_str(), node))

@@ -560,6 +560,8 @@ Networking must allow the controller to reach the agent through iroh using the r
   observation summaries and method/result-class binding.
 - `docs/adr/ADR-versioned-run-summary-storage.md`: schema-v12 closed run
   summaries and relational job/kind/status/trigger binding.
+- `docs/adr/ADR-versioned-trust-bundle-storage.md`: schema-v13 closed trust
+  bundles, bounded explicit allowlists, and relational lifecycle binding.
 - `docs/trust-policy.md`: trust policy as code schema, validation, and diff behavior.
 - `docs/backend.md`: SQLite contract and optional Postgres backend plan.
 - `docs/archive-export.md`: long-term history archive and signed audit export guidance.

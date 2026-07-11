@@ -10,6 +10,7 @@ pub const HEALTH_DEGRADED_METHODS_SCHEMA_V1: &str = "ocfleet.health.degraded-met
 pub const HEALTH_SUMMARY_SCHEMA_V1: &str = "ocfleet.health.summary.v1";
 pub const OBSERVATION_SUMMARY_SCHEMA_V1: &str = "ocfleet.observation.summary.v1";
 pub const RUN_SUMMARY_SCHEMA_V1: &str = "ocfleet.run.summary.v1";
+pub const TRUST_BUNDLE_SCHEMA_V1: &str = "ocfleet.trust.bundle.v1";
 
 const HEALTH_DEGRADED_METHODS: [&str; 5] = [
     "ocserv.cert.expiry",
@@ -395,6 +396,185 @@ fn validate_fixed_id(value: &str, max_len: usize, field: &str) -> Result<(), Str
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct TrustBundlePayloadV1 {
+    pub schema: String,
+    pub endpoint_id: String,
+    pub generation: u64,
+    pub status: String,
+    pub trusted_controllers: Vec<String>,
+    pub trusted_peers: Vec<String>,
+    pub authorized_path_probes: Vec<(String, String)>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct LegacyTrustBundleV1 {
+    endpoint_id: Option<String>,
+    generation: Option<u64>,
+    status: Option<String>,
+    trusted_controllers: Vec<String>,
+    trusted_peers: Vec<String>,
+    authorized_path_probes: Vec<(String, String)>,
+}
+
+impl TrustBundlePayloadV1 {
+    pub fn new(
+        endpoint_id: String,
+        generation: u64,
+        status: String,
+        trusted_controllers: Vec<String>,
+        trusted_peers: Vec<String>,
+        authorized_path_probes: Vec<(String, String)>,
+    ) -> Result<Self, String> {
+        let payload = Self {
+            schema: TRUST_BUNDLE_SCHEMA_V1.to_string(),
+            endpoint_id,
+            generation,
+            status,
+            trusted_controllers,
+            trusted_peers,
+            authorized_path_probes,
+        };
+        payload.validate()?;
+        Ok(payload)
+    }
+
+    pub fn from_legacy(
+        endpoint_id: &str,
+        generation: u64,
+        status: &str,
+        value: &Value,
+    ) -> Result<Self, String> {
+        let object = value
+            .as_object()
+            .ok_or_else(|| "legacy trust bundle must be an object".to_string())?;
+        if !object.is_empty()
+            && (object.len() != 6
+                || [
+                    "endpoint_id",
+                    "generation",
+                    "status",
+                    "trusted_controllers",
+                    "trusted_peers",
+                    "authorized_path_probes",
+                ]
+                .iter()
+                .any(|field| !object.contains_key(*field)))
+        {
+            return Err("legacy trust bundle must be empty or complete".to_string());
+        }
+        let legacy: LegacyTrustBundleV1 = serde_json::from_value(value.clone())
+            .map_err(|_| "trust bundle contains unsupported fields or values".to_string())?;
+        if legacy
+            .endpoint_id
+            .as_deref()
+            .is_some_and(|stored| stored != endpoint_id)
+            || legacy.generation.is_some_and(|stored| stored != generation)
+            || legacy
+                .status
+                .as_deref()
+                .is_some_and(|stored| stored != status)
+        {
+            return Err("legacy trust bundle is inconsistent with endpoint state".to_string());
+        }
+        Self::new(
+            endpoint_id.to_string(),
+            generation,
+            status.to_string(),
+            legacy.trusted_controllers,
+            legacy.trusted_peers,
+            legacy.authorized_path_probes,
+        )
+    }
+
+    pub fn from_value(value: &Value) -> Result<Self, String> {
+        let payload: Self = serde_json::from_value(value.clone())
+            .map_err(|_| "trust bundle payload is not closed v1 data".to_string())?;
+        payload.validate()?;
+        Ok(payload)
+    }
+
+    pub fn to_value(&self) -> Value {
+        serde_json::to_value(self).expect("trust bundle payload serializes")
+    }
+
+    pub fn public_bundle(&self) -> Value {
+        serde_json::json!({
+            "endpoint_id": self.endpoint_id,
+            "generation": self.generation,
+            "status": self.status,
+            "trusted_controllers": self.trusted_controllers,
+            "trusted_peers": self.trusted_peers,
+            "authorized_path_probes": self.authorized_path_probes,
+        })
+    }
+
+    pub fn validate_relationship(
+        &self,
+        endpoint_id: &str,
+        generation: u64,
+        status: &str,
+    ) -> Result<(), String> {
+        if self.endpoint_id != endpoint_id || self.generation != generation || self.status != status
+        {
+            return Err(
+                "trust bundle does not match relational endpoint, generation, or status"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.schema != TRUST_BUNDLE_SCHEMA_V1 {
+            return Err("trust bundle payload schema is unsupported".to_string());
+        }
+        validate_fixed_id(&self.endpoint_id, 128, "trust bundle endpoint ID")?;
+        if self.generation == 0 || self.generation > i64::MAX as u64 {
+            return Err("trust bundle generation is out of range".to_string());
+        }
+        if !matches!(
+            self.status.as_str(),
+            "active" | "rotated" | "revoked" | "quarantined"
+        ) {
+            return Err("trust bundle status is unsupported".to_string());
+        }
+        validate_trust_id_list(&self.trusted_controllers, "trusted controller")?;
+        validate_trust_id_list(&self.trusted_peers, "trusted peer")?;
+        if self.authorized_path_probes.len() > 1_024 {
+            return Err("trust bundle has too many authorized path probes".to_string());
+        }
+        let mut pairs = std::collections::BTreeSet::new();
+        for (source, target) in &self.authorized_path_probes {
+            validate_fixed_id(source, 128, "authorized path source")?;
+            validate_fixed_id(target, 128, "authorized path target")?;
+            if source == target {
+                return Err("authorized path probe requires distinct endpoints".to_string());
+            }
+            if !pairs.insert((source, target)) {
+                return Err("trust bundle authorized path probes must be unique".to_string());
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_trust_id_list(values: &[String], field: &str) -> Result<(), String> {
+    if values.len() > 1_024 {
+        return Err(format!("trust bundle has too many {field} entries"));
+    }
+    let mut unique = std::collections::BTreeSet::new();
+    for value in values {
+        validate_fixed_id(value, 128, field)?;
+        if !unique.insert(value) {
+            return Err(format!("trust bundle {field} entries must be unique"));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ObservationSummaryPayloadV1 {
     pub schema: String,
     pub result_class: String,
@@ -648,8 +828,8 @@ mod tests {
         HealthDegradedMethodsPayloadV1, HealthSummaryPayloadV1, OBSERVATION_SUMMARY_SCHEMA_V1,
         ObservationSummaryPayloadV1, RUN_SUMMARY_SCHEMA_V1, RunSummaryPayloadV1,
         SCHEDULER_PAIR_SCHEMA_V1, SCHEDULER_SELECTOR_SCHEMA_V1, SchedulerPairPayloadV1,
-        SchedulerSelectorPayloadV1, validate_health_payload_relationship,
-        validate_scheduler_payload_relationship,
+        SchedulerSelectorPayloadV1, TRUST_BUNDLE_SCHEMA_V1, TrustBundlePayloadV1,
+        validate_health_payload_relationship, validate_scheduler_payload_relationship,
     };
 
     #[test]
@@ -906,6 +1086,62 @@ mod tests {
                     "succeeded",
                     "scheduler.run.once",
                 )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn trust_bundle_payload_is_closed_versioned_bounded_and_relationally_bound() {
+        let payload = TrustBundlePayloadV1::from_legacy(
+            "endpoint-a",
+            2,
+            "active",
+            &json!({
+                "endpoint_id": "endpoint-a",
+                "generation": 2,
+                "status": "active",
+                "trusted_controllers": ["controller-a"],
+                "trusted_peers": ["peer-a"],
+                "authorized_path_probes": [["endpoint-a", "peer-a"]]
+            }),
+        )
+        .expect("valid trust bundle");
+        assert_eq!(payload.schema, TRUST_BUNDLE_SCHEMA_V1);
+        assert_eq!(
+            TrustBundlePayloadV1::from_value(&payload.to_value()).expect("round trip"),
+            payload
+        );
+        payload
+            .validate_relationship("endpoint-a", 2, "active")
+            .expect("matching relationship");
+        assert_eq!(payload.public_bundle()["trusted_peers"], json!(["peer-a"]));
+
+        let mut contaminated = payload.to_value();
+        contaminated["token"] = json!("secret");
+        assert!(TrustBundlePayloadV1::from_value(&contaminated).is_err());
+        assert!(
+            TrustBundlePayloadV1::from_legacy(
+                "endpoint-a",
+                2,
+                "active",
+                &json!({"client_address": "10.0.0.2"}),
+            )
+            .is_err()
+        );
+        assert!(
+            TrustBundlePayloadV1::new(
+                "endpoint-a".to_string(),
+                2,
+                "active".to_string(),
+                vec!["duplicate".to_string(), "duplicate".to_string()],
+                Vec::new(),
+                Vec::new(),
+            )
+            .is_err()
+        );
+        assert!(
+            payload
+                .validate_relationship("endpoint-a", 3, "active")
                 .is_err()
         );
     }

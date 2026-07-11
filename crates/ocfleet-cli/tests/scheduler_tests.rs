@@ -1704,7 +1704,10 @@ fn set_inactive_status_for_trust_gate_fixture(
     Connection::open(database)
         .expect("open database for contaminated trust-gate fixture")
         .execute(
-            "UPDATE endpoint_trust SET status = ?1 WHERE endpoint_id = ?2",
+            "UPDATE endpoint_trust
+             SET status = ?1,
+                 trust_bundle_json = json_set(trust_bundle_json, '$.status', ?1)
+             WHERE endpoint_id = ?2",
             rusqlite::params![status.as_str(), endpoint_id],
         )
         .expect("set contaminated endpoint status fixture");

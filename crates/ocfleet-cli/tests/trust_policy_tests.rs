@@ -612,6 +612,10 @@ fn trust_policy_diff_reports_controller_peer_and_path_probe_allowlist_drift() {
             "UPDATE endpoint_trust SET trust_bundle_json = ?1 WHERE endpoint_id = ?2",
             rusqlite::params![
                 serde_json::json!({
+                    "schema": "ocfleet.trust.bundle.v1",
+                    "endpoint_id": endpoint_a.clone(),
+                    "generation": 1,
+                    "status": "active",
                     "trusted_controllers": [unexpected_controller.clone()],
                     "trusted_peers": [unexpected_peer],
                     "authorized_path_probes": [[unexpected_controller, unexpected_target]],
@@ -686,6 +690,10 @@ fn trust_policy_diff_output_is_bounded_and_reports_truncation() {
             "UPDATE endpoint_trust SET trust_bundle_json = ?1 WHERE endpoint_id = ?2",
             rusqlite::params![
                 serde_json::json!({
+                    "schema": "ocfleet.trust.bundle.v1",
+                    "endpoint_id": endpoint_a.clone(),
+                    "generation": 1,
+                    "status": "active",
                     "trusted_controllers": unexpected_controllers,
                     "trusted_peers": [],
                     "authorized_path_probes": [],

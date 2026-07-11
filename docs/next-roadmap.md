@@ -123,7 +123,7 @@ Alert operator transitions and webhook-hook creation merged through pull
 request `#66` (`b4a0d6653d9862391ef535fd480abfb6c7e9b86a`). Silence/resolve compare persisted before-state
 and commit with actor/reason/audit; hook creation commits configuration and a
 redacted audit together. Alert delivery persistence is active on branch
-`codex/a1-alert-delivery-writers`. Each webhook attempt commits with audit, and
+`codex/a1-alert-delivery-writers` in pull request `#67`. Each webhook attempt commits with audit, and
 finalization compare-checks the complete bounded alert set before committing
 `last_sent_at` changes with the summary audit. External file/HTTPS I/O remains
 outside database transactions.

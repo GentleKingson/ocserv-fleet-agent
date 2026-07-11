@@ -264,6 +264,7 @@ and due/lease indexes establish the persistence contract. Queue writers, worker
 transport integration, recovery notification, rate limiting, and graceful
 shutdown remain active A5 work. JSONL paths remain operator supplied and are not
 persisted for daemon selection.
+Schema 22 delivery queue persistence is published in pull request `#92`.
 
 ### Baseline And Production Foundation
 

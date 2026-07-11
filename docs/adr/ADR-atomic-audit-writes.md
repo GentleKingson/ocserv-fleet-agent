@@ -42,8 +42,9 @@ the unique active trust. Enrollment and retention slices add their closed,
 idempotent atomic writers. Health snapshot batches and alert candidate
 evaluation also commit with their audits; alert evaluation compares the
 persisted row to its evaluated before-state before applying changes. Alert
-silence/resolve and webhook-hook creation now use the same atomic contract.
-Later slices cover delivery and other remaining mutations.
+silence/resolve, webhook-hook creation, delivery-attempt history, and delivery
+finalization now use the same atomic contract. Later slices cover other
+remaining mutations.
 Read-only events may continue to
 use the standalone audit writer because they have no paired business mutation.
 
@@ -95,7 +96,7 @@ continues to open SQLite with read-only and query-only enforcement.
 ## Rollback
 
 The node, scheduler, endpoint, enrollment, retention, health-evaluation, and
-alert-evaluation, alert-transition, and webhook-hook slices
+alert-evaluation, alert-transition, webhook-hook, and alert-delivery slices
 have no schema migration. Reverting one restores its previous call structure
 but also restores the known audit or integrity gap, so rollback is appropriate
 only as an emergency source rollback before production use. Stored rows and

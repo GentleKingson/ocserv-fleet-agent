@@ -41,6 +41,7 @@ pub const MAX_RETENTION_POLICY_AGE_DAYS: u64 = 36_500;
 pub const MAX_RETENTION_POLICY_ROWS: u64 = 10_000_000;
 pub const MAX_HEALTH_SNAPSHOT_WRITE_RECORDS: usize = 1_000;
 pub const MAX_ALERT_EVALUATION_RECORDS: usize = 1_000;
+pub const MAX_ALERT_DELIVERY_FINALIZE_RECORDS: usize = 1_000;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -385,6 +386,23 @@ pub struct AlertDeliveryAttemptRecord {
     pub http_status_class: Option<String>,
     pub error_code: Option<String>,
     pub bytes_sent: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlertDeliveryAttemptWrite {
+    pub attempt: AlertDeliveryAttemptRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlertDeliveryFinalizeWrite {
+    pub delivery_id: String,
+    pub hook_type: String,
+    pub ok: bool,
+    pub dry_run: bool,
+    pub alert_count: usize,
+    pub bytes_written: usize,
+    pub error_code: Option<String>,
+    pub entries: Vec<AlertEvaluationEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1736,28 +1754,96 @@ impl Store {
             .map_err(StoreError::from)
     }
 
-    pub fn insert_alert_delivery_attempt(
+    pub fn write_alert_delivery_attempt(
         &self,
-        attempt: &AlertDeliveryAttemptRecord,
+        write: &AlertDeliveryAttemptWrite,
+        actor: &str,
     ) -> Result<(), StoreError> {
-        validate_alert_delivery_attempt_record(attempt)?;
-        let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
-            "INSERT INTO alert_delivery_attempts
-             (attempt_id, alert_id, hook_id, attempt_no, attempted_at, status, http_status_class, error_code, bytes_sent)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
-                attempt.attempt_id.as_str(),
-                attempt.alert_id.as_str(),
-                attempt.hook_id.as_str(),
-                u64_to_i64(attempt.attempt_no)?,
-                attempt.attempted_at.as_str(),
-                attempt.status.as_str(),
-                attempt.http_status_class.as_deref(),
-                attempt.error_code.as_deref(),
-                u64_to_i64(attempt.bytes_sent)?,
-            ],
-        )?;
+        validate_actor(actor).map_err(StoreError::InvalidInput)?;
+        validate_alert_delivery_attempt_record(&write.attempt)?;
+        let params_hash = alert_delivery_attempt_hash(&write.attempt);
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        if alert_mutation_replay_tx(
+            &tx,
+            &write.attempt.attempt_id,
+            "alert.delivery.attempt",
+            actor,
+            &params_hash,
+        )? {
+            tx.commit()?;
+            return Ok(());
+        }
+        insert_alert_delivery_attempt_tx(&tx, &write.attempt)?;
+        let mut event = AuditEvent::new(actor, "alert.delivery.attempt");
+        event.ok = Some(write.attempt.status != "failed");
+        event.request_id = Some(write.attempt.attempt_id.clone());
+        event.params_hash = Some(params_hash);
+        event.detail_json = serde_json::json!({
+            "actor_type": "user",
+            "target_type": "alert_delivery_attempt",
+            "target_id": write.attempt.attempt_id,
+            "alert_id": write.attempt.alert_id,
+            "hook_id": write.attempt.hook_id,
+            "attempt_no": write.attempt.attempt_no,
+            "status": write.attempt.status,
+            "http_status_class": write.attempt.http_status_class,
+            "error_code": write.attempt.error_code,
+            "bytes_sent": write.attempt.bytes_sent,
+            "reason": Value::Null,
+        });
+        insert_audit_tx(&tx, &event)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn write_alert_delivery_finalize(
+        &self,
+        write: &AlertDeliveryFinalizeWrite,
+        actor: &str,
+    ) -> Result<(), StoreError> {
+        validate_actor(actor).map_err(StoreError::InvalidInput)?;
+        validate_alert_delivery_finalize(write)?;
+        let params_hash = alert_delivery_finalize_hash(write);
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        if alert_mutation_replay_tx(
+            &tx,
+            &write.delivery_id,
+            "alert.delivery",
+            actor,
+            &params_hash,
+        )? {
+            tx.commit()?;
+            return Ok(());
+        }
+        for entry in &write.entries {
+            let current =
+                get_alert_event_tx(&tx, &entry.before.as_ref().expect("validated").dedupe_key)?;
+            if current != entry.before {
+                return Err(StoreError::AlertMutationConflict {
+                    operation_id: write.delivery_id.clone(),
+                    detail: "alert state changed before delivery finalization",
+                });
+            }
+            upsert_alert_event_tx(&tx, &entry.after)?;
+        }
+        let mut event = AuditEvent::new(actor, "alert.delivery");
+        event.ok = Some(write.ok);
+        event.request_id = Some(write.delivery_id.clone());
+        event.params_hash = Some(params_hash);
+        event.detail_json = serde_json::json!({
+            "actor_type": "user",
+            "target_type": "alert_delivery",
+            "target_id": write.delivery_id,
+            "ok": write.ok,
+            "hook_type": write.hook_type,
+            "alert_count": write.alert_count,
+            "bytes_written": write.bytes_written,
+            "dry_run": write.dry_run,
+            "error_code": write.error_code,
+            "updated_alerts": write.entries.len(),
+            "reason": Value::Null,
+        });
+        insert_audit_tx(&tx, &event)?;
         tx.commit()?;
         Ok(())
     }
@@ -5198,6 +5284,7 @@ fn validate_alert_delivery_attempt_record(
     validate_safe_id("hook_id", &attempt.hook_id, 128)?;
     validate_u64_range("attempt_no", attempt.attempt_no, 1, 5)?;
     validate_u64_range("bytes_sent", attempt.bytes_sent, 0, 1_048_576)?;
+    validate_rfc3339(&attempt.attempted_at, "alert attempt attempted_at")?;
     if !matches!(attempt.status.as_str(), "succeeded" | "failed" | "dry_run") {
         return Err(StoreError::InvalidInput(
             "alert delivery attempt status is invalid".to_string(),
@@ -5209,6 +5296,159 @@ fn validate_alert_delivery_attempt_record(
     if let Some(error_code) = &attempt.error_code {
         validate_safe_id("error_code", error_code, 64)?;
     }
+    if attempt.status == "failed" && attempt.error_code.is_none() {
+        return Err(StoreError::InvalidInput(
+            "failed alert delivery attempt requires error_code".to_string(),
+        ));
+    }
+    if attempt.status != "failed" && attempt.error_code.is_some() {
+        return Err(StoreError::InvalidInput(
+            "non-failed alert delivery attempt cannot have error_code".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_alert_delivery_finalize(write: &AlertDeliveryFinalizeWrite) -> Result<(), StoreError> {
+    validate_audit_text(&write.delivery_id, "alert delivery_id", 96)?;
+    let Some(uuid) = write.delivery_id.strip_prefix("delivery-") else {
+        return Err(StoreError::InvalidInput(
+            "alert delivery_id must use delivery-<uuid> format".to_string(),
+        ));
+    };
+    Uuid::parse_str(uuid).map_err(|_| {
+        StoreError::InvalidInput("alert delivery_id must contain a UUID".to_string())
+    })?;
+    if !matches!(
+        write.hook_type.as_str(),
+        "jsonl_file" | "webhook" | "rejected"
+    ) {
+        return Err(StoreError::InvalidInput(
+            "alert delivery hook_type is invalid".to_string(),
+        ));
+    }
+    if write.entries.len() > MAX_ALERT_DELIVERY_FINALIZE_RECORDS {
+        return Err(StoreError::InvalidInput(format!(
+            "alert delivery finalization exceeds {MAX_ALERT_DELIVERY_FINALIZE_RECORDS} records"
+        )));
+    }
+    if write.alert_count > MAX_ALERT_DELIVERY_FINALIZE_RECORDS {
+        return Err(StoreError::InvalidInput(format!(
+            "alert delivery count exceeds {MAX_ALERT_DELIVERY_FINALIZE_RECORDS} records"
+        )));
+    }
+    if write.bytes_written > 16 * 1024 * 1024 {
+        return Err(StoreError::InvalidInput(
+            "alert delivery byte count exceeds 16 MiB".to_string(),
+        ));
+    }
+    if write.ok == write.error_code.is_some() {
+        return Err(StoreError::InvalidInput(
+            "alert delivery error_code must be present exactly when delivery failed".to_string(),
+        ));
+    }
+    if let Some(error_code) = &write.error_code {
+        validate_safe_id("error_code", error_code, 64)?;
+    }
+    if write.dry_run || !write.ok {
+        if !write.entries.is_empty() {
+            return Err(StoreError::InvalidInput(
+                "dry-run or failed delivery cannot update alerts".to_string(),
+            ));
+        }
+    } else if write.entries.len() != write.alert_count {
+        return Err(StoreError::InvalidInput(
+            "successful delivery must update every delivered alert".to_string(),
+        ));
+    }
+    let mut dedupe_keys = std::collections::BTreeSet::new();
+    for entry in &write.entries {
+        let before = entry.before.as_ref().ok_or_else(|| {
+            StoreError::InvalidInput("delivery finalization requires before-state".to_string())
+        })?;
+        validate_alert_event_record(before)?;
+        validate_alert_event_record(&entry.after)?;
+        if before.alert_id != entry.after.alert_id
+            || before.dedupe_key != entry.after.dedupe_key
+            || !dedupe_keys.insert(before.dedupe_key.as_str())
+        {
+            return Err(StoreError::InvalidInput(
+                "delivery finalization contains invalid alert identity".to_string(),
+            ));
+        }
+        let mut expected = before.clone();
+        expected.last_sent_at = entry.after.last_sent_at.clone();
+        if entry.after.last_sent_at.is_none() || entry.after != expected {
+            return Err(StoreError::InvalidInput(
+                "delivery finalization may change only last_sent_at".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn alert_delivery_attempt_hash(attempt: &AlertDeliveryAttemptRecord) -> String {
+    let payload = serde_json::json!({
+        "attempt_id": attempt.attempt_id,
+        "alert_id": attempt.alert_id,
+        "hook_id": attempt.hook_id,
+        "attempt_no": attempt.attempt_no,
+        "attempted_at": attempt.attempted_at,
+        "status": attempt.status,
+        "http_status_class": attempt.http_status_class,
+        "error_code": attempt.error_code,
+        "bytes_sent": attempt.bytes_sent,
+    });
+    blake3::hash(&serde_json::to_vec(&payload).expect("alert attempt hash JSON serializes"))
+        .to_hex()
+        .to_string()
+}
+
+fn alert_delivery_finalize_hash(write: &AlertDeliveryFinalizeWrite) -> String {
+    let entries = write
+        .entries
+        .iter()
+        .map(|entry| {
+            serde_json::json!({
+                "before": entry.before.as_ref().map(alert_event_hash_json),
+                "after": alert_event_hash_json(&entry.after),
+            })
+        })
+        .collect::<Vec<_>>();
+    let payload = serde_json::json!({
+        "hook_type": write.hook_type,
+        "ok": write.ok,
+        "dry_run": write.dry_run,
+        "alert_count": write.alert_count,
+        "bytes_written": write.bytes_written,
+        "error_code": write.error_code,
+        "entries": entries,
+    });
+    blake3::hash(&serde_json::to_vec(&payload).expect("alert delivery hash JSON serializes"))
+        .to_hex()
+        .to_string()
+}
+
+fn insert_alert_delivery_attempt_tx(
+    tx: &Transaction<'_>,
+    attempt: &AlertDeliveryAttemptRecord,
+) -> Result<(), StoreError> {
+    tx.execute(
+        "INSERT INTO alert_delivery_attempts
+         (attempt_id, alert_id, hook_id, attempt_no, attempted_at, status, http_status_class, error_code, bytes_sent)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            attempt.attempt_id.as_str(),
+            attempt.alert_id.as_str(),
+            attempt.hook_id.as_str(),
+            u64_to_i64(attempt.attempt_no)?,
+            attempt.attempted_at.as_str(),
+            attempt.status.as_str(),
+            attempt.http_status_class.as_deref(),
+            attempt.error_code.as_deref(),
+            u64_to_i64(attempt.bytes_sent)?,
+        ],
+    )?;
     Ok(())
 }
 

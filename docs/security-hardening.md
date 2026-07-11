@@ -150,8 +150,11 @@ Alert silence/resolve uses `alert-action-<uuid>`, verifies the exact persisted
 before-state, and commits the closed transition with actor, reason, and audit.
 Webhook-hook creation commits the validated configuration and redacted audit
 together; the endpoint path and HMAC secret are excluded. File/HTTPS delivery
-I/O remains outside database transactions and requires a separate durable
-attempt/finalization writer model.
+I/O remains outside database transactions. Separate durable attempt and
+finalization writers commit every webhook attempt with audit and compare-check
+the complete alert set before atomically updating
+`last_sent_at` with the final summary audit. External I/O still cannot be rolled
+back, so sink idempotency remains separate delivery-worker reliability work.
 
 - Keep controller audit exports redacted by default.
 - Keep agent audit primary log and spool on monitored storage.

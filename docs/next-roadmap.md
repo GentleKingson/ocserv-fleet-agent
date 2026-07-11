@@ -119,11 +119,14 @@ commits each bounded evaluation and low-sensitive audit together, uses stable
 evaluation identities for exact replay, and rejects stale alert before-state so
 a concurrent operator silence or resolve is not overwritten. It changes no
 schema, protocol, API route, agent capability, or default read-only boundary.
-Alert operator transitions and webhook-hook creation are active on branch
-`codex/a1-alert-actions-delivery` in pull request `#66`. Silence/resolve compare persisted before-state
+Alert operator transitions and webhook-hook creation merged through pull
+request `#66` (`b4a0d6653d9862391ef535fd480abfb6c7e9b86a`). Silence/resolve compare persisted before-state
 and commit with actor/reason/audit; hook creation commits configuration and a
-redacted audit together. Delivery persistence remains the next distinct slice
-because external file/HTTPS I/O cannot share a database transaction.
+redacted audit together. Alert delivery persistence is active on branch
+`codex/a1-alert-delivery-writers` in pull request `#67`. Each webhook attempt commits with audit, and
+finalization compare-checks the complete bounded alert set before committing
+`last_sent_at` changes with the summary audit. External file/HTTPS I/O remains
+outside database transactions.
 
 ### Baseline And Production Foundation
 

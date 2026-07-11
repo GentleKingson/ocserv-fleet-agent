@@ -28,7 +28,7 @@ printf '%s\n' \
   'mod tests {' \
   '    const FIXTURE_SQL: &str = "UPDATE nodes SET enabled = 0";' \
   '}' \
-  'pub fn reviewed(store: &Store, node: &NodeInsert, token: &EnrollmentTokenInsert, request: &JoinRequestInsert, approval: &ApprovalInput, claim: &LegacyEnrollmentClaimInput, policy: &RetentionPolicyRecord, apply: &RetentionApplyInput, health_policy: &HealthPolicyRecord, health: &HealthSnapshotWrite, alerts: &AlertEvaluationWrite, action: &AlertStateTransition, hook: &AlertWebhookHookRecord) {' \
+  'pub fn reviewed(store: &Store, node: &NodeInsert, token: &EnrollmentTokenInsert, request: &JoinRequestInsert, approval: &ApprovalInput, claim: &LegacyEnrollmentClaimInput, policy: &RetentionPolicyRecord, apply: &RetentionApplyInput, health_policy: &HealthPolicyRecord, health: &HealthSnapshotWrite, alerts: &AlertEvaluationWrite, alert: &AlertEventRecord, action: &AlertStateTransition, hook: &AlertWebhookHookRecord, attempt: &AlertDeliveryAttemptWrite, finalize: &AlertDeliveryFinalizeWrite) {' \
   '    Store::add_node(store, node, "actor");' \
   '    store.enable_node("node", "actor");' \
   '    store.disable_node("node", "actor");' \
@@ -49,6 +49,9 @@ printf '%s\n' \
   '    store.write_alert_evaluation(alerts, "actor");' \
   '    store.write_alert_state_transition(action, "actor");' \
   '    Store::write_alert_webhook_hook_create(store, hook, "actor");' \
+  '    store.upsert_alert_event(alert);' \
+  '    store.write_alert_delivery_attempt(attempt, "actor");' \
+  '    Store::write_alert_delivery_finalize(store, finalize, "actor");' \
   '}' \
   'pub const OTHER_QUERY: &str = "SELECT enabled FROM nodes";' \
   > "$cli_src/backend.rs"
@@ -251,9 +254,12 @@ done
 
 rm -f "$cli_src/unsafe_derived_state_mutator.rs"
 printf '%s\n' \
-  'pub fn bypass(store: &Store, action: &AlertStateTransition, hook: &AlertWebhookHookRecord) {' \
+  'pub fn bypass(store: &Store, alert: &AlertEventRecord, action: &AlertStateTransition, hook: &AlertWebhookHookRecord, attempt: &AlertDeliveryAttemptWrite, finalize: &AlertDeliveryFinalizeWrite) {' \
+  '    store.upsert_alert_event(alert);' \
   '    store.write_alert_state_transition(action, "actor");' \
   '    Store::write_alert_webhook_hook_create(store, hook, "actor");' \
+  '    store.write_alert_delivery_attempt(attempt, "actor");' \
+  '    Store::write_alert_delivery_finalize(store, finalize, "actor");' \
   '}' \
   > "$cli_src/unsafe_alert_action_mutator.rs"
 
@@ -263,8 +269,11 @@ if "$GUARD" --repo-root "$fixture_root" "$fixture_root" >"$alert_action_fail_out
   exit 1
 fi
 for expected in \
-  'unsafe_alert_action_mutator.rs:2: direct alert action mutator call outside reviewed store/backend boundary: write_alert_state_transition' \
-  'unsafe_alert_action_mutator.rs:3: direct alert action mutator call outside reviewed store/backend boundary: write_alert_webhook_hook_create'
+  'unsafe_alert_action_mutator.rs:2: direct alert action mutator call outside reviewed store/backend boundary: upsert_alert_event' \
+  'unsafe_alert_action_mutator.rs:3: direct alert action mutator call outside reviewed store/backend boundary: write_alert_state_transition' \
+  'unsafe_alert_action_mutator.rs:4: direct alert action mutator call outside reviewed store/backend boundary: write_alert_webhook_hook_create' \
+  'unsafe_alert_action_mutator.rs:5: direct alert action mutator call outside reviewed store/backend boundary: write_alert_delivery_attempt' \
+  'unsafe_alert_action_mutator.rs:6: direct alert action mutator call outside reviewed store/backend boundary: write_alert_delivery_finalize'
 do
   if ! grep -Fq "$expected" "$alert_action_fail_output"; then
     printf 'controller mutation guard did not report expected alert action violation: %s\n' "$expected" >&2

@@ -9,12 +9,14 @@ use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::args::{HealthCommand, HealthPolicyCommand, HealthSnapshotCommand};
-use crate::audit::AuditEvent;
+use crate::backend::StoreWriter;
 use crate::duration_args::parse_duration_seconds;
 use crate::input_validation::local_actor;
 use crate::store::{
-    HealthPolicyRecord, HealthSnapshotRecord, NodeRecord, ProbeObservationRecord, Store,
+    HealthPolicyRecord, HealthSnapshotRecord, HealthSnapshotWrite, NodeRecord,
+    ProbeObservationRecord, Store,
 };
+use uuid::Uuid;
 
 const OBSERVATION_READ_LIMIT: u64 = 1_000;
 const MAX_HEALTH_SNAPSHOT_LIMIT: u64 = 1_000;
@@ -130,11 +132,21 @@ fn run_health_summary(store: &Store, json_output: bool) -> anyhow::Result<()> {
     let mut rows = Vec::with_capacity(nodes.len());
     for node in &nodes {
         let row = compute_node_health(store, node, &generated_at, &policy)?;
-        upsert_health_snapshot(store, &row, &generated_at)?;
         rows.push(row);
     }
+    StoreWriter::write_health_snapshots(
+        store,
+        &HealthSnapshotWrite {
+            evaluation_id: format!("health-eval-{}", Uuid::new_v4()),
+            event: "health.summary".to_string(),
+            snapshots: rows
+                .iter()
+                .map(|row| health_snapshot(row, &generated_at))
+                .collect(),
+        },
+        &local_actor(),
+    )?;
     let counts = health_counts(&rows);
-    write_health_audit(store, "health.summary", &counts)?;
     print_health_output(&generated_at, &counts, &rows, json_output)?;
     Ok(())
 }
@@ -147,10 +159,17 @@ fn run_health_node(store: &Store, node_id: &str, json_output: bool) -> anyhow::R
         .get_node(node_id)?
         .with_context(|| format!("node not found: {node_id}"))?;
     let row = compute_node_health(store, &node, &generated_at, &policy)?;
-    upsert_health_snapshot(store, &row, &generated_at)?;
     let rows = vec![row];
+    StoreWriter::write_health_snapshots(
+        store,
+        &HealthSnapshotWrite {
+            evaluation_id: format!("health-eval-{}", Uuid::new_v4()),
+            event: "health.node".to_string(),
+            snapshots: vec![health_snapshot(&rows[0], &generated_at)],
+        },
+        &local_actor(),
+    )?;
     let counts = health_counts(&rows);
-    write_health_audit(store, "health.node", &counts)?;
     print_health_output(&generated_at, &counts, &rows, json_output)?;
     Ok(())
 }
@@ -195,7 +214,7 @@ fn run_health_policy_command(store: &Store, command: HealthPolicyCommand) -> any
                 bail!("--cert-critical-days must be less than or equal to --cert-warning-days");
             }
             policy.updated_at = now_rfc3339();
-            store.set_health_policy(&policy, &local_actor())?;
+            StoreWriter::write_health_policy(store, &policy, &local_actor())?;
             print_health_policy(&policy);
             Ok(())
         }
@@ -501,12 +520,8 @@ fn health_counts(rows: &[NodeHealth]) -> HealthCounts {
     counts
 }
 
-fn upsert_health_snapshot(
-    store: &Store,
-    row: &NodeHealth,
-    generated_at: &str,
-) -> anyhow::Result<()> {
-    store.upsert_health_snapshot(&HealthSnapshotRecord {
+fn health_snapshot(row: &NodeHealth, generated_at: &str) -> HealthSnapshotRecord {
+    HealthSnapshotRecord {
         node_id: row.node_id.clone(),
         endpoint_id: Some(row.endpoint_id.clone()),
         computed_at: generated_at.to_string(),
@@ -523,8 +538,7 @@ fn upsert_health_snapshot(
             "endpoint_status": row.endpoint_status,
             "consecutive_failures": row.consecutive_unreachable_failures,
         }),
-    })?;
-    Ok(())
+    }
 }
 
 fn print_health_output(
@@ -576,21 +590,6 @@ fn print_health_output(
             );
         }
     }
-    Ok(())
-}
-
-fn write_health_audit(
-    store: &Store,
-    event_name: &str,
-    counts: &HealthCounts,
-) -> anyhow::Result<()> {
-    let mut event = AuditEvent::new(local_actor(), event_name);
-    event.ok = Some(true);
-    event.detail_json = json!({
-        "node_count": counts.total,
-        "status_counts": counts.to_json(),
-    });
-    store.insert_audit(&event)?;
     Ok(())
 }
 

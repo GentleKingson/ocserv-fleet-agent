@@ -4,9 +4,10 @@ use ocfleet_cli::alert_webhook::{
     validate_webhook_endpoint, webhook_signature,
 };
 use ocfleet_cli::alerts::deliver_webhook_alerts_with_sender;
+use ocfleet_cli::backend::StoreWriter;
 use ocfleet_cli::store::{
-    AlertEventRecord, AlertWebhookHookRecord, HealthSnapshotRecord, NodeInsert,
-    ProbeObservationInsert, Store,
+    AlertEventRecord, AlertWebhookHookRecord, HealthSnapshotRecord, HealthSnapshotWrite,
+    NodeInsert, ProbeObservationInsert, Store,
 };
 use ocfleet_protocol::method::OCSERV_CERT_EXPIRY;
 use rusqlite::Connection;
@@ -157,20 +158,27 @@ fn upsert_alert(
 }
 
 fn seed_stale_health_snapshot(store: &Store) {
-    store
-        .upsert_health_snapshot(&HealthSnapshotRecord {
-            node_id: "hk-ocserv-01".to_string(),
-            endpoint_id: Some("endpoint-1".to_string()),
-            computed_at: "2026-07-08T00:00:00Z".to_string(),
-            status: "stale".to_string(),
-            freshness_seconds: Some(90_000),
-            last_success_at: Some("2026-07-07T00:00:00Z".to_string()),
-            last_failure_at: None,
-            last_error_code: None,
-            degraded_methods_json: json!(["probe.controller.ping"]),
-            summary_json: json!({"status": "stale"}),
-        })
-        .expect("seed health snapshot");
+    StoreWriter::write_health_snapshots(
+        store,
+        &HealthSnapshotWrite {
+            evaluation_id: format!("health-eval-{}", uuid::Uuid::new_v4()),
+            event: "health.node".to_string(),
+            snapshots: vec![HealthSnapshotRecord {
+                node_id: "hk-ocserv-01".to_string(),
+                endpoint_id: None,
+                computed_at: "2026-07-08T00:00:00Z".to_string(),
+                status: "stale".to_string(),
+                freshness_seconds: Some(90_000),
+                last_success_at: Some("2026-07-07T00:00:00Z".to_string()),
+                last_failure_at: None,
+                last_error_code: None,
+                degraded_methods_json: json!(["probe.controller.ping"]),
+                summary_json: json!({"status": "stale"}),
+            }],
+        },
+        "test-setup",
+    )
+    .expect("seed health snapshot");
 }
 
 fn latest_audit(database: &Path) -> (String, Value) {

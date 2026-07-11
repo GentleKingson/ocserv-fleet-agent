@@ -39,6 +39,8 @@ pub const MAX_RETENTION_APPLY_LIMIT: u64 = 100_000;
 pub const MAX_RETENTION_BATCH_SIZE: u64 = 1_000;
 pub const MAX_RETENTION_POLICY_AGE_DAYS: u64 = 36_500;
 pub const MAX_RETENTION_POLICY_ROWS: u64 = 10_000_000;
+pub const MAX_HEALTH_SNAPSHOT_WRITE_RECORDS: usize = 1_000;
+pub const MAX_ALERT_EVALUATION_RECORDS: usize = 1_000;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -91,6 +93,16 @@ pub enum StoreError {
     #[error("retention operation conflict for {operation_id}: {detail}")]
     RetentionOperationConflict {
         operation_id: String,
+        detail: &'static str,
+    },
+    #[error("health evaluation conflict for {evaluation_id}: {detail}")]
+    HealthEvaluationConflict {
+        evaluation_id: String,
+        detail: &'static str,
+    },
+    #[error("alert evaluation conflict for {evaluation_id}: {detail}")]
+    AlertEvaluationConflict {
+        evaluation_id: String,
         detail: &'static str,
     },
     #[error("join request {request_id} is {status}, expected {expected}")]
@@ -298,6 +310,13 @@ pub struct HealthSnapshotRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HealthSnapshotWrite {
+    pub evaluation_id: String,
+    pub event: String,
+    pub snapshots: Vec<HealthSnapshotRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AlertEventRecord {
     pub alert_id: String,
     pub dedupe_key: String,
@@ -310,6 +329,18 @@ pub struct AlertEventRecord {
     pub last_sent_at: Option<String>,
     pub resolved_at: Option<String>,
     pub detail_json: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlertEvaluationWrite {
+    pub evaluation_id: String,
+    pub entries: Vec<AlertEvaluationEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlertEvaluationEntry {
+    pub before: Option<AlertEventRecord>,
+    pub after: AlertEventRecord,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1400,40 +1431,55 @@ impl Store {
             .map_err(StoreError::from)
     }
 
-    pub fn upsert_health_snapshot(
+    pub fn write_health_snapshots(
         &self,
-        snapshot: &HealthSnapshotRecord,
+        write: &HealthSnapshotWrite,
+        actor: &str,
     ) -> Result<(), StoreError> {
-        validate_low_sensitive_json(&snapshot.degraded_methods_json, "health degraded methods")?;
-        validate_low_sensitive_json(&snapshot.summary_json, "health summary")?;
-        let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
-            "INSERT INTO health_snapshots
-             (node_id, endpoint_id, computed_at, status, freshness_seconds, last_success_at, last_failure_at, last_error_code, degraded_methods_json, summary_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-             ON CONFLICT(node_id) DO UPDATE SET
-               endpoint_id = excluded.endpoint_id,
-               computed_at = excluded.computed_at,
-               status = excluded.status,
-               freshness_seconds = excluded.freshness_seconds,
-               last_success_at = excluded.last_success_at,
-               last_failure_at = excluded.last_failure_at,
-               last_error_code = excluded.last_error_code,
-               degraded_methods_json = excluded.degraded_methods_json,
-               summary_json = excluded.summary_json",
-            params![
-                snapshot.node_id.as_str(),
-                snapshot.endpoint_id.as_deref(),
-                snapshot.computed_at.as_str(),
-                snapshot.status.as_str(),
-                option_u64_to_i64(snapshot.freshness_seconds)?,
-                snapshot.last_success_at.as_deref(),
-                snapshot.last_failure_at.as_deref(),
-                snapshot.last_error_code.as_deref(),
-                compact_json(&snapshot.degraded_methods_json),
-                compact_json(&snapshot.summary_json),
-            ],
-        )?;
+        validate_actor(actor).map_err(StoreError::InvalidInput)?;
+        validate_health_snapshot_write(write)?;
+        let params_hash = health_snapshot_write_hash(write);
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        if health_snapshot_replay_tx(&tx, write, actor, &params_hash)? {
+            tx.commit()?;
+            return Ok(());
+        }
+        for snapshot in &write.snapshots {
+            upsert_health_snapshot_tx(&tx, snapshot)?;
+        }
+        let mut status_counts = serde_json::Map::new();
+        for status in [
+            "healthy",
+            "degraded",
+            "unreachable",
+            "stale",
+            "disabled",
+            "unknown",
+        ] {
+            status_counts.insert(
+                status.to_string(),
+                Value::from(
+                    write
+                        .snapshots
+                        .iter()
+                        .filter(|snapshot| snapshot.status == status)
+                        .count(),
+                ),
+            );
+        }
+        let mut event = AuditEvent::new(actor, write.event.clone());
+        event.ok = Some(true);
+        event.request_id = Some(write.evaluation_id.clone());
+        event.params_hash = Some(params_hash);
+        event.detail_json = serde_json::json!({
+            "actor_type": "user",
+            "target_type": "health_snapshot_batch",
+            "target_id": write.evaluation_id,
+            "node_count": write.snapshots.len(),
+            "status_counts": status_counts,
+            "reason": Value::Null,
+        });
+        insert_audit_tx(&tx, &event)?;
         tx.commit()?;
         Ok(())
     }
@@ -1466,37 +1512,58 @@ impl Store {
     }
 
     pub fn upsert_alert_event(&self, alert: &AlertEventRecord) -> Result<(), StoreError> {
-        validate_low_sensitive_json(&alert.detail_json, "alert detail")?;
+        validate_alert_event_record(alert)?;
         let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
-            "INSERT INTO alert_events
-             (alert_id, dedupe_key, node_id, severity, state, reason_code, first_seen_at, last_seen_at, last_sent_at, resolved_at, detail_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-             ON CONFLICT(dedupe_key) DO UPDATE SET
-               alert_id = excluded.alert_id,
-               node_id = excluded.node_id,
-               severity = excluded.severity,
-               state = excluded.state,
-               reason_code = excluded.reason_code,
-               first_seen_at = excluded.first_seen_at,
-               last_seen_at = excluded.last_seen_at,
-               last_sent_at = excluded.last_sent_at,
-               resolved_at = excluded.resolved_at,
-               detail_json = excluded.detail_json",
-            params![
-                alert.alert_id.as_str(),
-                alert.dedupe_key.as_str(),
-                alert.node_id.as_deref(),
-                alert.severity.as_str(),
-                alert.state.as_str(),
-                alert.reason_code.as_str(),
-                alert.first_seen_at.as_str(),
-                alert.last_seen_at.as_str(),
-                alert.last_sent_at.as_deref(),
-                alert.resolved_at.as_deref(),
-                compact_json(&alert.detail_json),
-            ],
-        )?;
+        upsert_alert_event_tx(&tx, alert)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn write_alert_evaluation(
+        &self,
+        write: &AlertEvaluationWrite,
+        actor: &str,
+    ) -> Result<(), StoreError> {
+        validate_actor(actor).map_err(StoreError::InvalidInput)?;
+        validate_alert_evaluation_write(write)?;
+        let params_hash = alert_evaluation_write_hash(write);
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        if alert_evaluation_replay_tx(&tx, write, actor, &params_hash)? {
+            tx.commit()?;
+            return Ok(());
+        }
+        for entry in &write.entries {
+            let current = get_alert_event_tx(&tx, &entry.after.dedupe_key)?;
+            if current != entry.before {
+                return Err(StoreError::AlertEvaluationConflict {
+                    evaluation_id: write.evaluation_id.clone(),
+                    detail: "alert state changed after candidate evaluation",
+                });
+            }
+            upsert_alert_event_tx(&tx, &entry.after)?;
+        }
+        let open_alerts = write
+            .entries
+            .iter()
+            .filter(|entry| entry.after.state == "open")
+            .count();
+        let silenced_alerts = write.entries.len() - open_alerts;
+        let mut event = AuditEvent::new(actor, "alert.evaluate");
+        event.ok = Some(true);
+        event.request_id = Some(write.evaluation_id.clone());
+        event.params_hash = Some(params_hash);
+        event.detail_json = serde_json::json!({
+            "actor_type": "user",
+            "target_type": "alert_evaluation",
+            "target_id": write.evaluation_id,
+            "evaluated_candidates": write.entries.len(),
+            "upserted_alerts": write.entries.len(),
+            "open_alerts": open_alerts,
+            "silenced_alerts": silenced_alerts,
+            "created_or_updated_count": write.entries.len(),
+            "reason": Value::Null,
+        });
+        insert_audit_tx(&tx, &event)?;
         tx.commit()?;
         Ok(())
     }
@@ -5373,6 +5440,374 @@ fn get_retention_policy_tx(
          WHERE scope = ?1",
         [scope],
         retention_policy_from_row,
+    )
+    .optional()
+    .map_err(StoreError::from)
+}
+
+fn validate_health_snapshot_write(write: &HealthSnapshotWrite) -> Result<(), StoreError> {
+    validate_audit_text(&write.evaluation_id, "health evaluation_id", 96)?;
+    let Some(uuid) = write.evaluation_id.strip_prefix("health-eval-") else {
+        return Err(StoreError::InvalidInput(
+            "health evaluation_id must use health-eval-<uuid> format".to_string(),
+        ));
+    };
+    Uuid::parse_str(uuid).map_err(|_| {
+        StoreError::InvalidInput("health evaluation_id must contain a UUID".to_string())
+    })?;
+    if !matches!(write.event.as_str(), "health.summary" | "health.node") {
+        return Err(StoreError::InvalidInput(
+            "health evaluation event is not allowed".to_string(),
+        ));
+    }
+    if write.snapshots.len() > MAX_HEALTH_SNAPSHOT_WRITE_RECORDS {
+        return Err(StoreError::InvalidInput(format!(
+            "health snapshot batch exceeds {MAX_HEALTH_SNAPSHOT_WRITE_RECORDS} records"
+        )));
+    }
+    if write.event == "health.node" && write.snapshots.len() != 1 {
+        return Err(StoreError::InvalidInput(
+            "health.node requires exactly one snapshot".to_string(),
+        ));
+    }
+    let mut node_ids = std::collections::BTreeSet::new();
+    for snapshot in &write.snapshots {
+        validate_node_id(&snapshot.node_id)
+            .map_err(|err| StoreError::InvalidInput(err.to_string()))?;
+        if !node_ids.insert(snapshot.node_id.as_str()) {
+            return Err(StoreError::InvalidInput(
+                "health snapshot batch contains a duplicate node_id".to_string(),
+            ));
+        }
+        snapshot
+            .endpoint_id
+            .as_deref()
+            .map(validate_endpoint_id)
+            .transpose()
+            .map_err(StoreError::InvalidInput)?;
+        validate_rfc3339(&snapshot.computed_at, "health computed_at")?;
+        for (value, field) in [
+            (
+                snapshot.last_success_at.as_deref(),
+                "health last_success_at",
+            ),
+            (
+                snapshot.last_failure_at.as_deref(),
+                "health last_failure_at",
+            ),
+        ] {
+            if let Some(value) = value {
+                validate_rfc3339(value, field)?;
+            }
+        }
+        if !matches!(
+            snapshot.status.as_str(),
+            "healthy" | "degraded" | "unreachable" | "stale" | "disabled" | "unknown"
+        ) {
+            return Err(StoreError::InvalidInput(
+                "health snapshot status is not allowed".to_string(),
+            ));
+        }
+        if let Some(error_code) = &snapshot.last_error_code {
+            validate_audit_text(error_code, "health last_error_code", 64)?;
+        }
+        validate_low_sensitive_json(&snapshot.degraded_methods_json, "health degraded methods")?;
+        validate_low_sensitive_json(&snapshot.summary_json, "health summary")?;
+    }
+    Ok(())
+}
+
+fn validate_rfc3339(value: &str, field: &str) -> Result<(), StoreError> {
+    if OffsetDateTime::parse(value, &Rfc3339).is_err() {
+        return Err(StoreError::InvalidInput(format!("{field} must be RFC3339")));
+    }
+    Ok(())
+}
+
+fn health_snapshot_write_hash(write: &HealthSnapshotWrite) -> String {
+    let snapshots = write
+        .snapshots
+        .iter()
+        .map(|snapshot| {
+            serde_json::json!({
+                "node_id": snapshot.node_id,
+                "endpoint_id": snapshot.endpoint_id,
+                "computed_at": snapshot.computed_at,
+                "status": snapshot.status,
+                "freshness_seconds": snapshot.freshness_seconds,
+                "last_success_at": snapshot.last_success_at,
+                "last_failure_at": snapshot.last_failure_at,
+                "last_error_code": snapshot.last_error_code,
+                "degraded_methods": snapshot.degraded_methods_json,
+                "summary": snapshot.summary_json,
+            })
+        })
+        .collect::<Vec<_>>();
+    let payload = serde_json::json!({"event": write.event, "snapshots": snapshots});
+    blake3::hash(&serde_json::to_vec(&payload).expect("health snapshot hash JSON serializes"))
+        .to_hex()
+        .to_string()
+}
+
+fn health_snapshot_replay_tx(
+    tx: &Transaction<'_>,
+    write: &HealthSnapshotWrite,
+    actor: &str,
+    params_hash: &str,
+) -> Result<bool, StoreError> {
+    let mut stmt = tx.prepare(
+        "SELECT event, actor, params_hash
+         FROM controller_audit_log
+         WHERE request_id = ?1
+         ORDER BY id
+         LIMIT 2",
+    )?;
+    let rows = stmt.query_map([write.evaluation_id.as_str()], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+        ))
+    })?;
+    let existing = rows.collect::<Result<Vec<_>, _>>()?;
+    if existing.is_empty() {
+        return Ok(false);
+    }
+    if existing.len() == 1
+        && existing[0].0 == write.event
+        && existing[0].1 == actor
+        && existing[0].2.as_deref() == Some(params_hash)
+    {
+        return Ok(true);
+    }
+    Err(StoreError::HealthEvaluationConflict {
+        evaluation_id: write.evaluation_id.clone(),
+        detail: "evaluation audit provenance is mismatched or ambiguous",
+    })
+}
+
+fn upsert_health_snapshot_tx(
+    tx: &Transaction<'_>,
+    snapshot: &HealthSnapshotRecord,
+) -> Result<(), StoreError> {
+    tx.execute(
+        "INSERT INTO health_snapshots
+         (node_id, endpoint_id, computed_at, status, freshness_seconds, last_success_at, last_failure_at, last_error_code, degraded_methods_json, summary_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         ON CONFLICT(node_id) DO UPDATE SET
+           endpoint_id = excluded.endpoint_id,
+           computed_at = excluded.computed_at,
+           status = excluded.status,
+           freshness_seconds = excluded.freshness_seconds,
+           last_success_at = excluded.last_success_at,
+           last_failure_at = excluded.last_failure_at,
+           last_error_code = excluded.last_error_code,
+           degraded_methods_json = excluded.degraded_methods_json,
+           summary_json = excluded.summary_json",
+        params![
+            snapshot.node_id.as_str(),
+            snapshot.endpoint_id.as_deref(),
+            snapshot.computed_at.as_str(),
+            snapshot.status.as_str(),
+            option_u64_to_i64(snapshot.freshness_seconds)?,
+            snapshot.last_success_at.as_deref(),
+            snapshot.last_failure_at.as_deref(),
+            snapshot.last_error_code.as_deref(),
+            compact_json(&snapshot.degraded_methods_json),
+            compact_json(&snapshot.summary_json),
+        ],
+    )?;
+    Ok(())
+}
+
+fn validate_alert_evaluation_write(write: &AlertEvaluationWrite) -> Result<(), StoreError> {
+    validate_audit_text(&write.evaluation_id, "alert evaluation_id", 96)?;
+    let Some(uuid) = write.evaluation_id.strip_prefix("alert-eval-") else {
+        return Err(StoreError::InvalidInput(
+            "alert evaluation_id must use alert-eval-<uuid> format".to_string(),
+        ));
+    };
+    Uuid::parse_str(uuid).map_err(|_| {
+        StoreError::InvalidInput("alert evaluation_id must contain a UUID".to_string())
+    })?;
+    if write.entries.is_empty() || write.entries.len() > MAX_ALERT_EVALUATION_RECORDS {
+        return Err(StoreError::InvalidInput(format!(
+            "alert evaluation must contain 1-{MAX_ALERT_EVALUATION_RECORDS} records"
+        )));
+    }
+    let mut alert_ids = std::collections::BTreeSet::new();
+    let mut dedupe_keys = std::collections::BTreeSet::new();
+    for entry in &write.entries {
+        if let Some(before) = &entry.before {
+            validate_alert_event_record(before)?;
+            if before.alert_id != entry.after.alert_id
+                || before.dedupe_key != entry.after.dedupe_key
+            {
+                return Err(StoreError::InvalidInput(
+                    "alert evaluation cannot change alert identity".to_string(),
+                ));
+            }
+        }
+        validate_alert_event_record(&entry.after)?;
+        if !alert_ids.insert(entry.after.alert_id.as_str())
+            || !dedupe_keys.insert(entry.after.dedupe_key.as_str())
+        {
+            return Err(StoreError::InvalidInput(
+                "alert evaluation contains duplicate alert identity".to_string(),
+            ));
+        }
+        if !matches!(entry.after.state.as_str(), "open" | "silenced") {
+            return Err(StoreError::InvalidInput(
+                "alert evaluation can write only open or silenced candidates".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_alert_event_record(alert: &AlertEventRecord) -> Result<(), StoreError> {
+    validate_safe_id("alert_id", &alert.alert_id, 128)?;
+    validate_safe_id("dedupe_key", &alert.dedupe_key, 256)?;
+    if let Some(node_id) = &alert.node_id {
+        validate_node_id(node_id).map_err(|err| StoreError::InvalidInput(err.to_string()))?;
+    }
+    if !matches!(alert.severity.as_str(), "warning" | "critical") {
+        return Err(StoreError::InvalidInput(
+            "alert severity is not allowed".to_string(),
+        ));
+    }
+    if !matches!(alert.state.as_str(), "open" | "silenced" | "resolved") {
+        return Err(StoreError::InvalidInput(
+            "alert state is not allowed".to_string(),
+        ));
+    }
+    validate_safe_id("reason_code", &alert.reason_code, 64)?;
+    validate_rfc3339(&alert.first_seen_at, "alert first_seen_at")?;
+    validate_rfc3339(&alert.last_seen_at, "alert last_seen_at")?;
+    for (value, field) in [
+        (alert.last_sent_at.as_deref(), "alert last_sent_at"),
+        (alert.resolved_at.as_deref(), "alert resolved_at"),
+    ] {
+        if let Some(value) = value {
+            validate_rfc3339(value, field)?;
+        }
+    }
+    validate_low_sensitive_json(&alert.detail_json, "alert detail")?;
+    Ok(())
+}
+
+fn alert_evaluation_write_hash(write: &AlertEvaluationWrite) -> String {
+    let entries = write
+        .entries
+        .iter()
+        .map(|entry| {
+            serde_json::json!({
+                "before": entry.before.as_ref().map(alert_event_hash_json),
+                "after": alert_event_hash_json(&entry.after),
+            })
+        })
+        .collect::<Vec<_>>();
+    blake3::hash(&serde_json::to_vec(&entries).expect("alert evaluation hash JSON serializes"))
+        .to_hex()
+        .to_string()
+}
+
+fn alert_event_hash_json(alert: &AlertEventRecord) -> Value {
+    serde_json::json!({
+        "alert_id": alert.alert_id,
+        "dedupe_key": alert.dedupe_key,
+        "node_id": alert.node_id,
+        "severity": alert.severity,
+        "state": alert.state,
+        "reason_code": alert.reason_code,
+        "first_seen_at": alert.first_seen_at,
+        "last_seen_at": alert.last_seen_at,
+        "last_sent_at": alert.last_sent_at,
+        "resolved_at": alert.resolved_at,
+        "detail": alert.detail_json,
+    })
+}
+
+fn alert_evaluation_replay_tx(
+    tx: &Transaction<'_>,
+    write: &AlertEvaluationWrite,
+    actor: &str,
+    params_hash: &str,
+) -> Result<bool, StoreError> {
+    let mut stmt = tx.prepare(
+        "SELECT event, actor, params_hash
+         FROM controller_audit_log
+         WHERE request_id = ?1
+         ORDER BY id
+         LIMIT 2",
+    )?;
+    let rows = stmt.query_map([write.evaluation_id.as_str()], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+        ))
+    })?;
+    let existing = rows.collect::<Result<Vec<_>, _>>()?;
+    if existing.is_empty() {
+        return Ok(false);
+    }
+    if existing.len() == 1
+        && existing[0].0 == "alert.evaluate"
+        && existing[0].1 == actor
+        && existing[0].2.as_deref() == Some(params_hash)
+    {
+        return Ok(true);
+    }
+    Err(StoreError::AlertEvaluationConflict {
+        evaluation_id: write.evaluation_id.clone(),
+        detail: "evaluation audit provenance is mismatched or ambiguous",
+    })
+}
+
+fn upsert_alert_event_tx(tx: &Transaction<'_>, alert: &AlertEventRecord) -> Result<(), StoreError> {
+    tx.execute(
+        "INSERT INTO alert_events
+         (alert_id, dedupe_key, node_id, severity, state, reason_code, first_seen_at, last_seen_at, last_sent_at, resolved_at, detail_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+         ON CONFLICT(dedupe_key) DO UPDATE SET
+           alert_id = excluded.alert_id,
+           node_id = excluded.node_id,
+           severity = excluded.severity,
+           state = excluded.state,
+           reason_code = excluded.reason_code,
+           first_seen_at = excluded.first_seen_at,
+           last_seen_at = excluded.last_seen_at,
+           last_sent_at = excluded.last_sent_at,
+           resolved_at = excluded.resolved_at,
+           detail_json = excluded.detail_json",
+        params![
+            alert.alert_id.as_str(),
+            alert.dedupe_key.as_str(),
+            alert.node_id.as_deref(),
+            alert.severity.as_str(),
+            alert.state.as_str(),
+            alert.reason_code.as_str(),
+            alert.first_seen_at.as_str(),
+            alert.last_seen_at.as_str(),
+            alert.last_sent_at.as_deref(),
+            alert.resolved_at.as_deref(),
+            compact_json(&alert.detail_json),
+        ],
+    )?;
+    Ok(())
+}
+
+fn get_alert_event_tx(
+    tx: &Transaction<'_>,
+    dedupe_key: &str,
+) -> Result<Option<AlertEventRecord>, StoreError> {
+    tx.query_row(
+        "SELECT alert_id, dedupe_key, node_id, severity, state, reason_code, first_seen_at, last_seen_at, last_sent_at, resolved_at, detail_json
+         FROM alert_events
+         WHERE dedupe_key = ?1",
+        [dedupe_key],
+        alert_event_from_row,
     )
     .optional()
     .map_err(StoreError::from)

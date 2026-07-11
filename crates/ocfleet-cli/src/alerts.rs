@@ -19,11 +19,12 @@ use crate::alert_webhook::{
 };
 use crate::args::{AlertCommand, AlertHookCommand, AlertSeverity, AlertState};
 use crate::audit::AuditEvent;
+use crate::backend::StoreWriter;
 use crate::duration_args::parse_duration_seconds;
 use crate::input_validation::{local_actor, validate_reason};
 use crate::store::{
-    AlertDeliveryAttemptRecord, AlertEventRecord, AlertWebhookHookRecord, HealthPolicyRecord,
-    ProbeObservationRecord, Store,
+    AlertDeliveryAttemptRecord, AlertEvaluationEntry, AlertEvaluationWrite, AlertEventRecord,
+    AlertWebhookHookRecord, HealthPolicyRecord, ProbeObservationRecord, Store,
 };
 use std::path::Path;
 use std::thread;
@@ -103,11 +104,14 @@ fn evaluate_alert_records(
     let existing = store.list_alert_events()?;
     let policy = store.get_health_policy()?;
     let candidates = alert_candidates(store, &policy)?;
-    let mut updated = Vec::new();
+    let mut entries = Vec::new();
     for candidate in candidates {
-        let record = upsert_candidate(store, &existing, candidate, &now)?;
-        updated.push(record);
+        entries.push(candidate_record(&existing, candidate, &now));
     }
+    let updated = entries
+        .iter()
+        .map(|entry| entry.after.clone())
+        .collect::<Vec<_>>();
     let summary = AlertEvaluationSummary {
         evaluated_candidates: updated.len(),
         upserted_alerts: updated.len(),
@@ -118,6 +122,16 @@ fn evaluate_alert_records(
             .count(),
         created_or_updated_count: updated.len(),
     };
+    if !updated.is_empty() {
+        StoreWriter::write_alert_evaluation(
+            store,
+            &AlertEvaluationWrite {
+                evaluation_id: format!("alert-eval-{}", Uuid::new_v4()),
+                entries,
+            },
+            &local_actor(),
+        )?;
+    }
     Ok((updated, summary))
 }
 
@@ -542,11 +556,7 @@ pub fn deliver_webhook_alerts_with_sender(
 }
 
 fn evaluate_alerts_and_audit(store: &Store) -> anyhow::Result<AlertEvaluationSummary> {
-    let summary = evaluate_alerts_with_summary(store)?;
-    if summary.created_or_updated_count > 0 {
-        write_alert_evaluation_audit(store, &summary)?;
-    }
-    Ok(summary)
+    evaluate_alerts_with_summary(store)
 }
 
 fn run_alert_silence(
@@ -817,12 +827,11 @@ fn candidates_from_endpoint_trust(store: &Store) -> anyhow::Result<Vec<AlertCand
     Ok(candidates)
 }
 
-fn upsert_candidate(
-    store: &Store,
+fn candidate_record(
     existing_alerts: &[AlertEventRecord],
     candidate: AlertCandidate,
     now: &str,
-) -> anyhow::Result<AlertEventRecord> {
+) -> AlertEvaluationEntry {
     let existing = existing_alerts
         .iter()
         .find(|alert| alert.dedupe_key == candidate.dedupe_key);
@@ -835,7 +844,7 @@ fn upsert_candidate(
         "summary".to_string(),
         crate::alert_projection::project_summary(&candidate.summary),
     );
-    let record = AlertEventRecord {
+    let after = AlertEventRecord {
         alert_id: existing
             .map(|alert| alert.alert_id.clone())
             .unwrap_or_else(|| format!("alert-{}", Uuid::new_v4().simple())),
@@ -856,8 +865,10 @@ fn upsert_candidate(
         },
         detail_json: Value::Object(detail),
     };
-    store.upsert_alert_event(&record)?;
-    Ok(record)
+    AlertEvaluationEntry {
+        before: existing.cloned(),
+        after,
+    }
 }
 
 fn alert_is_silenced(alert: &AlertEventRecord, now: &str) -> bool {
@@ -1032,23 +1043,6 @@ fn alert_severity_name(severity: AlertSeverity) -> &'static str {
         AlertSeverity::Warning => "warning",
         AlertSeverity::Critical => "critical",
     }
-}
-
-fn write_alert_evaluation_audit(
-    store: &Store,
-    summary: &AlertEvaluationSummary,
-) -> anyhow::Result<()> {
-    let mut event = AuditEvent::new(local_actor(), "alert.evaluate");
-    event.ok = Some(true);
-    event.detail_json = json!({
-        "evaluated_candidates": summary.evaluated_candidates,
-        "upserted_alerts": summary.upserted_alerts,
-        "open_alerts": summary.open_alerts,
-        "silenced_alerts": summary.silenced_alerts,
-        "created_or_updated_count": summary.created_or_updated_count,
-    });
-    store.insert_audit(&event)?;
-    Ok(())
 }
 
 fn write_alert_audit(store: &Store, event_name: &str, detail_json: Value) -> anyhow::Result<()> {

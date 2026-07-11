@@ -72,17 +72,21 @@ that enrollment request/node/trust, endpoint lifecycle, scheduler job
 configuration, observation, RPC audit, run state, and job-clock changes roll
 back at their declared boundaries. Retention policy/apply also uses atomic
 writers; each scope's bounded delete batches share a transaction with their
-audit, and stable operation IDs make exact retries no-ops. Health/alert/delivery and other
-call sites remain to migrate.
+audit, and stable operation IDs make exact retries no-ops. Health snapshot
+batches and alert candidate evaluations also bind state and audit atomically;
+alert evaluation uses persisted before-state checks to preserve concurrent
+operator decisions. Alert silence/resolve/delivery and other call sites remain
+to migrate.
 Completing those families is required before claiming fully fail-closed
 controller mutation audit. The API remains read-only while that work is
 incomplete. The governing decision is recorded in
 [ADR-atomic-audit-writes](adr/ADR-atomic-audit-writes.md).
 
-Enrollment token/request/approval/claim, retention, and endpoint lifecycle CLI calls are
-routed through `StoreWriter`. A static source guard rejects direct production
-calls to those enrollment/retention writers, node add/enable/disable/remove, and endpoint
-rotate/revoke/quarantine outside the reviewed SQLite store and backend adapter.
+Enrollment token/request/approval/claim, retention, health evaluation, alert
+evaluation, and endpoint lifecycle CLI calls are routed through `StoreWriter`.
+A static source guard rejects direct production calls to those writers, node
+add/enable/disable/remove, and endpoint rotate/revoke/quarantine outside the
+reviewed SQLite store and backend adapter.
 This guard is a review backstop, not RBAC; the resolved actor and transactional
 audit remain the authority record.
 

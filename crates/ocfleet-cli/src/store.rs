@@ -35,7 +35,7 @@ use crate::storage_payloads::{
     validate_health_payload_relationship, validate_scheduler_payload_relationship,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 18;
+pub const CURRENT_SCHEMA_VERSION: i64 = 19;
 pub const DEFAULT_HEALTH_STALE_WINDOW_SECONDS: u64 = 24 * 60 * 60;
 pub const DEFAULT_HEALTH_UNREACHABLE_FAILURES: u64 = 3;
 pub const DEFAULT_HEALTH_CERT_WARNING_DAYS: u64 = 30;
@@ -74,6 +74,8 @@ pub enum StoreError {
     ObservabilityJobNotFound(String),
     #[error("observability run not found: {0}")]
     ObservabilityRunNotFound(String),
+    #[error("scheduler claim was lost for job: {0}")]
+    SchedulerClaimLost(String),
     #[error("observability run is not running: {0}")]
     ObservabilityRunNotRunning(String),
     #[error("enrollment rejected: {0}")]
@@ -279,6 +281,19 @@ pub struct SchedulerRunStart {
     pub job_id: String,
     pub started_at: String,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchedulerJobClaim {
+    pub job_id: String,
+    pub owner_id: String,
+    pub fence_token: u64,
+    pub claimed_at: String,
+    pub lease_expires_at: String,
+    pub active_run_id: Option<String>,
+}
+
+pub const MIN_SCHEDULER_LEASE_SECONDS: u64 = 5;
+pub const MAX_SCHEDULER_LEASE_SECONDS: u64 = 21_600;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SchedulerJobClockUpdate {
@@ -1051,6 +1066,156 @@ impl Store {
         Ok(row.map(observability_job_load_from_raw))
     }
 
+    pub(crate) fn claim_next_due_scheduler_job(
+        &self,
+        owner_id: &str,
+        now: &str,
+        lease_seconds: u64,
+        actor: &str,
+    ) -> Result<Option<SchedulerJobClaim>, StoreError> {
+        validate_scheduler_claim_input(owner_id, now, lease_seconds, actor)?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let job_id = tx
+            .query_row(
+                "SELECT j.job_id
+                 FROM observability_jobs j
+                 LEFT JOIN scheduler_job_claims c ON c.job_id = j.job_id
+                 WHERE j.enabled = 1
+                   AND (j.next_run_at IS NULL OR j.next_run_at <= ?1)
+                   AND (c.owner_id IS NULL OR c.lease_expires_at <= ?1)
+                 ORDER BY COALESCE(j.next_run_at, ''), j.job_id
+                 LIMIT 1",
+                [now],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let Some(job_id) = job_id else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        let claim =
+            acquire_scheduler_claim_tx(&tx, &job_id, owner_id, now, lease_seconds, actor, true)?;
+        tx.commit()?;
+        Ok(claim)
+    }
+
+    pub(crate) fn claim_scheduler_job(
+        &self,
+        job_id: &str,
+        owner_id: &str,
+        now: &str,
+        lease_seconds: u64,
+        actor: &str,
+    ) -> Result<Option<SchedulerJobClaim>, StoreError> {
+        validate_safe_id("scheduler job_id", job_id, 128)?;
+        validate_scheduler_claim_input(owner_id, now, lease_seconds, actor)?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let claim =
+            acquire_scheduler_claim_tx(&tx, job_id, owner_id, now, lease_seconds, actor, false)?;
+        tx.commit()?;
+        Ok(claim)
+    }
+
+    pub(crate) fn claim_due_scheduler_job(
+        &self,
+        job_id: &str,
+        owner_id: &str,
+        now: &str,
+        lease_seconds: u64,
+        actor: &str,
+    ) -> Result<Option<SchedulerJobClaim>, StoreError> {
+        validate_safe_id("scheduler job_id", job_id, 128)?;
+        validate_scheduler_claim_input(owner_id, now, lease_seconds, actor)?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let claim =
+            acquire_scheduler_claim_tx(&tx, job_id, owner_id, now, lease_seconds, actor, true)?;
+        tx.commit()?;
+        Ok(claim)
+    }
+
+    pub(crate) fn renew_scheduler_job_claim(
+        &self,
+        claim: &SchedulerJobClaim,
+        now: &str,
+        lease_seconds: u64,
+        actor: &str,
+    ) -> Result<SchedulerJobClaim, StoreError> {
+        validate_scheduler_claim(claim)?;
+        validate_scheduler_claim_input(&claim.owner_id, now, lease_seconds, actor)?;
+        let lease_expires_at = scheduler_lease_expiry(now, lease_seconds)?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let affected = tx.execute(
+            "UPDATE scheduler_job_claims
+             SET lease_expires_at = ?1, updated_at = ?2
+             WHERE job_id = ?3 AND owner_id = ?4 AND fence_token = ?5
+               AND lease_expires_at > ?2",
+            params![
+                lease_expires_at.as_str(),
+                now,
+                claim.job_id.as_str(),
+                claim.owner_id.as_str(),
+                u64_to_i64(claim.fence_token)?,
+            ],
+        )?;
+        if affected != 1 {
+            return Err(StoreError::SchedulerClaimLost(claim.job_id.clone()));
+        }
+        let renewed = SchedulerJobClaim {
+            lease_expires_at,
+            ..claim.clone()
+        };
+        insert_scheduler_claim_audit_tx(&tx, "scheduler.claim.renew", &renewed, actor, "renewed")?;
+        tx.commit()?;
+        Ok(renewed)
+    }
+
+    pub(crate) fn release_scheduler_job_claim(
+        &self,
+        claim: &SchedulerJobClaim,
+        released_at: &str,
+        actor: &str,
+    ) -> Result<(), StoreError> {
+        validate_scheduler_claim(claim)?;
+        validate_bounded_rfc3339(released_at, "scheduler released_at")?;
+        validate_actor(actor).map_err(StoreError::InvalidInput)?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let affected = tx.execute(
+            "UPDATE scheduler_job_claims
+             SET owner_id = NULL, claimed_at = NULL, lease_expires_at = NULL,
+                 active_run_id = NULL, updated_at = ?1
+             WHERE job_id = ?2 AND owner_id = ?3 AND fence_token = ?4",
+            params![
+                released_at,
+                claim.job_id.as_str(),
+                claim.owner_id.as_str(),
+                u64_to_i64(claim.fence_token)?,
+            ],
+        )?;
+        if affected != 1 {
+            return Err(StoreError::SchedulerClaimLost(claim.job_id.clone()));
+        }
+        insert_scheduler_claim_audit_tx(&tx, "scheduler.claim.release", claim, actor, "released")?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn get_scheduler_job_claim(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<SchedulerJobClaim>, StoreError> {
+        validate_safe_id("scheduler job_id", job_id, 128)?;
+        self.conn
+            .query_row(
+                "SELECT job_id, owner_id, fence_token, claimed_at, lease_expires_at, active_run_id
+                 FROM scheduler_job_claims
+                 WHERE job_id = ?1 AND owner_id IS NOT NULL",
+                [job_id],
+                scheduler_job_claim_from_row,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
     pub fn set_observability_job_enabled(
         &self,
         job_id: &str,
@@ -1091,12 +1256,39 @@ impl Store {
         start: &SchedulerRunStart,
         actor: &str,
     ) -> Result<(), StoreError> {
+        self.write_scheduler_run_start_with_claim(start, None, actor)
+    }
+
+    pub(crate) fn write_scheduler_claimed_run_start(
+        &self,
+        start: &SchedulerRunStart,
+        claim: &SchedulerJobClaim,
+        actor: &str,
+    ) -> Result<(), StoreError> {
+        self.write_scheduler_run_start_with_claim(start, Some(claim), actor)
+    }
+
+    fn write_scheduler_run_start_with_claim(
+        &self,
+        start: &SchedulerRunStart,
+        claim: Option<&SchedulerJobClaim>,
+        actor: &str,
+    ) -> Result<(), StoreError> {
         validate_actor(actor).map_err(StoreError::InvalidInput)?;
         validate_safe_id("scheduler run_id", &start.run_id, 128)?;
         validate_safe_id("scheduler job_id", &start.job_id, 128)?;
         validate_bounded_rfc3339(&start.started_at, "scheduler started_at")?;
 
-        let tx = self.conn.unchecked_transaction()?;
+        if let Some(claim) = claim {
+            validate_scheduler_claim(claim)?;
+            if claim.job_id != start.job_id {
+                return Err(StoreError::InvalidInput(
+                    "scheduler claim job_id does not match run start".to_string(),
+                ));
+            }
+        }
+
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let (kind, enabled) = get_observability_job_start_state_tx(&tx, &start.job_id)?
             .ok_or_else(|| StoreError::ObservabilityJobNotFound(start.job_id.clone()))?;
         validate_scheduler_job_kind(&kind)?;
@@ -1125,6 +1317,25 @@ impl Store {
             },
         )?;
 
+        if let Some(claim) = claim {
+            let affected = tx.execute(
+                "UPDATE scheduler_job_claims
+                 SET active_run_id = ?1, updated_at = ?2
+                 WHERE job_id = ?3 AND owner_id = ?4 AND fence_token = ?5
+                   AND active_run_id IS NULL AND lease_expires_at > ?2",
+                params![
+                    start.run_id.as_str(),
+                    start.started_at.as_str(),
+                    claim.job_id.as_str(),
+                    claim.owner_id.as_str(),
+                    u64_to_i64(claim.fence_token)?,
+                ],
+            )?;
+            if affected != 1 {
+                return Err(StoreError::SchedulerClaimLost(start.job_id.clone()));
+            }
+        }
+
         let mut event = AuditEvent::new(actor, "scheduler.run.start");
         event.ok = Some(true);
         event.detail_json = serde_json::json!({
@@ -1150,12 +1361,19 @@ impl Store {
         if let Some(run_id) = outcome.run_id.as_deref() {
             let run = get_observability_run_state_tx(&tx, run_id)?
                 .ok_or_else(|| StoreError::ObservabilityRunNotFound(run_id.to_string()))?;
-            ensure_running_observability_run(&run)?;
             if run.job_id.as_deref() != Some(outcome.job_id.as_str()) {
                 return Err(StoreError::InvalidInput(
                     "scheduler outcome job_id does not match run".to_string(),
                 ));
             }
+            let observed_at = outcome
+                .entries
+                .iter()
+                .map(|entry| entry.observation.observed_at.as_str())
+                .max()
+                .expect("validated scheduler outcome has entries");
+            ensure_active_scheduler_run_claim_tx(&tx, &outcome.job_id, run_id, observed_at)?;
+            ensure_running_observability_run(&run)?;
             let kind = get_observability_job_kind_tx(&tx, &outcome.job_id)?
                 .ok_or_else(|| StoreError::ObservabilityJobNotFound(outcome.job_id.clone()))?;
             validate_scheduler_job_kind(&kind)?;
@@ -1205,6 +1423,12 @@ impl Store {
                 "scheduler finish job_id does not match run".to_string(),
             ));
         }
+        ensure_active_scheduler_run_claim_tx(
+            &tx,
+            &finish.job_clock.job_id,
+            &finish.run_id,
+            &finish.finished_at,
+        )?;
         if OffsetDateTime::parse(&finish.finished_at, &Rfc3339)
             .expect("validated scheduler finished_at parses")
             < OffsetDateTime::parse(&run.started_at, &Rfc3339).map_err(|_| {
@@ -1264,6 +1488,16 @@ impl Store {
             ));
         }
         update_scheduler_job_clock_tx(&tx, &finish.job_clock)?;
+        tx.execute(
+            "UPDATE scheduler_job_claims
+             SET active_run_id = NULL, updated_at = ?1
+             WHERE job_id = ?2 AND active_run_id = ?3",
+            params![
+                finish.finished_at.as_str(),
+                finish.job_clock.job_id.as_str(),
+                finish.run_id.as_str(),
+            ],
+        )?;
 
         let mut event = AuditEvent::new(actor, "scheduler.run.finish");
         event.ok = Some(status != "failed");
@@ -3325,6 +3559,275 @@ struct ObservabilityRunState {
     status: String,
 }
 
+fn ensure_active_scheduler_run_claim_tx(
+    tx: &Transaction<'_>,
+    job_id: &str,
+    run_id: &str,
+    check_at: &str,
+) -> Result<(), StoreError> {
+    let claim = tx
+        .query_row(
+            "SELECT owner_id, active_run_id, lease_expires_at
+             FROM scheduler_job_claims WHERE job_id = ?1",
+            [job_id],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((owner_id, active_run_id, lease_expires_at)) = claim else {
+        return Ok(());
+    };
+    let check_at = OffsetDateTime::parse(check_at, &Rfc3339).map_err(|_| {
+        StoreError::InvalidInput("scheduler claim check timestamp is invalid".to_string())
+    })?;
+    let valid = owner_id.is_some()
+        && active_run_id.as_deref() == Some(run_id)
+        && lease_expires_at
+            .as_deref()
+            .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
+            .is_some_and(|expires| expires > check_at);
+    if !valid {
+        return Err(StoreError::SchedulerClaimLost(job_id.to_string()));
+    }
+    Ok(())
+}
+
+fn validate_scheduler_claim_input(
+    owner_id: &str,
+    now: &str,
+    lease_seconds: u64,
+    actor: &str,
+) -> Result<(), StoreError> {
+    validate_safe_id("scheduler owner_id", owner_id, 128)?;
+    validate_bounded_rfc3339(now, "scheduler claim timestamp")?;
+    validate_u64_range(
+        "scheduler lease_seconds",
+        lease_seconds,
+        MIN_SCHEDULER_LEASE_SECONDS,
+        MAX_SCHEDULER_LEASE_SECONDS,
+    )?;
+    validate_actor(actor).map_err(StoreError::InvalidInput)
+}
+
+fn validate_scheduler_claim(claim: &SchedulerJobClaim) -> Result<(), StoreError> {
+    validate_safe_id("scheduler job_id", &claim.job_id, 128)?;
+    validate_safe_id("scheduler owner_id", &claim.owner_id, 128)?;
+    if claim.fence_token == 0 || claim.fence_token > i64::MAX as u64 {
+        return Err(StoreError::InvalidInput(
+            "scheduler fence token is out of range".to_string(),
+        ));
+    }
+    validate_bounded_rfc3339(&claim.claimed_at, "scheduler claimed_at")?;
+    validate_bounded_rfc3339(&claim.lease_expires_at, "scheduler lease_expires_at")?;
+    if let Some(run_id) = &claim.active_run_id {
+        validate_safe_id("scheduler active_run_id", run_id, 128)?;
+    }
+    let claimed_at = OffsetDateTime::parse(&claim.claimed_at, &Rfc3339)
+        .expect("validated scheduler claimed_at parses");
+    let lease_expires_at = OffsetDateTime::parse(&claim.lease_expires_at, &Rfc3339)
+        .expect("validated scheduler lease_expires_at parses");
+    if lease_expires_at <= claimed_at {
+        return Err(StoreError::InvalidInput(
+            "scheduler lease must expire after it is claimed".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn scheduler_lease_expiry(now: &str, lease_seconds: u64) -> Result<String, StoreError> {
+    let lease_seconds = i64::try_from(lease_seconds)
+        .map_err(|_| StoreError::InvalidInput("scheduler lease_seconds exceeds i64".to_string()))?;
+    let now = OffsetDateTime::parse(now, &Rfc3339).map_err(|_| {
+        StoreError::InvalidInput("scheduler claim timestamp must be RFC3339".to_string())
+    })?;
+    (now + time::Duration::seconds(lease_seconds))
+        .format(&Rfc3339)
+        .map_err(|error| StoreError::InvalidInput(error.to_string()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn acquire_scheduler_claim_tx(
+    tx: &Transaction<'_>,
+    job_id: &str,
+    owner_id: &str,
+    now: &str,
+    lease_seconds: u64,
+    actor: &str,
+    require_due: bool,
+) -> Result<Option<SchedulerJobClaim>, StoreError> {
+    let job = tx
+        .query_row(
+            "SELECT enabled, next_run_at FROM observability_jobs WHERE job_id = ?1",
+            [job_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional()?;
+    let Some((enabled, next_run_at)) = job else {
+        return Err(StoreError::ObservabilityJobNotFound(job_id.to_string()));
+    };
+    let now_instant =
+        OffsetDateTime::parse(now, &Rfc3339).expect("validated scheduler claim timestamp parses");
+    let is_due = next_run_at.as_deref().is_none_or(|due| {
+        OffsetDateTime::parse(due, &Rfc3339).map_or(true, |due| due <= now_instant)
+    });
+    if !i64_to_bool(enabled, 0)? || (require_due && !is_due) {
+        return Ok(None);
+    }
+
+    let existing = tx
+        .query_row(
+            "SELECT owner_id, fence_token, lease_expires_at, active_run_id
+             FROM scheduler_job_claims WHERE job_id = ?1",
+            [job_id],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    if existing.as_ref().is_some_and(|(owner, _, expires, _)| {
+        owner.is_some()
+            && expires
+                .as_deref()
+                .and_then(|expires| OffsetDateTime::parse(expires, &Rfc3339).ok())
+                .is_some_and(|expires| expires > now_instant)
+    }) {
+        return Ok(None);
+    }
+    let (previous_fence, expired_run_id) =
+        existing.map_or((0, None), |(_, fence, _, run_id)| (fence, run_id));
+    let fence_token = previous_fence.checked_add(1).ok_or_else(|| {
+        StoreError::InvalidInput("scheduler fence token is exhausted".to_string())
+    })?;
+    if fence_token <= 0 {
+        return Err(StoreError::InvalidInput(
+            "stored scheduler fence token is invalid".to_string(),
+        ));
+    }
+    if let Some(run_id) = expired_run_id {
+        recover_expired_scheduler_run_tx(tx, job_id, &run_id, now, actor)?;
+    }
+    let lease_expires_at = scheduler_lease_expiry(now, lease_seconds)?;
+    tx.execute(
+        "INSERT INTO scheduler_job_claims
+         (job_id, owner_id, fence_token, claimed_at, lease_expires_at, active_run_id, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?4)
+         ON CONFLICT(job_id) DO UPDATE SET
+           owner_id = excluded.owner_id,
+           fence_token = excluded.fence_token,
+           claimed_at = excluded.claimed_at,
+           lease_expires_at = excluded.lease_expires_at,
+           active_run_id = NULL,
+           updated_at = excluded.updated_at",
+        params![
+            job_id,
+            owner_id,
+            fence_token,
+            now,
+            lease_expires_at.as_str(),
+        ],
+    )?;
+    let claim = SchedulerJobClaim {
+        job_id: job_id.to_string(),
+        owner_id: owner_id.to_string(),
+        fence_token: u64::try_from(fence_token).expect("positive fence token converts"),
+        claimed_at: now.to_string(),
+        lease_expires_at,
+        active_run_id: None,
+    };
+    insert_scheduler_claim_audit_tx(tx, "scheduler.claim.acquire", &claim, actor, "acquired")?;
+    Ok(Some(claim))
+}
+
+fn recover_expired_scheduler_run_tx(
+    tx: &Transaction<'_>,
+    job_id: &str,
+    run_id: &str,
+    recovered_at: &str,
+    actor: &str,
+) -> Result<(), StoreError> {
+    let run = get_observability_run_state_tx(tx, run_id)?
+        .ok_or_else(|| StoreError::ObservabilityRunNotFound(run_id.to_string()))?;
+    if run.job_id.as_deref() != Some(job_id) {
+        return Err(StoreError::InvalidInput(
+            "expired scheduler claim references a run for another job".to_string(),
+        ));
+    }
+    if run.status != "running" || run.finished_at.is_some() {
+        return Ok(());
+    }
+    let started_at = OffsetDateTime::parse(&run.started_at, &Rfc3339).map_err(|_| {
+        StoreError::InvalidInput("stored scheduler started_at is invalid".to_string())
+    })?;
+    let recovered = OffsetDateTime::parse(recovered_at, &Rfc3339)
+        .expect("validated scheduler recovery timestamp parses");
+    let finished_at = if recovered < started_at {
+        run.started_at.clone()
+    } else {
+        recovered_at.to_string()
+    };
+    let kind = get_observability_job_kind_tx(tx, job_id)?
+        .ok_or_else(|| StoreError::ObservabilityJobNotFound(job_id.to_string()))?;
+    let summary = RunSummaryPayloadV1::new(
+        Some(job_id.to_string()),
+        Some(kind.clone()),
+        "failed".to_string(),
+        "scheduler.run.once".to_string(),
+        Some(0),
+        Some(0),
+    )
+    .map_err(StoreError::InvalidInput)?;
+    let affected = tx.execute(
+        "UPDATE observability_runs
+         SET finished_at = ?1, status = 'failed', summary_json = ?2
+         WHERE run_id = ?3 AND job_id = ?4 AND status = 'running' AND finished_at IS NULL",
+        params![finished_at, summary.to_value().to_string(), run_id, job_id],
+    )?;
+    if affected != 1 {
+        return Err(StoreError::ObservabilityRunNotRunning(run_id.to_string()));
+    }
+    let mut event = AuditEvent::new(actor, "scheduler.run.recover");
+    event.ok = Some(false);
+    event.error_code = Some("SCHEDULER_LEASE_EXPIRED".to_string());
+    event.detail_json = serde_json::json!({
+        "run_id": run_id,
+        "job_id": job_id,
+        "kind": kind,
+        "status": "failed",
+        "reason_code": "SCHEDULER_LEASE_EXPIRED",
+        "result_class": "scheduler_summary",
+    });
+    insert_audit_tx(tx, &event)
+}
+
+fn insert_scheduler_claim_audit_tx(
+    tx: &Transaction<'_>,
+    event_name: &str,
+    claim: &SchedulerJobClaim,
+    actor: &str,
+    state: &str,
+) -> Result<(), StoreError> {
+    let mut event = AuditEvent::new(actor, event_name);
+    event.ok = Some(true);
+    event.detail_json = serde_json::json!({
+        "job_id": claim.job_id,
+        "correlation_id": claim.owner_id,
+        "generation": claim.fence_token,
+        "expires_at": claim.lease_expires_at,
+        "state": state,
+    });
+    insert_audit_tx(tx, &event)
+}
+
 fn validate_scheduler_outcome(
     outcome: &SchedulerOutcomeWrite,
     actor: &str,
@@ -5288,6 +5791,31 @@ fn observability_job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Obser
         last_run_at: row.get(9)?,
         created_at: row.get(10)?,
         updated_at: row.get(11)?,
+    })
+}
+
+fn scheduler_job_claim_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SchedulerJobClaim> {
+    let fence_token: i64 = row.get(2)?;
+    let fence_token = u64::try_from(fence_token).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(2, Type::Integer, Box::new(error))
+    })?;
+    if fence_token == 0 {
+        return Err(rusqlite::Error::FromSqlConversionFailure(
+            2,
+            Type::Integer,
+            Box::new(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "scheduler fence token must be positive",
+            )),
+        ));
+    }
+    Ok(SchedulerJobClaim {
+        job_id: row.get(0)?,
+        owner_id: row.get(1)?,
+        fence_token,
+        claimed_at: row.get(3)?,
+        lease_expires_at: row.get(4)?,
+        active_run_id: row.get(5)?,
     })
 }
 

@@ -33,6 +33,7 @@ fn migration_tests_new_database_creates_all_current_tables_and_indexes() {
         "health_policy",
         "alert_hooks",
         "alert_delivery_attempts",
+        "scheduler_job_claims",
     ] {
         assert_schema_object_exists(&conn, "table", table);
     }
@@ -43,6 +44,7 @@ fn migration_tests_new_database_creates_all_current_tables_and_indexes() {
         "idx_alert_events_state_last_seen_at",
         "idx_alert_delivery_attempts_alert_hook",
         "idx_alert_hooks_enabled_type",
+        "idx_scheduler_job_claims_expiry",
     ] {
         assert_schema_object_exists(&conn, "index", index);
     }
@@ -97,7 +99,7 @@ fn migration_tests_rejects_future_schema_without_backup_or_rebuild() {
 
 #[test]
 fn migration_tests_legacy_fixtures_upgrade_to_current() {
-    for version in 1..=CURRENT_SCHEMA_VERSION {
+    for version in 1..CURRENT_SCHEMA_VERSION {
         let dir = tempfile::tempdir().expect("temp dir");
         let db = dir.path().join("controller.sqlite");
         create_legacy_fixture(&db, version, 1);
@@ -874,6 +876,25 @@ fn migration_tests_audit_detail_v1_migrates_or_fails_closed() {
     assert_eq!(backup_files(bad_dir.path()).len(), 1);
 }
 
+#[test]
+fn migration_tests_scheduler_claim_table_upgrades_schema_18() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("controller.sqlite");
+    create_legacy_fixture(&db, 18, 1);
+
+    let store = Store::open(&db).expect("migrate v18 scheduler claims");
+    assert_eq!(
+        store.current_schema_version().expect("schema version"),
+        CURRENT_SCHEMA_VERSION
+    );
+    drop(store);
+    let conn = Connection::open(&db).expect("open migrated db");
+    assert_schema_object_exists(&conn, "table", "scheduler_job_claims");
+    assert_schema_object_exists(&conn, "index", "idx_scheduler_job_claims_expiry");
+    assert_eq!(backup_files(dir.path()).len(), 1);
+    assert_sqlite_checks_pass(&conn);
+}
+
 fn insert_legacy_delivery_attempt(conn: &Connection, bytes_sent: i64) {
     conn.execute(
         "INSERT INTO alert_delivery_attempts
@@ -910,7 +931,7 @@ fn insert_legacy_alert_hook(conn: &Connection, host_allow_json: &str) {
 }
 
 fn create_legacy_fixture(path: &Path, version: i64, rows: usize) {
-    assert!((1..=CURRENT_SCHEMA_VERSION).contains(&version));
+    assert!((1..CURRENT_SCHEMA_VERSION).contains(&version));
     let conn = Connection::open(path).expect("create fixture db");
     conn.pragma_update(None, "foreign_keys", "ON")
         .expect("enable foreign keys");

@@ -219,6 +219,15 @@ that omit storage envelopes. The completion audit makes A2 operationally mature
 without changing the read-only or trust boundary.
 The completion audit is published in pull request `#79`.
 
+The first A3 slice advances SQLite to migration `0019` and adds deterministic
+job claims with bounded expiry, monotonic fence tokens, active-run binding, and
+atomic abandoned-run recovery. Production run-once and daemon paths claim work
+through `StoreWriter`; two SQLite connections cannot acquire one due job, and
+an expired owner cannot persist after takeover. Periodic renewal, retry/misfire
+and maintenance policy, graceful in-flight shutdown, and the remaining A3
+acceptance matrix are still active work.
+Published for review in pull request `#80`.
+
 ### Baseline And Production Foundation
 
 | ID | Issue | Status | Depends on | Release target | Acceptance and required evidence |

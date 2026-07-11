@@ -143,6 +143,12 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         description: "Migrate controller audit details to closed versioned v1 payloads.",
         apply: apply_0018_versioned_audit_details,
     },
+    Migration {
+        version: 19,
+        name: "0019_scheduler_job_claims",
+        description: "Add fenced, expiring scheduler job claims.",
+        apply: apply_0019_scheduler_job_claims,
+    },
 ];
 
 pub(crate) fn migrate_to_current(
@@ -1360,6 +1366,32 @@ CREATE TABLE controller_audit_log (
         )?;
     }
     tx.execute_batch("DROP TABLE controller_audit_log_legacy_v17;")?;
+    Ok(())
+}
+
+fn apply_0019_scheduler_job_claims(tx: &Transaction<'_>) -> Result<(), StoreError> {
+    tx.execute_batch(
+        r#"
+CREATE TABLE scheduler_job_claims (
+  job_id TEXT PRIMARY KEY,
+  owner_id TEXT,
+  fence_token INTEGER NOT NULL DEFAULT 0 CHECK (fence_token >= 0),
+  claimed_at TEXT,
+  lease_expires_at TEXT,
+  active_run_id TEXT,
+  updated_at TEXT NOT NULL,
+  CHECK (
+    (owner_id IS NULL AND claimed_at IS NULL AND lease_expires_at IS NULL AND active_run_id IS NULL)
+    OR
+    (owner_id IS NOT NULL AND claimed_at IS NOT NULL AND lease_expires_at IS NOT NULL AND fence_token > 0)
+  ),
+  FOREIGN KEY(job_id) REFERENCES observability_jobs(job_id) ON DELETE CASCADE,
+  FOREIGN KEY(active_run_id) REFERENCES observability_runs(run_id) ON DELETE SET NULL
+);
+CREATE INDEX idx_scheduler_job_claims_expiry
+  ON scheduler_job_claims(lease_expires_at, job_id);
+"#,
+    )?;
     Ok(())
 }
 

@@ -106,6 +106,7 @@ printf '%s\n' \
   '    store.insert_probe_observation(observation);' \
   '    store.insert_observability_job(job, "actor");' \
   '    Store::set_observability_job_enabled(store, "job", true, "actor");' \
+  '    store.claim_scheduler_job("job", "owner", "2026-07-12T00:00:00Z", 30, "actor");' \
   '}' \
   > "$cli_src/unsafe_scheduler_writer.rs"
 
@@ -117,7 +118,8 @@ fi
 for expected in \
   'unsafe_scheduler_writer.rs:2: legacy scheduler persistence call outside transactional writer boundary: insert_probe_observation' \
   'unsafe_scheduler_writer.rs:3: direct scheduler config mutator call outside reviewed store/backend boundary: insert_observability_job' \
-  'unsafe_scheduler_writer.rs:4: direct scheduler config mutator call outside reviewed store/backend boundary: set_observability_job_enabled'
+  'unsafe_scheduler_writer.rs:4: direct scheduler config mutator call outside reviewed store/backend boundary: set_observability_job_enabled' \
+  'unsafe_scheduler_writer.rs:5: direct scheduler config mutator call outside reviewed store/backend boundary: claim_scheduler_job'
 do
   if ! grep -Fq "$expected" "$legacy_fail_output"; then
     printf 'controller mutation guard did not report expected scheduler violation: %s\n' "$expected" >&2

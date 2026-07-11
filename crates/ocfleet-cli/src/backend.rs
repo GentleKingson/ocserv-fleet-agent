@@ -5,8 +5,8 @@ use crate::store::{
     EnrollmentTokenInsert, EnrollmentTokenRecord, HealthPolicyRecord, HealthSnapshotRecord,
     HealthSnapshotWrite, JoinRequestInsert, JoinRequestRecord, LegacyEnrollmentClaimInput,
     NodeInsert, NodeRecord, ObservabilityJobRecord, ObservabilityRunRecord, ProbeObservationRecord,
-    RetentionApplyInput, RetentionApplyResult, RetentionPolicyRecord, SchedulerOutcomeWrite,
-    SchedulerRunFinish, SchedulerRunStart, Store, StoreError,
+    RetentionApplyInput, RetentionApplyResult, RetentionPolicyRecord, SchedulerJobClaim,
+    SchedulerOutcomeWrite, SchedulerRunFinish, SchedulerRunStart, Store, StoreError,
 };
 
 pub const MAX_STORE_READER_ROWS: u64 = 1_000;
@@ -59,9 +59,51 @@ pub trait StoreWriter {
     ) -> Result<(), Self::Error>;
     fn write_scheduler_job_enable(&self, job_id: &str, actor: &str) -> Result<(), Self::Error>;
     fn write_scheduler_job_disable(&self, job_id: &str, actor: &str) -> Result<(), Self::Error>;
+    fn write_scheduler_claim_next_due(
+        &self,
+        owner_id: &str,
+        now: &str,
+        lease_seconds: u64,
+        actor: &str,
+    ) -> Result<Option<SchedulerJobClaim>, Self::Error>;
+    fn write_scheduler_claim(
+        &self,
+        job_id: &str,
+        owner_id: &str,
+        now: &str,
+        lease_seconds: u64,
+        actor: &str,
+    ) -> Result<Option<SchedulerJobClaim>, Self::Error>;
+    fn write_scheduler_claim_due(
+        &self,
+        job_id: &str,
+        owner_id: &str,
+        now: &str,
+        lease_seconds: u64,
+        actor: &str,
+    ) -> Result<Option<SchedulerJobClaim>, Self::Error>;
+    fn write_scheduler_claim_renew(
+        &self,
+        claim: &SchedulerJobClaim,
+        now: &str,
+        lease_seconds: u64,
+        actor: &str,
+    ) -> Result<SchedulerJobClaim, Self::Error>;
+    fn write_scheduler_claim_release(
+        &self,
+        claim: &SchedulerJobClaim,
+        released_at: &str,
+        actor: &str,
+    ) -> Result<(), Self::Error>;
     fn write_scheduler_run_start(
         &self,
         start: &SchedulerRunStart,
+        actor: &str,
+    ) -> Result<(), Self::Error>;
+    fn write_scheduler_claimed_run_start(
+        &self,
+        start: &SchedulerRunStart,
+        claim: &SchedulerJobClaim,
         actor: &str,
     ) -> Result<(), Self::Error>;
     fn write_scheduler_outcome(
@@ -310,12 +352,72 @@ impl StoreWriter for Store {
         Store::set_observability_job_enabled(self, job_id, false, actor)
     }
 
+    fn write_scheduler_claim_next_due(
+        &self,
+        owner_id: &str,
+        now: &str,
+        lease_seconds: u64,
+        actor: &str,
+    ) -> Result<Option<SchedulerJobClaim>, Self::Error> {
+        Store::claim_next_due_scheduler_job(self, owner_id, now, lease_seconds, actor)
+    }
+
+    fn write_scheduler_claim(
+        &self,
+        job_id: &str,
+        owner_id: &str,
+        now: &str,
+        lease_seconds: u64,
+        actor: &str,
+    ) -> Result<Option<SchedulerJobClaim>, Self::Error> {
+        Store::claim_scheduler_job(self, job_id, owner_id, now, lease_seconds, actor)
+    }
+
+    fn write_scheduler_claim_due(
+        &self,
+        job_id: &str,
+        owner_id: &str,
+        now: &str,
+        lease_seconds: u64,
+        actor: &str,
+    ) -> Result<Option<SchedulerJobClaim>, Self::Error> {
+        Store::claim_due_scheduler_job(self, job_id, owner_id, now, lease_seconds, actor)
+    }
+
+    fn write_scheduler_claim_renew(
+        &self,
+        claim: &SchedulerJobClaim,
+        now: &str,
+        lease_seconds: u64,
+        actor: &str,
+    ) -> Result<SchedulerJobClaim, Self::Error> {
+        Store::renew_scheduler_job_claim(self, claim, now, lease_seconds, actor)
+    }
+
+    fn write_scheduler_claim_release(
+        &self,
+        claim: &SchedulerJobClaim,
+        released_at: &str,
+        actor: &str,
+    ) -> Result<(), Self::Error> {
+        Store::release_scheduler_job_claim(self, claim, released_at, actor)
+    }
+
     fn write_scheduler_run_start(
         &self,
         start: &SchedulerRunStart,
         actor: &str,
     ) -> Result<(), Self::Error> {
         Store::write_scheduler_run_start(self, start, actor)
+    }
+
+    fn write_scheduler_claimed_run_start(
+        &self,
+        start: &SchedulerRunStart,
+        claim: &SchedulerJobClaim,
+        actor: &str,
+    ) -> Result<(), Self::Error> {
+        Store::write_scheduler_claimed_run_start(self, start, claim, actor)
     }
 
     fn write_scheduler_outcome(

@@ -344,6 +344,11 @@ fields, unsafe or unbounded values, malformed audit metadata, invalid outcomes,
 negative durations, or relationship mismatches stop the upgrade and leave the
 version-17 database unchanged beside its private backup.
 
+Schema version 19 adds `scheduler_job_claims` and its expiry index without
+rewriting existing scheduler rows. The migration leaves existing jobs unclaimed;
+new scheduler executions acquire fenced claims lazily. Upgrade failure leaves
+the version-18 database unchanged beside its private backup.
+
 Before upgrades, keep an operator-managed backup as well:
 
 ```bash

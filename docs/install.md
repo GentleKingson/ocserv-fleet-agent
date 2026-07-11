@@ -338,6 +338,12 @@ detail payload derived from each constrained relational row. Invalid IDs,
 attempt numbers, statuses, HTTP classes, error codes, or byte counts stop the
 upgrade and leave the version-16 database unchanged beside its private backup.
 
+Schema version 18 rebuilds controller audit storage with required closed typed
+detail bound to every relational audit column. Invalid JSON, unknown top-level
+fields, unsafe or unbounded values, malformed audit metadata, invalid outcomes,
+negative durations, or relationship mismatches stop the upgrade and leave the
+version-17 database unchanged beside its private backup.
+
 Before upgrades, keep an operator-managed backup as well:
 
 ```bash

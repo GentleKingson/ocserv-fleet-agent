@@ -3,9 +3,9 @@ use std::path::{Path, PathBuf};
 
 use ocfleet_cli::private_file::{self, PrivateFileError};
 use ocfleet_cli::storage_payloads::{
-    AlertDetailPayloadV1, HealthDegradedMethodsPayloadV1, HealthSummaryPayloadV1,
-    ObservationSummaryPayloadV1, RunSummaryPayloadV1, SchedulerPairPayloadV1,
-    SchedulerSelectorPayloadV1, validate_health_payload_relationship,
+    AlertDetailPayloadV1, AuditDetailPayloadV1, HealthDegradedMethodsPayloadV1,
+    HealthSummaryPayloadV1, ObservationSummaryPayloadV1, RunSummaryPayloadV1,
+    SchedulerPairPayloadV1, SchedulerSelectorPayloadV1, validate_health_payload_relationship,
     validate_scheduler_payload_relationship,
 };
 use ocfleet_cli::store::{
@@ -694,27 +694,70 @@ fn alert_event_from_row(row: &Row<'_>) -> rusqlite::Result<AlertEventRecord> {
 }
 
 fn audit_record_from_row(row: &Row<'_>) -> rusqlite::Result<AuditRecord> {
+    let id = row.get(0)?;
+    let ts: String = row.get(1)?;
+    let actor: String = row.get(2)?;
+    let event: String = row.get(3)?;
+    let node_id: Option<String> = row.get(4)?;
+    let endpoint_id: Option<String> = row.get(5)?;
+    let method: Option<String> = row.get(6)?;
+    let request_id: Option<String> = row.get(7)?;
+    let params_hash: Option<String> = row.get(8)?;
     let ok: Option<i64> = row.get(9)?;
+    let ok = ok.map(|value| i64_to_bool(value, 9)).transpose()?;
+    let error_code: Option<String> = row.get(10)?;
     let duration_ms: Option<i64> = row.get(11)?;
-    let detail_json: Option<String> = row.get(12)?;
+    let duration_ms = duration_ms
+        .map(|value| {
+            u64::try_from(value).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(11, Type::Integer, Box::new(error))
+            })
+        })
+        .transpose()?;
+    let detail_json: String = row.get(12)?;
+    let detail_json = parse_json_column(&detail_json, 12)?;
+    let payload = AuditDetailPayloadV1::from_value(&detail_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            12,
+            Type::Text,
+            Box::new(io::Error::new(io::ErrorKind::InvalidData, error)),
+        )
+    })?;
+    payload
+        .validate_relationship(
+            &ts,
+            &actor,
+            &event,
+            node_id.as_deref(),
+            endpoint_id.as_deref(),
+            method.as_deref(),
+            request_id.as_deref(),
+            params_hash.as_deref(),
+            ok,
+            error_code.as_deref(),
+            duration_ms,
+        )
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                12,
+                Type::Text,
+                Box::new(io::Error::new(io::ErrorKind::InvalidData, error)),
+            )
+        })?;
     Ok(AuditRecord {
-        id: row.get(0)?,
-        ts: row.get(1)?,
-        actor: row.get(2)?,
-        event: row.get(3)?,
-        node_id: row.get(4)?,
-        endpoint_id: row.get(5)?,
-        method: row.get(6)?,
-        request_id: row.get(7)?,
-        params_hash: row.get(8)?,
-        ok: ok.map(|value| i64_to_bool(value, 9)).transpose()?,
-        error_code: row.get(10)?,
-        duration_ms: duration_ms.and_then(|value| u64::try_from(value).ok()),
-        detail_json: detail_json
-            .as_deref()
-            .map(|value| parse_json_column(value, 12))
-            .transpose()?
-            .unwrap_or(Value::Null),
+        id,
+        ts,
+        actor,
+        event,
+        node_id,
+        endpoint_id,
+        method,
+        request_id,
+        params_hash,
+        ok,
+        error_code,
+        duration_ms,
+        detail_json: payload.public_detail(),
     })
 }
 

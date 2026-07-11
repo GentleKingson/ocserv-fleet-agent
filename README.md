@@ -570,6 +570,8 @@ Networking must allow the controller to reach the agent through iroh using the r
   kind-bound enrollment label and scope storage.
 - `docs/adr/ADR-versioned-delivery-attempt-storage.md`: schema-v17 closed
   delivery-attempt details bound to relational history.
+- `docs/adr/ADR-versioned-audit-detail-storage.md`: schema-v18 closed typed
+  audit details bound to the complete relational record.
 - `docs/trust-policy.md`: trust policy as code schema, validation, and diff behavior.
 - `docs/backend.md`: SQLite contract and optional Postgres backend plan.
 - `docs/archive-export.md`: long-term history archive and signed audit export guidance.

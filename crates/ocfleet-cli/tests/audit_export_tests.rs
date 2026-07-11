@@ -42,7 +42,7 @@ fn run_ocfleet_failure(args: &[&str]) -> Output {
     output
 }
 
-fn seed_audit(store: &Store, database: &Path, id: usize, ts: &str) {
+fn seed_audit(store: &Store, _database: &Path, id: usize, ts: &str) {
     let mut event = AuditEvent::new(format!("operator-{id}@example.test"), "probe.history");
     event.ts = ts.to_string();
     event.node_id = Some(format!("node-{id}"));
@@ -54,35 +54,6 @@ fn seed_audit(store: &Store, database: &Path, id: usize, ts: &str) {
     event.duration_ms = Some(12);
     event.detail_json = json!({"message": "safe summary"});
     store.insert_audit(&event).expect("insert audit");
-
-    // Simulate a row written by an older build. Current storage rejects this
-    // payload, while export must still redact historical contamination.
-    Connection::open(database)
-        .expect("open database for legacy fixture")
-        .execute(
-            "UPDATE controller_audit_log SET detail_json = ?1 WHERE id = (SELECT max(id) FROM controller_audit_log)",
-            [json!({
-        "message": "safe summary",
-        "api_token": "token-value",
-        "username": "alice",
-        "client_ip": "10.0.0.2",
-        "session_id": "session-123",
-        "certificate_subject": "CN=alice",
-        "certificate_san": "alice.example",
-        "certificate_issuer": "Example CA",
-        "certificate_serial": "1234",
-        "stdout": "raw output",
-        "stderr": "raw error",
-        "raw_config": "auth = pam",
-        "log_message": "journal line",
-        "nested": {
-            "password": "password-value",
-            "private_key": "private-key-value",
-            "hmac_secret": "hmac-value"
-        }
-    }).to_string()],
-        )
-        .expect("inject legacy audit contamination");
 }
 
 fn exported_lines(path: &Path) -> Vec<Value> {
@@ -329,7 +300,7 @@ fn audit_export_tests_rejects_rows_over_max_rows() {
 
 #[test]
 #[cfg(unix)]
-fn audit_export_tests_default_redaction_hides_secret_fields() {
+fn audit_export_tests_default_redaction_exports_only_typed_safe_detail() {
     let dir = tempfile::tempdir().expect("temp dir");
     let database = dir.path().join("controller.sqlite");
     let database_arg = database.to_string_lossy().into_owned();
@@ -355,25 +326,8 @@ fn audit_export_tests_default_redaction_hides_secret_fields() {
     ]);
 
     let row = exported_lines(&output_path).remove(0);
-    assert_eq!(row["detail"]["api_token"], "<redacted>");
-    assert_eq!(row["detail"]["nested"]["password"], "<redacted>");
-    assert_eq!(row["detail"]["nested"]["private_key"], "<redacted>");
-    assert_eq!(row["detail"]["nested"]["hmac_secret"], "<redacted>");
-    for key in [
-        "username",
-        "client_ip",
-        "session_id",
-        "certificate_subject",
-        "certificate_san",
-        "certificate_issuer",
-        "certificate_serial",
-        "stdout",
-        "stderr",
-        "raw_config",
-        "log_message",
-    ] {
-        assert_eq!(row["detail"][key], "<redacted>", "field {key} leaked");
-    }
+    assert_eq!(row["detail"]["message"], "<redacted>");
+    assert!(row["detail"].get("_audit").is_none());
 }
 
 #[test]
@@ -408,16 +362,13 @@ fn audit_export_tests_none_redaction_keeps_identifiers_but_still_redacts_secret_
     assert_eq!(row["node_id"], "node-3");
     assert_eq!(row["endpoint_id"], "endpoint-3");
     assert_eq!(row["request_id"], "request-3");
-    assert_eq!(row["detail"]["api_token"], "<redacted>");
-    assert_eq!(row["detail"]["nested"]["private_key"], "<redacted>");
-    assert_eq!(row["detail"]["client_ip"], "<redacted>");
-    assert_eq!(row["detail"]["session_id"], "<redacted>");
-    assert_eq!(row["detail"]["raw_config"], "<redacted>");
+    assert_eq!(row["detail"]["message"], "<redacted>");
+    assert!(row["detail"].get("_audit").is_none());
 }
 
 #[test]
 #[cfg(unix)]
-fn audit_export_tests_redacts_contaminated_top_level_fields() {
+fn audit_export_tests_fails_closed_on_contaminated_storage() {
     let dir = tempfile::tempdir().expect("temp dir");
     let database = dir.path().join("controller.sqlite");
     let database_arg = database.to_string_lossy().into_owned();
@@ -442,7 +393,7 @@ fn audit_export_tests_redacts_contaminated_top_level_fields() {
         )
         .expect("insert contaminated audit row");
 
-    run_ocfleet(&[
+    let output = run_ocfleet_failure(&[
         "--database",
         &database_arg,
         "audit",
@@ -457,19 +408,9 @@ fn audit_export_tests_redacts_contaminated_top_level_fields() {
         "none",
     ]);
 
-    let text = fs::read_to_string(output_path).expect("read export");
-    for forbidden in [
-        "/etc/passwd",
-        "alice\nadmin",
-        "shell.exec",
-        "/etc/ocserv.conf",
-        "10.0.0.2",
-    ] {
-        assert!(
-            !text.contains(forbidden),
-            "top-level field leaked: {forbidden}"
-        );
-    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("audit detail payload is not closed v1 data"));
+    assert!(!output_path.exists());
 }
 
 #[test]

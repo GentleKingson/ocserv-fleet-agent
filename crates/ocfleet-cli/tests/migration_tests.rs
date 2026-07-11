@@ -35,6 +35,7 @@ fn migration_tests_new_database_creates_all_current_tables_and_indexes() {
         "alert_delivery_attempts",
         "scheduler_job_claims",
         "scheduler_maintenance",
+        "health_evaluation_runs",
     ] {
         assert_schema_object_exists(&conn, "table", table);
     }
@@ -46,6 +47,8 @@ fn migration_tests_new_database_creates_all_current_tables_and_indexes() {
         "idx_alert_delivery_attempts_alert_hook",
         "idx_alert_hooks_enabled_type",
         "idx_scheduler_job_claims_expiry",
+        "idx_health_evaluation_runs_input",
+        "idx_health_evaluation_runs_status_started",
     ] {
         assert_schema_object_exists(&conn, "index", index);
     }
@@ -911,6 +914,46 @@ fn migration_tests_scheduler_maintenance_upgrades_schema_19() {
     drop(store);
     let conn = Connection::open(&db).expect("open migrated db");
     assert_schema_object_exists(&conn, "table", "scheduler_maintenance");
+    assert_eq!(backup_files(dir.path()).len(), 1);
+    assert_sqlite_checks_pass(&conn);
+}
+
+#[test]
+fn migration_tests_health_evaluation_runs_upgrade_schema_20() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("controller.sqlite");
+    create_legacy_fixture(&db, 20, 1);
+
+    let store = Store::open(&db).expect("migrate v20 health evaluator runs");
+    assert_eq!(
+        store.current_schema_version().expect("schema version"),
+        CURRENT_SCHEMA_VERSION
+    );
+    drop(store);
+    let conn = Connection::open(&db).expect("open migrated db");
+    assert_schema_object_exists(&conn, "table", "health_evaluation_runs");
+    assert_schema_object_exists(&conn, "index", "idx_health_evaluation_runs_input");
+    assert_schema_object_exists(&conn, "index", "idx_health_evaluation_runs_status_started");
+    assert!(
+        conn.execute(
+            "INSERT INTO health_evaluation_runs
+             (evaluation_id, input_watermark, policy_version, computation_version, started_at, status)
+             VALUES ('health-eval-invalid', ?1, ?1, 'health-v1', ?2, 'completed')",
+            ("0".repeat(64), NOW),
+        )
+        .is_err(),
+        "completed runs must include a finish timestamp"
+    );
+    assert!(
+        conn.execute(
+            "INSERT INTO health_evaluation_runs
+             (evaluation_id, input_watermark, policy_version, computation_version, started_at, finished_at, status, failure_code)
+             VALUES ('health-eval-invalid-failure', ?1, ?1, 'health-v1', ?2, ?2, 'failed', NULL)",
+            ("0".repeat(64), NOW),
+        )
+        .is_err(),
+        "failed runs must include a bounded failure code"
+    );
     assert_eq!(backup_files(dir.path()).len(), 1);
     assert_sqlite_checks_pass(&conn);
 }

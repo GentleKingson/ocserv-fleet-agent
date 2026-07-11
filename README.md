@@ -594,6 +594,8 @@ Networking must allow the controller to reach the agent through iroh using the r
   watermark idempotency, lifecycle consistency, and authority boundaries.
 - `docs/a3-scheduler-reliability-inventory.md`: A3 acceptance requirements,
   implementation evidence, tests, and security-boundary completion gate.
+- `docs/a4-health-evaluator-inventory.md`: A4 independent evaluation,
+  persistence, recovery, shutdown, and security-boundary completion evidence.
 - `docs/a2-storage-inventory.md`: A2 payload-family closure inventory and
   migration/read-boundary evidence.
 - `docs/trust-policy.md`: trust policy as code schema, validation, and diff behavior.

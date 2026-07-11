@@ -4,6 +4,8 @@
 
 ### Added
 
+- A4 completion inventory mapping independent health evaluation, recovery,
+  compatibility, and security requirements to exact evidence.
 - Schema 21 adds bounded durable health evaluation run metadata keyed by input
   watermark, policy version, and computation version.
 - Health evaluation lifecycle writers atomically persist audited starts,

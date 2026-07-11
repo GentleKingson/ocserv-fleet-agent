@@ -229,8 +229,9 @@ Misfires coalesce arbitrarily old backlogs into one audited execution. Transient
 read-only RPC failures use a three-attempt exponential backoff while permanent
 and partial failures do not retry; worst-case attempts are reserved from the
 per-tick budget. Schema `0020` adds an atomically audited global maintenance
-window that suppresses claims and RPC without advancing clocks. Graceful
-in-flight shutdown and the remaining A3
+window that suppresses claims and RPC without advancing clocks. SIGINT/SIGTERM
+closes admission, drains the admitted job and claim, then supports restart with
+a fresh owner. Timeout/jitter and the remaining A3
 acceptance matrix are still active work.
 The schema-v20 maintenance policy is published in pull request `#84`.
 The bounded retry policy is published in pull request `#83`.

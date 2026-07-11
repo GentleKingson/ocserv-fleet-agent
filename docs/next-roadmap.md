@@ -260,11 +260,14 @@ The A4 completion audit is published in pull request `#91`.
 The first A5 slice advances SQLite to migration `0022` and adds a bounded fenced
 automatic webhook delivery queue. Durable idempotency and group keys, monotonic
 claim fences, five-attempt retry bounds, explicit dead-letter and success state,
-and due/lease indexes establish the persistence contract. Queue writers, worker
-transport integration, recovery notification, rate limiting, and graceful
+and due/lease indexes establish the persistence contract. Actor-bound atomic
+enqueue, deterministic claim, renewal, bounded expiry recovery, retry/DLQ,
+success, attempt-history, and audit writers are implemented with stale-fence
+rejection. Worker transport integration, grouping/rate limiting, and graceful
 shutdown remain active A5 work. JSONL paths remain operator supplied and are not
 persisted for daemon selection.
 Schema 22 delivery queue persistence is published in pull request `#92`.
+Atomic delivery queue writers are published in pull request `#93`.
 
 ### Baseline And Production Foundation
 

@@ -5,12 +5,12 @@ use ocfleet_cli::storage_payloads::{
 };
 use ocfleet_cli::store::{
     AlertDeliveryAttemptRecord, AlertDeliveryAttemptWrite, AlertDeliveryFinalizeWrite,
-    AlertEvaluationEntry, AlertEvaluationWrite, AlertEventRecord, AlertStateTransition,
-    AlertWebhookHookRecord, CURRENT_SCHEMA_VERSION, HealthEvaluationFailure,
-    HealthEvaluationFinish, HealthEvaluationStart, HealthSnapshotRecord, HealthSnapshotWrite,
-    ObservabilityJobRecord, ObservabilityRunInsert, ProbeObservationInsert, RetentionPolicyRecord,
-    SchedulerJobClockUpdate, SchedulerOutcomeEntry, SchedulerOutcomeWrite, SchedulerRunFinish,
-    SchedulerRunStart, Store, StoreError,
+    AlertDeliveryQueueEnqueue, AlertDeliveryQueueOutcome, AlertEvaluationEntry,
+    AlertEvaluationWrite, AlertEventRecord, AlertStateTransition, AlertWebhookHookRecord,
+    CURRENT_SCHEMA_VERSION, HealthEvaluationFailure, HealthEvaluationFinish, HealthEvaluationStart,
+    HealthSnapshotRecord, HealthSnapshotWrite, ObservabilityJobRecord, ObservabilityRunInsert,
+    ProbeObservationInsert, RetentionPolicyRecord, SchedulerJobClockUpdate, SchedulerOutcomeEntry,
+    SchedulerOutcomeWrite, SchedulerRunFinish, SchedulerRunStart, Store, StoreError,
 };
 use ocfleet_protocol::method::{
     OCSERV_CONFIG_FINGERPRINT, OCSERV_SERVICE_SUMMARY, OCSERV_SESSIONS_SUMMARY, OCSERV_VERSION,
@@ -2684,6 +2684,270 @@ fn alert_delivery_attempt_and_finalize_writers_are_atomic_and_replay_safe() {
         Err(StoreError::AlertMutationConflict { .. })
     ));
     assert_eq!(store.list_alert_events().expect("alerts"), vec![delivered]);
+}
+
+#[test]
+fn alert_delivery_queue_is_fenced_retryable_and_idempotent() {
+    let (_dir, store, db) = open_temp_store();
+    let hook = AlertWebhookHookRecord {
+        hook_id: "webhook-queue".to_string(),
+        name: "queue".to_string(),
+        hook_type: "webhook".to_string(),
+        endpoint_url: "https://93.184.216.34/alerts".to_string(),
+        endpoint_url_redacted: "https://93.184.216.34/<redacted>".to_string(),
+        endpoint_host: "93.184.216.34".to_string(),
+        host_allow: vec!["93.184.216.34".to_string()],
+        hmac_key_id: "abcd1234abcd1234".to_string(),
+        enabled: true,
+        max_attempts: 2,
+        timeout_ms: 1_500,
+        created_at: "2026-07-11T01:00:00Z".to_string(),
+        updated_at: "2026-07-11T01:00:00Z".to_string(),
+    };
+    StoreWriter::write_alert_webhook_hook_create(&store, &hook, TEST_ACTOR).expect("create hook");
+    store
+        .upsert_alert_event(&AlertEventRecord {
+            alert_id: "alert-queue".to_string(),
+            dedupe_key: "node:queue:stale".to_string(),
+            node_id: Some("queue".to_string()),
+            severity: "warning".to_string(),
+            state: "open".to_string(),
+            reason_code: "NODE_STALE".to_string(),
+            first_seen_at: "2026-07-11T01:00:00Z".to_string(),
+            last_seen_at: "2026-07-11T01:00:00Z".to_string(),
+            last_sent_at: None,
+            resolved_at: None,
+            detail_json: json!({"methods": [], "summary": {}}),
+        })
+        .expect("seed alert");
+    let enqueue = AlertDeliveryQueueEnqueue {
+        queue_id: "delivery-queue-00000000-0000-4000-8000-000000000001".to_string(),
+        alert_id: "alert-queue".to_string(),
+        hook_id: "webhook-queue".to_string(),
+        idempotency_key: "a".repeat(64),
+        group_key: "warning:node_stale".to_string(),
+        enqueued_at: "2026-07-11T01:00:00Z".to_string(),
+    };
+    StoreWriter::write_alert_delivery_queue_enqueue(&store, &enqueue, TEST_ACTOR).expect("enqueue");
+    let audit_count = store.audit_count().expect("audit count");
+    StoreWriter::write_alert_delivery_queue_enqueue(&store, &enqueue, TEST_ACTOR)
+        .expect("exact enqueue retry");
+    assert_eq!(store.audit_count().expect("audit count"), audit_count);
+    assert!(matches!(
+        StoreWriter::write_alert_delivery_queue_enqueue(&store, &enqueue, "different-actor"),
+        Err(StoreError::AlertMutationConflict { .. })
+    ));
+
+    let claim = StoreWriter::write_alert_delivery_queue_claim_next(
+        &store,
+        "worker-a",
+        "2026-07-11T01:00:01Z",
+        60,
+        TEST_ACTOR,
+    )
+    .expect("claim queue")
+    .expect("claim exists");
+    assert_eq!(claim.fence_token, 1);
+    assert!(
+        StoreWriter::write_alert_delivery_queue_claim_next(
+            &Store::open(&db).expect("second store"),
+            "worker-b",
+            "2026-07-11T01:00:02Z",
+            60,
+            TEST_ACTOR,
+        )
+        .expect("competing claim")
+        .is_none()
+    );
+    let expired_claim = claim.clone();
+    let claim = StoreWriter::write_alert_delivery_queue_claim_next(
+        &store,
+        "worker-b",
+        "2026-07-11T01:01:02Z",
+        60,
+        TEST_ACTOR,
+    )
+    .expect("recover expired claim")
+    .expect("recovered claim exists");
+    assert_eq!(claim.fence_token, 2);
+    assert!(matches!(
+        StoreWriter::write_alert_delivery_queue_renew(
+            &store,
+            &expired_claim,
+            "2026-07-11T01:01:03Z",
+            60,
+            TEST_ACTOR,
+        ),
+        Err(StoreError::AlertMutationConflict { .. })
+    ));
+    let claim = StoreWriter::write_alert_delivery_queue_renew(
+        &store,
+        &claim,
+        "2026-07-11T01:01:30Z",
+        60,
+        TEST_ACTOR,
+    )
+    .expect("renew claim");
+    let retry_outcome = AlertDeliveryQueueOutcome {
+        claim: claim.clone(),
+        attempt: AlertDeliveryAttemptRecord {
+            attempt_id: "queue-attempt-1".to_string(),
+            alert_id: claim.alert_id.clone(),
+            hook_id: claim.hook_id.clone(),
+            attempt_no: 1,
+            attempted_at: "2026-07-11T01:01:31Z".to_string(),
+            status: "failed".to_string(),
+            http_status_class: Some("5xx".to_string()),
+            error_code: Some("WEBHOOK_HTTP_5XX".to_string()),
+            bytes_sent: 128,
+        },
+        completed_at: "2026-07-11T01:01:31Z".to_string(),
+        retry_at: Some("2026-07-11T01:01:41Z".to_string()),
+        retryable: true,
+        max_attempts: 2,
+    };
+    inject_job_audit_failure(&db, "alert.delivery.queue.outcome");
+    assert_injected_job_audit_failure(StoreWriter::write_alert_delivery_queue_outcome(
+        &store,
+        &retry_outcome,
+        TEST_ACTOR,
+    ));
+    assert!(
+        store
+            .list_alert_delivery_attempts()
+            .expect("attempts")
+            .is_empty()
+    );
+    assert_eq!(
+        Connection::open(&db)
+            .expect("open queue database")
+            .query_row("SELECT status FROM alert_delivery_queue", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .expect("queue status"),
+        "claimed"
+    );
+    Connection::open(&db)
+        .expect("open queue database")
+        .execute_batch("DROP TRIGGER fail_scheduler_job_audit")
+        .expect("remove outcome audit failure trigger");
+    StoreWriter::write_alert_delivery_queue_outcome(&store, &retry_outcome, TEST_ACTOR)
+        .expect("persist retry outcome");
+    assert!(
+        StoreWriter::write_alert_delivery_queue_claim_next(
+            &store,
+            "worker-a",
+            "2026-07-11T01:01:40Z",
+            60,
+            TEST_ACTOR,
+        )
+        .expect("early claim")
+        .is_none()
+    );
+    let second_claim = StoreWriter::write_alert_delivery_queue_claim_next(
+        &store,
+        "worker-b",
+        "2026-07-11T01:01:41Z",
+        60,
+        TEST_ACTOR,
+    )
+    .expect("retry claim")
+    .expect("retry claim exists");
+    assert_eq!(second_claim.fence_token, 3);
+    assert_eq!(second_claim.attempt_count, 1);
+    StoreWriter::write_alert_delivery_queue_outcome(
+        &store,
+        &AlertDeliveryQueueOutcome {
+            claim: second_claim.clone(),
+            attempt: AlertDeliveryAttemptRecord {
+                attempt_id: "queue-attempt-2".to_string(),
+                alert_id: second_claim.alert_id.clone(),
+                hook_id: second_claim.hook_id.clone(),
+                attempt_no: 2,
+                attempted_at: "2026-07-11T01:01:42Z".to_string(),
+                status: "succeeded".to_string(),
+                http_status_class: Some("2xx".to_string()),
+                error_code: None,
+                bytes_sent: 128,
+            },
+            completed_at: "2026-07-11T01:01:42Z".to_string(),
+            retry_at: None,
+            retryable: false,
+            max_attempts: 2,
+        },
+        TEST_ACTOR,
+    )
+    .expect("persist success");
+    let (status, attempt_count, delivered): (String, i64, Option<String>) = Connection::open(&db)
+        .expect("open queue database")
+        .query_row(
+            "SELECT status, attempt_count, delivered_at FROM alert_delivery_queue",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("queue state");
+    assert_eq!(status, "succeeded");
+    assert_eq!(attempt_count, 2);
+    assert_eq!(delivered.as_deref(), Some("2026-07-11T01:01:42Z"));
+    let mut dead_enqueue = enqueue.clone();
+    dead_enqueue.queue_id = "delivery-queue-00000000-0000-4000-8000-000000000002".to_string();
+    dead_enqueue.idempotency_key = "b".repeat(64);
+    dead_enqueue.enqueued_at = "2026-07-11T01:02:00Z".to_string();
+    StoreWriter::write_alert_delivery_queue_enqueue(&store, &dead_enqueue, TEST_ACTOR)
+        .expect("enqueue dead-letter fixture");
+    let dead_claim = StoreWriter::write_alert_delivery_queue_claim_next(
+        &store,
+        "worker-a",
+        "2026-07-11T01:02:00Z",
+        60,
+        TEST_ACTOR,
+    )
+    .expect("claim dead-letter fixture")
+    .expect("dead-letter claim exists");
+    StoreWriter::write_alert_delivery_queue_outcome(
+        &store,
+        &AlertDeliveryQueueOutcome {
+            claim: dead_claim.clone(),
+            attempt: AlertDeliveryAttemptRecord {
+                attempt_id: "queue-attempt-dead".to_string(),
+                alert_id: dead_claim.alert_id.clone(),
+                hook_id: dead_claim.hook_id.clone(),
+                attempt_no: 1,
+                attempted_at: "2026-07-11T01:02:01Z".to_string(),
+                status: "failed".to_string(),
+                http_status_class: Some("4xx".to_string()),
+                error_code: Some("WEBHOOK_HTTP_4XX".to_string()),
+                bytes_sent: 128,
+            },
+            completed_at: "2026-07-11T01:02:01Z".to_string(),
+            retry_at: None,
+            retryable: false,
+            max_attempts: 2,
+        },
+        TEST_ACTOR,
+    )
+    .expect("persist dead-letter outcome");
+    assert_eq!(
+        Connection::open(&db)
+            .expect("open queue database")
+            .query_row(
+                "SELECT status FROM alert_delivery_queue WHERE queue_id = ?1",
+                [dead_enqueue.queue_id],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("dead-letter status"),
+        "dead_letter"
+    );
+    assert!(matches!(
+        StoreWriter::write_alert_delivery_queue_renew(
+            &store,
+            &claim,
+            "2026-07-11T01:01:50Z",
+            60,
+            TEST_ACTOR,
+        ),
+        Err(StoreError::AlertMutationConflict { .. })
+    ));
 }
 
 #[test]

@@ -59,6 +59,7 @@ const ALERT_EVALUATION_ERROR_CODE: &str = "ALERT_EVALUATION_FAILED";
 const ALERT_EVALUATION_ERROR_MESSAGE: &str = "local alert evaluation failed";
 const SCHEDULER_LEASE_SECONDS: u64 = 120;
 const SCHEDULER_LEASE_RENEW_SECONDS: u64 = 30;
+const MAX_REPORTED_MISSED_INTERVALS: u64 = 10_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StoredJobKind {
@@ -949,6 +950,25 @@ async fn run_due_jobs_once(
             stats.skipped_jobs += 1;
             continue;
         };
+        if let Some(missed_intervals) = scheduler_missed_intervals(&job, now)? {
+            let audit_result = write_scheduler_audit(
+                store,
+                actor,
+                "scheduler.job.misfire",
+                true,
+                json!({
+                    "job_id": job.job_id,
+                    "reason_code": "MISFIRE_COALESCED",
+                    "skipped_jobs": missed_intervals,
+                    "result": "run_once_without_catch_up",
+                    "result_class": SCHEDULER_RESULT_CLASS,
+                }),
+            );
+            if let Err(err) = audit_result {
+                let _ = release_scheduler_claim(store, &claim, actor);
+                return Err(err);
+            }
+        }
         let prepared = match prepare_scheduler_job(store, &job) {
             Ok(prepared) => prepared,
             Err(err) if err.downcast_ref::<StoreError>().is_some() => {
@@ -1172,6 +1192,30 @@ fn scheduler_job_clock(
         next_run_at,
         last_run_at: finished_at.to_string(),
     })
+}
+
+fn scheduler_missed_intervals(
+    job: &ObservabilityJobRecord,
+    now: OffsetDateTime,
+) -> anyhow::Result<Option<u64>> {
+    let Some(next_run_at) = job.next_run_at.as_deref() else {
+        return Ok(None);
+    };
+    let scheduled = OffsetDateTime::parse(next_run_at, &Rfc3339)
+        .with_context(|| format!("invalid next_run_at for job {}", job.job_id))?;
+    if scheduled >= now {
+        return Ok(None);
+    }
+    let elapsed_seconds = (now - scheduled).whole_seconds();
+    let interval_seconds =
+        i64::try_from(job.interval_seconds).context("scheduler job interval is too large")?;
+    if interval_seconds <= 0 || elapsed_seconds < interval_seconds {
+        return Ok(None);
+    }
+    let missed = u64::try_from(elapsed_seconds / interval_seconds)
+        .unwrap_or(MAX_REPORTED_MISSED_INTERVALS)
+        .min(MAX_REPORTED_MISSED_INTERVALS);
+    Ok(Some(missed))
 }
 
 fn prepare_scheduler_job(
@@ -3258,6 +3302,44 @@ mod tests {
             .expect("claim exists");
         assert!(renewed.lease_expires_at > claim.lease_expires_at);
         assert!(store.audit_count().expect("count renewed audits") >= audit_count_before + 2);
+    }
+
+    #[test]
+    fn scheduler_misfire_coalesces_and_bounds_missed_intervals() {
+        let scheduled =
+            OffsetDateTime::parse("2026-01-01T00:00:00Z", &Rfc3339).expect("scheduled timestamp");
+        let job = ObservabilityJobRecord {
+            job_id: "job-misfire".to_string(),
+            kind: "controller-ping".to_string(),
+            selector_json: SchedulerSelectorPayloadV1::new("role=ocserv".to_string(), None)
+                .expect("selector")
+                .to_value(),
+            pair_selector_json: None,
+            interval_seconds: 60,
+            jitter_seconds: 0,
+            timeout_ms: DEFAULT_DEADLINE_MS,
+            enabled: true,
+            next_run_at: Some(offset_to_rfc3339(scheduled)),
+            last_run_at: None,
+            created_at: offset_to_rfc3339(scheduled),
+            updated_at: offset_to_rfc3339(scheduled),
+        };
+
+        assert_eq!(
+            scheduler_missed_intervals(&job, scheduled + Duration::seconds(5 * 60))
+                .expect("misfire calculation"),
+            Some(5)
+        );
+        assert_eq!(
+            scheduler_missed_intervals(&job, scheduled + Duration::seconds(20_000 * 60))
+                .expect("bounded misfire calculation"),
+            Some(MAX_REPORTED_MISSED_INTERVALS)
+        );
+        assert_eq!(
+            scheduler_missed_intervals(&job, scheduled - Duration::seconds(60))
+                .expect("backward clock calculation"),
+            None
+        );
     }
 
     #[derive(Clone)]

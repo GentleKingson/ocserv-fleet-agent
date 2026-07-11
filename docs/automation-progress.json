@@ -2,11 +2,11 @@
   "baseline_commit": "b3c906a94823b4620dc1a2077a44e7160c0848b2",
   "current_phase": "A3",
   "completed_phases": ["A1", "A2"],
-  "active_branch": "codex/a3-scheduler-heartbeat",
+  "active_branch": "codex/a3-scheduler-misfire",
   "active_issue": 35,
-  "active_pr": 81,
+  "active_pr": null,
   "last_test_result": "passed",
-  "last_updated_at": "2026-07-11T17:58:00Z",
+  "last_updated_at": "2026-07-11T18:16:00Z",
   "blockers": [],
-  "next_action": "Merge pull request #81, then add bounded retry and misfire policy for issue #35."
+  "next_action": "Validate and publish bounded misfire coalescing, then add retry/backoff and maintenance policy for issue #35."
 }

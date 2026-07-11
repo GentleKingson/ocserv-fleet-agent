@@ -1123,6 +1123,80 @@ fn scheduler_tests_run_all_due_jobs_still_executes_every_due_job() {
 }
 
 #[test]
+fn scheduler_tests_misfire_coalesces_unbounded_backlog_into_one_run() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let database_arg = database.to_string_lossy().into_owned();
+    let job_id = add_controller_ping_job(&database_arg, "node_id=missing-misfire");
+    Connection::open(&database)
+        .expect("open database")
+        .execute(
+            "UPDATE observability_jobs SET next_run_at = '2020-01-01T00:00:00Z' WHERE job_id = ?1",
+            [&job_id],
+        )
+        .expect("age scheduler job");
+
+    let output = run_ocfleet(&["--database", &database_arg, "schedule", "run", "--once"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("due_jobs=1"));
+    assert!(stdout.contains("executed_jobs=1"));
+    assert_eq!(scheduler_audit_count(&database, "scheduler.job.misfire"), 1);
+    let (_, detail) =
+        wait_for_audit_event(&database, "scheduler.job.misfire", Duration::from_secs(1))
+            .expect("misfire audit");
+    assert_eq!(detail["reason_code"], "MISFIRE_COALESCED");
+    assert_eq!(detail["skipped_jobs"], 10_000);
+    assert_eq!(detail["result"], "run_once_without_catch_up");
+    assert_eq!(
+        Connection::open(&database)
+            .expect("open database")
+            .query_row(
+                "SELECT count(*) FROM observability_runs WHERE job_id = ?1",
+                [&job_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("run count"),
+        1
+    );
+}
+
+#[test]
+fn scheduler_tests_misfire_audit_failure_releases_claim_without_running() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let database_arg = database.to_string_lossy().into_owned();
+    let job_id = add_controller_ping_job(&database_arg, "node_id=missing-misfire-audit");
+    let conn = Connection::open(&database).expect("open database");
+    conn.execute(
+        "UPDATE observability_jobs SET next_run_at = '2020-01-01T00:00:00Z' WHERE job_id = ?1",
+        [&job_id],
+    )
+    .expect("age scheduler job");
+    drop(conn);
+    install_scheduler_audit_failure(&database, "scheduler.job.misfire");
+
+    run_ocfleet_failure(&["--database", &database_arg, "schedule", "run", "--once"]);
+    let conn = Connection::open(&database).expect("open database");
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM observability_runs WHERE job_id = ?1",
+            [&job_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("run count"),
+        0
+    );
+    let owner: Option<String> = conn
+        .query_row(
+            "SELECT owner_id FROM scheduler_job_claims WHERE job_id = ?1",
+            [&job_id],
+            |row| row.get(0),
+        )
+        .expect("claim row");
+    assert_eq!(owner, None);
+}
+
+#[test]
 fn scheduler_tests_invalid_job_and_run_ids_return_clear_errors() {
     let dir = tempfile::tempdir().expect("temp dir");
     let database = dir.path().join("controller.sqlite");

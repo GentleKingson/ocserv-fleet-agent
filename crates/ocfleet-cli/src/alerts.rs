@@ -18,14 +18,13 @@ use crate::alert_webhook::{
     webhook_error_for_status, webhook_payload_bytes,
 };
 use crate::args::{AlertCommand, AlertHookCommand, AlertSeverity, AlertState};
-use crate::audit::AuditEvent;
 use crate::backend::StoreWriter;
 use crate::duration_args::parse_duration_seconds;
 use crate::input_validation::{local_actor, validate_reason};
 use crate::store::{
-    AlertDeliveryAttemptRecord, AlertEvaluationEntry, AlertEvaluationWrite, AlertEventRecord,
-    AlertStateTransition, AlertWebhookHookRecord, HealthPolicyRecord, ProbeObservationRecord,
-    Store,
+    AlertDeliveryAttemptRecord, AlertDeliveryAttemptWrite, AlertDeliveryFinalizeWrite,
+    AlertEvaluationEntry, AlertEvaluationWrite, AlertEventRecord, AlertStateTransition,
+    AlertWebhookHookRecord, HealthPolicyRecord, ProbeObservationRecord, Store,
 };
 use std::path::Path;
 use std::thread;
@@ -332,17 +331,22 @@ fn run_alert_deliver(
     dry_run: bool,
     hmac_secret_file: Option<&Path>,
 ) -> anyhow::Result<()> {
+    let delivery_id = format!("delivery-{}", Uuid::new_v4());
     let hook = match parse_alert_hook(hook) {
         Ok(hook) => hook,
         Err(err) => {
-            write_alert_delivery_audit(
+            write_alert_delivery_finalize(
                 store,
-                "rejected",
-                false,
-                0,
-                0,
-                dry_run,
-                Some(ALERT_DELIVERY_ERROR_CODE),
+                AlertDeliveryFinalizeWrite {
+                    delivery_id: delivery_id.clone(),
+                    hook_type: "rejected".to_string(),
+                    ok: false,
+                    dry_run,
+                    alert_count: 0,
+                    bytes_written: 0,
+                    error_code: Some(ALERT_DELIVERY_ERROR_CODE.to_string()),
+                    entries: Vec::new(),
+                },
             )?;
             return Err(err);
         }
@@ -350,14 +354,18 @@ fn run_alert_deliver(
     let limit = match validate_delivery_limit(limit) {
         Ok(limit) => limit,
         Err(err) => {
-            write_alert_delivery_audit(
+            write_alert_delivery_finalize(
                 store,
-                hook.hook_type(),
-                false,
-                0,
-                0,
-                dry_run,
-                Some(ALERT_DELIVERY_ERROR_CODE),
+                AlertDeliveryFinalizeWrite {
+                    delivery_id: delivery_id.clone(),
+                    hook_type: hook.hook_type().to_string(),
+                    ok: false,
+                    dry_run,
+                    alert_count: 0,
+                    bytes_written: 0,
+                    error_code: Some(ALERT_DELIVERY_ERROR_CODE.to_string()),
+                    entries: Vec::new(),
+                },
             )?;
             return Err(err);
         }
@@ -389,34 +397,52 @@ fn run_alert_deliver(
     let summary = match summary {
         Ok(summary) => summary,
         Err(err) => {
-            write_alert_delivery_audit(
+            write_alert_delivery_finalize(
                 store,
-                hook.hook_type(),
-                false,
-                alerts.len(),
-                0,
-                dry_run,
-                Some(ALERT_DELIVERY_ERROR_CODE),
+                AlertDeliveryFinalizeWrite {
+                    delivery_id: delivery_id.clone(),
+                    hook_type: hook.hook_type().to_string(),
+                    ok: false,
+                    dry_run,
+                    alert_count: alerts.len(),
+                    bytes_written: 0,
+                    error_code: Some(ALERT_DELIVERY_ERROR_CODE.to_string()),
+                    entries: Vec::new(),
+                },
             )?;
             return Err(err);
         }
     };
 
-    if !dry_run {
+    let entries = if dry_run {
+        Vec::new()
+    } else {
         let sent_at = now_rfc3339();
-        for mut alert in alerts {
-            alert.last_sent_at = Some(sent_at.clone());
-            store.upsert_alert_event(&alert)?;
-        }
-    }
-    write_alert_delivery_audit(
+        alerts
+            .iter()
+            .cloned()
+            .map(|before| {
+                let mut after = before.clone();
+                after.last_sent_at = Some(sent_at.clone());
+                AlertEvaluationEntry {
+                    before: Some(before),
+                    after,
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+    write_alert_delivery_finalize(
         store,
-        hook.hook_type(),
-        true,
-        summary.record_count,
-        summary.bytes_written,
-        dry_run,
-        None,
+        AlertDeliveryFinalizeWrite {
+            delivery_id,
+            hook_type: hook.hook_type().to_string(),
+            ok: true,
+            dry_run,
+            alert_count: summary.record_count,
+            bytes_written: summary.bytes_written,
+            error_code: None,
+            entries,
+        },
     )?;
     println!("status=ok");
     println!("hook_type={}", hook.hook_type());
@@ -912,17 +938,23 @@ fn insert_delivery_attempt(
     hook: &AlertWebhookHookRecord,
     outcome: DeliveryAttemptOutcome<'_>,
 ) -> anyhow::Result<()> {
-    store.insert_alert_delivery_attempt(&AlertDeliveryAttemptRecord {
-        attempt_id: format!("attempt-{}", Uuid::new_v4().simple()),
-        alert_id: alert.alert_id.clone(),
-        hook_id: hook.hook_id.clone(),
-        attempt_no: outcome.attempt_no,
-        attempted_at: now_rfc3339(),
-        status: outcome.status.to_string(),
-        http_status_class: outcome.http_status_class.map(str::to_string),
-        error_code: outcome.error_code.map(str::to_string),
-        bytes_sent: u64::try_from(outcome.bytes_sent).context("bytes_sent is too large")?,
-    })?;
+    StoreWriter::write_alert_delivery_attempt(
+        store,
+        &AlertDeliveryAttemptWrite {
+            attempt: AlertDeliveryAttemptRecord {
+                attempt_id: format!("attempt-{}", Uuid::new_v4().simple()),
+                alert_id: alert.alert_id.clone(),
+                hook_id: hook.hook_id.clone(),
+                attempt_no: outcome.attempt_no,
+                attempted_at: now_rfc3339(),
+                status: outcome.status.to_string(),
+                http_status_class: outcome.http_status_class.map(str::to_string),
+                error_code: outcome.error_code.map(str::to_string),
+                bytes_sent: u64::try_from(outcome.bytes_sent).context("bytes_sent is too large")?,
+            },
+        },
+        &local_actor(),
+    )?;
     Ok(())
 }
 
@@ -1049,28 +1081,11 @@ fn alert_severity_name(severity: AlertSeverity) -> &'static str {
     }
 }
 
-fn write_alert_delivery_audit(
+fn write_alert_delivery_finalize(
     store: &Store,
-    hook_type: &str,
-    ok: bool,
-    alert_count: usize,
-    bytes_written: usize,
-    dry_run: bool,
-    error_code: Option<&str>,
+    write: AlertDeliveryFinalizeWrite,
 ) -> anyhow::Result<()> {
-    let mut event = AuditEvent::new(local_actor(), "alert.delivery");
-    event.ok = Some(ok);
-    let mut detail = Map::new();
-    detail.insert("ok".to_string(), json!(ok));
-    detail.insert("hook_type".to_string(), json!(hook_type));
-    detail.insert("alert_count".to_string(), json!(alert_count));
-    detail.insert("bytes_written".to_string(), json!(bytes_written));
-    detail.insert("dry_run".to_string(), json!(dry_run));
-    if let Some(error_code) = error_code {
-        detail.insert("error_code".to_string(), json!(error_code));
-    }
-    event.detail_json = Value::Object(detail);
-    store.insert_audit(&event)?;
+    StoreWriter::write_alert_delivery_finalize(store, &write, &local_actor())?;
     Ok(())
 }
 

@@ -60,6 +60,9 @@
 - Alert silence/resolve now compare the persisted before-state and commit the
   transition with actor, reason, and audit atomically. Webhook-hook creation
   commits configuration and its redacted audit in the same transaction.
+- Webhook delivery attempts now commit attempt history and a matching audit in
+  one transaction. Delivery finalization compare-checks every alert and commits
+  all `last_sent_at` updates with the delivery summary audit atomically.
 - Scheduler alert evaluation remains local-only and delivery remains an
   explicit CLI action.
 - API SQLite startup now validates private database/sidecar files, schema,
@@ -142,7 +145,7 @@
 - The collector normalizes operator-supplied aggregate metadata; it does not
   discover live ocserv state or call administration/log/service tools.
 - SQLite is the only runtime backend; Postgres always returns unavailable.
-- Alert delivery and other remaining legacy controller
+- Other remaining legacy controller
   mutations have not yet all moved to atomic `StoreWriter` actor/audit
   transactions. Health snapshots and alert candidate evaluation are migrated;
   recovery of incomplete scheduler `running` rows remains A3

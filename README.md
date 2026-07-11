@@ -19,8 +19,10 @@ production-complete.
   configuration, scheduler run/outcome/observation/job-clock writes, health
   snapshot batches, and alert candidate evaluation use actor-bearing
   `StoreWriter` transactions for state and audit. Alert silence/resolve and
-  webhook-hook creation also use compare-before or replay-safe atomic writers;
-  delivery persistence and other legacy mutations are still being migrated.
+  webhook-hook creation also use compare-before or replay-safe atomic writers.
+  Webhook attempts each commit with their audit, and successful delivery
+  finalization atomically updates all `last_sent_at` values with its summary
+  audit. Other legacy mutations are still being migrated.
 - Controller dispatch requires an enabled node and one Active trust row bound
   bidirectionally to that node. Active status by itself is not authorization;
   scheduler workers repeat the same binding check after concurrency waits.
@@ -545,6 +547,8 @@ Networking must allow the controller to reach the agent through iroh using the r
   batches and compare-before alert candidate evaluation.
 - `docs/adr/ADR-alert-operator-transition-atomicity.md`: atomic alert operator
   state transitions and webhook-hook creation.
+- `docs/adr/ADR-alert-delivery-persistence-atomicity.md`: durable delivery
+  attempt and finalization boundaries around external I/O.
 - `docs/trust-policy.md`: trust policy as code schema, validation, and diff behavior.
 - `docs/backend.md`: SQLite contract and optional Postgres backend plan.
 - `docs/archive-export.md`: long-term history archive and signed audit export guidance.

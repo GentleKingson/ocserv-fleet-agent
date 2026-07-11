@@ -1,11 +1,12 @@
 use ocfleet_cli::audit::AuditEvent;
 use ocfleet_cli::backend::StoreWriter;
 use ocfleet_cli::store::{
-    AlertDeliveryAttemptRecord, AlertEvaluationEntry, AlertEvaluationWrite, AlertEventRecord,
-    AlertStateTransition, AlertWebhookHookRecord, CURRENT_SCHEMA_VERSION, HealthSnapshotRecord,
-    HealthSnapshotWrite, ObservabilityJobRecord, ObservabilityRunInsert, ProbeObservationInsert,
-    RetentionPolicyRecord, SchedulerJobClockUpdate, SchedulerOutcomeEntry, SchedulerOutcomeWrite,
-    SchedulerRunFinish, SchedulerRunStart, Store, StoreError,
+    AlertDeliveryAttemptRecord, AlertDeliveryAttemptWrite, AlertDeliveryFinalizeWrite,
+    AlertEvaluationEntry, AlertEvaluationWrite, AlertEventRecord, AlertStateTransition,
+    AlertWebhookHookRecord, CURRENT_SCHEMA_VERSION, HealthSnapshotRecord, HealthSnapshotWrite,
+    ObservabilityJobRecord, ObservabilityRunInsert, ProbeObservationInsert, RetentionPolicyRecord,
+    SchedulerJobClockUpdate, SchedulerOutcomeEntry, SchedulerOutcomeWrite, SchedulerRunFinish,
+    SchedulerRunStart, Store, StoreError,
 };
 use ocfleet_protocol::method::{
     OCSERV_CONFIG_FINGERPRINT, OCSERV_SERVICE_SUMMARY, OCSERV_SESSIONS_SUMMARY, OCSERV_VERSION,
@@ -296,9 +297,14 @@ fn observability_store_tests_inserts_webhook_hook_and_delivery_attempt() {
         error_code: Some("WEBHOOK_HTTP_5XX".to_string()),
         bytes_sent: 512,
     };
-    store
-        .insert_alert_delivery_attempt(&attempt)
-        .expect("insert delivery attempt");
+    StoreWriter::write_alert_delivery_attempt(
+        &store,
+        &AlertDeliveryAttemptWrite {
+            attempt: attempt.clone(),
+        },
+        TEST_ACTOR,
+    )
+    .expect("insert delivery attempt");
 
     let hooks = store
         .list_alert_webhook_hooks()
@@ -1916,6 +1922,114 @@ fn alert_webhook_hook_create_is_atomic_and_actor_bound() {
         StoreWriter::write_alert_webhook_hook_create(&store, &hook, "other-actor"),
         Err(StoreError::AlertMutationConflict { .. })
     ));
+}
+
+#[test]
+fn alert_delivery_attempt_and_finalize_writers_are_atomic_and_replay_safe() {
+    let (_dir, store, db) = open_temp_store();
+    let hook = AlertWebhookHookRecord {
+        hook_id: "webhook-delivery".to_string(),
+        name: "delivery".to_string(),
+        hook_type: "webhook".to_string(),
+        endpoint_url: "https://93.184.216.34/alerts".to_string(),
+        endpoint_url_redacted: "https://93.184.216.34/<redacted>".to_string(),
+        endpoint_host: "93.184.216.34".to_string(),
+        host_allow: vec!["93.184.216.34".to_string()],
+        hmac_key_id: "abcd1234abcd1234".to_string(),
+        enabled: true,
+        max_attempts: 2,
+        timeout_ms: 1_500,
+        created_at: "2026-07-11T01:00:00Z".to_string(),
+        updated_at: "2026-07-11T01:00:00Z".to_string(),
+    };
+    StoreWriter::write_alert_webhook_hook_create(&store, &hook, TEST_ACTOR).expect("create hook");
+    let alert = AlertEventRecord {
+        alert_id: "alert-delivery".to_string(),
+        dedupe_key: "node:delivery:stale".to_string(),
+        node_id: Some("delivery".to_string()),
+        severity: "warning".to_string(),
+        state: "open".to_string(),
+        reason_code: "NODE_STALE".to_string(),
+        first_seen_at: "2026-07-11T01:00:00Z".to_string(),
+        last_seen_at: "2026-07-11T01:00:00Z".to_string(),
+        last_sent_at: None,
+        resolved_at: None,
+        detail_json: json!({"methods": []}),
+    };
+    store.upsert_alert_event(&alert).expect("seed alert");
+    let attempt = AlertDeliveryAttemptWrite {
+        attempt: AlertDeliveryAttemptRecord {
+            attempt_id: "attempt-delivery-1".to_string(),
+            alert_id: alert.alert_id.clone(),
+            hook_id: hook.hook_id.clone(),
+            attempt_no: 1,
+            attempted_at: "2026-07-11T01:01:00Z".to_string(),
+            status: "succeeded".to_string(),
+            http_status_class: Some("2xx".to_string()),
+            error_code: None,
+            bytes_sent: 128,
+        },
+    };
+    inject_job_audit_failure(&db, "alert.delivery.attempt");
+    assert_injected_job_audit_failure(StoreWriter::write_alert_delivery_attempt(
+        &store, &attempt, TEST_ACTOR,
+    ));
+    assert!(
+        store
+            .list_alert_delivery_attempts()
+            .expect("attempts")
+            .is_empty()
+    );
+    Connection::open(&db)
+        .expect("open db")
+        .execute_batch("DROP TRIGGER fail_scheduler_job_audit")
+        .expect("remove failure trigger");
+    StoreWriter::write_alert_delivery_attempt(&store, &attempt, TEST_ACTOR).expect("write attempt");
+    let audit_count = store.audit_count().expect("audit count");
+    StoreWriter::write_alert_delivery_attempt(&store, &attempt, TEST_ACTOR).expect("retry attempt");
+    assert_eq!(store.audit_count().expect("audit count"), audit_count);
+    assert!(matches!(
+        StoreWriter::write_alert_delivery_attempt(&store, &attempt, "other-actor"),
+        Err(StoreError::AlertMutationConflict { .. })
+    ));
+
+    let mut delivered = alert.clone();
+    delivered.last_sent_at = Some("2026-07-11T01:02:00Z".to_string());
+    let finalize = AlertDeliveryFinalizeWrite {
+        delivery_id: "delivery-00000000-0000-4000-8000-000000000001".to_string(),
+        hook_type: "webhook".to_string(),
+        ok: true,
+        dry_run: false,
+        alert_count: 1,
+        bytes_written: 128,
+        error_code: None,
+        entries: vec![AlertEvaluationEntry {
+            before: Some(alert.clone()),
+            after: delivered.clone(),
+        }],
+    };
+    inject_job_audit_failure(&db, "alert.delivery");
+    assert_injected_job_audit_failure(StoreWriter::write_alert_delivery_finalize(
+        &store, &finalize, TEST_ACTOR,
+    ));
+    assert_eq!(store.list_alert_events().expect("alerts"), vec![alert]);
+    Connection::open(&db)
+        .expect("open db")
+        .execute_batch("DROP TRIGGER fail_scheduler_job_audit")
+        .expect("remove failure trigger");
+    StoreWriter::write_alert_delivery_finalize(&store, &finalize, TEST_ACTOR)
+        .expect("finalize delivery");
+    StoreWriter::write_alert_delivery_finalize(&store, &finalize, TEST_ACTOR)
+        .expect("retry finalization");
+    let stale = AlertDeliveryFinalizeWrite {
+        delivery_id: "delivery-00000000-0000-4000-8000-000000000002".to_string(),
+        ..finalize
+    };
+    assert!(matches!(
+        StoreWriter::write_alert_delivery_finalize(&store, &stale, TEST_ACTOR),
+        Err(StoreError::AlertMutationConflict { .. })
+    ));
+    assert_eq!(store.list_alert_events().expect("alerts"), vec![delivered]);
 }
 
 #[test]

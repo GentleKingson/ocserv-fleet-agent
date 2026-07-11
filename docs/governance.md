@@ -76,8 +76,9 @@ audit, and stable operation IDs make exact retries no-ops. Health snapshot
 batches and alert candidate evaluations also bind state and audit atomically;
 alert evaluation uses persisted before-state checks to preserve concurrent
 operator decisions. Silence/resolve and webhook-hook creation also use atomic
-writers with compare-before or audit-backed replay. Alert delivery and other
-call sites remain to migrate.
+writers with compare-before or audit-backed replay. Webhook attempt history and
+delivery finalization now use separate atomic boundaries around external I/O.
+Other call sites remain to migrate.
 Completing those families is required before claiming fully fail-closed
 controller mutation audit. The API remains read-only while that work is
 incomplete. The governing decision is recorded in

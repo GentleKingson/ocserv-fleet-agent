@@ -109,8 +109,11 @@ commit bounded snapshot batches and audit through replay-safe writers. Alert
 candidate evaluation does the same and compares each persisted before-state in
 the immediate transaction so a concurrent silence or resolve is never
 overwritten. Alert silence/resolve use a compare-before transition writer, and
-webhook-hook creation commits configuration with redacted audit. Delivery and
-other legacy mutations are not all migrated to the writer trait. Future writer
+webhook-hook creation commits configuration with redacted audit. Each webhook
+attempt commits history and audit together; finalization compare-checks the
+bounded alert set and commits all `last_sent_at` changes with its audit. External
+I/O never occurs inside SQLite transactions. Other legacy mutations are not all
+migrated to the writer trait. Future writer
 interfaces must keep actor/audit input mandatory and must not loosen private
 file checks or redaction. The scheduler writer expansions change no schema,
 protocol, agent capability, or API route; neither does the binding/lifecycle

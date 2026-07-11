@@ -109,7 +109,8 @@ DIRECT_DERIVED_STATE_MUTATOR_RE = re.compile(
 )
 DIRECT_ALERT_ACTION_MUTATOR_RE = re.compile(
     r"(?:\.\s*|\bStore\s*::\s*)"
-    r"(write_alert_state_transition|write_alert_webhook_hook_create)\s*\("
+    r"(upsert_alert_event|write_alert_state_transition|write_alert_webhook_hook_create|"
+    r"write_alert_delivery_attempt|write_alert_delivery_finalize)\s*\("
 )
 DIRECT_RPC_AUDIT_RE = re.compile(r"\bwrite_rpc_audit\s*\(")
 LEGACY_SCHEDULER_WRITER_ALLOWED_FILES = {

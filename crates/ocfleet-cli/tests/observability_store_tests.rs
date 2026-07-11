@@ -177,7 +177,7 @@ fn scheduler_outcome_entry(
         expires_at: None,
         result_class: "controller_rpc_summary".to_string(),
         summary_json: json!({
-            "caller_marker": "bounded-but-not-run-summary",
+            "message": "bounded scheduler test summary",
             "result_class": "controller_rpc_summary",
         }),
     };
@@ -524,7 +524,11 @@ fn observability_store_tests_inserts_and_lists_probe_observation() {
     assert_eq!(observations[0].method, observation.method);
     assert_eq!(observations[0].ok, observation.ok);
     assert_eq!(observations[0].duration_ms, observation.duration_ms);
-    assert_eq!(observations[0].summary_json, observation.summary_json);
+    assert_eq!(observations[0].summary_json["sessions_total"], 12);
+    assert_eq!(
+        observations[0].summary_json["result_class"],
+        "low_sensitive_summary"
+    );
 }
 
 #[test]

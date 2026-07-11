@@ -457,7 +457,7 @@ fn health_summary_tests_json_output_is_valid_fixed_schema() {
             ok: true,
             error_code: None,
             observed_at: &observed_at,
-            summary_json: json!({"service": {"state": "running", "enabled": "enabled"}}),
+            summary_json: json!({"service_state": "running", "service_enabled": "enabled"}),
         },
     );
     drop(store);

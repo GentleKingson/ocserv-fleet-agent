@@ -152,6 +152,13 @@ status fail the migration after backup. CLI alert evaluation and both CLI/API
 read projections validate the payloads and expose only the established fixed
 public fields.
 
+The third A2 slice advances SQLite to migration `0011` and stores probe
+observation summaries in a closed envelope bound to relational method and result
+class. A fixed typed field catalog covers controller RPC, ocserv, and scheduler
+summaries. Writers canonicalize before persistence; migration and CLI/API readers
+reject unknown, nested, secret-like, address, raw, future-version, or mismatched
+data while public projections omit the storage wrapper.
+
 ### Baseline And Production Foundation
 
 | ID | Issue | Status | Depends on | Release target | Acceptance and required evidence |

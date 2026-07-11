@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 
 use ocfleet_cli::private_file::{self, PrivateFileError};
 use ocfleet_cli::storage_payloads::{
-    HealthDegradedMethodsPayloadV1, HealthSummaryPayloadV1, SchedulerPairPayloadV1,
-    SchedulerSelectorPayloadV1, validate_health_payload_relationship,
+    HealthDegradedMethodsPayloadV1, HealthSummaryPayloadV1, ObservationSummaryPayloadV1,
+    SchedulerPairPayloadV1, SchedulerSelectorPayloadV1, validate_health_payload_relationship,
     validate_scheduler_payload_relationship,
 };
 use ocfleet_cli::store::{
@@ -606,19 +606,39 @@ fn probe_observation_from_row(row: &Row<'_>) -> rusqlite::Result<ProbeObservatio
     let ok: Option<i64> = row.get(5)?;
     let duration_ms: Option<i64> = row.get(7)?;
     let summary_json: String = row.get(11)?;
+    let method: String = row.get(4)?;
+    let result_class: String = row.get(10)?;
+    let summary_json = parse_json_column(&summary_json, 11)?;
+    let payload = ObservationSummaryPayloadV1::from_value(&summary_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            11,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
+        )
+    })?;
+    if payload.method != method || payload.result_class != result_class {
+        return Err(rusqlite::Error::FromSqlConversionFailure(
+            11,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "observation summary does not match relational method/result class",
+            )),
+        ));
+    }
     Ok(ProbeObservationRecord {
         observation_id: row.get(0)?,
         run_id: row.get(1)?,
         node_id: row.get(2)?,
         endpoint_id: row.get(3)?,
-        method: row.get(4)?,
+        method,
         ok: ok.map(|value| i64_to_bool(value, 5)).transpose()?,
         error_code: row.get(6)?,
         duration_ms: duration_ms.and_then(|value| u64::try_from(value).ok()),
         observed_at: row.get(8)?,
         expires_at: row.get(9)?,
-        result_class: row.get(10)?,
-        summary_json: parse_json_column(&summary_json, 11)?,
+        result_class,
+        summary_json: payload.public_summary(),
     })
 }
 

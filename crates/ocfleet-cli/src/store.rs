@@ -28,12 +28,12 @@ use crate::input_validation::{
 use crate::migrations;
 use crate::private_file::{self, PrivateFileError};
 use crate::storage_payloads::{
-    HealthDegradedMethodsPayloadV1, HealthSummaryPayloadV1, SchedulerPairPayloadV1,
-    SchedulerSelectorPayloadV1, validate_health_payload_relationship,
+    HealthDegradedMethodsPayloadV1, HealthSummaryPayloadV1, ObservationSummaryPayloadV1,
+    SchedulerPairPayloadV1, SchedulerSelectorPayloadV1, validate_health_payload_relationship,
     validate_scheduler_payload_relationship,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 10;
+pub const CURRENT_SCHEMA_VERSION: i64 = 11;
 pub const DEFAULT_HEALTH_STALE_WINDOW_SECONDS: u64 = 24 * 60 * 60;
 pub const DEFAULT_HEALTH_UNREACHABLE_FAILURES: u64 = 3;
 pub const DEFAULT_HEALTH_CERT_WARNING_DAYS: u64 = 30;
@@ -3473,11 +3473,31 @@ fn insert_observability_run_tx(
     Ok(())
 }
 
+fn canonical_observation_summary(
+    observation: &ProbeObservationInsert,
+) -> Result<Value, StoreError> {
+    let payload = ObservationSummaryPayloadV1::from_value(&observation.summary_json)
+        .or_else(|_| {
+            ObservationSummaryPayloadV1::from_legacy(
+                &observation.method,
+                &observation.result_class,
+                &observation.summary_json,
+            )
+        })
+        .map_err(StoreError::InvalidInput)?;
+    if payload.method != observation.method || payload.result_class != observation.result_class {
+        return Err(StoreError::InvalidInput(
+            "observation summary does not match relational method/result class".to_string(),
+        ));
+    }
+    Ok(payload.to_value())
+}
+
 fn insert_probe_observation_tx(
     tx: &Transaction<'_>,
     observation: &ProbeObservationInsert,
 ) -> Result<(), StoreError> {
-    validate_low_sensitive_json(&observation.summary_json, "observation summary")?;
+    let summary_json = canonical_observation_summary(observation)?;
     tx.execute(
         "INSERT INTO probe_observations
          (observation_id, run_id, node_id, endpoint_id, method, ok, error_code, duration_ms, observed_at, expires_at, result_class, summary_json)
@@ -3494,7 +3514,7 @@ fn insert_probe_observation_tx(
             observation.observed_at.as_str(),
             observation.expires_at.as_deref(),
             observation.result_class.as_str(),
-            compact_json(&observation.summary_json),
+            compact_json(&summary_json),
         ],
     )?;
     Ok(())
@@ -5201,19 +5221,39 @@ fn probe_observation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Probe
     let ok: Option<i64> = row.get(5)?;
     let duration_ms: Option<i64> = row.get(7)?;
     let summary_json: String = row.get(11)?;
+    let method: String = row.get(4)?;
+    let result_class: String = row.get(10)?;
+    let summary_json = parse_json_column(&summary_json, 11)?;
+    let payload = ObservationSummaryPayloadV1::from_value(&summary_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            11,
+            Type::Text,
+            Box::new(io::Error::new(io::ErrorKind::InvalidData, error)),
+        )
+    })?;
+    if payload.method != method || payload.result_class != result_class {
+        return Err(rusqlite::Error::FromSqlConversionFailure(
+            11,
+            Type::Text,
+            Box::new(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "observation summary does not match relational method/result class",
+            )),
+        ));
+    }
     Ok(ProbeObservationRecord {
         observation_id: row.get(0)?,
         run_id: row.get(1)?,
         node_id: row.get(2)?,
         endpoint_id: row.get(3)?,
-        method: row.get(4)?,
+        method,
         ok: ok.map(|value| i64_to_bool(value, 5)).transpose()?,
         error_code: row.get(6)?,
         duration_ms: duration_ms.map(i64_to_u64).transpose()?,
         observed_at: row.get(8)?,
         expires_at: row.get(9)?,
-        result_class: row.get(10)?,
-        summary_json: parse_json_column(&summary_json, 11)?,
+        result_class,
+        summary_json: payload.public_summary(),
     })
 }
 

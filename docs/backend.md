@@ -71,6 +71,11 @@ snapshot status and typed summary status must agree. Alert evaluation consumes
 the typed fields, while CLI/API projections unwrap only the established public
 shape.
 
+The third A2 slice advances SQLite to schema version 11 and closes probe
+observation summaries over a fixed field DTO bound to method and result class.
+The SQLite and independent API readers validate persisted envelopes and return
+only public summary fields.
+
 The first production-hardening slice added node add/enable/disable/remove to this
 contract and removed the CLI's post-commit success audits. Audit-trigger failure
 tests prove both `nodes` and `endpoint_trust` changes roll back. The second slice

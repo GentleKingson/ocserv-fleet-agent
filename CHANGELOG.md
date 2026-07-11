@@ -30,6 +30,9 @@
   as closed schema-tagged v1 payloads. Migration preserves exact legacy meaning,
   while unsupported methods, unknown fields, invalid bounds, future versions,
   and relational-status mismatches fail closed after private backup.
+- SQLite schema version 11 stores probe observation summaries in a closed
+  method/result-class-bound payload. Writers and CLI/API readers reject unknown,
+  nested, sensitive, address, future-version, and relationally mismatched data.
 - Node add, enable, disable, and remove now take an explicit resolved actor and
   commit their registry/trust change and success audit in one SQLite
   transaction through `StoreWriter`.

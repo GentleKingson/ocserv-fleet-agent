@@ -4,6 +4,7 @@ use serde_json::{Map, Value, json};
 
 use crate::args::ObservationCommand;
 use crate::input_validation::validate_selector;
+use crate::storage_payloads::ObservationSummaryPayloadV1;
 use crate::store::{ProbeObservationRecord, Store};
 
 pub const MAX_OBSERVATION_QUERY_LIMIT: u64 = 1_000;
@@ -120,6 +121,9 @@ pub fn observation_to_json(observation: &ProbeObservationRecord) -> Value {
 }
 
 pub fn safe_observation_summary(value: &Value) -> Value {
+    if let Ok(payload) = ObservationSummaryPayloadV1::from_value(value) {
+        return payload.public_summary();
+    }
     let mut budget = ProjectionBudget {
         entries_remaining: 256,
         string_bytes_remaining: 4_096,

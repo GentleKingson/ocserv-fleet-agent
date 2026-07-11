@@ -272,6 +272,28 @@ async fn health_route_fails_closed_for_contaminated_versioned_summary() {
 }
 
 #[tokio::test]
+async fn observations_route_fails_closed_for_contaminated_versioned_summary() {
+    let fixture = Fixture::new();
+    Connection::open(&fixture.database)
+        .expect("open fixture")
+        .execute(
+            "UPDATE probe_observations SET summary_json = ?1 WHERE observation_id = 'obs-a'",
+            [r#"{"schema":"ocfleet.observation.summary.v1","result_class":"controller_rpc_summary","method":"probe.controller.ping","fields":{"message":"pong","client_address":"10.0.0.2"}}"#],
+        )
+        .expect("contaminate observation summary");
+
+    let (status, _, body) = raw_request(
+        fixture.router(None),
+        Method::GET,
+        "/observations?limit=10",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(!body.contains("10.0.0.2"));
+}
+
+#[tokio::test]
 async fn forbidden_methods_do_not_write() {
     let fixture = Fixture::new();
     let before = table_counts(&fixture.database);
@@ -1073,16 +1095,6 @@ fn seed_database(path: &Path) {
     // Model an externally polluted database so API fail-closed projection is
     // tested independently from the controller's write-time validation.
     let conn = Connection::open(path).expect("open db for pollution fixture");
-    conn.execute(
-        "UPDATE probe_observations SET summary_json = ?1 WHERE observation_id = 'obs-a'",
-        [json!({
-            "status": "failed",
-            "username": "alice",
-            "raw_body": "raw-secret"
-        })
-        .to_string()],
-    )
-    .expect("pollute observation summary");
     conn.execute(
         "UPDATE alert_events SET detail_json = ?1 WHERE alert_id = 'alert-a'",
         [json!({

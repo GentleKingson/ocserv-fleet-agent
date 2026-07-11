@@ -237,7 +237,7 @@ fn health_policy_tests_unreachable_failure_threshold_controls_alerts() {
                 ok: false,
                 error_code: Some("RPC_TIMEOUT"),
                 observed_at: &observed_at,
-                summary_json: json!({"result_class": "controller_rpc_summary"}),
+                summary_json: json!({"result_class": "low_sensitive_summary"}),
             },
         );
     }

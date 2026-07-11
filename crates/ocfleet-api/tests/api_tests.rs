@@ -7,9 +7,10 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode, header};
 use ocfleet_api::{ApiCli, ApiConfig, AppState, RedactionMode, build_router};
 use ocfleet_cli::audit::AuditEvent;
+use ocfleet_cli::backend::StoreWriter;
 use ocfleet_cli::store::{
-    AlertEventRecord, CURRENT_SCHEMA_VERSION, HealthSnapshotRecord, NodeInsert,
-    ObservabilityJobRecord, ObservabilityRunInsert, ProbeObservationInsert, Store,
+    AlertEventRecord, CURRENT_SCHEMA_VERSION, HealthSnapshotRecord, HealthSnapshotWrite,
+    NodeInsert, ObservabilityJobRecord, ObservabilityRunInsert, ProbeObservationInsert, Store,
 };
 use rusqlite::Connection;
 use serde_json::{Value, json};
@@ -961,20 +962,27 @@ fn seed_database(path: &Path) {
             summary_json: json!({"status": "failed"}),
         })
         .expect("insert observation");
-    store
-        .upsert_health_snapshot(&HealthSnapshotRecord {
-            node_id: "node-a".to_string(),
-            endpoint_id: Some("endpoint-a".to_string()),
-            computed_at: "2026-07-09T00:02:00Z".to_string(),
-            status: "unreachable".to_string(),
-            freshness_seconds: Some(60),
-            last_success_at: None,
-            last_failure_at: Some("2026-07-09T00:01:02Z".to_string()),
-            last_error_code: Some("ENDPOINT_NOT_ALLOWED".to_string()),
-            degraded_methods_json: json!(["probe.controller.ping"]),
-            summary_json: json!({"status": "unreachable"}),
-        })
-        .expect("insert health");
+    StoreWriter::write_health_snapshots(
+        &store,
+        &HealthSnapshotWrite {
+            evaluation_id: "health-eval-00000000-0000-4000-8000-000000000004".to_string(),
+            event: "health.node".to_string(),
+            snapshots: vec![HealthSnapshotRecord {
+                node_id: "node-a".to_string(),
+                endpoint_id: None,
+                computed_at: "2026-07-09T00:02:00Z".to_string(),
+                status: "unreachable".to_string(),
+                freshness_seconds: Some(60),
+                last_success_at: None,
+                last_failure_at: Some("2026-07-09T00:01:02Z".to_string()),
+                last_error_code: Some("ENDPOINT_NOT_ALLOWED".to_string()),
+                degraded_methods_json: json!(["probe.controller.ping"]),
+                summary_json: json!({"status": "unreachable"}),
+            }],
+        },
+        "api-test",
+    )
+    .expect("insert health");
     store
         .upsert_alert_event(&AlertEventRecord {
             alert_id: "alert-a".to_string(),

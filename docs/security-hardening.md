@@ -138,6 +138,14 @@ report without deleting again. A changed scope, cutoff intent, policy bounds,
 limit, or batch size fails closed. `retention explain` and `apply --dry-run`
 remain query-only, and `controller_audit_log` is never a retention target.
 
+Health summary/node evaluation uses a generated `health-eval-<uuid>` and commits
+the complete bounded snapshot batch with one low-sensitive audit. Alert
+candidate evaluation uses `alert-eval-<uuid>` and verifies every evaluated
+before-state inside the immediate transaction before committing the candidate
+batch and audit. A concurrent silence or resolve therefore causes the stale
+evaluation to fail instead of restoring an older state. Exact same-actor,
+same-input retries are no-ops; divergent replay fails closed.
+
 - Keep controller audit exports redacted by default.
 - Keep agent audit primary log and spool on monitored storage.
 - Treat `audit_dropped` or repeated audit write failures as operational incidents, because affected RPCs should fail closed when neither primary nor spool can record the event.

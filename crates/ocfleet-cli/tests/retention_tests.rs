@@ -1,8 +1,8 @@
 use ocfleet_cli::audit::AuditEvent;
 use ocfleet_cli::backend::StoreWriter;
 use ocfleet_cli::store::{
-    AlertEventRecord, HealthSnapshotRecord, ObservabilityRunInsert, ProbeObservationInsert,
-    RetentionApplyInput, Store, StoreError,
+    AlertEventRecord, HealthSnapshotRecord, HealthSnapshotWrite, ObservabilityRunInsert,
+    ProbeObservationInsert, RetentionApplyInput, Store, StoreError,
 };
 use rusqlite::Connection;
 use serde_json::{Value, json};
@@ -60,20 +60,27 @@ fn insert_observation(store: &Store, observation_id: &str, observed_at: &str) {
 }
 
 fn insert_old_health_and_alert(store: &Store) {
-    store
-        .upsert_health_snapshot(&HealthSnapshotRecord {
-            node_id: "hk-ocserv-01".to_string(),
-            endpoint_id: Some("endpoint-1".to_string()),
-            computed_at: "2026-01-01T00:00:00Z".to_string(),
-            status: "stale".to_string(),
-            freshness_seconds: Some(86_400),
-            last_success_at: None,
-            last_failure_at: Some("2026-01-01T00:00:00Z".to_string()),
-            last_error_code: Some("RPC_TIMEOUT".to_string()),
-            degraded_methods_json: json!(["probe.controller.ping"]),
-            summary_json: json!({"status": "stale"}),
-        })
-        .expect("insert health snapshot");
+    StoreWriter::write_health_snapshots(
+        store,
+        &HealthSnapshotWrite {
+            evaluation_id: format!("health-eval-{}", uuid::Uuid::new_v4()),
+            event: "health.node".to_string(),
+            snapshots: vec![HealthSnapshotRecord {
+                node_id: "hk-ocserv-01".to_string(),
+                endpoint_id: None,
+                computed_at: "2026-01-01T00:00:00Z".to_string(),
+                status: "stale".to_string(),
+                freshness_seconds: Some(86_400),
+                last_success_at: None,
+                last_failure_at: Some("2026-01-01T00:00:00Z".to_string()),
+                last_error_code: Some("RPC_TIMEOUT".to_string()),
+                degraded_methods_json: json!(["probe.controller.ping"]),
+                summary_json: json!({"status": "stale"}),
+            }],
+        },
+        "test-setup",
+    )
+    .expect("insert health snapshot");
     store
         .upsert_alert_event(&AlertEventRecord {
             alert_id: "alert-1".to_string(),

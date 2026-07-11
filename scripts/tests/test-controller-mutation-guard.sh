@@ -28,7 +28,7 @@ printf '%s\n' \
   'mod tests {' \
   '    const FIXTURE_SQL: &str = "UPDATE nodes SET enabled = 0";' \
   '}' \
-  'pub fn reviewed(store: &Store, node: &NodeInsert, token: &EnrollmentTokenInsert, request: &JoinRequestInsert, approval: &ApprovalInput, claim: &LegacyEnrollmentClaimInput, policy: &RetentionPolicyRecord, apply: &RetentionApplyInput) {' \
+  'pub fn reviewed(store: &Store, node: &NodeInsert, token: &EnrollmentTokenInsert, request: &JoinRequestInsert, approval: &ApprovalInput, claim: &LegacyEnrollmentClaimInput, policy: &RetentionPolicyRecord, apply: &RetentionApplyInput, health_policy: &HealthPolicyRecord, health: &HealthSnapshotWrite, alerts: &AlertEvaluationWrite) {' \
   '    Store::add_node(store, node, "actor");' \
   '    store.enable_node("node", "actor");' \
   '    store.disable_node("node", "actor");' \
@@ -44,6 +44,9 @@ printf '%s\n' \
   '    Store::claim_legacy_enrollment(store, claim, "actor");' \
   '    store.set_retention_policy(policy, "actor");' \
   '    Store::apply_retention(store, apply, "actor");' \
+  '    store.set_health_policy(health_policy, "actor");' \
+  '    Store::write_health_snapshots(store, health, "actor");' \
+  '    store.write_alert_evaluation(alerts, "actor");' \
   '}' \
   'pub const OTHER_QUERY: &str = "SELECT enabled FROM nodes";' \
   > "$cli_src/backend.rs"
@@ -214,6 +217,32 @@ do
   if ! grep -Fq "$expected" "$retention_fail_output"; then
     printf 'controller mutation guard did not report expected retention mutator violation: %s\n' "$expected" >&2
     sed -n '1,120p' "$retention_fail_output" >&2
+    exit 1
+  fi
+done
+
+rm -f "$cli_src/unsafe_retention_mutator.rs"
+printf '%s\n' \
+  'pub fn bypass(store: &Store, policy: &HealthPolicyRecord, health: &HealthSnapshotWrite, alerts: &AlertEvaluationWrite) {' \
+  '    store.set_health_policy(policy, "actor");' \
+  '    Store::write_health_snapshots(store, health, "actor");' \
+  '    store.write_alert_evaluation(alerts, "actor");' \
+  '}' \
+  > "$cli_src/unsafe_derived_state_mutator.rs"
+
+derived_state_fail_output="$tmp_dir/derived-state-fail-output"
+if "$GUARD" --repo-root "$fixture_root" "$fixture_root" >"$derived_state_fail_output" 2>&1; then
+  printf 'controller mutation guard accepted direct derived-state mutator calls\n' >&2
+  exit 1
+fi
+for expected in \
+  'unsafe_derived_state_mutator.rs:2: direct derived-state mutator call outside reviewed store/backend boundary: set_health_policy' \
+  'unsafe_derived_state_mutator.rs:3: direct derived-state mutator call outside reviewed store/backend boundary: write_health_snapshots' \
+  'unsafe_derived_state_mutator.rs:4: direct derived-state mutator call outside reviewed store/backend boundary: write_alert_evaluation'
+do
+  if ! grep -Fq "$expected" "$derived_state_fail_output"; then
+    printf 'controller mutation guard did not report expected derived-state mutator violation: %s\n' "$expected" >&2
+    sed -n '1,120p' "$derived_state_fail_output" >&2
     exit 1
   fi
 done

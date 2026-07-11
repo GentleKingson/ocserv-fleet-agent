@@ -1,11 +1,11 @@
 use crate::audit::AuditEvent;
 use crate::store::{
-    AlertEventRecord, ApprovalInput, AuditRecord, EndpointTrustRecord, EnrollmentTokenInsert,
-    EnrollmentTokenRecord, HealthPolicyRecord, HealthSnapshotRecord, JoinRequestInsert,
-    JoinRequestRecord, LegacyEnrollmentClaimInput, NodeInsert, NodeRecord, ObservabilityJobRecord,
-    ObservabilityRunRecord, ProbeObservationRecord, RetentionApplyInput, RetentionApplyResult,
-    RetentionPolicyRecord, SchedulerOutcomeWrite, SchedulerRunFinish, SchedulerRunStart, Store,
-    StoreError,
+    AlertEvaluationWrite, AlertEventRecord, ApprovalInput, AuditRecord, EndpointTrustRecord,
+    EnrollmentTokenInsert, EnrollmentTokenRecord, HealthPolicyRecord, HealthSnapshotRecord,
+    HealthSnapshotWrite, JoinRequestInsert, JoinRequestRecord, LegacyEnrollmentClaimInput,
+    NodeInsert, NodeRecord, ObservabilityJobRecord, ObservabilityRunRecord, ProbeObservationRecord,
+    RetentionApplyInput, RetentionApplyResult, RetentionPolicyRecord, SchedulerOutcomeWrite,
+    SchedulerRunFinish, SchedulerRunStart, Store, StoreError,
 };
 
 pub const MAX_STORE_READER_ROWS: u64 = 1_000;
@@ -76,6 +76,16 @@ pub trait StoreWriter {
     fn write_health_policy(
         &self,
         policy: &HealthPolicyRecord,
+        actor: &str,
+    ) -> Result<(), Self::Error>;
+    fn write_health_snapshots(
+        &self,
+        write: &HealthSnapshotWrite,
+        actor: &str,
+    ) -> Result<(), Self::Error>;
+    fn write_alert_evaluation(
+        &self,
+        write: &AlertEvaluationWrite,
         actor: &str,
     ) -> Result<(), Self::Error>;
     fn write_retention_policy(
@@ -309,6 +319,22 @@ impl StoreWriter for Store {
         actor: &str,
     ) -> Result<(), Self::Error> {
         Store::set_health_policy(self, policy, actor)
+    }
+
+    fn write_health_snapshots(
+        &self,
+        write: &HealthSnapshotWrite,
+        actor: &str,
+    ) -> Result<(), Self::Error> {
+        Store::write_health_snapshots(self, write, actor)
+    }
+
+    fn write_alert_evaluation(
+        &self,
+        write: &AlertEvaluationWrite,
+        actor: &str,
+    ) -> Result<(), Self::Error> {
+        Store::write_alert_evaluation(self, write, actor)
     }
 
     fn write_retention_policy(

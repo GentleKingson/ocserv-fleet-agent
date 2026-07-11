@@ -106,13 +106,18 @@ optional request IDs, serializes the final token use, closes terminal
 transitions, and keeps token/submitted-identity material out of audit and
 `Debug`. It changes no schema, protocol, API route, agent capability, or default
 read-only boundary.
-Retention policy/apply atomicity is active on branch
-`codex/a1-retention-writers` in pull request `#64`. The slice keeps
+Retention policy/apply atomicity merged through pull request `#64`
+(`876f60de5a1cecf0dbb4304f2643641f2a5e088d`). That slice keeps
 dry-run/explain read-only, moves
 each non-dry-run scope deletion and its audit into one immediate transaction,
 and uses stable operation IDs for exact replay across multi-scope partial
 progress. It introduces no schema, protocol, API, agent-capability, or default
-read-only boundary change.
+read-only boundary change. Health snapshot and alert candidate evaluation
+atomicity is active on branch `codex/a1-health-alert-writers`. This slice
+commits each bounded evaluation and low-sensitive audit together, uses stable
+evaluation identities for exact replay, and rejects stale alert before-state so
+a concurrent operator silence or resolve is not overwritten. It changes no
+schema, protocol, API route, agent capability, or default read-only boundary.
 
 ### Baseline And Production Foundation
 

@@ -104,8 +104,12 @@ an outcome or finish persistence failure leaves the run `running` and does not
 advance the job clock. Retention policy writes and each scope apply now commit
 through actor-bearing writers. Apply uses a stable operation ID, one immediate
 transaction for all bounded batches in a scope, and exact audit-backed replay;
-legacy unaudited prune entry points are removed. Health/alert/delivery and other legacy
-mutations are not all migrated to the writer trait. Future writer
+legacy unaudited prune entry points are removed. Health summary/node commands
+commit bounded snapshot batches and audit through replay-safe writers. Alert
+candidate evaluation does the same and compares each persisted before-state in
+the immediate transaction so a concurrent silence or resolve is never
+overwritten. Alert operator actions, delivery, and other legacy mutations are
+not all migrated to the writer trait. Future writer
 interfaces must keep actor/audit input mandatory and must not loosen private
 file checks or redaction. The scheduler writer expansions change no schema,
 protocol, agent capability, or API route; neither does the binding/lifecycle

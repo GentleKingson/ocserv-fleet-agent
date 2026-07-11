@@ -16,10 +16,10 @@ production-complete.
   validation/diff, and optional signed audit export are implemented.
 - Production hardening is active: enrollment approval/legacy claim, node
   lifecycle, enrollment token/request transitions, retention, scheduler job
-  configuration, and scheduler run/outcome/observation/job-clock writes use
-  actor-bearing `StoreWriter` transactions for state and audit.
-  Health/alert/delivery and other legacy controller mutations are still being
-  migrated.
+  configuration, scheduler run/outcome/observation/job-clock writes, health
+  snapshot batches, and alert candidate evaluation use actor-bearing
+  `StoreWriter` transactions for state and audit. Alert operator actions,
+  delivery, and other legacy controller mutations are still being migrated.
 - Controller dispatch requires an enabled node and one Active trust row bound
   bidirectionally to that node. Active status by itself is not authorization;
   scheduler workers repeat the same binding check after concurrency waits.
@@ -60,9 +60,11 @@ production-complete.
   - `ocfleet observation` list/show queries for bounded low-sensitive stored
     observations
   - `ocfleet health` summaries, node health views, and local health policy
-    thresholds derived from stored observations; `health snapshot list` reports
-    the latest stored snapshot per node
-  - `ocfleet alert` filtered list, silence, resolve, test, private
+    thresholds derived from stored observations; snapshot batches and their
+    evaluation audit commit atomically, and `health snapshot list` reports the
+    latest stored snapshot per node
+  - `ocfleet alert` atomically persists bounded candidate batches with
+    compare-before conflict checks, plus filtered list, silence, resolve, test, private
     `jsonl_file` delivery, and explicitly configured HTTPS webhook delivery for
     bounded low-sensitive alert events
   - `ocfleet retention` policy, dry-run explanation, and pruning for
@@ -538,6 +540,8 @@ Networking must allow the controller to reach the agent through iroh using the r
   transition, idempotency, and audit-provenance decision.
 - `docs/adr/ADR-retention-apply-atomicity.md`: retention transaction, bounded
   batching, and durable replay decision.
+- `docs/adr/ADR-derived-state-evaluation-atomicity.md`: atomic health snapshot
+  batches and compare-before alert candidate evaluation.
 - `docs/trust-policy.md`: trust policy as code schema, validation, and diff behavior.
 - `docs/backend.md`: SQLite contract and optional Postgres backend plan.
 - `docs/archive-export.md`: long-term history archive and signed audit export guidance.

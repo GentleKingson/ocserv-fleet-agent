@@ -1,10 +1,11 @@
 use ocfleet_cli::audit::AuditEvent;
 use ocfleet_cli::backend::StoreWriter;
 use ocfleet_cli::store::{
-    AlertDeliveryAttemptRecord, AlertEventRecord, AlertWebhookHookRecord, CURRENT_SCHEMA_VERSION,
-    HealthSnapshotRecord, ObservabilityJobRecord, ObservabilityRunInsert, ProbeObservationInsert,
-    RetentionPolicyRecord, SchedulerJobClockUpdate, SchedulerOutcomeEntry, SchedulerOutcomeWrite,
-    SchedulerRunFinish, SchedulerRunStart, Store, StoreError,
+    AlertDeliveryAttemptRecord, AlertEvaluationEntry, AlertEvaluationWrite, AlertEventRecord,
+    AlertWebhookHookRecord, CURRENT_SCHEMA_VERSION, HealthSnapshotRecord, HealthSnapshotWrite,
+    ObservabilityJobRecord, ObservabilityRunInsert, ProbeObservationInsert, RetentionPolicyRecord,
+    SchedulerJobClockUpdate, SchedulerOutcomeEntry, SchedulerOutcomeWrite, SchedulerRunFinish,
+    SchedulerRunStart, Store, StoreError,
 };
 use ocfleet_protocol::method::{
     OCSERV_CONFIG_FINGERPRINT, OCSERV_SERVICE_SUMMARY, OCSERV_SESSIONS_SUMMARY, OCSERV_VERSION,
@@ -1513,9 +1514,10 @@ fn scheduler_finish_rejects_missing_terminal_and_mismatched_job() {
 #[test]
 fn observability_store_tests_upserts_health_snapshot() {
     let (_dir, store, _db) = open_temp_store();
+    let endpoint_id = iroh::SecretKey::generate().public().to_string();
     let initial = HealthSnapshotRecord {
         node_id: "hk-ocserv-01".to_string(),
-        endpoint_id: Some("endpoint-1".to_string()),
+        endpoint_id: Some(endpoint_id),
         computed_at: "2026-07-08T07:00:00Z".to_string(),
         status: "healthy".to_string(),
         freshness_seconds: Some(30),
@@ -1525,9 +1527,16 @@ fn observability_store_tests_upserts_health_snapshot() {
         degraded_methods_json: json!([]),
         summary_json: json!({"state": "running"}),
     };
-    store
-        .upsert_health_snapshot(&initial)
-        .expect("insert health snapshot");
+    StoreWriter::write_health_snapshots(
+        &store,
+        &HealthSnapshotWrite {
+            evaluation_id: format!("health-eval-{}", uuid::Uuid::new_v4()),
+            event: "health.node".to_string(),
+            snapshots: vec![initial.clone()],
+        },
+        TEST_ACTOR,
+    )
+    .expect("insert health snapshot");
 
     let updated = HealthSnapshotRecord {
         status: "degraded".to_string(),
@@ -1538,14 +1547,255 @@ fn observability_store_tests_upserts_health_snapshot() {
         summary_json: json!({"state": "running", "version_status": "unavailable"}),
         ..initial.clone()
     };
-    store
-        .upsert_health_snapshot(&updated)
-        .expect("update health snapshot");
+    StoreWriter::write_health_snapshots(
+        &store,
+        &HealthSnapshotWrite {
+            evaluation_id: format!("health-eval-{}", uuid::Uuid::new_v4()),
+            event: "health.node".to_string(),
+            snapshots: vec![updated.clone()],
+        },
+        TEST_ACTOR,
+    )
+    .expect("update health snapshot");
 
     let snapshots = store
         .list_health_snapshots()
         .expect("list health snapshots");
     assert_eq!(snapshots, vec![updated]);
+}
+
+#[test]
+fn health_snapshot_writer_is_atomic_idempotent_and_actor_bound() {
+    let (_dir, store, db) = open_temp_store();
+    let snapshots = vec![
+        HealthSnapshotRecord {
+            node_id: "health-batch-a".to_string(),
+            endpoint_id: None,
+            computed_at: "2026-07-11T01:00:00Z".to_string(),
+            status: "healthy".to_string(),
+            freshness_seconds: Some(1),
+            last_success_at: Some("2026-07-11T01:00:00Z".to_string()),
+            last_failure_at: None,
+            last_error_code: None,
+            degraded_methods_json: json!([]),
+            summary_json: json!({"status": "healthy"}),
+        },
+        HealthSnapshotRecord {
+            node_id: "health-batch-b".to_string(),
+            endpoint_id: None,
+            computed_at: "2026-07-11T01:00:00Z".to_string(),
+            status: "degraded".to_string(),
+            freshness_seconds: Some(2),
+            last_success_at: None,
+            last_failure_at: Some("2026-07-11T00:59:00Z".to_string()),
+            last_error_code: Some("RPC_TIMEOUT".to_string()),
+            degraded_methods_json: json!(["probe.controller.ping"]),
+            summary_json: json!({"status": "degraded"}),
+        },
+    ];
+    let write = HealthSnapshotWrite {
+        evaluation_id: "health-eval-00000000-0000-4000-8000-000000000001".to_string(),
+        event: "health.summary".to_string(),
+        snapshots: snapshots.clone(),
+    };
+    StoreWriter::write_health_snapshots(&store, &write, TEST_ACTOR).expect("write health batch");
+    let audit_count = store.audit_count().expect("audit count");
+    StoreWriter::write_health_snapshots(&store, &write, TEST_ACTOR).expect("exact health retry");
+    assert_eq!(store.audit_count().expect("audit count"), audit_count);
+    assert_eq!(store.list_health_snapshots().expect("snapshots"), snapshots);
+    assert!(matches!(
+        StoreWriter::write_health_snapshots(&store, &write, "different-actor"),
+        Err(StoreError::HealthEvaluationConflict { .. })
+    ));
+    let mut divergent = write.clone();
+    divergent.snapshots[0].status = "degraded".to_string();
+    assert!(matches!(
+        StoreWriter::write_health_snapshots(&store, &divergent, TEST_ACTOR),
+        Err(StoreError::HealthEvaluationConflict { .. })
+    ));
+
+    let (actor, event, detail) = latest_job_audit(&db);
+    assert_eq!(actor, TEST_ACTOR);
+    assert_eq!(event, "health.summary");
+    assert_eq!(detail["node_count"], 2);
+    assert_eq!(detail["status_counts"]["healthy"], 1);
+    assert_eq!(detail["status_counts"]["degraded"], 1);
+}
+
+#[test]
+fn health_snapshot_writer_rolls_back_every_row_when_audit_fails() {
+    let (_dir, store, db) = open_temp_store();
+    inject_job_audit_failure(&db, "health.summary");
+    let write = HealthSnapshotWrite {
+        evaluation_id: "health-eval-00000000-0000-4000-8000-000000000002".to_string(),
+        event: "health.summary".to_string(),
+        snapshots: vec![HealthSnapshotRecord {
+            node_id: "health-rollback".to_string(),
+            endpoint_id: None,
+            computed_at: "2026-07-11T01:00:00Z".to_string(),
+            status: "unknown".to_string(),
+            freshness_seconds: None,
+            last_success_at: None,
+            last_failure_at: None,
+            last_error_code: None,
+            degraded_methods_json: json!([]),
+            summary_json: json!({"status": "unknown"}),
+        }],
+    };
+    assert_injected_job_audit_failure(StoreWriter::write_health_snapshots(
+        &store, &write, TEST_ACTOR,
+    ));
+    assert!(store.list_health_snapshots().expect("snapshots").is_empty());
+}
+
+#[test]
+fn alert_evaluation_writer_is_atomic_idempotent_and_actor_bound() {
+    let (_dir, store, db) = open_temp_store();
+    let alerts = vec![
+        AlertEventRecord {
+            alert_id: "alert-eval-a".to_string(),
+            dedupe_key: "node:health-a:stale".to_string(),
+            node_id: Some("health-a".to_string()),
+            severity: "warning".to_string(),
+            state: "open".to_string(),
+            reason_code: "NODE_STALE".to_string(),
+            first_seen_at: "2026-07-11T01:00:00Z".to_string(),
+            last_seen_at: "2026-07-11T01:00:00Z".to_string(),
+            last_sent_at: None,
+            resolved_at: None,
+            detail_json: json!({"methods": ["probe.controller.ping"]}),
+        },
+        AlertEventRecord {
+            alert_id: "alert-eval-b".to_string(),
+            dedupe_key: "node:health-b:stale".to_string(),
+            node_id: Some("health-b".to_string()),
+            severity: "critical".to_string(),
+            state: "silenced".to_string(),
+            reason_code: "NODE_UNREACHABLE".to_string(),
+            first_seen_at: "2026-07-11T01:00:00Z".to_string(),
+            last_seen_at: "2026-07-11T01:00:00Z".to_string(),
+            last_sent_at: None,
+            resolved_at: None,
+            detail_json: json!({"methods": ["probe.controller.ping"]}),
+        },
+    ];
+    let write = AlertEvaluationWrite {
+        evaluation_id: "alert-eval-00000000-0000-4000-8000-000000000001".to_string(),
+        entries: alerts
+            .iter()
+            .cloned()
+            .map(|after| AlertEvaluationEntry {
+                before: None,
+                after,
+            })
+            .collect(),
+    };
+    StoreWriter::write_alert_evaluation(&store, &write, TEST_ACTOR)
+        .expect("write alert evaluation");
+    let audit_count = store.audit_count().expect("audit count");
+    StoreWriter::write_alert_evaluation(&store, &write, TEST_ACTOR)
+        .expect("exact alert evaluation retry");
+    assert_eq!(store.audit_count().expect("audit count"), audit_count);
+    assert_eq!(store.list_alert_events().expect("alerts"), alerts);
+    assert!(matches!(
+        StoreWriter::write_alert_evaluation(&store, &write, "different-actor"),
+        Err(StoreError::AlertEvaluationConflict { .. })
+    ));
+    let mut divergent = write.clone();
+    divergent.entries[0].after.severity = "critical".to_string();
+    assert!(matches!(
+        StoreWriter::write_alert_evaluation(&store, &divergent, TEST_ACTOR),
+        Err(StoreError::AlertEvaluationConflict { .. })
+    ));
+
+    let (actor, event, detail) = latest_job_audit(&db);
+    assert_eq!(actor, TEST_ACTOR);
+    assert_eq!(event, "alert.evaluate");
+    assert_eq!(detail["evaluated_candidates"], 2);
+    assert_eq!(detail["open_alerts"], 1);
+    assert_eq!(detail["silenced_alerts"], 1);
+}
+
+#[test]
+fn alert_evaluation_writer_rolls_back_every_row_when_audit_fails() {
+    let (_dir, store, db) = open_temp_store();
+    inject_job_audit_failure(&db, "alert.evaluate");
+    let write = AlertEvaluationWrite {
+        evaluation_id: "alert-eval-00000000-0000-4000-8000-000000000002".to_string(),
+        entries: vec![AlertEvaluationEntry {
+            before: None,
+            after: AlertEventRecord {
+                alert_id: "alert-eval-rollback".to_string(),
+                dedupe_key: "node:health-rollback:stale".to_string(),
+                node_id: Some("health-rollback".to_string()),
+                severity: "warning".to_string(),
+                state: "open".to_string(),
+                reason_code: "NODE_STALE".to_string(),
+                first_seen_at: "2026-07-11T01:00:00Z".to_string(),
+                last_seen_at: "2026-07-11T01:00:00Z".to_string(),
+                last_sent_at: None,
+                resolved_at: None,
+                detail_json: json!({"methods": []}),
+            },
+        }],
+    };
+    assert_injected_job_audit_failure(StoreWriter::write_alert_evaluation(
+        &store, &write, TEST_ACTOR,
+    ));
+    assert!(store.list_alert_events().expect("alerts").is_empty());
+}
+
+#[test]
+fn alert_evaluation_writer_rejects_stale_candidate_state() {
+    let (_dir, store, _db) = open_temp_store();
+    let before = AlertEventRecord {
+        alert_id: "alert-eval-stale".to_string(),
+        dedupe_key: "node:health-stale:stale".to_string(),
+        node_id: Some("health-stale".to_string()),
+        severity: "warning".to_string(),
+        state: "open".to_string(),
+        reason_code: "NODE_STALE".to_string(),
+        first_seen_at: "2026-07-11T01:00:00Z".to_string(),
+        last_seen_at: "2026-07-11T01:00:00Z".to_string(),
+        last_sent_at: None,
+        resolved_at: None,
+        detail_json: json!({"methods": []}),
+    };
+    store.upsert_alert_event(&before).expect("seed alert");
+    let mut after = before.clone();
+    after.last_seen_at = "2026-07-11T01:01:00Z".to_string();
+    let mut concurrently_silenced = before.clone();
+    concurrently_silenced.state = "silenced".to_string();
+    concurrently_silenced.detail_json = json!({
+        "methods": [],
+        "silenced_until": "2026-07-11T02:00:00Z"
+    });
+    store
+        .upsert_alert_event(&concurrently_silenced)
+        .expect("concurrent silence");
+    let audit_count = store.audit_count().expect("audit count");
+
+    let result = StoreWriter::write_alert_evaluation(
+        &store,
+        &AlertEvaluationWrite {
+            evaluation_id: "alert-eval-00000000-0000-4000-8000-000000000003".to_string(),
+            entries: vec![AlertEvaluationEntry {
+                before: Some(before),
+                after,
+            }],
+        },
+        TEST_ACTOR,
+    );
+
+    assert!(matches!(
+        result,
+        Err(StoreError::AlertEvaluationConflict { .. })
+    ));
+    assert_eq!(store.audit_count().expect("audit count"), audit_count);
+    assert_eq!(
+        store.list_alert_events().expect("alerts"),
+        vec![concurrently_silenced]
+    );
 }
 
 #[test]

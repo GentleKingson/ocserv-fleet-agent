@@ -52,6 +52,11 @@
   actor-bearing `StoreWriter` transactions. Stable `retention-<uuid>` operation
   IDs make exact applies replayable without another deletion; all bounded
   batches and their audit commit together or roll back together.
+- Health summary/node evaluation now commits its bounded snapshot batch and
+  matching low-sensitive audit atomically with replay-safe evaluation IDs.
+- Alert candidate evaluation now commits its bounded candidate batch and audit
+  atomically. Per-alert before-state checks reject stale evaluations rather
+  than overwriting a concurrent silence or resolve decision.
 - Scheduler alert evaluation remains local-only and delivery remains an
   explicit CLI action.
 - API SQLite startup now validates private database/sidecar files, schema,
@@ -94,6 +99,9 @@
   apply mutators. Audit-trigger, concurrent replay, divergent replay, and
   multi-scope partial-progress tests prove every committed deletion scope has
   exactly one matching audit and no audit failure can leave unaudited deletes.
+- Extended the production mutation guard to cover health policy/snapshot and
+  alert-evaluation writers. Audit-trigger and stale-before tests prove batch
+  rollback, exact retry, actor binding, and concurrent decision preservation.
 - Added audit-insert failure coverage proving scheduler job add, enable, and
   disable roll back their `observability_jobs` changes instead of committing
   without audit. Scheduler audit before/after projections use only fixed job
@@ -131,9 +139,10 @@
 - The collector normalizes operator-supplied aggregate metadata; it does not
   discover live ocserv state or call administration/log/service tools.
 - SQLite is the only runtime backend; Postgres always returns unavailable.
-- Health/alert/delivery and other remaining legacy controller
+- Alert operator actions, delivery, and other remaining legacy controller
   mutations have not yet all moved to atomic `StoreWriter` actor/audit
-  transactions. Recovery of incomplete scheduler `running` rows remains A3
+  transactions. Health snapshots and alert candidate evaluation are migrated;
+  recovery of incomplete scheduler `running` rows remains A3
   scheduler-reliability work.
 - Legacy approved-unbound enrollment rows require an explicit exact `enroll
   claim`; there is intentionally no automatic discovery or repair.

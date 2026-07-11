@@ -327,6 +327,36 @@ async fn alerts_route_fails_closed_for_contaminated_versioned_detail() {
 }
 
 #[tokio::test]
+async fn audit_route_fails_closed_for_contaminated_versioned_detail() {
+    let fixture = Fixture::new();
+    let conn = Connection::open(&fixture.database).expect("open fixture");
+    let raw: String = conn
+        .query_row(
+            "SELECT detail_json FROM controller_audit_log WHERE event = 'test.event'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("load audit detail");
+    let mut detail: Value = serde_json::from_str(&raw).expect("parse audit detail");
+    detail["_audit"]["client_address"] = json!("10.0.0.2");
+    conn.execute(
+        "UPDATE controller_audit_log SET detail_json = ?1 WHERE event = 'test.event'",
+        [detail.to_string()],
+    )
+    .expect("contaminate audit detail");
+
+    let (status, _, body) = raw_request(
+        fixture.router(None),
+        Method::GET,
+        "/audit/export?from=2026-07-09T00:00:00Z&to=2026-07-10T00:00:00Z&max_rows=10",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(!body.contains("10.0.0.2"));
+}
+
+#[tokio::test]
 async fn forbidden_methods_do_not_write() {
     let fixture = Fixture::new();
     let before = table_counts(&fixture.database);
@@ -707,13 +737,12 @@ async fn redaction_removes_forbidden_observation_and_audit_fields() {
     )
     .await;
     let audit_text = serde_json::to_string(&audit).expect("json");
-    assert!(!audit_text.contains("super-secret"));
-    assert!(!audit_text.contains("Bearer abc"));
-    assert!(!audit_text.contains("BEGIN CERTIFICATE"));
-    assert!(!audit_text.contains("raw_config"));
-    assert!(!audit_text.contains(&"x".repeat(300)));
+    assert!(!audit_text.contains("_audit"));
     assert!(audit_text.contains("sha256:"));
-    assert_eq!(audit["items"][0]["detail"]["token"], "<redacted>");
+    assert_eq!(
+        audit["items"][0]["detail"]["result_class"],
+        "controller_rpc_summary"
+    );
 }
 
 #[tokio::test]
@@ -1124,22 +1153,4 @@ fn seed_database(path: &Path) {
     });
     store.insert_audit(&event).expect("insert audit");
     drop(store);
-
-    // Model externally polluted audit data so projection is tested independently
-    // from the controller's write-time validation.
-    let conn = Connection::open(path).expect("open db for pollution fixture");
-    conn.execute(
-        "UPDATE controller_audit_log SET detail_json = ?1 WHERE event = 'test.event'",
-        [json!({
-            "token": "super-secret",
-            "authorization": "Bearer abc",
-            "node_id": "node-a",
-            "result_class": "controller_rpc_summary",
-            "raw_config": "listen-host = 0.0.0.0",
-            "note": "-----BEGIN CERTIFICATE----- data",
-            "oversized": "x".repeat(300)
-        })
-        .to_string()],
-    )
-    .expect("pollute audit detail");
 }

@@ -106,6 +106,12 @@ delivery-attempt detail payload bound to every relational attempt field. The
 table is rebuilt with its foreign keys and index; readers reject envelope or
 relational contamination before returning delivery history.
 
+The tenth A2 slice advances SQLite to schema version 18 and closes controller
+audit detail storage over a typed, bounded field vocabulary bound to every
+relational audit column. The table is rebuilt with required versioned detail;
+controller and independent API readers reject contamination and expose only the
+validated public fields.
+
 The first production-hardening slice added node add/enable/disable/remove to this
 contract and removed the CLI's post-commit success audits. Audit-trigger failure
 tests prove both `nodes` and `endpoint_trust` changes roll back. The second slice

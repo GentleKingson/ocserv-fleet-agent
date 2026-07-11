@@ -11,11 +11,12 @@ use time::{OffsetDateTime, macros::format_description};
 
 use crate::private_file::{self, PrivateFileError};
 use crate::storage_payloads::{
-    AlertDetailPayloadV1, AlertHostAllowPayloadV1, DeliveryAttemptDetailPayloadV1,
-    EnrollmentMetadataKindV1, EnrollmentMetadataPayloadV1, HEALTH_SUMMARY_SCHEMA_V1,
-    HealthDegradedMethodsPayloadV1, HealthSummaryPayloadV1, ObservationSummaryPayloadV1,
-    RunSummaryPayloadV1, SchedulerPairPayloadV1, SchedulerSelectorPayloadV1, TrustBundlePayloadV1,
-    validate_health_payload_relationship, validate_scheduler_payload_relationship,
+    AlertDetailPayloadV1, AlertHostAllowPayloadV1, AuditDetailPayloadV1,
+    DeliveryAttemptDetailPayloadV1, EnrollmentMetadataKindV1, EnrollmentMetadataPayloadV1,
+    HEALTH_SUMMARY_SCHEMA_V1, HealthDegradedMethodsPayloadV1, HealthSummaryPayloadV1,
+    ObservationSummaryPayloadV1, RunSummaryPayloadV1, SchedulerPairPayloadV1,
+    SchedulerSelectorPayloadV1, TrustBundlePayloadV1, validate_health_payload_relationship,
+    validate_scheduler_payload_relationship,
 };
 use crate::store::{CURRENT_SCHEMA_VERSION, StoreError};
 
@@ -135,6 +136,12 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         name: "0017_versioned_delivery_attempt_details",
         description: "Add closed versioned delivery-attempt detail payloads.",
         apply: apply_0017_versioned_delivery_attempt_details,
+    },
+    Migration {
+        version: 18,
+        name: "0018_versioned_audit_details",
+        description: "Migrate controller audit details to closed versioned v1 payloads.",
+        apply: apply_0018_versioned_audit_details,
     },
 ];
 
@@ -1216,6 +1223,143 @@ CREATE INDEX idx_alert_delivery_attempts_alert_hook
   ON alert_delivery_attempts(alert_id, hook_id, attempted_at);
 "#,
     )?;
+    Ok(())
+}
+
+fn apply_0018_versioned_audit_details(tx: &Transaction<'_>) -> Result<(), StoreError> {
+    type LegacyAuditRow = (
+        i64,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+    );
+    let rows = {
+        let mut stmt = tx.prepare(
+            "SELECT id, ts, actor, event, node_id, endpoint_id, method, request_id, params_hash, ok, error_code, duration_ms, detail_json FROM controller_audit_log ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+                row.get(8)?,
+                row.get(9)?,
+                row.get(10)?,
+                row.get(11)?,
+                row.get(12)?,
+            ))
+        })?;
+        rows.collect::<Result<Vec<LegacyAuditRow>, _>>()?
+    };
+    tx.execute_batch(
+        r#"
+ALTER TABLE controller_audit_log RENAME TO controller_audit_log_legacy_v17;
+CREATE TABLE controller_audit_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts TEXT NOT NULL,
+  actor TEXT NOT NULL,
+  event TEXT NOT NULL,
+  node_id TEXT,
+  endpoint_id TEXT,
+  method TEXT,
+  request_id TEXT,
+  params_hash TEXT,
+  ok INTEGER CHECK (ok IS NULL OR ok IN (0, 1)),
+  error_code TEXT,
+  duration_ms INTEGER CHECK (duration_ms IS NULL OR duration_ms >= 0),
+  detail_json TEXT NOT NULL CHECK (json_valid(detail_json))
+);
+"#,
+    )?;
+    for (
+        id,
+        ts,
+        actor,
+        event,
+        node_id,
+        endpoint_id,
+        method,
+        request_id,
+        params_hash,
+        ok,
+        error_code,
+        duration_ms,
+        detail_json,
+    ) in rows
+    {
+        let ok = ok
+            .map(|value| match value {
+                0 => Ok(false),
+                1 => Ok(true),
+                _ => Err(StoreError::InvalidInput(
+                    "legacy audit outcome is invalid".to_string(),
+                )),
+            })
+            .transpose()?;
+        let duration = duration_ms
+            .map(|value| {
+                u64::try_from(value).map_err(|_| {
+                    StoreError::InvalidInput("legacy audit duration is invalid".to_string())
+                })
+            })
+            .transpose()?;
+        let detail = match detail_json {
+            Some(raw) => serde_json::from_str(&raw).map_err(|_| {
+                StoreError::InvalidInput("legacy audit detail JSON is invalid".to_string())
+            })?,
+            None => serde_json::json!({}),
+        };
+        let payload = AuditDetailPayloadV1::new(
+            ts.clone(),
+            actor.clone(),
+            event.clone(),
+            node_id.clone(),
+            endpoint_id.clone(),
+            method.clone(),
+            request_id.clone(),
+            params_hash.clone(),
+            ok,
+            error_code.clone(),
+            duration,
+            &detail,
+        )
+        .map_err(StoreError::InvalidInput)?;
+        tx.execute(
+            "INSERT INTO controller_audit_log
+             (id, ts, actor, event, node_id, endpoint_id, method, request_id, params_hash, ok, error_code, duration_ms, detail_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            rusqlite::params![
+                id,
+                ts,
+                actor,
+                event,
+                node_id,
+                endpoint_id,
+                method,
+                request_id,
+                params_hash,
+                ok.map(i64::from),
+                error_code,
+                duration_ms,
+                payload.to_value().to_string(),
+            ],
+        )?;
+    }
+    tx.execute_batch("DROP TABLE controller_audit_log_legacy_v17;")?;
     Ok(())
 }
 

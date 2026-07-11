@@ -57,6 +57,11 @@
   every relational attempt field. Migration rebuilds the table and preserves
   its index/foreign keys; writers and readers reject unknown, out-of-range,
   future-version, or relationally inconsistent data.
+- SQLite schema version 18 stores controller audit details in closed, typed
+  payloads bound to every relational audit field. Migration rebuilds the table;
+  writers and CLI/API readers reject unknown, unsafe, malformed,
+  future-version, or relationally inconsistent data without exposing the
+  storage envelope.
 - Node add, enable, disable, and remove now take an explicit resolved actor and
   commit their registry/trust change and success audit in one SQLite
   transaction through `StoreWriter`.

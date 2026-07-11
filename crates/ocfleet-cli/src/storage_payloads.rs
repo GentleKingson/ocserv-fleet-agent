@@ -21,6 +21,7 @@ pub const ALERT_DETAIL_SCHEMA_V1: &str = "ocfleet.alert.detail.v1";
 pub const ALERT_HOST_ALLOW_SCHEMA_V1: &str = "ocfleet.alert.host-allow.v1";
 pub const ENROLLMENT_METADATA_SCHEMA_V1: &str = "ocfleet.enrollment.metadata.v1";
 pub const DELIVERY_ATTEMPT_DETAIL_SCHEMA_V1: &str = "ocfleet.delivery-attempt.detail.v1";
+pub const AUDIT_DETAIL_SCHEMA_V1: &str = "ocfleet.audit.detail.v1";
 
 const HEALTH_DEGRADED_METHODS: [&str; 5] = [
     "ocserv.cert.expiry",
@@ -1074,6 +1075,422 @@ impl DeliveryAttemptDetailPayloadV1 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum AuditDetailValueV1 {
+    Null,
+    Bool(bool),
+    Number(serde_json::Number),
+    String(String),
+    Array(Vec<AuditDetailValueV1>),
+    Object(BTreeMap<String, AuditDetailValueV1>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditDetailPayloadV1 {
+    #[serde(rename = "_audit")]
+    pub record: AuditDetailRecordV1,
+    #[serde(flatten)]
+    pub fields: BTreeMap<String, AuditDetailValueV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuditDetailRecordV1 {
+    pub schema: String,
+    pub ts: String,
+    pub actor: String,
+    pub event: String,
+    pub node_id: Option<String>,
+    pub endpoint_id: Option<String>,
+    pub method: Option<String>,
+    pub request_id: Option<String>,
+    pub params_hash: Option<String>,
+    pub ok: Option<bool>,
+    pub error_code: Option<String>,
+    pub duration_ms: Option<u64>,
+}
+
+impl AuditDetailPayloadV1 {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        ts: String,
+        actor: String,
+        event: String,
+        node_id: Option<String>,
+        endpoint_id: Option<String>,
+        method: Option<String>,
+        request_id: Option<String>,
+        params_hash: Option<String>,
+        ok: Option<bool>,
+        error_code: Option<String>,
+        duration_ms: Option<u64>,
+        detail: &Value,
+    ) -> Result<Self, String> {
+        let fields = serde_json::from_value(detail.clone())
+            .map_err(|_| "audit detail must be a typed object".to_string())?;
+        let payload = Self {
+            record: AuditDetailRecordV1 {
+                schema: AUDIT_DETAIL_SCHEMA_V1.to_string(),
+                ts,
+                actor,
+                event,
+                node_id,
+                endpoint_id,
+                method,
+                request_id,
+                params_hash,
+                ok,
+                error_code,
+                duration_ms,
+            },
+            fields,
+        };
+        payload.validate()?;
+        Ok(payload)
+    }
+
+    pub fn from_value(value: &Value) -> Result<Self, String> {
+        let payload: Self = serde_json::from_value(value.clone())
+            .map_err(|_| "audit detail payload is not closed v1 data".to_string())?;
+        payload.validate()?;
+        Ok(payload)
+    }
+
+    pub fn to_value(&self) -> Value {
+        serde_json::to_value(self).expect("audit detail payload serializes")
+    }
+
+    pub fn public_detail(&self) -> Value {
+        serde_json::to_value(&self.fields).expect("audit detail fields serialize")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn validate_relationship(
+        &self,
+        ts: &str,
+        actor: &str,
+        event: &str,
+        node_id: Option<&str>,
+        endpoint_id: Option<&str>,
+        method: Option<&str>,
+        request_id: Option<&str>,
+        params_hash: Option<&str>,
+        ok: Option<bool>,
+        error_code: Option<&str>,
+        duration_ms: Option<u64>,
+    ) -> Result<(), String> {
+        if self.record.ts != ts
+            || self.record.actor != actor
+            || self.record.event != event
+            || self.record.node_id.as_deref() != node_id
+            || self.record.endpoint_id.as_deref() != endpoint_id
+            || self.record.method.as_deref() != method
+            || self.record.request_id.as_deref() != request_id
+            || self.record.params_hash.as_deref() != params_hash
+            || self.record.ok != ok
+            || self.record.error_code.as_deref() != error_code
+            || self.record.duration_ms != duration_ms
+        {
+            return Err("audit detail payload does not match its relational record".to_string());
+        }
+        Ok(())
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.record.schema != AUDIT_DETAIL_SCHEMA_V1 {
+            return Err("audit detail payload schema is unsupported".to_string());
+        }
+        validate_audit_payload_text(&self.record.ts, 64, "audit timestamp")?;
+        OffsetDateTime::parse(&self.record.ts, &Rfc3339)
+            .map_err(|_| "audit timestamp must be RFC3339".to_string())?;
+        validate_audit_payload_text(&self.record.actor, 128, "audit actor")?;
+        validate_audit_payload_text(&self.record.event, 128, "audit event")?;
+        for (value, field) in [
+            (self.record.node_id.as_deref(), "audit node ID"),
+            (self.record.endpoint_id.as_deref(), "audit endpoint ID"),
+            (self.record.method.as_deref(), "audit method"),
+            (self.record.request_id.as_deref(), "audit request ID"),
+            (self.record.params_hash.as_deref(), "audit params hash"),
+            (self.record.error_code.as_deref(), "audit error code"),
+        ] {
+            if let Some(value) = value {
+                validate_audit_payload_text(value, 128, field)?;
+            }
+        }
+        if self
+            .record
+            .duration_ms
+            .is_some_and(|value| value > i64::MAX as u64)
+        {
+            return Err("audit duration exceeds i64".to_string());
+        }
+        if self.fields.len() > 128 {
+            return Err("audit detail has too many top-level fields".to_string());
+        }
+        if let Some(key) = self
+            .fields
+            .keys()
+            .find(|key| !is_known_audit_detail_key(key))
+        {
+            return Err(format!(
+                "audit detail contains unknown top-level field {key}"
+            ));
+        }
+        crate::store::validate_low_sensitive_json(&self.to_value(), "audit detail payload")
+            .map_err(|error| error.to_string())
+    }
+}
+
+fn validate_audit_payload_text(value: &str, max: usize, field: &str) -> Result<(), String> {
+    if value.is_empty()
+        || value.len() > max
+        || value
+            .bytes()
+            .any(|byte| !byte.is_ascii() || byte.is_ascii_control())
+    {
+        return Err(format!("{field} is not bounded ASCII text"));
+    }
+    Ok(())
+}
+
+fn is_known_audit_detail_key(key: &str) -> bool {
+    matches!(
+        key,
+        "action"
+            | "active_endpoint"
+            | "actor_type"
+            | "after"
+            | "after_state"
+            | "agent_controllers"
+            | "agent_path_probes"
+            | "agent_peers"
+            | "alert_count"
+            | "alert_created_or_updated_count"
+            | "alert_evaluation"
+            | "alert_evaluation_error_code"
+            | "alert_evaluation_error_message"
+            | "alert_evaluation_ok"
+            | "alert_evaluated_candidates"
+            | "alert_events"
+            | "alert_events_upserted"
+            | "alert_id"
+            | "alert_open_alerts"
+            | "alert_silenced_alerts"
+            | "algorithm"
+            | "assigned_endpoint_id"
+            | "attempt_id"
+            | "attempt_no"
+            | "attempted_at"
+            | "authoritative_policy"
+            | "batch_count"
+            | "batch_size"
+            | "before"
+            | "before_state"
+            | "bytes_sent"
+            | "bytes_written"
+            | "cert_count"
+            | "cert_critical_days"
+            | "cert_warning_days"
+            | "checksum"
+            | "code"
+            | "computed_at"
+            | "content_sha256"
+            | "correlation_id"
+            | "created_at"
+            | "created_database"
+            | "created_identity_file"
+            | "created_or_updated_count"
+            | "cutoff"
+            | "dedupe_key"
+            | "degraded_methods"
+            | "deleted_count"
+            | "description_present"
+            | "detail"
+            | "diff_count"
+            | "diffs"
+            | "disabled"
+            | "disabled_node_count"
+            | "dry_run"
+            | "due_jobs"
+            | "duration_ms"
+            | "enabled"
+            | "enabled_jobs"
+            | "enabled_node_count"
+            | "endpoint"
+            | "endpoint_filter"
+            | "endpoint_host"
+            | "endpoint_id"
+            | "endpoint_status"
+            | "endpoint_trust_state"
+            | "endpoint_url_redacted"
+            | "entries"
+            | "error"
+            | "error_code"
+            | "evaluated_candidates"
+            | "executed_jobs"
+            | "expires_at"
+            | "failed_observation_count"
+            | "failed_observations"
+            | "fingerprint_present"
+            | "finished_at"
+            | "first_seen_at"
+            | "freshness_seconds"
+            | "from"
+            | "generation"
+            | "groups"
+            | "health_score"
+            | "hmac_key_id"
+            | "hook_id"
+            | "hook_type"
+            | "host_allow"
+            | "http_status_class"
+            | "id"
+            | "ignored"
+            | "interval_seconds"
+            | "issuance"
+            | "jitter_seconds"
+            | "job"
+            | "job_count"
+            | "job_id"
+            | "jobs"
+            | "join_request"
+            | "kind"
+            | "label_count"
+            | "last_error_code"
+            | "last_failure_at"
+            | "last_run_at"
+            | "last_run_job_id"
+            | "last_seen_at"
+            | "last_sent_at"
+            | "last_success_at"
+            | "last_observation"
+            | "limit"
+            | "matched_count"
+            | "max_age_days"
+            | "max_attempts"
+            | "max_concurrency"
+            | "max_rows"
+            | "max_uses"
+            | "message"
+            | "method"
+            | "name"
+            | "new_endpoint"
+            | "new_endpoint_id"
+            | "new_value"
+            | "newest_candidate"
+            | "next_run_at"
+            | "no_config_generated"
+            | "no_forwarding"
+            | "no_probe_executed"
+            | "no_route_discovery"
+            | "node"
+            | "node_count"
+            | "node_filter"
+            | "node_id"
+            | "nodes"
+            | "observation_count"
+            | "observation_id"
+            | "observations"
+            | "observed_at"
+            | "ok"
+            | "old_endpoint"
+            | "old_value"
+            | "oldest_candidate"
+            | "open_alerts"
+            | "output_path_hash"
+            | "params_hash"
+            | "peer_request_id"
+            | "planned_delete_count"
+            | "policy_class"
+            | "previous_endpoint_id"
+            | "reason"
+            | "reason_code"
+            | "record_count"
+            | "records"
+            | "redaction_mode"
+            | "region"
+            | "registered_node_count"
+            | "registry"
+            | "registry_authorizes_probe"
+            | "registry_endpoint"
+            | "registry_potential_pair_count"
+            | "report_checksum"
+            | "request_id"
+            | "requested_cutoff"
+            | "requested_endpoint_id_present"
+            | "requested_label_count"
+            | "required_source_policy"
+            | "required_target_policy"
+            | "resolved_at"
+            | "result"
+            | "result_class"
+            | "role"
+            | "rotated_to"
+            | "root_request_id"
+            | "row_count"
+            | "rows_deleted"
+            | "rpc_methods"
+            | "run"
+            | "run_count"
+            | "run_id"
+            | "run_ids"
+            | "runs"
+            | "schema"
+            | "schema_version"
+            | "scope"
+            | "scope_count"
+            | "selector"
+            | "selector_class"
+            | "sessions"
+            | "severity"
+            | "signature_algorithm"
+            | "signature_public_key_fingerprint"
+            | "signed_at"
+            | "signed_file"
+            | "silenced_alerts"
+            | "since"
+            | "skipped_jobs"
+            | "skipped_tasks"
+            | "snapshots"
+            | "source"
+            | "source_endpoint_id"
+            | "source_node_id"
+            | "source_status"
+            | "stale_window_seconds"
+            | "started_at"
+            | "state"
+            | "status"
+            | "status_counts"
+            | "summary"
+            | "summary_json"
+            | "supported_probe_methods"
+            | "target_agent_endpoint_id"
+            | "target_count"
+            | "target_endpoint_id"
+            | "target_endpoint_status"
+            | "target_endpoint_trust_state"
+            | "target_id"
+            | "target_node_id"
+            | "target_status"
+            | "target_type"
+            | "tick_seconds"
+            | "timeout_ms"
+            | "to"
+            | "token_id"
+            | "topology_discovery"
+            | "total"
+            | "triggered_by"
+            | "ts"
+            | "unreachable_consecutive_failures"
+            | "updated_alerts"
+            | "updated_at"
+            | "upserted_alerts"
+            | "used_count"
+            | "valid"
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ObservationSummaryPayloadV1 {
     pub schema: String,
@@ -1324,8 +1741,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ALERT_DETAIL_SCHEMA_V1, ALERT_HOST_ALLOW_SCHEMA_V1, AlertDetailPayloadV1,
-        AlertHostAllowPayloadV1, DELIVERY_ATTEMPT_DETAIL_SCHEMA_V1, DeliveryAttemptDetailPayloadV1,
+        ALERT_DETAIL_SCHEMA_V1, ALERT_HOST_ALLOW_SCHEMA_V1, AUDIT_DETAIL_SCHEMA_V1,
+        AlertDetailPayloadV1, AlertHostAllowPayloadV1, AuditDetailPayloadV1,
+        DELIVERY_ATTEMPT_DETAIL_SCHEMA_V1, DeliveryAttemptDetailPayloadV1,
         ENROLLMENT_METADATA_SCHEMA_V1, EnrollmentMetadataKindV1, EnrollmentMetadataPayloadV1,
         HEALTH_DEGRADED_METHODS_SCHEMA_V1, HEALTH_SUMMARY_SCHEMA_V1,
         HealthDegradedMethodsPayloadV1, HealthSummaryPayloadV1, OBSERVATION_SUMMARY_SCHEMA_V1,
@@ -1804,6 +2222,73 @@ mod tests {
                 0,
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn audit_detail_payload_is_closed_typed_and_relationally_complete() {
+        let payload = AuditDetailPayloadV1::new(
+            "2026-07-11T00:00:00Z".to_string(),
+            "operator".to_string(),
+            "node.list".to_string(),
+            None,
+            None,
+            None,
+            Some("request-a".to_string()),
+            None,
+            Some(true),
+            None,
+            Some(4),
+            &json!({"node_count": 2, "message": "safe summary"}),
+        )
+        .expect("valid audit detail");
+        assert_eq!(payload.record.schema, AUDIT_DETAIL_SCHEMA_V1);
+        assert_eq!(payload.public_detail()["node_count"], 2);
+        let value = payload.to_value();
+        assert_eq!(value["_audit"]["event"], "node.list");
+        assert_eq!(value["message"], "safe summary");
+        assert_eq!(
+            AuditDetailPayloadV1::from_value(&value).expect("round trip"),
+            payload
+        );
+        payload
+            .validate_relationship(
+                "2026-07-11T00:00:00Z",
+                "operator",
+                "node.list",
+                None,
+                None,
+                None,
+                Some("request-a"),
+                None,
+                Some(true),
+                None,
+                Some(4),
+            )
+            .expect("matching relationship");
+
+        let mut unknown_envelope = value.clone();
+        unknown_envelope["_audit"]["future"] = json!(true);
+        assert!(AuditDetailPayloadV1::from_value(&unknown_envelope).is_err());
+        let mut unknown_detail = value;
+        unknown_detail["future"] = json!(true);
+        assert!(AuditDetailPayloadV1::from_value(&unknown_detail).is_err());
+        assert!(
+            payload
+                .validate_relationship(
+                    "2026-07-11T00:00:00Z",
+                    "operator",
+                    "node.show",
+                    None,
+                    None,
+                    None,
+                    Some("request-a"),
+                    None,
+                    Some(true),
+                    None,
+                    Some(4),
+                )
+                .is_err()
         );
     }
 }

@@ -202,6 +202,14 @@ rebuilds the table and recreates its index and foreign keys; writers and readers
 reject unknown, malformed, future-version, out-of-range, or mismatched data.
 Published for review in pull request `#77`.
 
+The tenth A2 slice advances SQLite to migration `0018` and stores controller
+audit detail in a closed, recursively typed, bounded payload. Its `_audit`
+record is bound to every relational audit column, while a finite top-level
+detail vocabulary rejects unknown legacy data. Migration rebuilds the table;
+writers and controller/API readers fail closed on unsafe, malformed,
+future-version, or mismatched data and never expose the storage envelope.
+Published for review in pull request `#78`.
+
 ### Baseline And Production Foundation
 
 | ID | Issue | Status | Depends on | Release target | Acceptance and required evidence |

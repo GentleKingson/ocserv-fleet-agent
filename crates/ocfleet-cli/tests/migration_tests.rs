@@ -834,6 +834,46 @@ fn migration_tests_delivery_attempt_detail_v1_migrates_or_fails_closed() {
     assert_eq!(backup_files(bad_dir.path()).len(), 1);
 }
 
+#[test]
+fn migration_tests_audit_detail_v1_migrates_or_fails_closed() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("controller.sqlite");
+    create_legacy_fixture(&db, 17, 1);
+    let store = Store::open(&db).expect("migrate v17 audit detail");
+    let records = store
+        .list_audit_window("2026-07-08T00:00:00Z", "2026-07-10T00:00:00Z", 10)
+        .expect("read migrated audit");
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].event, "node.add");
+    assert_eq!(records[0].detail_json, serde_json::json!({}));
+    drop(store);
+    let conn = Connection::open(&db).expect("open migrated db");
+    let raw: String = conn
+        .query_row(
+            "SELECT detail_json FROM controller_audit_log WHERE event = 'node.add'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read typed audit detail");
+    let raw: serde_json::Value = serde_json::from_str(&raw).expect("audit detail JSON");
+    assert_eq!(raw["_audit"]["schema"], "ocfleet.audit.detail.v1");
+    assert_eq!(raw["_audit"]["event"], "node.add");
+
+    let bad_dir = tempfile::tempdir().expect("bad temp dir");
+    let bad_db = bad_dir.path().join("controller.sqlite");
+    create_legacy_fixture(&bad_db, 17, 1);
+    let conn = Connection::open(&bad_db).expect("open contaminated v17 db");
+    conn.execute(
+        "UPDATE controller_audit_log SET detail_json = ?1 WHERE event = 'node.add'",
+        [r#"{"future":true}"#],
+    )
+    .expect("contaminate audit detail");
+    drop(conn);
+    make_private_database_file(&bad_db);
+    assert!(Store::open(&bad_db).is_err());
+    assert_eq!(backup_files(bad_dir.path()).len(), 1);
+}
+
 fn insert_legacy_delivery_attempt(conn: &Connection, bytes_sent: i64) {
     conn.execute(
         "INSERT INTO alert_delivery_attempts

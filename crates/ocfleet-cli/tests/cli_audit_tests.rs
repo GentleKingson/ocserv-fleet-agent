@@ -142,9 +142,13 @@ fn node_list_writes_success_audit_with_node_count() {
     ]);
     run_ocfleet(&["--database", &database_arg, "node", "list"]);
 
-    let (event, ok, detail) = latest_audit(&database);
+    let (event, ok, mut detail) = latest_audit(&database);
     assert_eq!(event, "node.list");
     assert_eq!(ok, 1);
+    detail
+        .as_object_mut()
+        .expect("audit detail object")
+        .remove("_audit");
     assert_eq!(detail, serde_json::json!({ "node_count": 1 }));
 }
 
@@ -371,7 +375,8 @@ fn ping_unbound_endpoint_trust_fails_closed_before_key_loading() {
         "hk-ocserv-01",
     ]);
 
-    assert!(String::from_utf8_lossy(&output.stderr).contains("trust is unbound"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("trust is unbound"), "stderr={stderr}");
     assert!(!secret_key.exists());
     let audit = latest_rpc_audit(&database);
     assert_eq!(audit.error_code.as_deref(), Some("ENDPOINT_NOT_ALLOWED"));
@@ -731,7 +736,8 @@ fn probe_path_target_binding_mismatch_fails_closed_before_key_loading() {
         "target-node",
     ]);
 
-    assert!(String::from_utf8_lossy(&output.stderr).contains("trust binding mismatch"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("trust binding mismatch"), "stderr={stderr}");
     assert!(!secret_key.exists());
     let audit = latest_rpc_audit(&database);
     assert_eq!(audit.error_code.as_deref(), Some("ENDPOINT_NOT_ALLOWED"));

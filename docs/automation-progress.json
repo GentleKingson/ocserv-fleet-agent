@@ -2,11 +2,11 @@
   "baseline_commit": "b3c906a94823b4620dc1a2077a44e7160c0848b2",
   "current_phase": "A2",
   "completed_phases": ["A1"],
-  "active_branch": "codex/a2-delivery-attempt-storage",
+  "active_branch": "codex/a2-audit-detail-storage",
   "active_issue": 34,
-  "active_pr": 77,
+  "active_pr": 78,
   "last_test_result": "passed",
-  "last_updated_at": "2026-07-11T14:31:32Z",
+  "last_updated_at": "2026-07-11T15:59:25Z",
   "blockers": [],
-  "next_action": "Monitor and merge pull request #77, then implement the remaining AuditDetailV1 family on issue #34."
+  "next_action": "Monitor and merge pull request #78, then close the issue #34 typed-storage inventory."
 }

@@ -424,6 +424,8 @@ fn parses_scheduler_operability_commands() {
                         name,
                         kind,
                         interval,
+                        jitter_seconds,
+                        timeout_ms,
                         selector,
                         source_node_id,
                         target_node_id,
@@ -436,6 +438,8 @@ fn parses_scheduler_operability_commands() {
     assert_eq!(name.as_deref(), Some("HK ping"));
     assert_eq!(kind, ScheduleJobKind::ControllerPing);
     assert_eq!(interval, "5m");
+    assert_eq!(jitter_seconds, 0);
+    assert_eq!(timeout_ms, ocfleet_protocol::DEFAULT_DEADLINE_MS);
     assert_eq!(selector.as_deref(), Some("node_id=hk-ocserv-01"));
     assert_eq!(source_node_id, None);
     assert_eq!(target_node_id, None);

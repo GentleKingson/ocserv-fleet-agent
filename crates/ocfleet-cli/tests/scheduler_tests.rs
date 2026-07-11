@@ -226,6 +226,10 @@ fn scheduler_tests_schedule_job_add_and_list() {
         "controller-ping",
         "--interval",
         "60s",
+        "--jitter-seconds",
+        "10",
+        "--timeout-ms",
+        "1250",
     ]);
     let job_id = parse_job_id(&add.stdout);
 
@@ -238,6 +242,17 @@ fn scheduler_tests_schedule_job_add_and_list() {
     assert!(stdout.contains("selector=role=ocserv"));
     assert!(stdout.contains("next_run_at="));
     assert!(stdout.contains("last_run_at="));
+    let show = json_stdout(&run_ocfleet(&[
+        "--database",
+        &database_arg,
+        "schedule",
+        "job",
+        "show",
+        &job_id,
+        "--json",
+    ]));
+    assert_eq!(show["job"]["jitter_seconds"], 10);
+    assert_eq!(show["job"]["timeout_ms"], 1250);
 }
 
 #[test]
@@ -355,6 +370,39 @@ fn scheduler_tests_too_frequent_interval_rejected() {
     ]);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("between 60 and 86400"));
+}
+
+#[test]
+fn scheduler_tests_invalid_jitter_and_timeout_are_rejected() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let database_arg = database.to_string_lossy().into_owned();
+    for extra in [
+        ["--jitter-seconds", "61"],
+        ["--timeout-ms", "999"],
+        ["--timeout-ms", "30001"],
+    ] {
+        let output = run_ocfleet_failure(&[
+            "--database",
+            &database_arg,
+            "schedule",
+            "job",
+            "add",
+            "--kind",
+            "controller-ping",
+            "--interval",
+            "60s",
+            extra[0],
+            extra[1],
+        ]);
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(if extra[0].contains("jitter") {
+                "jitter-seconds"
+            } else {
+                "timeout-ms"
+            })
+        );
+    }
 }
 
 #[test]

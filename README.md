@@ -429,7 +429,9 @@ Use the Phase 12 CLI observability surface:
 target/debug/ocfleet schedule job add \
   --kind controller-ping \
   --selector node_id=hk-ocserv-01 \
-  --interval 60s
+  --interval 60s \
+  --jitter-seconds 10 \
+  --timeout-ms 5000
 
 target/debug/ocfleet schedule job add \
   --kind path-probe \
@@ -584,6 +586,8 @@ Networking must allow the controller to reach the agent through iroh using the r
   maintenance suppression without clock, selector, or trust mutation.
 - `docs/adr/ADR-scheduler-graceful-shutdown.md`: SIGINT/SIGTERM admission stop,
   in-flight drain, claim release, and restart behavior.
+- `docs/adr/ADR-scheduler-timeout-jitter.md`: bounded attempt deadlines and
+  deterministic post-run schedule spreading.
 - `docs/a2-storage-inventory.md`: A2 payload-family closure inventory and
   migration/read-boundary evidence.
 - `docs/trust-policy.md`: trust policy as code schema, validation, and diff behavior.

@@ -231,7 +231,8 @@ and partial failures do not retry; worst-case attempts are reserved from the
 per-tick budget. Schema `0020` adds an atomically audited global maintenance
 window that suppresses claims and RPC without advancing clocks. SIGINT/SIGTERM
 closes admission, drains the admitted job and claim, then supports restart with
-a fresh owner. Timeout/jitter and the remaining A3
+a fresh owner. Per-attempt timeouts produce typed audits and observations;
+deterministic bounded jitter spreads post-run clocks. The remaining A3
 acceptance matrix are still active work.
 Graceful daemon drain and restart are published in pull request `#85`.
 The schema-v20 maintenance policy is published in pull request `#84`.

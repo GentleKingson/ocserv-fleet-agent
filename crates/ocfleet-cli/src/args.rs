@@ -404,6 +404,10 @@ pub enum ScheduleJobCommand {
         kind: ScheduleJobKind,
         #[arg(long)]
         interval: String,
+        #[arg(long, default_value_t = 0)]
+        jitter_seconds: u64,
+        #[arg(long, default_value_t = ocfleet_protocol::DEFAULT_DEADLINE_MS)]
+        timeout_ms: u64,
         #[arg(long)]
         selector: Option<String>,
         #[arg(long)]

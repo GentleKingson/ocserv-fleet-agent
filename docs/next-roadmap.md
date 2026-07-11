@@ -93,12 +93,19 @@ adds aggregate-only doctor diagnostics plus a production bypass guard. It does
 not change schema, protocol, API routes, agent capabilities, or the default
 read-only boundary. Statuses describe the milestone, not just the amount of
 supporting code already in the repository. Explicit enrollment binding and its
-actor-bearing writer migration are active on branch
-`codex/a1-enrollment-binding-writers` in pull request `#62`. The active slice
-makes new approval one atomic operator-owned node/request/trust/audit transition
-and adds a strict
-manual claim for legacy approved-unbound rows. It introduces no schema,
+actor-bearing writer migration merged through pull request `#62`
+(`27b1fe56a957b0b3c79b2e5e9348090964943caf`). That slice makes new
+approval one atomic operator-owned node/request/trust/audit transition and adds
+a strict manual claim for legacy approved-unbound rows. It introduces no schema,
 protocol, API, agent-capability, or default read-only boundary change.
+Enrollment token lifecycle and request-decision transitions are active on branch
+`codex/a1-enrollment-transitions` in pull request `#63`. This slice routes token
+create/revoke and request submit/reject through actor-bearing immediate
+transactions, adds stable
+optional request IDs, serializes the final token use, closes terminal
+transitions, and keeps token/submitted-identity material out of audit and
+`Debug`. It changes no schema, protocol, API route, agent capability, or default
+read-only boundary.
 
 ### Baseline And Production Foundation
 

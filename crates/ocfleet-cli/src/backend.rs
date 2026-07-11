@@ -1,9 +1,10 @@
 use crate::audit::AuditEvent;
 use crate::store::{
-    AlertEventRecord, ApprovalInput, AuditRecord, EndpointTrustRecord, HealthPolicyRecord,
-    HealthSnapshotRecord, LegacyEnrollmentClaimInput, NodeInsert, NodeRecord,
-    ObservabilityJobRecord, ObservabilityRunRecord, ProbeObservationRecord, SchedulerOutcomeWrite,
-    SchedulerRunFinish, SchedulerRunStart, Store, StoreError,
+    AlertEventRecord, ApprovalInput, AuditRecord, EndpointTrustRecord, EnrollmentTokenInsert,
+    EnrollmentTokenRecord, HealthPolicyRecord, HealthSnapshotRecord, JoinRequestInsert,
+    JoinRequestRecord, LegacyEnrollmentClaimInput, NodeInsert, NodeRecord, ObservabilityJobRecord,
+    ObservabilityRunRecord, ProbeObservationRecord, SchedulerOutcomeWrite, SchedulerRunFinish,
+    SchedulerRunStart, Store, StoreError,
 };
 
 pub const MAX_STORE_READER_ROWS: u64 = 1_000;
@@ -76,6 +77,28 @@ pub trait StoreWriter {
         policy: &HealthPolicyRecord,
         actor: &str,
     ) -> Result<(), Self::Error>;
+    fn write_enrollment_token_create(
+        &self,
+        token: &EnrollmentTokenInsert,
+        actor: &str,
+    ) -> Result<EnrollmentTokenRecord, Self::Error>;
+    fn write_enrollment_token_revoke(
+        &self,
+        token_id: &str,
+        actor: &str,
+        reason: &str,
+    ) -> Result<EnrollmentTokenRecord, Self::Error>;
+    fn write_enrollment_request_submit(
+        &self,
+        request: &JoinRequestInsert,
+        actor: &str,
+    ) -> Result<JoinRequestRecord, Self::Error>;
+    fn write_enrollment_request_reject(
+        &self,
+        request_id: &str,
+        actor: &str,
+        reason: &str,
+    ) -> Result<JoinRequestRecord, Self::Error>;
     fn write_enrollment_approval(
         &self,
         approval: &ApprovalInput,
@@ -275,6 +298,40 @@ impl StoreWriter for Store {
         actor: &str,
     ) -> Result<(), Self::Error> {
         Store::set_health_policy(self, policy, actor)
+    }
+
+    fn write_enrollment_token_create(
+        &self,
+        token: &EnrollmentTokenInsert,
+        actor: &str,
+    ) -> Result<EnrollmentTokenRecord, Self::Error> {
+        Store::create_enrollment_token(self, token, actor)
+    }
+
+    fn write_enrollment_token_revoke(
+        &self,
+        token_id: &str,
+        actor: &str,
+        reason: &str,
+    ) -> Result<EnrollmentTokenRecord, Self::Error> {
+        Store::revoke_enrollment_token(self, token_id, actor, reason)
+    }
+
+    fn write_enrollment_request_submit(
+        &self,
+        request: &JoinRequestInsert,
+        actor: &str,
+    ) -> Result<JoinRequestRecord, Self::Error> {
+        Store::submit_join_request(self, request, actor)
+    }
+
+    fn write_enrollment_request_reject(
+        &self,
+        request_id: &str,
+        actor: &str,
+        reason: &str,
+    ) -> Result<JoinRequestRecord, Self::Error> {
+        Store::reject_join_request(self, request_id, actor, reason)
     }
 
     fn write_enrollment_approval(

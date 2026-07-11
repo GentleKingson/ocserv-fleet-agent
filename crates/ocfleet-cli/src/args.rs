@@ -181,6 +181,11 @@ pub enum EnrollTokenCommand {
         #[arg(long)]
         description: Option<String>,
     },
+    Revoke {
+        token_id: String,
+        #[arg(long)]
+        reason: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -192,6 +197,8 @@ pub enum EnrollRequestCommand {
             .args(["token", "token_file", "token_stdin"])
     ))]
     Create {
+        #[arg(long)]
+        request_id: Option<String>,
         #[arg(
             long,
             help = "Enrollment token as a command-line argument (discouraged; prefer --token-file or --token-stdin)"
@@ -211,6 +218,11 @@ pub enum EnrollRequestCommand {
         hostname: String,
         #[arg(long)]
         agent_version: String,
+    },
+    Reject {
+        join_request_id: String,
+        #[arg(long)]
+        reason: String,
     },
 }
 

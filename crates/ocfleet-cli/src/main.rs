@@ -207,9 +207,13 @@ async fn main() -> anyhow::Result<()> {
                         max_uses,
                         description,
                     } => run_enroll_token_create(&store, &ttl, max_uses, description)?,
+                    EnrollTokenCommand::Revoke { token_id, reason } => {
+                        run_enroll_token_revoke(&store, &token_id, &reason)?
+                    }
                 },
                 EnrollCommand::Request { command } => match command {
                     EnrollRequestCommand::Create {
+                        request_id,
                         token,
                         token_file,
                         token_stdin,
@@ -221,6 +225,7 @@ async fn main() -> anyhow::Result<()> {
                     } => run_enroll_request_create(
                         &store,
                         EnrollRequestCreateInput {
+                            request_id,
                             token,
                             token_file,
                             token_stdin,
@@ -231,6 +236,10 @@ async fn main() -> anyhow::Result<()> {
                             agent_version,
                         },
                     )?,
+                    EnrollRequestCommand::Reject {
+                        join_request_id,
+                        reason,
+                    } => run_enroll_request_reject(&store, &join_request_id, &reason)?,
                 },
                 EnrollCommand::Approve {
                     join_request_id,
@@ -410,11 +419,11 @@ fn run_enroll_token_create(
         .format(&Rfc3339)
         .expect("RFC3339 formatting succeeds");
     let actor = local_actor();
-    store.create_enrollment_token(
+    StoreWriter::write_enrollment_token_create(
+        store,
         &EnrollmentTokenInsert {
             token_id: token_id.clone(),
             token_hash: Store::hash_enrollment_token(&token),
-            created_by: actor.clone(),
             expires_at: expires_at.clone(),
             max_uses,
             description,
@@ -429,6 +438,15 @@ fn run_enroll_token_create(
     println!("expires_at={expires_at}");
     println!("max_uses={max_uses}");
     println!("plaintext_visible_once=true");
+    Ok(())
+}
+
+fn run_enroll_token_revoke(store: &Store, token_id: &str, reason: &str) -> anyhow::Result<()> {
+    validate_reason(reason).map_err(anyhow::Error::msg)?;
+    let token =
+        StoreWriter::write_enrollment_token_revoke(store, token_id, &local_actor(), reason)?;
+    println!("token_id={}", token.token_id);
+    println!("status={}", token.status.as_str());
     Ok(())
 }
 
@@ -515,6 +533,7 @@ fn print_enrollment_binding(approved: &ocfleet_cli::store::JoinRequestRecord, no
 }
 
 struct EnrollRequestCreateInput {
+    request_id: Option<String>,
     token: Option<String>,
     token_file: Option<PathBuf>,
     token_stdin: bool,
@@ -529,8 +548,13 @@ fn run_enroll_request_create(store: &Store, input: EnrollRequestCreateInput) -> 
     validate_hostname(&input.hostname).map_err(anyhow::Error::msg)?;
     validate_agent_version(&input.agent_version).map_err(anyhow::Error::msg)?;
     let token = resolve_enrollment_token(input.token, input.token_file, input.token_stdin)?;
-    let join = store.submit_join_request(
+    let request_id = input
+        .request_id
+        .unwrap_or_else(|| format!("join-{}", Uuid::new_v4()));
+    let join = StoreWriter::write_enrollment_request_submit(
+        store,
         &JoinRequestInsert {
+            request_id,
             token_plaintext: token,
             agent_public_key: input.agent_public_key,
             fingerprint: input.fingerprint,
@@ -539,12 +563,29 @@ fn run_enroll_request_create(store: &Store, input: EnrollRequestCreateInput) -> 
             agent_version: input.agent_version,
             requested_labels_json: json!({}),
         },
-        "agent",
+        &local_actor(),
     )?;
     println!("join_request_id={}", join.request_id);
     println!("token_id={}", join.token_id);
     println!("status={}", join.status.as_str());
     println!("hostname={}", join.hostname);
+    Ok(())
+}
+
+fn run_enroll_request_reject(
+    store: &Store,
+    join_request_id: &str,
+    reason: &str,
+) -> anyhow::Result<()> {
+    validate_reason(reason).map_err(anyhow::Error::msg)?;
+    let rejected = StoreWriter::write_enrollment_request_reject(
+        store,
+        join_request_id,
+        &local_actor(),
+        reason,
+    )?;
+    println!("join_request_id={}", rejected.request_id);
+    println!("status={}", rejected.status.as_str());
     Ok(())
 }
 

@@ -574,6 +574,23 @@ fn inject_audit_insert_failure(database: &Path) {
     .expect("install audit failure trigger");
 }
 
+fn inject_audit_event_failure(database: &Path, event: &str) {
+    assert!(matches!(
+        event,
+        "enrollment.token.reject" | "enrollment.token.expire"
+    ));
+    let conn = Connection::open(database).expect("open db for audit failure injection");
+    conn.execute_batch(&format!(
+        "CREATE TRIGGER fail_selected_controller_audit_insert
+         BEFORE INSERT ON controller_audit_log
+         WHEN NEW.event = '{event}'
+         BEGIN
+           SELECT RAISE(ABORT, 'injected selected audit insert failure');
+         END;"
+    ))
+    .expect("install selected audit failure trigger");
+}
+
 fn seed_pending_enrollment(
     store: &Store,
     token_id: &str,
@@ -585,7 +602,6 @@ fn seed_pending_enrollment(
             &EnrollmentTokenInsert {
                 token_id: token_id.to_string(),
                 token_hash: Store::hash_enrollment_token(token_plaintext),
-                created_by: "operator".to_string(),
                 expires_at: future_time(),
                 max_uses: 1,
                 description: None,
@@ -598,6 +614,7 @@ fn seed_pending_enrollment(
     store
         .submit_join_request(
             &JoinRequestInsert {
+                request_id: format!("join-{}", uuid::Uuid::new_v4()),
                 token_plaintext: token_plaintext.to_string(),
                 agent_public_key: "agent-public-key".to_string(),
                 fingerprint: "agent-fingerprint".to_string(),
@@ -620,6 +637,35 @@ fn approval_input(request_id: &str, endpoint_id: &str, node_id: &str) -> Approva
         role: "ocserv".to_string(),
         reason: "ticket-123".to_string(),
         approved_labels_json: serde_json::json!({}),
+    }
+}
+
+fn enrollment_token_input(
+    token_id: &str,
+    token_plaintext: &str,
+    expires_at: &str,
+) -> EnrollmentTokenInsert {
+    EnrollmentTokenInsert {
+        token_id: token_id.to_string(),
+        token_hash: Store::hash_enrollment_token(token_plaintext),
+        expires_at: expires_at.to_string(),
+        max_uses: 1,
+        description: Some("operator enrollment".to_string()),
+        labels_json: serde_json::json!({}),
+        scope_json: serde_json::json!({}),
+    }
+}
+
+fn join_request_input(request_id: &str, token_plaintext: &str) -> JoinRequestInsert {
+    JoinRequestInsert {
+        request_id: request_id.to_string(),
+        token_plaintext: token_plaintext.to_string(),
+        agent_public_key: "agent-public-key".to_string(),
+        fingerprint: "agent-fingerprint".to_string(),
+        requested_endpoint_id: None,
+        hostname: "agent-supplied.example".to_string(),
+        agent_version: "0.2.0".to_string(),
+        requested_labels_json: serde_json::json!({}),
     }
 }
 
@@ -686,7 +732,6 @@ fn enrollment_token_is_hash_only_and_use_creates_pending_join_request() {
             &EnrollmentTokenInsert {
                 token_id: "tok-1".to_string(),
                 token_hash: token_hash.clone(),
-                created_by: "operator".to_string(),
                 expires_at: future_time(),
                 max_uses: 1,
                 description: Some("prod node onboarding".to_string()),
@@ -709,6 +754,7 @@ fn enrollment_token_is_hash_only_and_use_creates_pending_join_request() {
     let join = store
         .submit_join_request(
             &JoinRequestInsert {
+                request_id: format!("join-{}", uuid::Uuid::new_v4()),
                 token_plaintext: token_plaintext.to_string(),
                 agent_public_key: "agent-public-key".to_string(),
                 fingerprint: "agent-fingerprint".to_string(),
@@ -744,7 +790,6 @@ fn enrollment_token_rejects_expired_or_overused_tokens_and_audits_rejection() {
             &EnrollmentTokenInsert {
                 token_id: "tok-1".to_string(),
                 token_hash: Store::hash_enrollment_token(token_plaintext),
-                created_by: "operator".to_string(),
                 expires_at: future_time(),
                 max_uses: 1,
                 description: None,
@@ -757,6 +802,7 @@ fn enrollment_token_rejects_expired_or_overused_tokens_and_audits_rejection() {
     store
         .submit_join_request(
             &JoinRequestInsert {
+                request_id: format!("join-{}", uuid::Uuid::new_v4()),
                 token_plaintext: token_plaintext.to_string(),
                 agent_public_key: "agent-public-key".to_string(),
                 fingerprint: "agent-fingerprint".to_string(),
@@ -771,6 +817,7 @@ fn enrollment_token_rejects_expired_or_overused_tokens_and_audits_rejection() {
 
     let second_use = store.submit_join_request(
         &JoinRequestInsert {
+            request_id: format!("join-{}", uuid::Uuid::new_v4()),
             token_plaintext: token_plaintext.to_string(),
             agent_public_key: "agent-public-key-2".to_string(),
             fingerprint: "agent-fingerprint-2".to_string(),
@@ -792,7 +839,6 @@ fn enrollment_token_rejects_expired_or_overused_tokens_and_audits_rejection() {
             &EnrollmentTokenInsert {
                 token_id: "tok-expired".to_string(),
                 token_hash: Store::hash_enrollment_token("expired-token"),
-                created_by: "operator".to_string(),
                 expires_at: past_time(),
                 max_uses: 1,
                 description: None,
@@ -805,6 +851,7 @@ fn enrollment_token_rejects_expired_or_overused_tokens_and_audits_rejection() {
 
     let expired = store.submit_join_request(
         &JoinRequestInsert {
+            request_id: format!("join-{}", uuid::Uuid::new_v4()),
             token_plaintext: "expired-token".to_string(),
             agent_public_key: "agent-public-key-3".to_string(),
             fingerprint: "agent-fingerprint-3".to_string(),
@@ -819,6 +866,503 @@ fn enrollment_token_rejects_expired_or_overused_tokens_and_audits_rejection() {
 }
 
 #[test]
+fn enrollment_token_create_is_actor_owned_idempotent_and_low_sensitive() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("controller.sqlite");
+    let store = Store::open(&db).expect("store opens");
+    let input = enrollment_token_input(
+        "tok-create-idempotent",
+        "private-token-value",
+        &future_time(),
+    );
+
+    let first = StoreWriter::write_enrollment_token_create(&store, &input, "issuing-operator")
+        .expect("create token");
+    for debug in [format!("{input:?}"), format!("{first:?}")] {
+        assert!(!debug.contains("private-token-value"));
+        assert!(!debug.contains(&input.token_hash));
+    }
+    let retry = StoreWriter::write_enrollment_token_create(&store, &input, "issuing-operator")
+        .expect("exact token create retry");
+    assert_eq!(retry, first);
+    assert_eq!(first.created_by, "issuing-operator");
+    assert_eq!(audit_event_count(&db, "enrollment.token.create"), 1);
+
+    let different_actor =
+        StoreWriter::write_enrollment_token_create(&store, &input, "different-operator")
+            .expect_err("a different actor cannot adopt an issued token id");
+    assert!(matches!(
+        different_actor,
+        StoreError::EnrollmentTokenConflict { .. }
+    ));
+
+    let (event, detail) = latest_audit_event(&db);
+    assert_eq!(event, "enrollment.token.create");
+    let detail_text = detail.to_string();
+    assert!(!detail_text.contains("private-token-value"));
+    assert!(!detail_text.contains(&input.token_hash));
+    assert_eq!(detail["after"]["status"], "active");
+    assert_eq!(detail["after"]["used_count"], 0);
+}
+
+#[test]
+fn enrollment_writer_boundaries_reject_invalid_ids_hashes_counts_and_plaintext() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("controller.sqlite");
+    let store = Store::open(&db).expect("store opens");
+
+    for (token_id, token_hash, max_uses) in [
+        ("invalid/id", Store::hash_enrollment_token("value"), 1),
+        ("tok-invalid-hash", "not-a-hash".to_string(), 1),
+        ("tok-zero", Store::hash_enrollment_token("zero"), 0),
+        (
+            "tok-too-many",
+            Store::hash_enrollment_token("too-many"),
+            ocfleet_cli::store::MAX_ENROLLMENT_TOKEN_USES + 1,
+        ),
+    ] {
+        let input = EnrollmentTokenInsert {
+            token_id: token_id.to_string(),
+            token_hash,
+            expires_at: future_time(),
+            max_uses,
+            description: None,
+            labels_json: serde_json::json!({}),
+            scope_json: serde_json::json!({}),
+        };
+        assert!(matches!(
+            StoreWriter::write_enrollment_token_create(&store, &input, "operator"),
+            Err(StoreError::InvalidInput(_))
+        ));
+    }
+
+    let token = enrollment_token_input("tok-request-validation", "valid-token", &future_time());
+    StoreWriter::write_enrollment_token_create(&store, &token, "operator")
+        .expect("create valid token");
+    let invalid_id = join_request_input("not-a-join-uuid", "valid-token");
+    assert!(matches!(
+        StoreWriter::write_enrollment_request_submit(&store, &invalid_id, "operator"),
+        Err(StoreError::InvalidInput(_))
+    ));
+    let request_id = format!("join-{}", uuid::Uuid::new_v4());
+    let mut invalid_plaintext = join_request_input(&request_id, "valid-token");
+    invalid_plaintext.token_plaintext = "value with whitespace".to_string();
+    assert!(matches!(
+        StoreWriter::write_enrollment_request_submit(&store, &invalid_plaintext, "operator"),
+        Err(StoreError::InvalidInput(_))
+    ));
+    assert_eq!(
+        store
+            .get_enrollment_token("tok-request-validation")
+            .expect("load token")
+            .expect("token exists")
+            .used_count,
+        0
+    );
+}
+
+#[test]
+fn enrollment_token_create_and_revoke_roll_back_when_audit_fails() {
+    let create_dir = tempfile::tempdir().expect("temp dir");
+    let create_db = create_dir.path().join("controller.sqlite");
+    let create_store = Store::open(&create_db).expect("store opens");
+    inject_audit_insert_failure(&create_db);
+    let create_input = enrollment_token_input(
+        "tok-create-rollback",
+        "create-rollback-value",
+        &future_time(),
+    );
+    let create_error =
+        StoreWriter::write_enrollment_token_create(&create_store, &create_input, "operator")
+            .expect_err("audit failure rejects token creation");
+    assert!(matches!(create_error, StoreError::Sqlite(_)));
+    assert!(
+        create_store
+            .get_enrollment_token("tok-create-rollback")
+            .expect("query rolled-back token")
+            .is_none()
+    );
+
+    let revoke_dir = tempfile::tempdir().expect("temp dir");
+    let revoke_db = revoke_dir.path().join("controller.sqlite");
+    let revoke_store = Store::open(&revoke_db).expect("store opens");
+    let revoke_input = enrollment_token_input(
+        "tok-revoke-rollback",
+        "revoke-rollback-value",
+        &future_time(),
+    );
+    StoreWriter::write_enrollment_token_create(&revoke_store, &revoke_input, "operator")
+        .expect("seed token");
+    inject_audit_insert_failure(&revoke_db);
+    let revoke_error = StoreWriter::write_enrollment_token_revoke(
+        &revoke_store,
+        "tok-revoke-rollback",
+        "operator",
+        "ticket-rollback",
+    )
+    .expect_err("audit failure rejects token revocation");
+    assert!(matches!(revoke_error, StoreError::Sqlite(_)));
+    assert_eq!(
+        revoke_store
+            .get_enrollment_token("tok-revoke-rollback")
+            .expect("load token after rollback")
+            .expect("token exists")
+            .status,
+        EnrollmentTokenStatus::Active
+    );
+}
+
+#[test]
+fn enrollment_token_revoke_has_closed_idempotent_transitions() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("controller.sqlite");
+    let store = Store::open(&db).expect("store opens");
+    let active = enrollment_token_input("tok-revoke", "revoke-token-value", &future_time());
+    StoreWriter::write_enrollment_token_create(&store, &active, "creator")
+        .expect("create active token");
+
+    let revoked = StoreWriter::write_enrollment_token_revoke(
+        &store,
+        "tok-revoke",
+        "revoking-operator",
+        "ticket-123",
+    )
+    .expect("revoke active token");
+    assert_eq!(revoked.status, EnrollmentTokenStatus::Revoked);
+    let revoke_audits = audit_event_count(&db, "enrollment.token.revoke");
+    let retry = StoreWriter::write_enrollment_token_revoke(
+        &store,
+        "tok-revoke",
+        "revoking-operator",
+        "ticket-123",
+    )
+    .expect("exact revoked token retry is a no-op");
+    assert_eq!(retry, revoked);
+    assert_eq!(
+        audit_event_count(&db, "enrollment.token.revoke"),
+        revoke_audits
+    );
+    assert!(matches!(
+        StoreWriter::write_enrollment_token_revoke(
+            &store,
+            "tok-revoke",
+            "different-operator",
+            "ticket-123",
+        ),
+        Err(StoreError::EnrollmentTokenConflict { .. })
+    ));
+    assert!(matches!(
+        StoreWriter::write_enrollment_token_revoke(
+            &store,
+            "tok-revoke",
+            "revoking-operator",
+            "different retry text",
+        ),
+        Err(StoreError::EnrollmentTokenConflict { .. })
+    ));
+
+    let create_retry = StoreWriter::write_enrollment_token_create(&store, &active, "creator")
+        .expect("token creation remains idempotent after later transitions");
+    assert_eq!(create_retry.status, EnrollmentTokenStatus::Revoked);
+    assert_eq!(audit_event_count(&db, "enrollment.token.create"), 1);
+
+    let expired = enrollment_token_input("tok-expired-revoke", "expired-revoke", &past_time());
+    StoreWriter::write_enrollment_token_create(&store, &expired, "creator")
+        .expect("create expired-by-time token");
+    assert!(matches!(
+        StoreWriter::write_enrollment_token_revoke(
+            &store,
+            "tok-expired-revoke",
+            "operator",
+            "late revoke",
+        ),
+        Err(StoreError::InvalidEnrollmentTokenTransition { .. })
+    ));
+    let request_id = format!("join-{}", uuid::Uuid::new_v4());
+    assert!(matches!(
+        StoreWriter::write_enrollment_request_submit(
+            &store,
+            &join_request_input(&request_id, "expired-revoke"),
+            "operator",
+        ),
+        Err(StoreError::EnrollmentRejected(_))
+    ));
+    let error = StoreWriter::write_enrollment_token_revoke(
+        &store,
+        "tok-expired-revoke",
+        "operator",
+        "late revoke",
+    )
+    .expect_err("expired token cannot transition to revoked");
+    assert!(matches!(
+        error,
+        StoreError::InvalidEnrollmentTokenTransition { .. }
+    ));
+}
+
+#[test]
+fn join_request_submission_is_idempotent_and_does_not_consume_twice() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("controller.sqlite");
+    let store = Store::open(&db).expect("store opens");
+    let token = enrollment_token_input("tok-submit-retry", "submit-retry-value", &future_time());
+    StoreWriter::write_enrollment_token_create(&store, &token, "operator").expect("create token");
+    let request_id = format!("join-{}", uuid::Uuid::new_v4());
+    let request = join_request_input(&request_id, "submit-retry-value");
+    let request_debug = format!("{request:?}");
+    for forbidden in [
+        "submit-retry-value",
+        "agent-public-key",
+        "agent-fingerprint",
+    ] {
+        assert!(!request_debug.contains(forbidden));
+    }
+
+    let first = StoreWriter::write_enrollment_request_submit(&store, &request, "request-operator")
+        .expect("submit request");
+    let response_debug = format!("{first:?}");
+    for forbidden in [
+        "agent-public-key",
+        "agent-fingerprint",
+        "agent-supplied.example",
+    ] {
+        assert!(!response_debug.contains(forbidden));
+    }
+    let retry = StoreWriter::write_enrollment_request_submit(&store, &request, "request-operator")
+        .expect("exact request retry");
+    assert_eq!(retry, first);
+    assert_eq!(audit_event_count(&db, "enrollment.token.use"), 1);
+    assert_eq!(
+        store
+            .get_enrollment_token("tok-submit-retry")
+            .expect("load token")
+            .expect("token exists")
+            .used_count,
+        1
+    );
+    assert!(matches!(
+        StoreWriter::write_enrollment_request_submit(&store, &request, "different-operator"),
+        Err(StoreError::EnrollmentRequestConflict { .. })
+    ));
+
+    let mut mismatch = request.clone();
+    mismatch.hostname = "different.example".to_string();
+    assert!(matches!(
+        StoreWriter::write_enrollment_request_submit(&store, &mismatch, "request-operator"),
+        Err(StoreError::EnrollmentRequestConflict { .. })
+    ));
+    let (_, detail) = latest_audit_event(&db);
+    let detail_text = detail.to_string();
+    assert!(!detail_text.contains("submit-retry-value"));
+    assert!(!detail_text.contains("agent-public-key"));
+    assert!(!detail_text.contains("agent-fingerprint"));
+    assert!(!detail_text.contains("agent-supplied.example"));
+}
+
+#[test]
+fn join_request_submission_serializes_the_final_token_use() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("controller.sqlite");
+    let store = Store::open(&db).expect("store opens");
+    let token = enrollment_token_input("tok-final-use", "final-use-value", &future_time());
+    StoreWriter::write_enrollment_token_create(&store, &token, "operator")
+        .expect("create single-use token");
+    drop(store);
+
+    let barrier = Arc::new(Barrier::new(2));
+    let mut handles = Vec::new();
+    for _ in 0..2 {
+        let database = db.clone();
+        let barrier = Arc::clone(&barrier);
+        handles.push(std::thread::spawn(move || {
+            let store = Store::open(&database).expect("open racing store");
+            let request_id = format!("join-{}", uuid::Uuid::new_v4());
+            let request = join_request_input(&request_id, "final-use-value");
+            barrier.wait();
+            StoreWriter::write_enrollment_request_submit(&store, &request, "operator")
+        }));
+    }
+    let results = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("racing writer joins"))
+        .collect::<Vec<_>>();
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| matches!(result, Err(StoreError::EnrollmentRejected(reason)) if reason == "max_uses_exhausted"))
+            .count(),
+        1
+    );
+
+    let store = Store::open(&db).expect("reopen store");
+    assert_eq!(
+        store
+            .get_enrollment_token("tok-final-use")
+            .expect("load token")
+            .expect("token exists")
+            .used_count,
+        1
+    );
+    assert_eq!(audit_event_count(&db, "enrollment.token.use"), 1);
+    assert_eq!(audit_event_count(&db, "enrollment.token.reject"), 1);
+}
+
+#[test]
+fn lazy_token_expiry_and_rejection_roll_back_together_on_audit_failure() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("controller.sqlite");
+    let store = Store::open(&db).expect("store opens");
+    let token = enrollment_token_input("tok-expire-rollback", "expire-rollback", &past_time());
+    StoreWriter::write_enrollment_token_create(&store, &token, "operator")
+        .expect("create expired-by-time token");
+    inject_audit_insert_failure(&db);
+    let request_id = format!("join-{}", uuid::Uuid::new_v4());
+    let error = StoreWriter::write_enrollment_request_submit(
+        &store,
+        &join_request_input(&request_id, "expire-rollback"),
+        "operator",
+    )
+    .expect_err("expiry audit failure rejects the whole transition");
+    assert!(matches!(error, StoreError::Sqlite(_)));
+    assert_eq!(
+        store
+            .get_enrollment_token("tok-expire-rollback")
+            .expect("load token")
+            .expect("token exists")
+            .status,
+        EnrollmentTokenStatus::Active
+    );
+    assert!(
+        store
+            .get_join_request(&request_id)
+            .expect("query join")
+            .is_none()
+    );
+}
+
+#[test]
+fn lazy_token_expiry_rolls_back_when_the_second_audit_fails() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("controller.sqlite");
+    let store = Store::open(&db).expect("store opens");
+    let token = enrollment_token_input(
+        "tok-expire-second-audit",
+        "expire-second-audit",
+        &past_time(),
+    );
+    StoreWriter::write_enrollment_token_create(&store, &token, "operator")
+        .expect("create expired-by-time token");
+    inject_audit_event_failure(&db, "enrollment.token.reject");
+    let request_id = format!("join-{}", uuid::Uuid::new_v4());
+    let error = StoreWriter::write_enrollment_request_submit(
+        &store,
+        &join_request_input(&request_id, "expire-second-audit"),
+        "operator",
+    )
+    .expect_err("second audit failure rejects the whole expiry transition");
+    assert!(matches!(error, StoreError::Sqlite(_)));
+    assert_eq!(
+        store
+            .get_enrollment_token("tok-expire-second-audit")
+            .expect("load token")
+            .expect("token exists")
+            .status,
+        EnrollmentTokenStatus::Active
+    );
+    assert_eq!(audit_event_count(&db, "enrollment.token.expire"), 0);
+    assert!(
+        store
+            .get_join_request(&request_id)
+            .expect("query join")
+            .is_none()
+    );
+}
+
+#[test]
+fn join_request_rejection_is_atomic_closed_and_idempotent() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("controller.sqlite");
+    let store = Store::open(&db).expect("store opens");
+    let join = seed_pending_enrollment(&store, "tok-reject-request", "reject-request-token", None);
+
+    let rejected = StoreWriter::write_enrollment_request_reject(
+        &store,
+        &join.request_id,
+        "rejecting-operator",
+        "identity mismatch",
+    )
+    .expect("reject pending request");
+    assert_eq!(rejected.status, JoinRequestStatus::Rejected);
+    assert_eq!(
+        rejected.rejection_reason.as_deref(),
+        Some("identity mismatch")
+    );
+    let rejection_audits = audit_event_count(&db, "enrollment.reject");
+    let retry = StoreWriter::write_enrollment_request_reject(
+        &store,
+        &join.request_id,
+        "rejecting-operator",
+        "identity mismatch",
+    )
+    .expect("exact rejection retry");
+    assert_eq!(retry, rejected);
+    assert_eq!(
+        audit_event_count(&db, "enrollment.reject"),
+        rejection_audits
+    );
+    assert!(matches!(
+        StoreWriter::write_enrollment_request_reject(
+            &store,
+            &join.request_id,
+            "different-operator",
+            "identity mismatch",
+        ),
+        Err(StoreError::EnrollmentRequestConflict { .. })
+    ));
+    assert!(matches!(
+        StoreWriter::write_enrollment_request_reject(
+            &store,
+            &join.request_id,
+            "operator",
+            "different reason",
+        ),
+        Err(StoreError::EnrollmentRequestConflict { .. })
+    ));
+    assert!(matches!(
+        store.approve_join_request(
+            &approval_input(&join.request_id, &generated_endpoint_id(), "rejected-node"),
+            "operator",
+        ),
+        Err(StoreError::InvalidJoinRequestStatus { .. })
+    ));
+}
+
+#[test]
+fn join_request_rejection_rolls_back_when_audit_fails() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("controller.sqlite");
+    let store = Store::open(&db).expect("store opens");
+    let join =
+        seed_pending_enrollment(&store, "tok-reject-rollback", "reject-rollback-token", None);
+    inject_audit_insert_failure(&db);
+    let error = StoreWriter::write_enrollment_request_reject(
+        &store,
+        &join.request_id,
+        "operator",
+        "ticket-rollback",
+    )
+    .expect_err("audit failure rejects request rejection");
+    assert!(matches!(error, StoreError::Sqlite(_)));
+    let unchanged = store
+        .get_join_request(&join.request_id)
+        .expect("load request")
+        .expect("request exists");
+    assert_eq!(unchanged.status, JoinRequestStatus::Pending);
+    assert!(unchanged.rejection_reason.is_none());
+}
+
+#[test]
 fn approving_join_request_creates_active_endpoint_and_audit_before_after() {
     let dir = tempfile::tempdir().expect("temp dir");
     let db = dir.path().join("controller.sqlite");
@@ -830,7 +1374,6 @@ fn approving_join_request_creates_active_endpoint_and_audit_before_after() {
             &EnrollmentTokenInsert {
                 token_id: "tok-approval".to_string(),
                 token_hash: Store::hash_enrollment_token(token_plaintext),
-                created_by: "operator".to_string(),
                 expires_at: future_time(),
                 max_uses: 1,
                 description: None,
@@ -843,6 +1386,7 @@ fn approving_join_request_creates_active_endpoint_and_audit_before_after() {
     let join = store
         .submit_join_request(
             &JoinRequestInsert {
+                request_id: format!("join-{}", uuid::Uuid::new_v4()),
                 token_plaintext: token_plaintext.to_string(),
                 agent_public_key: "agent-public-key".to_string(),
                 fingerprint: "agent-fingerprint".to_string(),
@@ -1720,7 +2264,6 @@ fn submit_join_request_validates_agent_key_fingerprint_and_requested_endpoint() 
             &EnrollmentTokenInsert {
                 token_id: "tok-validate-fields".to_string(),
                 token_hash: Store::hash_enrollment_token(token_plaintext),
-                created_by: "operator".to_string(),
                 expires_at: future_time(),
                 max_uses: 10,
                 description: None,
@@ -1749,6 +2292,7 @@ fn submit_join_request_validates_agent_key_fingerprint_and_requested_endpoint() 
         let err = store
             .submit_join_request(
                 &JoinRequestInsert {
+                    request_id: format!("join-{}", uuid::Uuid::new_v4()),
                     token_plaintext: token_plaintext.to_string(),
                     agent_public_key: agent_public_key.to_string(),
                     fingerprint: fingerprint.to_string(),
@@ -1782,7 +2326,6 @@ fn approving_join_request_requires_requested_endpoint_match_when_present() {
             &EnrollmentTokenInsert {
                 token_id: "tok-endpoint-binding".to_string(),
                 token_hash: Store::hash_enrollment_token(token_plaintext),
-                created_by: "operator".to_string(),
                 expires_at: future_time(),
                 max_uses: 1,
                 description: None,
@@ -1795,6 +2338,7 @@ fn approving_join_request_requires_requested_endpoint_match_when_present() {
     let join = store
         .submit_join_request(
             &JoinRequestInsert {
+                request_id: format!("join-{}", uuid::Uuid::new_v4()),
                 token_plaintext: token_plaintext.to_string(),
                 agent_public_key: "agent-public-key".to_string(),
                 fingerprint: "agent-fingerprint".to_string(),
@@ -1846,7 +2390,6 @@ fn approving_join_request_rejects_non_canonical_endpoint_id() {
             &EnrollmentTokenInsert {
                 token_id: "tok-invalid-endpoint".to_string(),
                 token_hash: Store::hash_enrollment_token(token_plaintext),
-                created_by: "operator".to_string(),
                 expires_at: future_time(),
                 max_uses: 1,
                 description: None,
@@ -1859,6 +2402,7 @@ fn approving_join_request_rejects_non_canonical_endpoint_id() {
     let join = store
         .submit_join_request(
             &JoinRequestInsert {
+                request_id: format!("join-{}", uuid::Uuid::new_v4()),
                 token_plaintext: token_plaintext.to_string(),
                 agent_public_key: "agent-public-key".to_string(),
                 fingerprint: "agent-fingerprint".to_string(),

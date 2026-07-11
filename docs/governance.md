@@ -63,22 +63,23 @@ bodies, raw stdout/stderr, raw logs, raw config, certificate material, usernames
 client IPs, or session IDs. Retention policies do not delete
 `controller_audit_log`; long-term audit handling is export/archive based.
 
-Current enforcement is partial and must not be overstated. Enrollment approval
-and legacy claim, node/endpoint lifecycle, scheduler job configuration, and
+Current enforcement is partial and must not be overstated. Enrollment token and
+request transitions, approval and legacy claim, node/endpoint lifecycle,
+scheduler job configuration, and
 scheduler run start/outcome/finish transitions are actor-bound `StoreWriter`
 operations audited in their SQLite transaction. Failure-injection tests prove
 that enrollment request/node/trust, endpoint lifecycle, scheduler job
 configuration, observation, RPC audit, run state, and job-clock changes roll
-back at their declared boundaries. Enrollment token/request transitions,
-health/alert/delivery, retention, and other call sites remain to migrate.
+back at their declared boundaries. Health/alert/delivery, retention, and other
+call sites remain to migrate.
 Completing those families is required before claiming fully fail-closed
 controller mutation audit. The API remains read-only while that work is
 incomplete. The governing decision is recorded in
 [ADR-atomic-audit-writes](adr/ADR-atomic-audit-writes.md).
 
-Enrollment approval/claim and endpoint lifecycle CLI calls are routed through
-`StoreWriter`. A static source guard rejects direct production calls to those
-enrollment writers, node add/enable/disable/remove, and endpoint
+Enrollment token/request/approval/claim and endpoint lifecycle CLI calls are
+routed through `StoreWriter`. A static source guard rejects direct production
+calls to those enrollment writers, node add/enable/disable/remove, and endpoint
 rotate/revoke/quarantine outside the reviewed SQLite store and backend adapter.
 This guard is a review backstop, not RBAC; the resolved actor and transactional
 audit remain the authority record.

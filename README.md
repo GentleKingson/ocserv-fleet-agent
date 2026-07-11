@@ -15,11 +15,10 @@ production-complete.
 - Governance foundation work has started: actor identity, trust policy
   validation/diff, and optional signed audit export are implemented.
 - Production hardening is active: enrollment approval/legacy claim, node
-  lifecycle, scheduler job configuration, and scheduler
+  lifecycle, enrollment token/request transitions, scheduler job configuration, and scheduler
   run/outcome/observation/job-clock writes use actor-bearing `StoreWriter`
-  transactions for state and audit. Enrollment token/request transitions,
-  health/alert/delivery, retention, and other legacy controller mutations are
-  still being migrated.
+  transactions for state and audit. Health/alert/delivery, retention, and other
+  legacy controller mutations are still being migrated.
 - Controller dispatch requires an enabled node and one Active trust row bound
   bidirectionally to that node. Active status by itself is not authorization;
   scheduler workers repeat the same binding check after concurrency waits.
@@ -229,6 +228,7 @@ target/debug/ocfleet enroll token create \
 install -m 0600 /dev/null ./enrollment.token
 # Put the plaintext token printed above into ./enrollment.token, then run:
 target/debug/ocfleet enroll request create \
+  --request-id join-<uuid> \
   --token-file ./enrollment.token \
   --agent-public-key <agent-public-key> \
   --fingerprint <agent-fingerprint> \
@@ -242,12 +242,23 @@ target/debug/ocfleet enroll approve <join-request-id> \
   --region hk \
   --role ocserv \
   --reason "ticket-123"
+
+# Alternatively, close a pending request and revoke an unused token:
+target/debug/ocfleet enroll request reject <join-request-id> \
+  --reason "identity mismatch"
+target/debug/ocfleet enroll token revoke <token-id> \
+  --reason "onboarding cancelled"
 ```
 
 Enrollment tokens only create pending join requests. Approval uses the resolved
 operator actor and explicit node metadata to insert the registry node, bound
 generation-1 trust row, request decision, and audit event in one transaction.
 It never derives controller identity from the submitted hostname or labels.
+`--request-id` is optional and defaults to a generated `join-<uuid>`. Replaying
+the exact request with the same actor neither consumes another token use nor
+writes another success audit. Token use, expiry, revocation, and request
+decisions commit with their low-sensitive audit in one transaction; divergent
+terminal retries fail closed.
 
 Rows approved by older binaries remain unbound and rejected for dispatch. Repair
 one only by naming its exact approved request and assigned EndpointID:
@@ -510,6 +521,8 @@ Networking must allow the controller to reach the agent through iroh using the r
   dependencies, acceptance gates, and completion evidence.
 - `docs/adr/ADR-atomic-audit-writes.md`: fail-closed controller mutation and
   audit transaction decision.
+- `docs/adr/ADR-enrollment-transition-atomicity.md`: enrollment token/request
+  transition, idempotency, and audit-provenance decision.
 - `docs/trust-policy.md`: trust policy as code schema, validation, and diff behavior.
 - `docs/backend.md`: SQLite contract and optional Postgres backend plan.
 - `docs/archive-export.md`: long-term history archive and signed audit export guidance.

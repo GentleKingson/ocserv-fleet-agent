@@ -828,6 +828,91 @@ fn parses_enroll_token_create_defaults_and_overrides() {
 }
 
 #[test]
+fn parses_enrollment_token_revoke_and_request_reject() {
+    let token = Cli::parse_from([
+        "ocfleet",
+        "enroll",
+        "token",
+        "revoke",
+        "tok-123",
+        "--reason",
+        "ticket-123",
+    ]);
+    let Command::Enroll {
+        command:
+            EnrollCommand::Token {
+                command: EnrollTokenCommand::Revoke { token_id, reason },
+            },
+    } = token.command
+    else {
+        panic!("expected enrollment token revoke command");
+    };
+    assert_eq!(token_id, "tok-123");
+    assert_eq!(reason, "ticket-123");
+
+    let request = Cli::parse_from([
+        "ocfleet",
+        "enroll",
+        "request",
+        "reject",
+        "join-123",
+        "--reason",
+        "identity mismatch",
+    ]);
+    let Command::Enroll {
+        command:
+            EnrollCommand::Request {
+                command:
+                    EnrollRequestCommand::Reject {
+                        join_request_id,
+                        reason,
+                    },
+            },
+    } = request.command
+    else {
+        panic!("expected enrollment request reject command");
+    };
+    assert_eq!(join_request_id, "join-123");
+    assert_eq!(reason, "identity mismatch");
+}
+
+#[test]
+fn parses_enroll_request_create_idempotency_id() {
+    let request_id = format!("join-{}", uuid::Uuid::new_v4());
+    let cli = Cli::parse_from([
+        "ocfleet",
+        "enroll",
+        "request",
+        "create",
+        "--request-id",
+        &request_id,
+        "--token",
+        "secret-token",
+        "--agent-public-key",
+        "agent-public-key",
+        "--fingerprint",
+        "agent-fingerprint",
+        "--hostname",
+        "hk-ocserv-01",
+        "--agent-version",
+        "0.2.0",
+    ]);
+    let Command::Enroll {
+        command:
+            EnrollCommand::Request {
+                command:
+                    EnrollRequestCommand::Create {
+                        request_id: parsed, ..
+                    },
+            },
+    } = cli.command
+    else {
+        panic!("expected enrollment request create command");
+    };
+    assert_eq!(parsed.as_deref(), Some(request_id.as_str()));
+}
+
+#[test]
 fn parses_enroll_approve_command() {
     let cli = Cli::parse_from([
         "ocfleet",
@@ -957,6 +1042,7 @@ fn parses_enroll_request_create_command() {
             EnrollCommand::Request {
                 command:
                     EnrollRequestCommand::Create {
+                        request_id,
                         token,
                         token_file,
                         token_stdin,
@@ -972,6 +1058,7 @@ fn parses_enroll_request_create_command() {
         panic!("expected enroll request create command");
     };
 
+    assert!(request_id.is_none());
     assert_eq!(token.as_deref(), Some("secret-token"));
     assert_eq!(token_file, None);
     assert!(!token_stdin);

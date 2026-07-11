@@ -6,7 +6,8 @@ use ocfleet_cli::storage_payloads::{
 use ocfleet_cli::store::{
     AlertDeliveryAttemptRecord, AlertDeliveryAttemptWrite, AlertDeliveryFinalizeWrite,
     AlertEvaluationEntry, AlertEvaluationWrite, AlertEventRecord, AlertStateTransition,
-    AlertWebhookHookRecord, CURRENT_SCHEMA_VERSION, HealthSnapshotRecord, HealthSnapshotWrite,
+    AlertWebhookHookRecord, CURRENT_SCHEMA_VERSION, HealthEvaluationFailure,
+    HealthEvaluationFinish, HealthEvaluationStart, HealthSnapshotRecord, HealthSnapshotWrite,
     ObservabilityJobRecord, ObservabilityRunInsert, ProbeObservationInsert, RetentionPolicyRecord,
     SchedulerJobClockUpdate, SchedulerOutcomeEntry, SchedulerOutcomeWrite, SchedulerRunFinish,
     SchedulerRunStart, Store, StoreError,
@@ -2030,6 +2031,234 @@ fn health_snapshot_writer_rolls_back_every_row_when_audit_fails() {
         &store, &write, TEST_ACTOR,
     ));
     assert!(store.list_health_snapshots().expect("snapshots").is_empty());
+}
+
+fn health_evaluation_start(evaluation_id: &str, watermark: char) -> HealthEvaluationStart {
+    HealthEvaluationStart {
+        evaluation_id: evaluation_id.to_string(),
+        input_watermark: watermark.to_string().repeat(64),
+        policy_version: "b".repeat(64),
+        computation_version: "health-v1".to_string(),
+        started_at: "2026-07-11T01:00:00Z".to_string(),
+    }
+}
+
+#[test]
+fn health_evaluation_lifecycle_is_atomic_idempotent_and_actor_bound() {
+    let (_dir, store, _db) = open_temp_store();
+    let evaluation_id = "health-eval-00000000-0000-4000-8000-000000000010";
+    let start = health_evaluation_start(evaluation_id, 'a');
+    StoreWriter::write_health_evaluation_start(&store, &start, TEST_ACTOR)
+        .expect("start evaluation");
+    let audit_count = store.audit_count().expect("audit count");
+    StoreWriter::write_health_evaluation_start(&store, &start, TEST_ACTOR)
+        .expect("exact start replay");
+    assert_eq!(store.audit_count().expect("audit count"), audit_count);
+    assert!(matches!(
+        StoreWriter::write_health_evaluation_start(&store, &start, "different-actor"),
+        Err(StoreError::HealthEvaluationConflict { .. })
+    ));
+    let mut duplicate_key = start.clone();
+    duplicate_key.evaluation_id = "health-eval-00000000-0000-4000-8000-000000000011".to_string();
+    assert!(matches!(
+        StoreWriter::write_health_evaluation_start(&store, &duplicate_key, TEST_ACTOR),
+        Err(StoreError::HealthEvaluationConflict { .. })
+    ));
+
+    let snapshot = HealthSnapshotRecord {
+        node_id: "health-evaluator-node".to_string(),
+        endpoint_id: None,
+        computed_at: "2026-07-11T01:00:01Z".to_string(),
+        status: "healthy".to_string(),
+        freshness_seconds: Some(1),
+        last_success_at: Some("2026-07-11T01:00:00Z".to_string()),
+        last_failure_at: None,
+        last_error_code: None,
+        degraded_methods_json: health_methods(&[]),
+        summary_json: health_summary("healthy"),
+    };
+    StoreWriter::write_health_evaluation_finish(
+        &store,
+        &HealthEvaluationFinish {
+            evaluation_id: evaluation_id.to_string(),
+            finished_at: "2026-07-11T01:00:02Z".to_string(),
+            snapshots: vec![snapshot.clone()],
+        },
+        TEST_ACTOR,
+    )
+    .expect("finish evaluation");
+    let run = store
+        .get_health_evaluation_run(evaluation_id)
+        .expect("read run")
+        .expect("run exists");
+    assert_eq!(run.status, "completed");
+    assert_eq!(run.snapshot_count, 1);
+    assert_eq!(
+        store.list_health_snapshots().expect("snapshots"),
+        vec![snapshot]
+    );
+    assert!(matches!(
+        StoreWriter::write_health_evaluation_failure(
+            &store,
+            &HealthEvaluationFailure {
+                evaluation_id: evaluation_id.to_string(),
+                finished_at: "2026-07-11T01:00:03Z".to_string(),
+                failure_code: "HEALTH_EVALUATION_FAILED".to_string(),
+            },
+            TEST_ACTOR,
+        ),
+        Err(StoreError::HealthEvaluationConflict { .. })
+    ));
+}
+
+#[test]
+fn health_evaluation_mutations_roll_back_when_audit_fails() {
+    let (_dir, store, db) = open_temp_store();
+    let start_id = "health-eval-00000000-0000-4000-8000-000000000012";
+    inject_job_audit_failure(&db, "health.evaluation.start");
+    assert_injected_job_audit_failure(StoreWriter::write_health_evaluation_start(
+        &store,
+        &health_evaluation_start(start_id, 'c'),
+        TEST_ACTOR,
+    ));
+    assert!(
+        store
+            .get_health_evaluation_run(start_id)
+            .expect("read start rollback")
+            .is_none()
+    );
+    Connection::open(&db)
+        .expect("open database")
+        .execute_batch("DROP TRIGGER fail_scheduler_job_audit")
+        .expect("remove start failure trigger");
+
+    let finish_id = "health-eval-00000000-0000-4000-8000-000000000013";
+    StoreWriter::write_health_evaluation_start(
+        &store,
+        &health_evaluation_start(finish_id, 'd'),
+        TEST_ACTOR,
+    )
+    .expect("start finish rollback run");
+    inject_job_audit_failure(&db, "health.evaluation.finish");
+    assert_injected_job_audit_failure(StoreWriter::write_health_evaluation_finish(
+        &store,
+        &HealthEvaluationFinish {
+            evaluation_id: finish_id.to_string(),
+            finished_at: "2026-07-11T01:00:02Z".to_string(),
+            snapshots: vec![],
+        },
+        TEST_ACTOR,
+    ));
+    assert_eq!(
+        store
+            .get_health_evaluation_run(finish_id)
+            .expect("read run")
+            .expect("run exists")
+            .status,
+        "running"
+    );
+    Connection::open(&db)
+        .expect("open database")
+        .execute_batch("DROP TRIGGER fail_scheduler_job_audit")
+        .expect("remove finish failure trigger");
+
+    let failure_id = "health-eval-00000000-0000-4000-8000-000000000014";
+    StoreWriter::write_health_evaluation_start(
+        &store,
+        &health_evaluation_start(failure_id, 'e'),
+        TEST_ACTOR,
+    )
+    .expect("start failed evaluation");
+    StoreWriter::write_health_evaluation_failure(
+        &store,
+        &HealthEvaluationFailure {
+            evaluation_id: failure_id.to_string(),
+            finished_at: "2026-07-11T01:00:02Z".to_string(),
+            failure_code: "HEALTH_INPUT_INVALID".to_string(),
+        },
+        TEST_ACTOR,
+    )
+    .expect("persist bounded failure");
+    let failed = store
+        .get_health_evaluation_run(failure_id)
+        .expect("read failed run")
+        .expect("failed run exists");
+    assert_eq!(failed.status, "failed");
+    assert_eq!(failed.failure_code.as_deref(), Some("HEALTH_INPUT_INVALID"));
+}
+
+#[test]
+fn health_evaluation_recovery_is_bounded_atomic_and_instant_ordered() {
+    let (_dir, store, db) = open_temp_store();
+    let old_id = "health-eval-00000000-0000-4000-8000-000000000015";
+    let recent_id = "health-eval-00000000-0000-4000-8000-000000000016";
+    let mut old = health_evaluation_start(old_id, 'f');
+    old.started_at = "2026-07-11T02:00:00+02:00".to_string();
+    let mut recent = health_evaluation_start(recent_id, '1');
+    recent.started_at = "2026-07-11T00:30:00Z".to_string();
+    StoreWriter::write_health_evaluation_start(&store, &old, TEST_ACTOR).expect("start old");
+    StoreWriter::write_health_evaluation_start(&store, &recent, TEST_ACTOR).expect("start recent");
+
+    inject_job_audit_failure(&db, "health.evaluation.recover");
+    assert_injected_job_audit_failure(
+        StoreWriter::write_health_evaluation_recovery(
+            &store,
+            "2026-07-11T00:15:00Z",
+            "2026-07-11T01:00:00Z",
+            TEST_ACTOR,
+        )
+        .map(|_| ()),
+    );
+    assert_eq!(
+        store
+            .get_health_evaluation_run(old_id)
+            .expect("read old")
+            .expect("old exists")
+            .status,
+        "running"
+    );
+    Connection::open(&db)
+        .expect("open database")
+        .execute_batch("DROP TRIGGER fail_scheduler_job_audit")
+        .expect("remove recovery failure trigger");
+
+    assert_eq!(
+        StoreWriter::write_health_evaluation_recovery(
+            &store,
+            "2026-07-11T00:15:00Z",
+            "2026-07-11T01:00:00Z",
+            TEST_ACTOR,
+        )
+        .expect("recover abandoned run"),
+        1
+    );
+    let old = store
+        .get_health_evaluation_run(old_id)
+        .expect("read old")
+        .expect("old exists");
+    assert_eq!(old.status, "failed");
+    assert_eq!(
+        old.failure_code.as_deref(),
+        Some("HEALTH_EVALUATION_ABANDONED")
+    );
+    assert_eq!(
+        store
+            .get_health_evaluation_run(recent_id)
+            .expect("read recent")
+            .expect("recent exists")
+            .status,
+        "running"
+    );
+    assert_eq!(
+        StoreWriter::write_health_evaluation_recovery(
+            &store,
+            "2026-07-11T00:15:00Z",
+            "2026-07-11T01:00:00Z",
+            TEST_ACTOR,
+        )
+        .expect("idempotent recovery"),
+        0
+    );
 }
 
 #[test]

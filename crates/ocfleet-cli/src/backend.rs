@@ -2,12 +2,12 @@ use crate::audit::AuditEvent;
 use crate::store::{
     AlertDeliveryAttemptWrite, AlertDeliveryFinalizeWrite, AlertEvaluationWrite, AlertEventRecord,
     AlertStateTransition, AlertWebhookHookRecord, ApprovalInput, AuditRecord, EndpointTrustRecord,
-    EnrollmentTokenInsert, EnrollmentTokenRecord, HealthPolicyRecord, HealthSnapshotRecord,
-    HealthSnapshotWrite, JoinRequestInsert, JoinRequestRecord, LegacyEnrollmentClaimInput,
-    NodeInsert, NodeRecord, ObservabilityJobRecord, ObservabilityRunRecord, ProbeObservationRecord,
-    RetentionApplyInput, RetentionApplyResult, RetentionPolicyRecord, SchedulerJobClaim,
-    SchedulerMaintenanceWindow, SchedulerOutcomeWrite, SchedulerRunFinish, SchedulerRunStart,
-    Store, StoreError,
+    EnrollmentTokenInsert, EnrollmentTokenRecord, HealthEvaluationFailure, HealthEvaluationFinish,
+    HealthEvaluationStart, HealthPolicyRecord, HealthSnapshotRecord, HealthSnapshotWrite,
+    JoinRequestInsert, JoinRequestRecord, LegacyEnrollmentClaimInput, NodeInsert, NodeRecord,
+    ObservabilityJobRecord, ObservabilityRunRecord, ProbeObservationRecord, RetentionApplyInput,
+    RetentionApplyResult, RetentionPolicyRecord, SchedulerJobClaim, SchedulerMaintenanceWindow,
+    SchedulerOutcomeWrite, SchedulerRunFinish, SchedulerRunStart, Store, StoreError,
 };
 
 pub const MAX_STORE_READER_ROWS: u64 = 1_000;
@@ -137,6 +137,27 @@ pub trait StoreWriter {
         write: &HealthSnapshotWrite,
         actor: &str,
     ) -> Result<(), Self::Error>;
+    fn write_health_evaluation_start(
+        &self,
+        start: &HealthEvaluationStart,
+        actor: &str,
+    ) -> Result<(), Self::Error>;
+    fn write_health_evaluation_finish(
+        &self,
+        finish: &HealthEvaluationFinish,
+        actor: &str,
+    ) -> Result<(), Self::Error>;
+    fn write_health_evaluation_failure(
+        &self,
+        failure: &HealthEvaluationFailure,
+        actor: &str,
+    ) -> Result<(), Self::Error>;
+    fn write_health_evaluation_recovery(
+        &self,
+        cutoff: &str,
+        recovered_at: &str,
+        actor: &str,
+    ) -> Result<usize, Self::Error>;
     fn write_alert_evaluation(
         &self,
         write: &AlertEvaluationWrite,
@@ -477,6 +498,39 @@ impl StoreWriter for Store {
         actor: &str,
     ) -> Result<(), Self::Error> {
         Store::write_health_snapshots(self, write, actor)
+    }
+
+    fn write_health_evaluation_start(
+        &self,
+        start: &HealthEvaluationStart,
+        actor: &str,
+    ) -> Result<(), Self::Error> {
+        Store::write_health_evaluation_start(self, start, actor)
+    }
+
+    fn write_health_evaluation_finish(
+        &self,
+        finish: &HealthEvaluationFinish,
+        actor: &str,
+    ) -> Result<(), Self::Error> {
+        Store::write_health_evaluation_finish(self, finish, actor)
+    }
+
+    fn write_health_evaluation_failure(
+        &self,
+        failure: &HealthEvaluationFailure,
+        actor: &str,
+    ) -> Result<(), Self::Error> {
+        Store::write_health_evaluation_failure(self, failure, actor)
+    }
+
+    fn write_health_evaluation_recovery(
+        &self,
+        cutoff: &str,
+        recovered_at: &str,
+        actor: &str,
+    ) -> Result<usize, Self::Error> {
+        Store::write_health_evaluation_recovery(self, cutoff, recovered_at, actor)
     }
 
     fn write_alert_evaluation(

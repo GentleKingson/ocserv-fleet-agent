@@ -25,10 +25,13 @@ make running, completed, and failed rows internally consistent and cap a batch
 at 1,000 snapshots.
 
 The table stores no observation bodies, addresses, trust material, endpoint
-secrets, commands, paths, or arbitrary errors. Later A4 slices will atomically
-bind completed runs to snapshot writes, recover abandoned running rows, and add
-the independent evaluator loop. The evaluator remains observation-only and
-cannot contact agents or mutate nodes, trust, scheduler jobs, or maintenance.
+secrets, commands, paths, or arbitrary errors. Actor-bound writer methods create
+runs idempotently, atomically bind completed runs to snapshot writes, persist
+bounded typed failures, and recover at most 100 abandoned runs per transaction.
+Recovery parses RFC 3339 instants rather than ordering timestamp text, and every
+lifecycle mutation commits its audit in the same transaction. The independent
+evaluator loop remains a later A4 slice. The evaluator remains observation-only
+and cannot contact agents or mutate nodes, trust, scheduler jobs, or maintenance.
 
 ## Compatibility And Rollback
 

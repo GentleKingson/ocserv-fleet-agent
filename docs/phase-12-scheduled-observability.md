@@ -294,6 +294,37 @@ Rules:
   and `alert_delivery_attempts` for low-sensitive webhook attempt outcomes.
   JSONL delivery failures are recorded in `alert.delivery` audit rows.
 
+### `health_policy`
+
+Stores controller-local advisory health and alert thresholds. Current columns:
+
+- `id INTEGER PRIMARY KEY` fixed to the singleton row
+- `stale_window_seconds INTEGER NOT NULL`
+- `unreachable_consecutive_failures INTEGER NOT NULL`
+- `cert_warning_days INTEGER NOT NULL`
+- `cert_critical_days INTEGER NOT NULL`
+- `updated_at TEXT NOT NULL`
+
+Policy changes are actor-bearing atomic writes. The policy affects derived
+health and alert evaluation only; it cannot authorize RPC, trust, or mutation.
+
+### `alert_hooks`
+
+Stores fixed HTTPS webhook configuration. It includes hook identity/type,
+redacted endpoint metadata, the schema-v15 typed host allowlist, HMAC key ID,
+enabled state, bounded retry/timeout settings, and timestamps. HMAC secrets are
+never stored. Only the fixed `webhook` type exists; shell, command, script, and
+template hooks are forbidden.
+
+### `alert_delivery_attempts`
+
+Stores bounded webhook attempt history: attempt/alert/hook identity, attempt
+number, timestamp, fixed status, HTTP status class, error code, byte count, and
+the schema-v17 detail payload bound to every relational field. It stores no
+response body, URL credentials, HMAC secret, command output, or arbitrary
+destination. Attempt persistence and its audit are atomic; network I/O remains
+outside the transaction.
+
 ### `retention_policies`
 
 Stores retention limits for observability history.
@@ -504,6 +535,7 @@ RPCs. Non-loopback listeners require `--auth-token-file`.
 
 Implemented read-only routes:
 
+- `GET /`
 - `GET /healthz`
 - `GET /health/summary`
 - `GET /health/nodes`

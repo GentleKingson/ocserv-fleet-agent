@@ -79,8 +79,9 @@ scaffold, implemented slice, operational maturity, and release verification.
 
 ## Execution DAG
 
-The current execution node is **A2** on issue `#34`. A1 is operationally mature
-for the current production controller mutation inventory. The node-lifecycle slice
+The current execution node is **A3** on issue `#35`. A1 and A2 are
+operationally mature for the current production controller mutation and storage
+inventories. The node-lifecycle slice
 merged through pull request `#57`, the scheduler-job configuration slice merged
 through pull request `#58`, and the endpoint-trust fail-closed slice merged
 through pull request `#59`. Atomic scheduler run, outcome, observation, audit,
@@ -210,13 +211,21 @@ writers and controller/API readers fail closed on unsafe, malformed,
 future-version, or mismatched data and never expose the storage envelope.
 Published for review in pull request `#78`.
 
+The final A2 inventory is recorded in `docs/a2-storage-inventory.md`. All nine
+payload families named by issue `#34`, plus the adjacent webhook-host and
+enrollment-metadata families discovered during the audit, now use typed
+versioned writes, fail-closed migration, strict readers, and public projections
+that omit storage envelopes. The completion audit makes A2 operationally mature
+without changing the read-only or trust boundary.
+The completion audit is published in pull request `#79`.
+
 ### Baseline And Production Foundation
 
 | ID | Issue | Status | Depends on | Release target | Acceptance and required evidence |
 | --- | --- | --- | --- | --- | --- |
 | N0 Baseline and authoritative roadmap | n/a | operationally mature | none | `v0.2.x` | Baseline commit, versions, schemas, crates, binaries, features, workflows, test results, incomplete code, and documentation drift are recorded. This DAG and progress file exist and contain no secret or host-specific path. |
 | A1 Atomic controller mutation audit | `#33` | operationally mature | N0 | `v0.2.x` | Every production mutation uses an actor-bound transactional writer; injected audit failure and crash-boundary tests prove rollback; direct mutation SQL and mutator bypasses outside approved store/backend boundaries are prevented; API remains read-only. `docs/a1-mutation-inventory.md` enumerates every family and its evidence. |
-| A2 Typed versioned storage | `#34` | implemented slice | A1 | `v0.2.x` | New writes use closed, versioned payload types; legacy rows migrate or are quarantined/fail closed; contaminated fixtures cover oversize, unknown, secret-like, address, nesting, and method failures; CLI/API never expose raw persisted JSON. Scheduler selector/pair payloads satisfy this contract; remaining dynamic JSON families do not yet. |
+| A2 Typed versioned storage | `#34` | operationally mature | A1 | `v0.2.x` | New writes use closed, versioned payload types; legacy rows migrate or fail closed after private backup; contaminated fixtures cover oversize, unknown, secret-like, address, nesting, version, relationship, and method failures; CLI/API never expose raw persisted JSON. `docs/a2-storage-inventory.md` enumerates every requested family and its evidence. |
 | A3 Scheduler reliability | `#35` | implemented slice | A1, A2 | `v0.3.0` | SQLite lease, fencing, deterministic claim, bounded retry/backoff, misfire, jitter, timeout, recovery, maintenance, concurrency, budget, and shutdown semantics pass competing-instance, crash, skew, and duplicate-suppression tests. |
 | A4 Independent health evaluator | `#36` | implemented slice | A1, A2, A3 | `v0.3.0` | Idempotent evaluation runs record watermark, policy/computation versions, snapshots, and failures without agent RPC or trust/node/scheduler mutation; recovery and shutdown tests pass; dashboard freshness no longer depends on an interactive health command. |
 | A5 Safe alert delivery worker | `#37` | implemented slice | A1, A2, A3, A4 | `v0.3.0` | Fixed JSONL/HTTPS queues support claim, bounded retry, dead-letter, recovery, grouping, rate limit, idempotency, history, and shutdown. SSRF, HMAC, no-redirect, secret-redaction, and forbidden command/script/template tests pass. |
@@ -298,11 +307,10 @@ all affected documents:
 | `docs/roadmap.md`, `docs/status.md`, and `docs/implementation-summary.md` use incompatible future/partial/complete language for the same API, dashboard, and release slices. | A8 `#40` | Adopt this status vocabulary and make older roadmap material clearly historical or consistent. |
 | `SECURITY.md` describes reload/restart/config apply as forbidden without distinguishing current/default-build prohibition from the separately designed future controlled-write track. | D0 `#52`, A8 `#40` | Separate current-release forbidden behavior from forbidden-forever generic execution and link the default-off preview boundary. |
 | The audited status set omitted protocol `1`, ALPN, the complete feature inventory, and several schema versions. | N0 | Recorded in this baseline; add automated drift checks before any value changes. |
-| Phase 12 schema prose omits `health_policy`, `alert_hooks`, and `alert_delivery_attempts`, and its API route list omits dashboard `GET /`. | A2 `#34`, A5 `#37`, B3 `#43` | Align schema and route inventories with migrations/router and test the inventory. |
 | `/health/summary` is documented as fleet-wide but silently counts only `--max-limit` rows. | B3 `#43` | Compute an exact bounded aggregate or return explicit overflow/truncation metadata and update OpenAPI. |
 | Unknown-query rejection is documented globally, but routes without a query extractor ignore unknown keys. | B3 `#43` | Reject unknown/duplicate query keys consistently or narrow the contract route by route. |
 | OpenAPI fixes query maxima/defaults and redaction defaults that are configurable at process startup. | B3 `#43` | Represent server-configured bounds/defaults accurately and validate runtime responses against the contract. |
-| Audit API accepts offset RFC3339 values but compares their original text lexically in SQLite; interval closure is undocumented. | A2 `#34`, B3 `#43` | Normalize to canonical UTC before persistence/query and document the exact half-open interval. |
+| Audit API accepts offset RFC3339 values but compares their original text lexically in SQLite; interval closure is undocumented. | B3 `#43` | Normalize to canonical UTC before persistence/query and document the exact half-open interval. |
 | OpenAPI low-sensitive prose excludes selectors while the job schema requires and returns a controller-local selector; runtime also supports `HEAD` and structured 405/500 responses not fully described by the contract. | B3 `#43` | Distinguish safe controller selectors from forbidden agent-local selectors and make method/error/header behavior explicit. |
 | `scripts/check-doc-claims.sh` checks a small README phrase set rather than schema/protocol/feature/CLI/API drift. | A8 `#40` | Add source-derived checks for versions, features, routes, CLI examples, migrations, and safety claims. |
 | README and Phase 12 development commands omit all-feature and repository-script gates; examples also contain version/toolchain drift. | A8 `#40` | Publish one canonical local/CI verification matrix and keep examples tied to workspace/toolchain versions. |

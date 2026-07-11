@@ -461,6 +461,8 @@ target/debug/ocfleet observation list \
   --limit 50 \
   --json
 target/debug/ocfleet health summary
+target/debug/ocfleet health evaluator run --json
+target/debug/ocfleet health evaluator daemon --interval-seconds 60
 target/debug/ocfleet health snapshot list --limit 50 --json
 target/debug/ocfleet alert list
 target/debug/ocfleet alert list --state open --severity critical --json

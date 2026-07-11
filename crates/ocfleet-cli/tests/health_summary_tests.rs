@@ -6,7 +6,9 @@ use ocfleet_protocol::method::{
 };
 use rusqlite::Connection;
 use serde_json::{Value, json};
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output, Stdio};
+use std::thread;
+use std::time::Duration as StdDuration;
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 
 fn run_ocfleet(args: &[&str]) -> Output {
@@ -22,6 +24,38 @@ fn run_ocfleet(args: &[&str]) -> Output {
         String::from_utf8_lossy(&output.stderr)
     );
     output
+}
+
+fn spawn_ocfleet(args: &[&str]) -> Child {
+    Command::new(env!("CARGO_BIN_EXE_ocfleet"))
+        .args(args)
+        .env("USER", "health-user")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ocfleet")
+}
+
+fn wait_for_health_evaluation(database: &std::path::Path, timeout: StdDuration) {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        let found = Connection::open(database)
+            .and_then(|conn| {
+                conn.query_row(
+                    "SELECT EXISTS(
+                       SELECT 1 FROM health_evaluation_runs WHERE status = 'completed'
+                     )",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+            })
+            .unwrap_or(0);
+        if found == 1 {
+            return;
+        }
+        thread::sleep(StdDuration::from_millis(25));
+    }
+    panic!("timed out waiting for completed health evaluation");
 }
 
 fn add_node(store: &Store, node_id: &str) {
@@ -561,4 +595,202 @@ fn health_summary_tests_writes_health_audit_without_raw_response_body() {
     assert_eq!(detail["node_count"], 1);
     assert!(detail.get("nodes").is_none());
     assert!(detail.get("response").is_none());
+}
+
+#[test]
+fn health_evaluator_run_is_independent_idempotent_and_persists_snapshots() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let database_arg = database.to_string_lossy().into_owned();
+    let store = Store::open(&database).expect("open store");
+    add_node(&store, "hk-ocserv-01");
+    drop(store);
+
+    let first = run_ocfleet(&[
+        "--database",
+        &database_arg,
+        "health",
+        "evaluator",
+        "run",
+        "--json",
+    ]);
+    let first: Value = serde_json::from_slice(&first.stdout).expect("valid evaluator JSON");
+    assert_eq!(first["schema"], "ocfleet.health_evaluator.v1");
+    assert_eq!(first["status"], "completed");
+
+    let second = run_ocfleet(&[
+        "--database",
+        &database_arg,
+        "health",
+        "evaluator",
+        "run",
+        "--json",
+    ]);
+    let second: Value = serde_json::from_slice(&second.stdout).expect("valid evaluator JSON");
+    assert_eq!(second["status"], "replayed");
+
+    let conn = Connection::open(&database).expect("open database");
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM health_evaluation_runs WHERE status = 'completed'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("completed evaluation count"),
+        1
+    );
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM health_snapshots", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .expect("snapshot count"),
+        1
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM controller_audit_log
+             WHERE event IN ('health.evaluation.start', 'health.evaluation.finish')",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("evaluator audit count"),
+        2
+    );
+}
+
+#[test]
+fn health_evaluator_persists_bounded_failure_without_raw_input() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let database_arg = database.to_string_lossy().into_owned();
+    let store = Store::open(&database).expect("open store");
+    add_node(&store, "hk-ocserv-01");
+    let observed_at = now_rfc3339();
+    insert_observation(
+        &store,
+        ObservationFixture {
+            observation_id: "obs-contaminated",
+            node_id: "hk-ocserv-01",
+            method: PROBE_CONTROLLER_PING,
+            ok: true,
+            error_code: None,
+            observed_at: &observed_at,
+            summary_json: json!({"message": "pong"}),
+        },
+    );
+    drop(store);
+    let conn = Connection::open(&database).expect("open database");
+    conn.pragma_update(None, "ignore_check_constraints", true)
+        .expect("ignore constraints");
+    conn.execute(
+        "UPDATE probe_observations SET summary_json = '{\"raw\":\"/etc/secret\"}'
+         WHERE observation_id = 'obs-contaminated'",
+        [],
+    )
+    .expect("contaminate observation");
+    drop(conn);
+
+    let output = run_ocfleet(&[
+        "--database",
+        &database_arg,
+        "health",
+        "evaluator",
+        "run",
+        "--json",
+    ]);
+    let value: Value = serde_json::from_slice(&output.stdout).expect("valid evaluator JSON");
+    assert_eq!(value["status"], "failed");
+
+    let conn = Connection::open(&database).expect("open database");
+    let (status, failure_code): (String, Option<String>) = conn
+        .query_row(
+            "SELECT status, failure_code FROM health_evaluation_runs",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("failed evaluation");
+    assert_eq!(status, "failed");
+    assert_eq!(failure_code.as_deref(), Some("HEALTH_EVALUATION_FAILED"));
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM health_snapshots", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .expect("snapshot count"),
+        0
+    );
+    let audit_detail: String = conn
+        .query_row(
+            "SELECT detail_json FROM controller_audit_log
+             WHERE event = 'health.evaluation.fail'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("failure audit");
+    assert!(!audit_detail.contains("/etc/secret"));
+    assert!(!audit_detail.contains("raw"));
+}
+
+#[cfg(unix)]
+#[test]
+fn health_evaluator_daemon_drains_on_sigterm_and_restarts_cleanly() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let database_arg = database.to_string_lossy().into_owned();
+    drop(Store::open(&database).expect("open store"));
+
+    let child = spawn_ocfleet(&[
+        "--database",
+        &database_arg,
+        "health",
+        "evaluator",
+        "daemon",
+        "--interval-seconds",
+        "10",
+    ]);
+    wait_for_health_evaluation(&database, StdDuration::from_secs(30));
+    let signal = Command::new("kill")
+        .args(["-TERM", child.id().to_string().as_str()])
+        .output()
+        .expect("signal evaluator daemon");
+    assert!(signal.status.success());
+    let output = child.wait_with_output().expect("wait for evaluator daemon");
+    assert!(
+        output.status.success(),
+        "daemon failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("status=stopped"));
+
+    let second = spawn_ocfleet(&[
+        "--database",
+        &database_arg,
+        "health",
+        "evaluator",
+        "daemon",
+        "--interval-seconds",
+        "10",
+    ]);
+    thread::sleep(StdDuration::from_millis(500));
+    let signal = Command::new("kill")
+        .args(["-TERM", second.id().to_string().as_str()])
+        .output()
+        .expect("signal restarted evaluator daemon");
+    assert!(signal.status.success());
+    let output = second
+        .wait_with_output()
+        .expect("wait for restarted daemon");
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("status=stopped"));
+
+    let conn = Connection::open(&database).expect("open database");
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM health_evaluation_runs WHERE status = 'running'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("running evaluation count"),
+        0
+    );
 }

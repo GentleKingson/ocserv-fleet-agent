@@ -354,6 +354,14 @@ is created during migration, so existing schedules continue normally. Set and
 clear operations are actor-bound and atomically audited. Upgrade failure leaves
 the version-19 database unchanged beside its private backup.
 
+Schema version 21 adds empty `health_evaluation_runs` metadata and indexes. It
+does not rewrite current snapshots or start an evaluator. After migration,
+operators may run `ocfleet health evaluator daemon --interval-seconds 60` under
+their process supervisor. SIGINT and SIGTERM stop the daemon after its current
+evaluation, while restart recovery marks abandoned runs with a fixed bounded
+failure code. Upgrade failure leaves the version-20 database unchanged beside
+its private backup.
+
 Before upgrades, keep an operator-managed backup as well:
 
 ```bash

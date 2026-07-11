@@ -38,10 +38,12 @@ stored start time rather than creating a negative-duration run.
 
 ## Current Limit
 
-This slice uses the bounded maximum lease while a job is active. Periodic lease
-renewal, shorter crash-detection windows, misfire/retry policy, maintenance,
-graceful in-flight shutdown, and the final A3 completion matrix remain work on
-issue `#35`. A3 is not operationally mature from this slice alone.
+Production execution uses a two-minute lease and renews it every 30 seconds on
+an independent SQLite connection. Renewal failure cancels the in-flight future
+and fails closed; a later owner recovers the abandoned run through the fenced
+takeover path. Misfire/retry policy, maintenance, graceful in-flight shutdown,
+and the final A3 completion matrix remain work on issue `#35`. A3 is not
+operationally mature from this slice alone.
 
 ## Rollback
 

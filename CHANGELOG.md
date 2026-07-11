@@ -4,6 +4,8 @@
 
 ### Added
 
+- Scheduler lease heartbeats renew active claims every 30 seconds with a
+  two-minute expiry and fail closed when fencing is lost.
 - OpenAPI 3.1.1 contract and drift tests for the 14-route `GET`-only API.
 - Read-only dashboard views for fleet health, nodes, jobs, runs, observations,
   alerts, and bounded audit previews.

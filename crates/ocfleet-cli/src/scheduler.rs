@@ -37,10 +37,10 @@ use crate::controller_rpc::{
 use crate::input_validation::{validate_description, validate_selector};
 use crate::storage_payloads::{SchedulerPairPayloadV1, SchedulerSelectorPayloadV1};
 use crate::store::{
-    InvalidObservabilityJobRecord, MAX_SCHEDULER_LEASE_SECONDS, NodeRecord,
-    ObservabilityJobLoadResult, ObservabilityJobRecord, ObservabilityRunRecord,
-    ProbeObservationInsert, SchedulerJobClaim, SchedulerJobClockUpdate, SchedulerOutcomeEntry,
-    SchedulerOutcomeWrite, SchedulerRunFinish, SchedulerRunStart, Store, StoreError,
+    InvalidObservabilityJobRecord, NodeRecord, ObservabilityJobLoadResult, ObservabilityJobRecord,
+    ObservabilityRunRecord, ProbeObservationInsert, SchedulerJobClaim, SchedulerJobClockUpdate,
+    SchedulerOutcomeEntry, SchedulerOutcomeWrite, SchedulerRunFinish, SchedulerRunStart, Store,
+    StoreError,
 };
 
 const DEFAULT_SELECTOR: &str = "role=ocserv";
@@ -57,6 +57,8 @@ const MAX_TARGETS_PER_JOB: usize = 50;
 const MAX_QUERY_LIMIT: u64 = 1_000;
 const ALERT_EVALUATION_ERROR_CODE: &str = "ALERT_EVALUATION_FAILED";
 const ALERT_EVALUATION_ERROR_MESSAGE: &str = "local alert evaluation failed";
+const SCHEDULER_LEASE_SECONDS: u64 = 120;
+const SCHEDULER_LEASE_RENEW_SECONDS: u64 = 30;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StoredJobKind {
@@ -1026,7 +1028,7 @@ async fn run_target_job_once(
         job_id,
         owner_id,
         &now_rfc3339(),
-        MAX_SCHEDULER_LEASE_SECONDS,
+        SCHEDULER_LEASE_SECONDS,
         actor,
     )?
     .with_context(|| format!("observability job is already claimed: {job_id}"))?;
@@ -1062,7 +1064,7 @@ fn try_claim_due_job(
         job_id,
         owner_id,
         &now_rfc3339(),
-        MAX_SCHEDULER_LEASE_SECONDS,
+        SCHEDULER_LEASE_SECONDS,
         actor,
     )
 }
@@ -1248,7 +1250,20 @@ async fn run_job(
         tick_context.actor,
     )?;
 
-    let mut stats = run_job_after_start(tick_context, job, prepared, &run_id).await?;
+    // Use an independent connection so renewal can proceed while the execution future
+    // borrows the tick context and waits on bounded RPC work.
+    let heartbeat_store = Store::open(tick_context.database_path)?;
+    let heartbeat_actor = tick_context.actor;
+    let execution = run_job_after_start(tick_context, job, prepared, &run_id);
+    let mut stats = run_with_scheduler_claim_heartbeat(
+        &heartbeat_store,
+        heartbeat_actor,
+        claim,
+        std::time::Duration::from_secs(SCHEDULER_LEASE_RENEW_SECONDS),
+        SCHEDULER_LEASE_SECONDS,
+        execution,
+    )
+    .await?;
 
     let finished_at = now_rfc3339();
     StoreWriter::write_scheduler_run_finish(
@@ -1262,6 +1277,38 @@ async fn run_job(
     )?;
     stats.run_ids.push(run_id);
     Ok(stats)
+}
+
+async fn run_with_scheduler_claim_heartbeat<F, T>(
+    store: &Store,
+    actor: &str,
+    claim: &SchedulerJobClaim,
+    renew_interval: std::time::Duration,
+    lease_seconds: u64,
+    execution: F,
+) -> anyhow::Result<T>
+where
+    F: Future<Output = anyhow::Result<T>>,
+{
+    tokio::pin!(execution);
+    let mut renew = tokio::time::interval(renew_interval);
+    renew.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    renew.tick().await;
+
+    loop {
+        tokio::select! {
+            result = &mut execution => return result,
+            _ = renew.tick() => {
+                StoreWriter::write_scheduler_claim_renew(
+                    store,
+                    claim,
+                    &now_rfc3339(),
+                    lease_seconds,
+                    actor,
+                )?;
+            }
+        }
+    }
 }
 
 async fn run_job_after_start(
@@ -3151,6 +3198,66 @@ mod tests {
         peak_by_node: HashMap<String, usize>,
         active_by_method: HashMap<String, usize>,
         peak_by_method: HashMap<String, usize>,
+    }
+
+    #[tokio::test]
+    async fn scheduler_claim_heartbeat_renews_during_execution() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let database = dir.path().join("controller.sqlite");
+        let store = Store::open(&database).expect("open store");
+        let now = now_rfc3339();
+        let job = ObservabilityJobRecord {
+            job_id: "job-heartbeat".to_string(),
+            kind: "controller-ping".to_string(),
+            selector_json: SchedulerSelectorPayloadV1::new(
+                "role=ocserv".to_string(),
+                Some("heartbeat test".to_string()),
+            )
+            .expect("selector")
+            .to_value(),
+            pair_selector_json: None,
+            interval_seconds: MIN_INTERVAL_SECONDS,
+            jitter_seconds: 0,
+            timeout_ms: DEFAULT_DEADLINE_MS,
+            enabled: true,
+            next_run_at: Some(now.clone()),
+            last_run_at: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        };
+        StoreWriter::write_scheduler_job_add(&store, &job, "heartbeat-test").expect("add job");
+        let claim = StoreWriter::write_scheduler_claim(
+            &store,
+            &job.job_id,
+            "scheduler-heartbeat-test",
+            &now,
+            5,
+            "heartbeat-test",
+        )
+        .expect("claim write")
+        .expect("claim acquired");
+        let audit_count_before = store.audit_count().expect("count audits");
+
+        run_with_scheduler_claim_heartbeat(
+            &store,
+            "heartbeat-test",
+            &claim,
+            StdDuration::from_millis(100),
+            5,
+            async {
+                tokio::time::sleep(StdDuration::from_millis(250)).await;
+                Ok(())
+            },
+        )
+        .await
+        .expect("heartbeat execution");
+
+        let renewed = store
+            .get_scheduler_job_claim(&job.job_id)
+            .expect("load claim")
+            .expect("claim exists");
+        assert!(renewed.lease_expires_at > claim.lease_expires_at);
+        assert!(store.audit_count().expect("count renewed audits") >= audit_count_before + 2);
     }
 
     #[derive(Clone)]

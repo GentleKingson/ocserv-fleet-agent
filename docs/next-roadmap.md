@@ -113,12 +113,17 @@ each non-dry-run scope deletion and its audit into one immediate transaction,
 and uses stable operation IDs for exact replay across multi-scope partial
 progress. It introduces no schema, protocol, API, agent-capability, or default
 read-only boundary change. Health snapshot and alert candidate evaluation
-atomicity is active on branch `codex/a1-health-alert-writers` in pull request
-`#65`. This slice
+atomicity merged through pull request `#65`
+(`9aae8fff7e27f5de50206af641e8e9ac84749872`). That slice
 commits each bounded evaluation and low-sensitive audit together, uses stable
 evaluation identities for exact replay, and rejects stale alert before-state so
 a concurrent operator silence or resolve is not overwritten. It changes no
 schema, protocol, API route, agent capability, or default read-only boundary.
+Alert operator transitions and webhook-hook creation are active on branch
+`codex/a1-alert-actions-delivery` in pull request `#66`. Silence/resolve compare persisted before-state
+and commit with actor/reason/audit; hook creation commits configuration and a
+redacted audit together. Delivery persistence remains the next distinct slice
+because external file/HTTPS I/O cannot share a database transaction.
 
 ### Baseline And Production Foundation
 

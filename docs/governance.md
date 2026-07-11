@@ -75,8 +75,9 @@ writers; each scope's bounded delete batches share a transaction with their
 audit, and stable operation IDs make exact retries no-ops. Health snapshot
 batches and alert candidate evaluations also bind state and audit atomically;
 alert evaluation uses persisted before-state checks to preserve concurrent
-operator decisions. Alert silence/resolve/delivery and other call sites remain
-to migrate.
+operator decisions. Silence/resolve and webhook-hook creation also use atomic
+writers with compare-before or audit-backed replay. Alert delivery and other
+call sites remain to migrate.
 Completing those families is required before claiming fully fail-closed
 controller mutation audit. The API remains read-only while that work is
 incomplete. The governing decision is recorded in

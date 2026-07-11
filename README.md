@@ -18,8 +18,9 @@ production-complete.
   lifecycle, enrollment token/request transitions, retention, scheduler job
   configuration, scheduler run/outcome/observation/job-clock writes, health
   snapshot batches, and alert candidate evaluation use actor-bearing
-  `StoreWriter` transactions for state and audit. Alert operator actions,
-  delivery, and other legacy controller mutations are still being migrated.
+  `StoreWriter` transactions for state and audit. Alert silence/resolve and
+  webhook-hook creation also use compare-before or replay-safe atomic writers;
+  delivery persistence and other legacy mutations are still being migrated.
 - Controller dispatch requires an enabled node and one Active trust row bound
   bidirectionally to that node. Active status by itself is not authorization;
   scheduler workers repeat the same binding check after concurrency waits.
@@ -542,6 +543,8 @@ Networking must allow the controller to reach the agent through iroh using the r
   batching, and durable replay decision.
 - `docs/adr/ADR-derived-state-evaluation-atomicity.md`: atomic health snapshot
   batches and compare-before alert candidate evaluation.
+- `docs/adr/ADR-alert-operator-transition-atomicity.md`: atomic alert operator
+  state transitions and webhook-hook creation.
 - `docs/trust-policy.md`: trust policy as code schema, validation, and diff behavior.
 - `docs/backend.md`: SQLite contract and optional Postgres backend plan.
 - `docs/archive-export.md`: long-term history archive and signed audit export guidance.

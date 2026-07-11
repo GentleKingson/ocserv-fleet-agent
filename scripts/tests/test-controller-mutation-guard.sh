@@ -28,7 +28,7 @@ printf '%s\n' \
   'mod tests {' \
   '    const FIXTURE_SQL: &str = "UPDATE nodes SET enabled = 0";' \
   '}' \
-  'pub fn reviewed(store: &Store, node: &NodeInsert, token: &EnrollmentTokenInsert, request: &JoinRequestInsert, approval: &ApprovalInput, claim: &LegacyEnrollmentClaimInput, policy: &RetentionPolicyRecord, apply: &RetentionApplyInput, health_policy: &HealthPolicyRecord, health: &HealthSnapshotWrite, alerts: &AlertEvaluationWrite) {' \
+  'pub fn reviewed(store: &Store, node: &NodeInsert, token: &EnrollmentTokenInsert, request: &JoinRequestInsert, approval: &ApprovalInput, claim: &LegacyEnrollmentClaimInput, policy: &RetentionPolicyRecord, apply: &RetentionApplyInput, health_policy: &HealthPolicyRecord, health: &HealthSnapshotWrite, alerts: &AlertEvaluationWrite, action: &AlertStateTransition, hook: &AlertWebhookHookRecord) {' \
   '    Store::add_node(store, node, "actor");' \
   '    store.enable_node("node", "actor");' \
   '    store.disable_node("node", "actor");' \
@@ -47,6 +47,8 @@ printf '%s\n' \
   '    store.set_health_policy(health_policy, "actor");' \
   '    Store::write_health_snapshots(store, health, "actor");' \
   '    store.write_alert_evaluation(alerts, "actor");' \
+  '    store.write_alert_state_transition(action, "actor");' \
+  '    Store::write_alert_webhook_hook_create(store, hook, "actor");' \
   '}' \
   'pub const OTHER_QUERY: &str = "SELECT enabled FROM nodes";' \
   > "$cli_src/backend.rs"
@@ -243,6 +245,30 @@ do
   if ! grep -Fq "$expected" "$derived_state_fail_output"; then
     printf 'controller mutation guard did not report expected derived-state mutator violation: %s\n' "$expected" >&2
     sed -n '1,120p' "$derived_state_fail_output" >&2
+    exit 1
+  fi
+done
+
+rm -f "$cli_src/unsafe_derived_state_mutator.rs"
+printf '%s\n' \
+  'pub fn bypass(store: &Store, action: &AlertStateTransition, hook: &AlertWebhookHookRecord) {' \
+  '    store.write_alert_state_transition(action, "actor");' \
+  '    Store::write_alert_webhook_hook_create(store, hook, "actor");' \
+  '}' \
+  > "$cli_src/unsafe_alert_action_mutator.rs"
+
+alert_action_fail_output="$tmp_dir/alert-action-fail-output"
+if "$GUARD" --repo-root "$fixture_root" "$fixture_root" >"$alert_action_fail_output" 2>&1; then
+  printf 'controller mutation guard accepted direct alert action mutator calls\n' >&2
+  exit 1
+fi
+for expected in \
+  'unsafe_alert_action_mutator.rs:2: direct alert action mutator call outside reviewed store/backend boundary: write_alert_state_transition' \
+  'unsafe_alert_action_mutator.rs:3: direct alert action mutator call outside reviewed store/backend boundary: write_alert_webhook_hook_create'
+do
+  if ! grep -Fq "$expected" "$alert_action_fail_output"; then
+    printf 'controller mutation guard did not report expected alert action violation: %s\n' "$expected" >&2
+    sed -n '1,120p' "$alert_action_fail_output" >&2
     exit 1
   fi
 done

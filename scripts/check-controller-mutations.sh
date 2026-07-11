@@ -107,6 +107,10 @@ DIRECT_DERIVED_STATE_MUTATOR_RE = re.compile(
     r"(?:\.\s*|\bStore\s*::\s*)"
     r"(set_health_policy|write_health_snapshots|write_alert_evaluation)\s*\("
 )
+DIRECT_ALERT_ACTION_MUTATOR_RE = re.compile(
+    r"(?:\.\s*|\bStore\s*::\s*)"
+    r"(write_alert_state_transition|write_alert_webhook_hook_create)\s*\("
+)
 DIRECT_RPC_AUDIT_RE = re.compile(r"\bwrite_rpc_audit\s*\(")
 LEGACY_SCHEDULER_WRITER_ALLOWED_FILES = {
     ("crates", "ocfleet-cli", "src", "store.rs"),
@@ -124,6 +128,10 @@ DIRECT_RETENTION_MUTATOR_ALLOWED_FILES = {
     ("crates", "ocfleet-cli", "src", "backend.rs"),
 }
 DIRECT_DERIVED_STATE_MUTATOR_ALLOWED_FILES = {
+    ("crates", "ocfleet-cli", "src", "store.rs"),
+    ("crates", "ocfleet-cli", "src", "backend.rs"),
+}
+DIRECT_ALERT_ACTION_MUTATOR_ALLOWED_FILES = {
     ("crates", "ocfleet-cli", "src", "store.rs"),
     ("crates", "ocfleet-cli", "src", "backend.rs"),
 }
@@ -396,6 +404,17 @@ for path in files:
                     display_path(path),
                     line,
                     "direct derived-state mutator call outside reviewed store/backend boundary",
+                    match.group(1),
+                )
+            )
+    if parts not in DIRECT_ALERT_ACTION_MUTATOR_ALLOWED_FILES:
+        for match in DIRECT_ALERT_ACTION_MUTATOR_RE.finditer(code):
+            line = source.count("\n", 0, match.start()) + 1
+            violations.append(
+                (
+                    display_path(path),
+                    line,
+                    "direct alert action mutator call outside reviewed store/backend boundary",
                     match.group(1),
                 )
             )

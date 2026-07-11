@@ -105,6 +105,11 @@ pub enum StoreError {
         evaluation_id: String,
         detail: &'static str,
     },
+    #[error("alert mutation conflict for {operation_id}: {detail}")]
+    AlertMutationConflict {
+        operation_id: String,
+        detail: &'static str,
+    },
     #[error("join request {request_id} is {status}, expected {expected}")]
     InvalidJoinRequestStatus {
         request_id: String,
@@ -341,6 +346,15 @@ pub struct AlertEvaluationWrite {
 pub struct AlertEvaluationEntry {
     pub before: Option<AlertEventRecord>,
     pub after: AlertEventRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlertStateTransition {
+    pub operation_id: String,
+    pub event: String,
+    pub before: AlertEventRecord,
+    pub after: AlertEventRecord,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1568,6 +1582,45 @@ impl Store {
         Ok(())
     }
 
+    pub fn write_alert_state_transition(
+        &self,
+        write: &AlertStateTransition,
+        actor: &str,
+    ) -> Result<(), StoreError> {
+        validate_actor(actor).map_err(StoreError::InvalidInput)?;
+        validate_alert_state_transition(write)?;
+        let params_hash = alert_state_transition_hash(write);
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        if alert_mutation_replay_tx(&tx, &write.operation_id, &write.event, actor, &params_hash)? {
+            tx.commit()?;
+            return Ok(());
+        }
+        let current = get_alert_event_tx(&tx, &write.before.dedupe_key)?;
+        if current.as_ref() != Some(&write.before) {
+            return Err(StoreError::AlertMutationConflict {
+                operation_id: write.operation_id.clone(),
+                detail: "alert state changed before operator transition",
+            });
+        }
+        upsert_alert_event_tx(&tx, &write.after)?;
+        let mut event = AuditEvent::new(actor, write.event.clone());
+        event.ok = Some(true);
+        event.request_id = Some(write.operation_id.clone());
+        event.params_hash = Some(params_hash);
+        event.detail_json = serde_json::json!({
+            "actor_type": "user",
+            "target_type": "alert",
+            "target_id": write.after.alert_id,
+            "dedupe_key": write.after.dedupe_key,
+            "before_state": write.before.state,
+            "after_state": write.after.state,
+            "reason": write.reason,
+        });
+        insert_audit_tx(&tx, &event)?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn list_alert_events(&self) -> Result<Vec<AlertEventRecord>, StoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT alert_id, dedupe_key, node_id, severity, state, reason_code, first_seen_at, last_seen_at, last_sent_at, resolved_at, detail_json
@@ -1614,37 +1667,43 @@ impl Store {
             .map_err(StoreError::from)
     }
 
-    pub fn insert_alert_webhook_hook(
+    pub fn write_alert_webhook_hook_create(
         &self,
         hook: &AlertWebhookHookRecord,
+        actor: &str,
     ) -> Result<(), StoreError> {
+        validate_actor(actor).map_err(StoreError::InvalidInput)?;
         validate_alert_webhook_hook_record(hook)?;
-        let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
-            "INSERT INTO alert_hooks
-             (hook_id, name, hook_type, endpoint_url, endpoint_url_redacted, endpoint_host, host_allow_json, hmac_key_id, enabled, max_attempts, timeout_ms, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-            params![
-                hook.hook_id.as_str(),
-                hook.name.as_str(),
-                hook.hook_type.as_str(),
-                hook.endpoint_url.as_str(),
-                hook.endpoint_url_redacted.as_str(),
-                hook.endpoint_host.as_str(),
-                compact_json(&Value::Array(
-                    hook.host_allow
-                        .iter()
-                        .map(|host| Value::String(host.clone()))
-                        .collect()
-                )),
-                hook.hmac_key_id.as_str(),
-                bool_to_i64(hook.enabled),
-                u64_to_i64(hook.max_attempts)?,
-                u64_to_i64(hook.timeout_ms)?,
-                hook.created_at.as_str(),
-                hook.updated_at.as_str(),
-            ],
-        )?;
+        let params_hash = alert_webhook_hook_hash(hook);
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        if alert_mutation_replay_tx(
+            &tx,
+            &hook.hook_id,
+            "alert.hook.add_webhook",
+            actor,
+            &params_hash,
+        )? {
+            tx.commit()?;
+            return Ok(());
+        }
+        insert_alert_webhook_hook_tx(&tx, hook)?;
+        let mut event = AuditEvent::new(actor, "alert.hook.add_webhook");
+        event.ok = Some(true);
+        event.request_id = Some(hook.hook_id.clone());
+        event.params_hash = Some(params_hash);
+        event.detail_json = serde_json::json!({
+            "actor_type": "user",
+            "target_type": "alert_webhook_hook",
+            "target_id": hook.hook_id,
+            "hook_type": hook.hook_type,
+            "endpoint_host": hook.endpoint_host,
+            "hmac_key_id": hook.hmac_key_id,
+            "enabled": hook.enabled,
+            "max_attempts": hook.max_attempts,
+            "timeout_ms": hook.timeout_ms,
+            "reason": Value::Null,
+        });
+        insert_audit_tx(&tx, &event)?;
         tx.commit()?;
         Ok(())
     }
@@ -5126,6 +5185,8 @@ fn validate_alert_webhook_hook_record(hook: &AlertWebhookHookRecord) -> Result<(
     }
     validate_u64_range("max_attempts", hook.max_attempts, 1, 5)?;
     validate_u64_range("timeout_ms", hook.timeout_ms, 1_000, 5_000)?;
+    validate_rfc3339(&hook.created_at, "alert hook created_at")?;
+    validate_rfc3339(&hook.updated_at, "alert hook updated_at")?;
     Ok(())
 }
 
@@ -5811,6 +5872,181 @@ fn get_alert_event_tx(
     )
     .optional()
     .map_err(StoreError::from)
+}
+
+fn validate_alert_state_transition(write: &AlertStateTransition) -> Result<(), StoreError> {
+    validate_audit_text(&write.operation_id, "alert operation_id", 96)?;
+    let Some(uuid) = write.operation_id.strip_prefix("alert-action-") else {
+        return Err(StoreError::InvalidInput(
+            "alert operation_id must use alert-action-<uuid> format".to_string(),
+        ));
+    };
+    Uuid::parse_str(uuid).map_err(|_| {
+        StoreError::InvalidInput("alert operation_id must contain a UUID".to_string())
+    })?;
+    if !matches!(write.event.as_str(), "alert.silence" | "alert.resolve") {
+        return Err(StoreError::InvalidInput(
+            "alert transition event is not allowed".to_string(),
+        ));
+    }
+    validate_reason(&write.reason).map_err(StoreError::InvalidInput)?;
+    validate_alert_event_record(&write.before)?;
+    validate_alert_event_record(&write.after)?;
+    if write.before.alert_id != write.after.alert_id
+        || write.before.dedupe_key != write.after.dedupe_key
+        || write.before.node_id != write.after.node_id
+    {
+        return Err(StoreError::InvalidInput(
+            "alert transition cannot change alert identity".to_string(),
+        ));
+    }
+    let expected_state = if write.event == "alert.silence" {
+        "silenced"
+    } else {
+        "resolved"
+    };
+    if write.after.state != expected_state {
+        return Err(StoreError::InvalidInput(
+            "alert transition after-state does not match event".to_string(),
+        ));
+    }
+    let reason_key = if write.event == "alert.silence" {
+        "silence_reason"
+    } else {
+        "resolve_reason"
+    };
+    if write
+        .after
+        .detail_json
+        .get(reason_key)
+        .and_then(Value::as_str)
+        != Some(write.reason.as_str())
+    {
+        return Err(StoreError::InvalidInput(
+            "alert transition reason does not match stored detail".to_string(),
+        ));
+    }
+    if write.event == "alert.silence" {
+        let until = write
+            .after
+            .detail_json
+            .get("silenced_until")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                StoreError::InvalidInput("alert silence requires silenced_until".to_string())
+            })?;
+        validate_rfc3339(until, "alert silenced_until")?;
+        if write.after.resolved_at.is_some() {
+            return Err(StoreError::InvalidInput(
+                "silenced alert cannot have resolved_at".to_string(),
+            ));
+        }
+    } else if write.after.resolved_at.as_deref() != Some(write.after.last_seen_at.as_str()) {
+        return Err(StoreError::InvalidInput(
+            "resolved alert timestamps must match".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn alert_state_transition_hash(write: &AlertStateTransition) -> String {
+    let payload = serde_json::json!({
+        "event": write.event,
+        "before": alert_event_hash_json(&write.before),
+        "after": alert_event_hash_json(&write.after),
+        "reason": write.reason,
+    });
+    blake3::hash(&serde_json::to_vec(&payload).expect("alert transition hash JSON serializes"))
+        .to_hex()
+        .to_string()
+}
+
+fn alert_webhook_hook_hash(hook: &AlertWebhookHookRecord) -> String {
+    let payload = serde_json::json!({
+        "hook_id": hook.hook_id,
+        "name": hook.name,
+        "hook_type": hook.hook_type,
+        "endpoint_url": hook.endpoint_url,
+        "endpoint_url_redacted": hook.endpoint_url_redacted,
+        "endpoint_host": hook.endpoint_host,
+        "host_allow": hook.host_allow,
+        "hmac_key_id": hook.hmac_key_id,
+        "enabled": hook.enabled,
+        "max_attempts": hook.max_attempts,
+        "timeout_ms": hook.timeout_ms,
+        "created_at": hook.created_at,
+        "updated_at": hook.updated_at,
+    });
+    blake3::hash(&serde_json::to_vec(&payload).expect("alert hook hash JSON serializes"))
+        .to_hex()
+        .to_string()
+}
+
+fn alert_mutation_replay_tx(
+    tx: &Transaction<'_>,
+    operation_id: &str,
+    event: &str,
+    actor: &str,
+    params_hash: &str,
+) -> Result<bool, StoreError> {
+    let mut stmt = tx.prepare(
+        "SELECT event, actor, params_hash FROM controller_audit_log
+         WHERE request_id = ?1 ORDER BY id LIMIT 2",
+    )?;
+    let rows = stmt.query_map([operation_id], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+        ))
+    })?;
+    let existing = rows.collect::<Result<Vec<_>, _>>()?;
+    if existing.is_empty() {
+        return Ok(false);
+    }
+    if existing.len() == 1
+        && existing[0].0 == event
+        && existing[0].1 == actor
+        && existing[0].2.as_deref() == Some(params_hash)
+    {
+        return Ok(true);
+    }
+    Err(StoreError::AlertMutationConflict {
+        operation_id: operation_id.to_string(),
+        detail: "mutation audit provenance is mismatched or ambiguous",
+    })
+}
+
+fn insert_alert_webhook_hook_tx(
+    tx: &Transaction<'_>,
+    hook: &AlertWebhookHookRecord,
+) -> Result<(), StoreError> {
+    tx.execute(
+        "INSERT INTO alert_hooks
+         (hook_id, name, hook_type, endpoint_url, endpoint_url_redacted, endpoint_host, host_allow_json, hmac_key_id, enabled, max_attempts, timeout_ms, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        params![
+            hook.hook_id.as_str(),
+            hook.name.as_str(),
+            hook.hook_type.as_str(),
+            hook.endpoint_url.as_str(),
+            hook.endpoint_url_redacted.as_str(),
+            hook.endpoint_host.as_str(),
+            compact_json(&Value::Array(
+                hook.host_allow
+                    .iter()
+                    .map(|host| Value::String(host.clone()))
+                    .collect()
+            )),
+            hook.hmac_key_id.as_str(),
+            bool_to_i64(hook.enabled),
+            u64_to_i64(hook.max_attempts)?,
+            u64_to_i64(hook.timeout_ms)?,
+            hook.created_at.as_str(),
+            hook.updated_at.as_str(),
+        ],
+    )?;
+    Ok(())
 }
 
 fn validate_retention_policy(policy: &RetentionPolicyRecord) -> Result<(), StoreError> {

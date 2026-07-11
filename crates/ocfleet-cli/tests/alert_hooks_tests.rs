@@ -123,8 +123,7 @@ fn seed_webhook_hook(
         created_at: "2026-07-08T00:00:00Z".to_string(),
         updated_at: "2026-07-08T00:00:00Z".to_string(),
     };
-    store
-        .insert_alert_webhook_hook(&hook)
+    StoreWriter::write_alert_webhook_hook_create(store, &hook, "test-setup")
         .expect("insert webhook hook");
     hook
 }

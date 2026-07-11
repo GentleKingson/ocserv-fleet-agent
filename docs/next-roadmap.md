@@ -120,7 +120,7 @@ evaluation identities for exact replay, and rejects stale alert before-state so
 a concurrent operator silence or resolve is not overwritten. It changes no
 schema, protocol, API route, agent capability, or default read-only boundary.
 Alert operator transitions and webhook-hook creation are active on branch
-`codex/a1-alert-actions-delivery`. Silence/resolve compare persisted before-state
+`codex/a1-alert-actions-delivery` in pull request `#66`. Silence/resolve compare persisted before-state
 and commit with actor/reason/audit; hook creation commits configuration and a
 redacted audit together. Delivery persistence remains the next distinct slice
 because external file/HTTPS I/O cannot share a database transaction.

@@ -786,6 +786,64 @@ fn migration_tests_enrollment_metadata_v1_migrates_or_fails_closed() {
     assert_eq!(backup_files(decision_dir.path()).len(), 1);
 }
 
+#[test]
+fn migration_tests_delivery_attempt_detail_v1_migrates_or_fails_closed() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("controller.sqlite");
+    create_legacy_fixture(&db, 16, 1);
+    let conn = Connection::open(&db).expect("open v16 db");
+    insert_legacy_alert_hook(
+        &conn,
+        r#"{"schema":"ocfleet.alert.host-allow.v1","hosts":["93.184.216.34"]}"#,
+    );
+    insert_legacy_delivery_attempt(&conn, 512);
+    drop(conn);
+    let store = Store::open(&db).expect("migrate v16 delivery attempt detail");
+    let attempts = store
+        .list_alert_delivery_attempts()
+        .expect("read migrated attempts");
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].attempt_id, "attempt-legacy");
+    assert_eq!(attempts[0].bytes_sent, 512);
+    drop(store);
+    let conn = Connection::open(&db).expect("open migrated db");
+    let raw: String = conn
+        .query_row(
+            "SELECT detail_json FROM alert_delivery_attempts WHERE attempt_id = 'attempt-legacy'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read typed delivery detail");
+    let raw: serde_json::Value = serde_json::from_str(&raw).expect("delivery detail JSON");
+    assert_eq!(raw["schema"], "ocfleet.delivery-attempt.detail.v1");
+    assert_eq!(raw["attempt_id"], "attempt-legacy");
+    assert_eq!(raw["bytes_sent"], 512);
+
+    let bad_dir = tempfile::tempdir().expect("bad temp dir");
+    let bad_db = bad_dir.path().join("controller.sqlite");
+    create_legacy_fixture(&bad_db, 16, 1);
+    let conn = Connection::open(&bad_db).expect("open contaminated v16 db");
+    insert_legacy_alert_hook(
+        &conn,
+        r#"{"schema":"ocfleet.alert.host-allow.v1","hosts":["93.184.216.34"]}"#,
+    );
+    insert_legacy_delivery_attempt(&conn, 1_048_577);
+    drop(conn);
+    make_private_database_file(&bad_db);
+    assert!(Store::open(&bad_db).is_err());
+    assert_eq!(backup_files(bad_dir.path()).len(), 1);
+}
+
+fn insert_legacy_delivery_attempt(conn: &Connection, bytes_sent: i64) {
+    conn.execute(
+        "INSERT INTO alert_delivery_attempts
+         (attempt_id, alert_id, hook_id, attempt_no, attempted_at, status, http_status_class, error_code, bytes_sent)
+         VALUES ('attempt-legacy', 'alert-0000', 'webhook-legacy', 1, ?1, 'failed', '5xx', 'WEBHOOK_HTTP_5XX', ?2)",
+        (NOW, bytes_sent),
+    )
+    .expect("insert legacy delivery attempt");
+}
+
 fn insert_legacy_join_request(
     conn: &Connection,
     requested_labels_json: &str,

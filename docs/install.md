@@ -333,6 +333,11 @@ unsupported versions or kinds, nested values, invalid keys or bounds,
 sensitive/address-like data, and approved labels on non-approved requests stop
 the upgrade and leave the version-15 database unchanged beside its backup.
 
+Schema version 17 rebuilds alert delivery-attempt storage with a required closed
+detail payload derived from each constrained relational row. Invalid IDs,
+attempt numbers, statuses, HTTP classes, error codes, or byte counts stop the
+upgrade and leave the version-16 database unchanged beside its private backup.
+
 Before upgrades, keep an operator-managed backup as well:
 
 ```bash

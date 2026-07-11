@@ -11,10 +11,10 @@ use time::{OffsetDateTime, macros::format_description};
 
 use crate::private_file::{self, PrivateFileError};
 use crate::storage_payloads::{
-    AlertDetailPayloadV1, AlertHostAllowPayloadV1, EnrollmentMetadataKindV1,
-    EnrollmentMetadataPayloadV1, HEALTH_SUMMARY_SCHEMA_V1, HealthDegradedMethodsPayloadV1,
-    HealthSummaryPayloadV1, ObservationSummaryPayloadV1, RunSummaryPayloadV1,
-    SchedulerPairPayloadV1, SchedulerSelectorPayloadV1, TrustBundlePayloadV1,
+    AlertDetailPayloadV1, AlertHostAllowPayloadV1, DeliveryAttemptDetailPayloadV1,
+    EnrollmentMetadataKindV1, EnrollmentMetadataPayloadV1, HEALTH_SUMMARY_SCHEMA_V1,
+    HealthDegradedMethodsPayloadV1, HealthSummaryPayloadV1, ObservationSummaryPayloadV1,
+    RunSummaryPayloadV1, SchedulerPairPayloadV1, SchedulerSelectorPayloadV1, TrustBundlePayloadV1,
     validate_health_payload_relationship, validate_scheduler_payload_relationship,
 };
 use crate::store::{CURRENT_SCHEMA_VERSION, StoreError};
@@ -129,6 +129,12 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         name: "0016_versioned_enrollment_metadata",
         description: "Migrate enrollment labels and scope to closed versioned v1 payloads.",
         apply: apply_0016_versioned_enrollment_metadata,
+    },
+    Migration {
+        version: 17,
+        name: "0017_versioned_delivery_attempt_details",
+        description: "Add closed versioned delivery-attempt detail payloads.",
+        apply: apply_0017_versioned_delivery_attempt_details,
     },
 ];
 
@@ -1115,6 +1121,102 @@ fn migrate_enrollment_metadata(
         .or_else(|_| EnrollmentMetadataPayloadV1::from_legacy(kind, &value))
         .map_err(StoreError::InvalidInput)?;
     Ok(payload.to_value())
+}
+
+fn apply_0017_versioned_delivery_attempt_details(tx: &Transaction<'_>) -> Result<(), StoreError> {
+    let rows = {
+        let mut stmt = tx.prepare(
+            "SELECT attempt_id, alert_id, hook_id, attempt_no, attempted_at, status, http_status_class, error_code, bytes_sent FROM alert_delivery_attempts ORDER BY attempt_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, i64>(8)?,
+            ))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    tx.execute_batch(
+        r#"
+ALTER TABLE alert_delivery_attempts RENAME TO alert_delivery_attempts_legacy_v16;
+CREATE TABLE alert_delivery_attempts (
+  attempt_id TEXT PRIMARY KEY,
+  alert_id TEXT NOT NULL,
+  hook_id TEXT NOT NULL,
+  attempt_no INTEGER NOT NULL CHECK (attempt_no BETWEEN 1 AND 5),
+  attempted_at TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('succeeded', 'failed', 'dry_run')),
+  http_status_class TEXT,
+  error_code TEXT,
+  bytes_sent INTEGER NOT NULL CHECK (bytes_sent >= 0),
+  detail_json TEXT NOT NULL CHECK (json_valid(detail_json)),
+  FOREIGN KEY(alert_id) REFERENCES alert_events(alert_id) ON DELETE CASCADE,
+  FOREIGN KEY(hook_id) REFERENCES alert_hooks(hook_id) ON DELETE CASCADE
+);
+"#,
+    )?;
+    for (
+        attempt_id,
+        alert_id,
+        hook_id,
+        attempt_no,
+        attempted_at,
+        status,
+        http_status_class,
+        error_code,
+        bytes_sent,
+    ) in rows
+    {
+        let attempt_no = u64::try_from(attempt_no).map_err(|_| {
+            StoreError::InvalidInput("legacy delivery attempt number is invalid".to_string())
+        })?;
+        let bytes_sent = u64::try_from(bytes_sent).map_err(|_| {
+            StoreError::InvalidInput("legacy delivery byte count is invalid".to_string())
+        })?;
+        let payload = DeliveryAttemptDetailPayloadV1::new(
+            attempt_id.clone(),
+            alert_id.clone(),
+            hook_id.clone(),
+            attempt_no,
+            status.clone(),
+            http_status_class.clone(),
+            error_code.clone(),
+            bytes_sent,
+        )
+        .map_err(StoreError::InvalidInput)?;
+        tx.execute(
+            "INSERT INTO alert_delivery_attempts
+             (attempt_id, alert_id, hook_id, attempt_no, attempted_at, status, http_status_class, error_code, bytes_sent, detail_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            rusqlite::params![
+                attempt_id,
+                alert_id,
+                hook_id,
+                attempt_no,
+                attempted_at,
+                status,
+                http_status_class,
+                error_code,
+                bytes_sent,
+                payload.to_value().to_string(),
+            ],
+        )?;
+    }
+    tx.execute_batch(
+        r#"
+DROP TABLE alert_delivery_attempts_legacy_v16;
+CREATE INDEX idx_alert_delivery_attempts_alert_hook
+  ON alert_delivery_attempts(alert_id, hook_id, attempted_at);
+"#,
+    )?;
+    Ok(())
 }
 
 fn observability_tables_have_current_constraints(tx: &Transaction<'_>) -> Result<bool, StoreError> {

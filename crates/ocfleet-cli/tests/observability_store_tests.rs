@@ -270,7 +270,7 @@ fn observability_store_tests_new_observability_tables_exist() {
 
 #[test]
 fn observability_store_tests_inserts_webhook_hook_and_delivery_attempt() {
-    let (_dir, store, _db) = open_temp_store();
+    let (_dir, store, db) = open_temp_store();
     let hook = AlertWebhookHookRecord {
         hook_id: "webhook-1".to_string(),
         name: "ops".to_string(),
@@ -337,6 +337,29 @@ fn observability_store_tests_inserts_webhook_hook_and_delivery_attempt() {
         .list_alert_delivery_attempts()
         .expect("list delivery attempts");
     assert_eq!(attempts, vec![attempt]);
+
+    let conn = Connection::open(&db).expect("open delivery detail fixture");
+    let raw: String = conn
+        .query_row(
+            "SELECT detail_json FROM alert_delivery_attempts WHERE attempt_id = 'attempt-1'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read typed delivery detail");
+    let mut raw: Value = serde_json::from_str(&raw).expect("typed delivery detail");
+    assert_eq!(raw["schema"], "ocfleet.delivery-attempt.detail.v1");
+    assert_eq!(raw["bytes_sent"], 512);
+    raw["client_address"] = json!("10.0.0.2");
+    conn.execute(
+        "UPDATE alert_delivery_attempts SET detail_json = ?1 WHERE attempt_id = 'attempt-1'",
+        [raw.to_string()],
+    )
+    .expect("contaminate delivery detail");
+    let error = store
+        .list_alert_delivery_attempts()
+        .expect_err("contaminated delivery detail must fail closed");
+    assert!(error.to_string().contains("delivery attempt detail"));
+    assert!(!error.to_string().contains("10.0.0.2"));
 }
 
 #[test]

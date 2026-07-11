@@ -20,6 +20,7 @@ pub const TRUST_BUNDLE_SCHEMA_V1: &str = "ocfleet.trust.bundle.v1";
 pub const ALERT_DETAIL_SCHEMA_V1: &str = "ocfleet.alert.detail.v1";
 pub const ALERT_HOST_ALLOW_SCHEMA_V1: &str = "ocfleet.alert.host-allow.v1";
 pub const ENROLLMENT_METADATA_SCHEMA_V1: &str = "ocfleet.enrollment.metadata.v1";
+pub const DELIVERY_ATTEMPT_DETAIL_SCHEMA_V1: &str = "ocfleet.delivery-attempt.detail.v1";
 
 const HEALTH_DEGRADED_METHODS: [&str; 5] = [
     "ocserv.cert.expiry",
@@ -986,6 +987,94 @@ impl EnrollmentMetadataKindV1 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct DeliveryAttemptDetailPayloadV1 {
+    pub schema: String,
+    pub attempt_id: String,
+    pub alert_id: String,
+    pub hook_id: String,
+    pub attempt_no: u64,
+    pub status: String,
+    pub http_status_class: Option<String>,
+    pub error_code: Option<String>,
+    pub bytes_sent: u64,
+}
+
+impl DeliveryAttemptDetailPayloadV1 {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        attempt_id: String,
+        alert_id: String,
+        hook_id: String,
+        attempt_no: u64,
+        status: String,
+        http_status_class: Option<String>,
+        error_code: Option<String>,
+        bytes_sent: u64,
+    ) -> Result<Self, String> {
+        let payload = Self {
+            schema: DELIVERY_ATTEMPT_DETAIL_SCHEMA_V1.to_string(),
+            attempt_id,
+            alert_id,
+            hook_id,
+            attempt_no,
+            status,
+            http_status_class,
+            error_code,
+            bytes_sent,
+        };
+        payload.validate()?;
+        Ok(payload)
+    }
+
+    pub fn from_value(value: &Value) -> Result<Self, String> {
+        let payload: Self = serde_json::from_value(value.clone())
+            .map_err(|_| "delivery attempt detail payload is not closed v1 data".to_string())?;
+        payload.validate()?;
+        Ok(payload)
+    }
+
+    pub fn to_value(&self) -> Value {
+        serde_json::to_value(self).expect("delivery attempt detail payload serializes")
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.schema != DELIVERY_ATTEMPT_DETAIL_SCHEMA_V1 {
+            return Err("delivery attempt detail payload schema is unsupported".to_string());
+        }
+        for (value, field) in [
+            (&self.attempt_id, "delivery attempt ID"),
+            (&self.alert_id, "delivery alert ID"),
+            (&self.hook_id, "delivery hook ID"),
+        ] {
+            validate_fixed_id(value, 128, field)?;
+        }
+        if !(1..=5).contains(&self.attempt_no) {
+            return Err("delivery attempt number is out of range".to_string());
+        }
+        if !matches!(self.status.as_str(), "succeeded" | "failed" | "dry_run") {
+            return Err("delivery attempt status is unsupported".to_string());
+        }
+        if self
+            .http_status_class
+            .as_deref()
+            .is_some_and(|class| !matches!(class, "1xx" | "2xx" | "3xx" | "4xx" | "5xx"))
+        {
+            return Err("delivery HTTP status class is unsupported".to_string());
+        }
+        if let Some(error_code) = &self.error_code {
+            validate_fixed_id(error_code, 128, "delivery error code")?;
+        }
+        if self.bytes_sent > 1_048_576 {
+            return Err("delivery attempt byte count is out of range".to_string());
+        }
+        crate::store::validate_low_sensitive_json(&self.to_value(), "delivery attempt detail")
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ObservationSummaryPayloadV1 {
     pub schema: String,
     pub result_class: String,
@@ -1236,8 +1325,9 @@ mod tests {
 
     use super::{
         ALERT_DETAIL_SCHEMA_V1, ALERT_HOST_ALLOW_SCHEMA_V1, AlertDetailPayloadV1,
-        AlertHostAllowPayloadV1, ENROLLMENT_METADATA_SCHEMA_V1, EnrollmentMetadataKindV1,
-        EnrollmentMetadataPayloadV1, HEALTH_DEGRADED_METHODS_SCHEMA_V1, HEALTH_SUMMARY_SCHEMA_V1,
+        AlertHostAllowPayloadV1, DELIVERY_ATTEMPT_DETAIL_SCHEMA_V1, DeliveryAttemptDetailPayloadV1,
+        ENROLLMENT_METADATA_SCHEMA_V1, EnrollmentMetadataKindV1, EnrollmentMetadataPayloadV1,
+        HEALTH_DEGRADED_METHODS_SCHEMA_V1, HEALTH_SUMMARY_SCHEMA_V1,
         HealthDegradedMethodsPayloadV1, HealthSummaryPayloadV1, OBSERVATION_SUMMARY_SCHEMA_V1,
         ObservationSummaryPayloadV1, RUN_SUMMARY_SCHEMA_V1, RunSummaryPayloadV1,
         SCHEDULER_PAIR_SCHEMA_V1, SCHEDULER_SELECTOR_SCHEMA_V1, SchedulerPairPayloadV1,
@@ -1676,6 +1766,42 @@ mod tests {
             EnrollmentMetadataPayloadV1::from_legacy(
                 EnrollmentMetadataKindV1::RequestedLabels,
                 &json!({"nested": {"value": true}}),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn delivery_attempt_detail_payload_is_closed_and_relationally_complete() {
+        let payload = DeliveryAttemptDetailPayloadV1::new(
+            "attempt-1".to_string(),
+            "alert-1".to_string(),
+            "webhook-1".to_string(),
+            2,
+            "failed".to_string(),
+            Some("5xx".to_string()),
+            Some("WEBHOOK_HTTP_5XX".to_string()),
+            512,
+        )
+        .expect("valid delivery attempt detail");
+        assert_eq!(payload.schema, DELIVERY_ATTEMPT_DETAIL_SCHEMA_V1);
+        assert_eq!(
+            DeliveryAttemptDetailPayloadV1::from_value(&payload.to_value()).expect("round trip"),
+            payload
+        );
+        let mut contaminated = payload.to_value();
+        contaminated["client_address"] = json!("10.0.0.2");
+        assert!(DeliveryAttemptDetailPayloadV1::from_value(&contaminated).is_err());
+        assert!(
+            DeliveryAttemptDetailPayloadV1::new(
+                "attempt-1".to_string(),
+                "alert-1".to_string(),
+                "webhook-1".to_string(),
+                6,
+                "failed".to_string(),
+                None,
+                Some("WEBHOOK_HTTP_5XX".to_string()),
+                0,
             )
             .is_err()
         );

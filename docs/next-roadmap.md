@@ -196,6 +196,12 @@ reject unknown, nested, sensitive, malformed, future-version, wrong-kind, or
 decision-inconsistent data without changing enrollment identity or trust.
 The slice is published in pull request `#76`.
 
+The ninth A2 slice advances SQLite to migration `0017` and adds closed delivery
+attempt detail payloads bound to every relational attempt field. Migration
+rebuilds the table and recreates its index and foreign keys; writers and readers
+reject unknown, malformed, future-version, out-of-range, or mismatched data.
+Publication is in progress.
+
 ### Baseline And Production Foundation
 
 | ID | Issue | Status | Depends on | Release target | Acceptance and required evidence |

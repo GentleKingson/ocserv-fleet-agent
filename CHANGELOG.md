@@ -53,6 +53,10 @@
   requested/approved labels in closed kind-bound scalar-map payloads. Migration,
   writers, and readers reject unknown, nested, sensitive, malformed,
   future-version, or decision-inconsistent data.
+- SQLite schema version 17 adds closed delivery-attempt detail payloads bound to
+  every relational attempt field. Migration rebuilds the table and preserves
+  its index/foreign keys; writers and readers reject unknown, out-of-range,
+  future-version, or relationally inconsistent data.
 - Node add, enable, disable, and remove now take an explicit resolved actor and
   commit their registry/trust change and success audit in one SQLite
   transaction through `StoreWriter`.

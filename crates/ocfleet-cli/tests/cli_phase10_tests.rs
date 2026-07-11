@@ -103,7 +103,6 @@ fn seed_join_request(
             &EnrollmentTokenInsert {
                 token_id: token_id.to_string(),
                 token_hash: Store::hash_enrollment_token(token_plaintext),
-                created_by: "seed-operator".to_string(),
                 expires_at: "2099-01-01T00:00:00Z".to_string(),
                 max_uses: 1,
                 description: None,
@@ -116,6 +115,7 @@ fn seed_join_request(
     store
         .submit_join_request(
             &JoinRequestInsert {
+                request_id: format!("join-{}", uuid::Uuid::new_v4()),
                 token_plaintext: token_plaintext.to_string(),
                 agent_public_key: "agent-public-key".to_string(),
                 fingerprint: "agent-fingerprint".to_string(),
@@ -163,6 +163,132 @@ fn enroll_token_create_prints_plaintext_once_and_stores_only_hash() {
 }
 
 #[test]
+fn enrollment_token_revoke_and_request_reject_use_explicit_cli_actor() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let database_arg = database.to_string_lossy().into_owned();
+
+    let token_output = run_ocfleet(&[
+        "--database",
+        &database_arg,
+        "--actor",
+        "issuing-operator",
+        "enroll",
+        "token",
+        "create",
+        "--ttl",
+        "24h",
+        "--max-uses",
+        "2",
+    ]);
+    let token_text = stdout(&token_output);
+    let token_id = field(&token_text, "token_id").to_string();
+    let token = field(&token_text, "token").to_string();
+    let request_id = format!("join-{}", uuid::Uuid::new_v4());
+    let request_args = [
+        "--database",
+        database_arg.as_str(),
+        "--actor",
+        "request-operator",
+        "enroll",
+        "request",
+        "create",
+        "--request-id",
+        request_id.as_str(),
+        "--token",
+        token.as_str(),
+        "--agent-public-key",
+        "agent-public-key",
+        "--fingerprint",
+        "agent-fingerprint",
+        "--hostname",
+        "agent.example",
+        "--agent-version",
+        "0.2.0",
+    ];
+    let first_request = run_ocfleet(&request_args);
+    let retry_request = run_ocfleet(&request_args);
+    assert_eq!(
+        field(&stdout(&first_request), "join_request_id"),
+        request_id
+    );
+    assert_eq!(
+        field(&stdout(&retry_request), "join_request_id"),
+        request_id
+    );
+
+    let reject_output = run_ocfleet(&[
+        "--database",
+        &database_arg,
+        "--actor",
+        "rejecting-operator",
+        "enroll",
+        "request",
+        "reject",
+        &request_id,
+        "--reason",
+        "identity mismatch",
+    ]);
+    assert_eq!(field(&stdout(&reject_output), "status"), "rejected");
+
+    let revoke_output = run_ocfleet(&[
+        "--database",
+        &database_arg,
+        "--actor",
+        "revoking-operator",
+        "enroll",
+        "token",
+        "revoke",
+        &token_id,
+        "--reason",
+        "ticket-123",
+    ]);
+    assert_eq!(field(&stdout(&revoke_output), "status"), "revoked");
+
+    let store = Store::open(&database).expect("store reopens");
+    assert_eq!(
+        store
+            .get_enrollment_token(&token_id)
+            .expect("load token")
+            .expect("token exists")
+            .used_count,
+        1
+    );
+    assert_eq!(
+        store
+            .get_join_request(&request_id)
+            .expect("load request")
+            .expect("request exists")
+            .status,
+        JoinRequestStatus::Rejected
+    );
+    let conn = Connection::open(&database).expect("open audit database");
+    for (event, expected_actor) in [
+        ("enrollment.token.create", "issuing-operator"),
+        ("enrollment.token.use", "request-operator"),
+        ("enrollment.reject", "rejecting-operator"),
+        ("enrollment.token.revoke", "revoking-operator"),
+    ] {
+        let actor: String = conn
+            .query_row(
+                "SELECT actor FROM controller_audit_log WHERE event = ?1",
+                [event],
+                |row| row.get(0),
+            )
+            .expect("load event actor");
+        assert_eq!(actor, expected_actor, "unexpected actor for {event}");
+    }
+    let token_use_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM controller_audit_log WHERE event = 'enrollment.token.use'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count token use audits");
+    assert_eq!(token_use_count, 1);
+}
+
+#[test]
 fn enroll_approve_activates_pending_join_request() {
     let dir = tempfile::tempdir().expect("temp dir");
     let database = dir.path().join("controller.sqlite");
@@ -174,7 +300,6 @@ fn enroll_approve_activates_pending_join_request() {
             &EnrollmentTokenInsert {
                 token_id: "tok-approve".to_string(),
                 token_hash: Store::hash_enrollment_token(token_plaintext),
-                created_by: "operator".to_string(),
                 expires_at: "2099-01-01T00:00:00Z".to_string(),
                 max_uses: 1,
                 description: None,
@@ -187,6 +312,7 @@ fn enroll_approve_activates_pending_join_request() {
     let join = store
         .submit_join_request(
             &JoinRequestInsert {
+                request_id: format!("join-{}", uuid::Uuid::new_v4()),
                 token_plaintext: token_plaintext.to_string(),
                 agent_public_key: "agent-public-key".to_string(),
                 fingerprint: "agent-fingerprint".to_string(),
@@ -361,7 +487,6 @@ fn enroll_request_create_reads_token_from_file_and_stdin() {
                 &EnrollmentTokenInsert {
                     token_id: format!("tok-request-{source}"),
                     token_hash: Store::hash_enrollment_token(&token_plaintext),
-                    created_by: "operator".to_string(),
                     expires_at: "2099-01-01T00:00:00Z".to_string(),
                     max_uses: 1,
                     description: None,
@@ -505,7 +630,6 @@ fn enroll_approve_rejects_endpoint_mismatch_when_request_named_endpoint() {
             &EnrollmentTokenInsert {
                 token_id: "tok-approve-bound".to_string(),
                 token_hash: Store::hash_enrollment_token(token_plaintext),
-                created_by: "operator".to_string(),
                 expires_at: "2099-01-01T00:00:00Z".to_string(),
                 max_uses: 1,
                 description: None,
@@ -518,6 +642,7 @@ fn enroll_approve_rejects_endpoint_mismatch_when_request_named_endpoint() {
     let join = store
         .submit_join_request(
             &JoinRequestInsert {
+                request_id: format!("join-{}", uuid::Uuid::new_v4()),
                 token_plaintext: token_plaintext.to_string(),
                 agent_public_key: "agent-public-key".to_string(),
                 fingerprint: "agent-fingerprint".to_string(),
@@ -570,7 +695,6 @@ fn enroll_approve_rejects_non_canonical_endpoint_id() {
             &EnrollmentTokenInsert {
                 token_id: "tok-approve-invalid".to_string(),
                 token_hash: Store::hash_enrollment_token(token_plaintext),
-                created_by: "operator".to_string(),
                 expires_at: "2099-01-01T00:00:00Z".to_string(),
                 max_uses: 1,
                 description: None,
@@ -583,6 +707,7 @@ fn enroll_approve_rejects_non_canonical_endpoint_id() {
     let join = store
         .submit_join_request(
             &JoinRequestInsert {
+                request_id: format!("join-{}", uuid::Uuid::new_v4()),
                 token_plaintext: token_plaintext.to_string(),
                 agent_public_key: "agent-public-key".to_string(),
                 fingerprint: "agent-fingerprint".to_string(),
@@ -639,7 +764,6 @@ fn enroll_request_create_rejects_control_characters_in_agent_fields() {
                 &EnrollmentTokenInsert {
                     token_id: "tok-request".to_string(),
                     token_hash: Store::hash_enrollment_token(token_plaintext),
-                    created_by: "operator".to_string(),
                     expires_at: "2099-01-01T00:00:00Z".to_string(),
                     max_uses: 1,
                     description: None,

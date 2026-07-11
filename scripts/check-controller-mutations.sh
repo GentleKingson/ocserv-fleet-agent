@@ -97,7 +97,8 @@ DIRECT_NODE_ENDPOINT_MUTATOR_RE = re.compile(
 )
 DIRECT_ENROLLMENT_MUTATOR_RE = re.compile(
     r"(?:\.\s*|\bStore\s*::\s*)"
-    r"(approve_join_request|claim_legacy_enrollment)\s*\("
+    r"(create_enrollment_token|revoke_enrollment_token|submit_join_request|"
+    r"reject_join_request|approve_join_request|claim_legacy_enrollment)\s*\("
 )
 DIRECT_RPC_AUDIT_RE = re.compile(r"\bwrite_rpc_audit\s*\(")
 LEGACY_SCHEDULER_WRITER_ALLOWED_FILES = {

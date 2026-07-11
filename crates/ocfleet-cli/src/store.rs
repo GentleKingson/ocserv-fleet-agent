@@ -10,6 +10,7 @@ use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params, types::Type,
 };
 use serde_json::Value;
+use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -32,6 +33,7 @@ pub const DEFAULT_HEALTH_UNREACHABLE_FAILURES: u64 = 3;
 pub const DEFAULT_HEALTH_CERT_WARNING_DAYS: u64 = 30;
 pub const DEFAULT_HEALTH_CERT_CRITICAL_DAYS: u64 = 7;
 pub const MAX_SCHEDULER_OUTCOME_ENTRIES: usize = 4;
+pub const MAX_ENROLLMENT_TOKEN_USES: u32 = 10_000;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -61,8 +63,26 @@ pub enum StoreError {
     ObservabilityRunNotRunning(String),
     #[error("enrollment rejected: {0}")]
     EnrollmentRejected(String),
+    #[error("enrollment token not found: {0}")]
+    EnrollmentTokenNotFound(String),
+    #[error("enrollment token conflict for {token_id}: {detail}")]
+    EnrollmentTokenConflict {
+        token_id: String,
+        detail: &'static str,
+    },
+    #[error("invalid enrollment token transition for {token_id}: {status} cannot {action}")]
+    InvalidEnrollmentTokenTransition {
+        token_id: String,
+        status: String,
+        action: &'static str,
+    },
     #[error("join request not found: {0}")]
     JoinRequestNotFound(String),
+    #[error("enrollment request conflict for {request_id}: {detail}")]
+    EnrollmentRequestConflict {
+        request_id: String,
+        detail: &'static str,
+    },
     #[error("join request {request_id} is {status}, expected {expected}")]
     InvalidJoinRequestStatus {
         request_id: String,
@@ -353,11 +373,10 @@ pub struct HealthPolicyRecord {
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct EnrollmentTokenInsert {
     pub token_id: String,
     pub token_hash: String,
-    pub created_by: String,
     pub expires_at: String,
     pub max_uses: u32,
     pub description: Option<String>,
@@ -365,7 +384,28 @@ pub struct EnrollmentTokenInsert {
     pub scope_json: Value,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl fmt::Debug for EnrollmentTokenInsert {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EnrollmentTokenInsert")
+            .field("token_id", &self.token_id)
+            .field("token_hash", &"[REDACTED]")
+            .field("expires_at", &self.expires_at)
+            .field("max_uses", &self.max_uses)
+            .field("description_present", &self.description.is_some())
+            .field(
+                "label_count",
+                &self.labels_json.as_object().map_or(0, serde_json::Map::len),
+            )
+            .field(
+                "scope_count",
+                &self.scope_json.as_object().map_or(0, serde_json::Map::len),
+            )
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub struct EnrollmentTokenRecord {
     pub token_id: String,
     pub token_hash: String,
@@ -380,8 +420,34 @@ pub struct EnrollmentTokenRecord {
     pub scope_json: Value,
 }
 
-#[derive(Debug, Clone)]
+impl fmt::Debug for EnrollmentTokenRecord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EnrollmentTokenRecord")
+            .field("token_id", &self.token_id)
+            .field("token_hash", &"[REDACTED]")
+            .field("created_at", &self.created_at)
+            .field("created_by", &self.created_by)
+            .field("expires_at", &self.expires_at)
+            .field("max_uses", &self.max_uses)
+            .field("used_count", &self.used_count)
+            .field("status", &self.status)
+            .field("description_present", &self.description.is_some())
+            .field(
+                "label_count",
+                &self.labels_json.as_object().map_or(0, serde_json::Map::len),
+            )
+            .field(
+                "scope_count",
+                &self.scope_json.as_object().map_or(0, serde_json::Map::len),
+            )
+            .finish()
+    }
+}
+
+#[derive(Clone)]
 pub struct JoinRequestInsert {
+    pub request_id: String,
     pub token_plaintext: String,
     pub agent_public_key: String,
     pub fingerprint: String,
@@ -389,6 +455,31 @@ pub struct JoinRequestInsert {
     pub hostname: String,
     pub agent_version: String,
     pub requested_labels_json: Value,
+}
+
+impl fmt::Debug for JoinRequestInsert {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("JoinRequestInsert")
+            .field("request_id", &self.request_id)
+            .field("token_plaintext", &"[REDACTED]")
+            .field("agent_public_key", &"[REDACTED]")
+            .field("fingerprint", &"[REDACTED]")
+            .field(
+                "requested_endpoint_id_present",
+                &self.requested_endpoint_id.is_some(),
+            )
+            .field("hostname_present", &!self.hostname.is_empty())
+            .field("agent_version", &self.agent_version)
+            .field(
+                "requested_label_count",
+                &self
+                    .requested_labels_json
+                    .as_object()
+                    .map_or(0, serde_json::Map::len),
+            )
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -412,7 +503,7 @@ pub struct LegacyEnrollmentClaimInput {
     pub reason: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct JoinRequestRecord {
     pub request_id: String,
     pub token_id: String,
@@ -430,6 +521,48 @@ pub struct JoinRequestRecord {
     pub approved_by: Option<String>,
     pub rejection_reason: Option<String>,
     pub audit_correlation_id: String,
+}
+
+impl fmt::Debug for JoinRequestRecord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("JoinRequestRecord")
+            .field("request_id", &self.request_id)
+            .field("token_id", &self.token_id)
+            .field("status", &self.status)
+            .field("agent_public_key", &"[REDACTED]")
+            .field("fingerprint", &"[REDACTED]")
+            .field(
+                "requested_endpoint_id_present",
+                &self.requested_endpoint_id.is_some(),
+            )
+            .field(
+                "assigned_endpoint_id_present",
+                &self.assigned_endpoint_id.is_some(),
+            )
+            .field("hostname_present", &!self.hostname.is_empty())
+            .field("agent_version", &self.agent_version)
+            .field(
+                "requested_label_count",
+                &self
+                    .requested_labels_json
+                    .as_object()
+                    .map_or(0, serde_json::Map::len),
+            )
+            .field(
+                "approved_label_count",
+                &self
+                    .approved_labels_json
+                    .as_object()
+                    .map_or(0, serde_json::Map::len),
+            )
+            .field("created_at", &self.created_at)
+            .field("approved_at", &self.approved_at)
+            .field("approved_by", &self.approved_by)
+            .field("rejection_reason", &self.rejection_reason)
+            .field("audit_correlation_id", &self.audit_correlation_id)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1834,15 +1967,40 @@ impl Store {
         &self,
         token: &EnrollmentTokenInsert,
         actor: &str,
-    ) -> Result<(), StoreError> {
-        validate_actor(&token.created_by).map_err(StoreError::InvalidInput)?;
+    ) -> Result<EnrollmentTokenRecord, StoreError> {
         validate_actor(actor).map_err(StoreError::InvalidInput)?;
+        validate_enrollment_token_input(token)?;
         if let Some(description) = &token.description {
             validate_description(description).map_err(StoreError::InvalidInput)?;
         }
         validate_label_json(&token.labels_json, "labels").map_err(StoreError::InvalidInput)?;
         validate_label_json(&token.scope_json, "scope").map_err(StoreError::InvalidInput)?;
-        let tx = self.conn.unchecked_transaction()?;
+        validate_low_sensitive_json(&token.labels_json, "enrollment token labels")?;
+        validate_low_sensitive_json(&token.scope_json, "enrollment token scope")?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        if let Some(existing) = get_enrollment_token_tx(&tx, &token.token_id)? {
+            if enrollment_token_matches_create(&existing, token, actor) {
+                validate_enrollment_token_audit_provenance_tx(
+                    &tx,
+                    "enrollment.token.create",
+                    &token.token_id,
+                    actor,
+                    None,
+                )?;
+                tx.commit()?;
+                return Ok(existing);
+            }
+            return Err(StoreError::EnrollmentTokenConflict {
+                token_id: token.token_id.clone(),
+                detail: "token id already exists with different issuance metadata",
+            });
+        }
+        if get_enrollment_token_by_hash_tx(&tx, &token.token_hash)?.is_some() {
+            return Err(StoreError::EnrollmentTokenConflict {
+                token_id: token.token_id.clone(),
+                detail: "token credential is already assigned to another token id",
+            });
+        }
         tx.execute(
             "INSERT INTO enrollment_tokens
              (token_id, token_hash, created_at, created_by, expires_at, max_uses, used_count, status, description, labels_json, scope_json)
@@ -1850,7 +2008,7 @@ impl Store {
             params![
                 token.token_id.as_str(),
                 token.token_hash.as_str(),
-                token.created_by.as_str(),
+                actor,
                 token.expires_at.as_str(),
                 i64::from(token.max_uses),
                 EnrollmentTokenStatus::Active.as_str(),
@@ -1859,26 +2017,15 @@ impl Store {
                 token.scope_json.to_string(),
             ],
         )?;
+        let after = get_enrollment_token_tx(&tx, &token.token_id)?
+            .expect("created enrollment token exists");
         let mut event = AuditEvent::new(actor, "enrollment.token.create");
         event.ok = Some(true);
-        event.detail_json = json_detail(
-            "enrollment_token",
-            &token.token_id,
-            None,
-            Some(serde_json::json!({
-                "token_id": token.token_id.clone(),
-                "status": EnrollmentTokenStatus::Active.as_str(),
-                "expires_at": token.expires_at.clone(),
-                "max_uses": token.max_uses,
-                "description": token.description.clone(),
-                "labels": token.labels_json.clone(),
-                "scope": token.scope_json.clone(),
-            })),
-            None,
-        );
+        event.detail_json =
+            enrollment_token_transition_audit_json(&token.token_id, None, Some(&after), None);
         insert_audit_tx(&tx, &event)?;
         tx.commit()?;
-        Ok(())
+        Ok(after)
     }
 
     pub fn get_enrollment_token(
@@ -1896,12 +2043,82 @@ impl Store {
             .map_err(StoreError::from)
     }
 
+    pub fn revoke_enrollment_token(
+        &self,
+        token_id: &str,
+        actor: &str,
+        reason: &str,
+    ) -> Result<EnrollmentTokenRecord, StoreError> {
+        validate_actor(actor).map_err(StoreError::InvalidInput)?;
+        validate_reason(reason).map_err(StoreError::InvalidInput)?;
+        validate_enrollment_token_id(token_id)?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let before = get_enrollment_token_tx(&tx, token_id)?
+            .ok_or_else(|| StoreError::EnrollmentTokenNotFound(token_id.to_string()))?;
+        match before.status {
+            EnrollmentTokenStatus::Revoked => {
+                validate_enrollment_token_audit_provenance_tx(
+                    &tx,
+                    "enrollment.token.revoke",
+                    token_id,
+                    actor,
+                    Some(reason),
+                )?;
+                tx.commit()?;
+                return Ok(before);
+            }
+            EnrollmentTokenStatus::Expired => {
+                return Err(StoreError::InvalidEnrollmentTokenTransition {
+                    token_id: token_id.to_string(),
+                    status: before.status.as_str().to_string(),
+                    action: "revoke",
+                });
+            }
+            EnrollmentTokenStatus::Active => {}
+        }
+        if token_is_expired(&before.expires_at) {
+            return Err(StoreError::InvalidEnrollmentTokenTransition {
+                token_id: token_id.to_string(),
+                status: EnrollmentTokenStatus::Expired.as_str().to_string(),
+                action: "revoke",
+            });
+        }
+        let affected = tx.execute(
+            "UPDATE enrollment_tokens SET status = ?1 WHERE token_id = ?2 AND status = ?3",
+            params![
+                EnrollmentTokenStatus::Revoked.as_str(),
+                token_id,
+                EnrollmentTokenStatus::Active.as_str(),
+            ],
+        )?;
+        if affected != 1 {
+            return Err(StoreError::EnrollmentTokenConflict {
+                token_id: token_id.to_string(),
+                detail: "token state changed during revocation",
+            });
+        }
+        let after = get_enrollment_token_tx(&tx, token_id)?.expect("revoked token exists");
+        let mut event = AuditEvent::new(actor, "enrollment.token.revoke");
+        event.ok = Some(true);
+        event.detail_json = enrollment_token_transition_audit_json(
+            token_id,
+            Some(&before),
+            Some(&after),
+            Some(reason),
+        );
+        insert_audit_tx(&tx, &event)?;
+        tx.commit()?;
+        Ok(after)
+    }
+
     pub fn submit_join_request(
         &self,
         request: &JoinRequestInsert,
         actor: &str,
     ) -> Result<JoinRequestRecord, StoreError> {
         validate_actor(actor).map_err(StoreError::InvalidInput)?;
+        validate_enrollment_request_id(&request.request_id)?;
+        validate_enrollment_token_plaintext(&request.token_plaintext)?;
         validate_agent_public_key(&request.agent_public_key).map_err(StoreError::InvalidInput)?;
         validate_agent_fingerprint(&request.fingerprint).map_err(StoreError::InvalidInput)?;
         let requested_endpoint_id = request
@@ -1914,56 +2131,106 @@ impl Store {
         validate_agent_version(&request.agent_version).map_err(StoreError::InvalidInput)?;
         validate_label_json(&request.requested_labels_json, "requested_labels")
             .map_err(StoreError::InvalidInput)?;
-        let tx = self.conn.unchecked_transaction()?;
+        validate_low_sensitive_json(
+            &request.requested_labels_json,
+            "enrollment requested labels",
+        )?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let token_hash = Self::hash_enrollment_token(&request.token_plaintext);
-        let token = tx
-            .query_row(
-                "SELECT token_id, token_hash, created_at, created_by, expires_at, max_uses, used_count, status, description, labels_json, scope_json
-                 FROM enrollment_tokens WHERE token_hash = ?1",
-                [token_hash],
-                enrollment_token_from_row,
-            )
-            .optional()?;
+        let token = get_enrollment_token_by_hash_tx(&tx, &token_hash)?;
         let Some(token) = token else {
-            audit_join_rejection_tx(&tx, actor, None, "unknown_token")?;
+            audit_join_rejection_tx(&tx, actor, Some(&request.request_id), None, "unknown_token")?;
             tx.commit()?;
             return Err(StoreError::EnrollmentRejected("unknown_token".to_string()));
         };
 
+        if let Some(existing) = get_join_request_tx(&tx, &request.request_id)? {
+            if join_request_matches_submission(
+                &existing,
+                request,
+                &token.token_id,
+                requested_endpoint_id.as_deref(),
+            ) {
+                validate_join_submission_audit_provenance_tx(&tx, &existing, actor)?;
+                tx.commit()?;
+                return Ok(existing);
+            }
+            return Err(StoreError::EnrollmentRequestConflict {
+                request_id: request.request_id.clone(),
+                detail: "request id already exists with different enrollment input",
+            });
+        }
+
         if token.status != EnrollmentTokenStatus::Active {
             let reason = token.status.as_str();
-            audit_join_rejection_tx(&tx, actor, Some(&token.token_id), reason)?;
+            audit_join_rejection_tx(
+                &tx,
+                actor,
+                Some(&request.request_id),
+                Some(&token.token_id),
+                reason,
+            )?;
             tx.commit()?;
             return Err(StoreError::EnrollmentRejected(reason.to_string()));
         }
         if token_is_expired(&token.expires_at) {
-            tx.execute(
-                "UPDATE enrollment_tokens SET status = ?1 WHERE token_id = ?2",
+            let affected = tx.execute(
+                "UPDATE enrollment_tokens SET status = ?1 WHERE token_id = ?2 AND status = ?3",
                 params![
                     EnrollmentTokenStatus::Expired.as_str(),
-                    token.token_id.as_str()
+                    token.token_id.as_str(),
+                    EnrollmentTokenStatus::Active.as_str(),
                 ],
             )?;
-            audit_join_rejection_tx(&tx, actor, Some(&token.token_id), "expired")?;
+            if affected != 1 {
+                return Err(StoreError::EnrollmentTokenConflict {
+                    token_id: token.token_id.clone(),
+                    detail: "token state changed during expiry",
+                });
+            }
+            let expired = get_enrollment_token_tx(&tx, &token.token_id)?
+                .expect("expired enrollment token exists");
+            let mut event = AuditEvent::new(actor, "enrollment.token.expire");
+            event.ok = Some(true);
+            event.request_id = Some(request.request_id.clone());
+            event.detail_json = enrollment_token_transition_audit_json(
+                &token.token_id,
+                Some(&token),
+                Some(&expired),
+                Some("expired"),
+            );
+            insert_audit_tx(&tx, &event)?;
+            audit_join_rejection_tx(
+                &tx,
+                actor,
+                Some(&request.request_id),
+                Some(&token.token_id),
+                "expired",
+            )?;
             tx.commit()?;
             return Err(StoreError::EnrollmentRejected("expired".to_string()));
         }
         if token.used_count >= token.max_uses {
-            audit_join_rejection_tx(&tx, actor, Some(&token.token_id), "max_uses_exhausted")?;
+            audit_join_rejection_tx(
+                &tx,
+                actor,
+                Some(&request.request_id),
+                Some(&token.token_id),
+                "max_uses_exhausted",
+            )?;
             tx.commit()?;
             return Err(StoreError::EnrollmentRejected(
                 "max_uses_exhausted".to_string(),
             ));
         }
 
-        let request_id = format!("join-{}", Uuid::new_v4());
         let correlation_id = format!("corr-{}", Uuid::new_v4());
         tx.execute(
             "INSERT INTO join_requests
              (request_id, token_id, status, agent_public_key, fingerprint, requested_endpoint_id, assigned_endpoint_id, hostname, agent_version, requested_labels_json, approved_labels_json, created_at, approved_at, approved_by, rejection_reason, audit_correlation_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, ?9, '{}', strftime('%Y-%m-%dT%H:%M:%SZ','now'), NULL, NULL, NULL, ?10)",
             params![
-                request_id.as_str(),
+                request.request_id.as_str(),
                 token.token_id.as_str(),
                 JoinRequestStatus::Pending.as_str(),
                 request.agent_public_key.as_str(),
@@ -1975,34 +2242,31 @@ impl Store {
                 correlation_id.as_str(),
             ],
         )?;
-        tx.execute(
-            "UPDATE enrollment_tokens SET used_count = used_count + 1 WHERE token_id = ?1",
-            [token.token_id.as_str()],
+        let affected = tx.execute(
+            "UPDATE enrollment_tokens
+             SET used_count = used_count + 1
+             WHERE token_id = ?1 AND status = ?2 AND used_count = ?3 AND used_count < max_uses",
+            params![
+                token.token_id.as_str(),
+                EnrollmentTokenStatus::Active.as_str(),
+                i64::from(token.used_count),
+            ],
         )?;
+        if affected != 1 {
+            return Err(StoreError::EnrollmentTokenConflict {
+                token_id: token.token_id.clone(),
+                detail: "token use count changed during request submission",
+            });
+        }
 
         let mut event = AuditEvent::new(actor, "enrollment.token.use");
         event.ok = Some(true);
-        event.request_id = Some(request_id.clone());
-        event.detail_json = json_detail(
-            "join_request",
-            &request_id,
-            None,
-            Some(serde_json::json!({
-                "request_id": request_id.clone(),
-                "token_id": token.token_id.clone(),
-                "status": JoinRequestStatus::Pending.as_str(),
-                "fingerprint": request.fingerprint.clone(),
-                "hostname": request.hostname.clone(),
-                "agent_version": request.agent_version.clone(),
-                "requested_endpoint_id": requested_endpoint_id.clone(),
-                "requested_labels": request.requested_labels_json.clone(),
-                "correlation_id": correlation_id.clone(),
-            })),
-            None,
-        );
+        event.request_id = Some(request.request_id.clone());
+        let joined = get_join_request_tx(&tx, &request.request_id)?.expect("join request inserted");
+        let token_after =
+            get_enrollment_token_tx(&tx, &token.token_id)?.expect("used enrollment token exists");
+        event.detail_json = enrollment_token_use_audit_json(&token, &token_after, &joined);
         insert_audit_tx(&tx, &event)?;
-        let joined = get_join_request_tx(&tx, &event.request_id.clone().expect("request id set"))?
-            .expect("join request inserted");
         tx.commit()?;
         Ok(joined)
     }
@@ -2020,6 +2284,65 @@ impl Store {
             )
             .optional()
             .map_err(StoreError::from)
+    }
+
+    pub fn reject_join_request(
+        &self,
+        request_id: &str,
+        actor: &str,
+        reason: &str,
+    ) -> Result<JoinRequestRecord, StoreError> {
+        validate_actor(actor).map_err(StoreError::InvalidInput)?;
+        validate_reason(reason).map_err(StoreError::InvalidInput)?;
+        validate_enrollment_request_id(request_id)?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let before = get_join_request_tx(&tx, request_id)?
+            .ok_or_else(|| StoreError::JoinRequestNotFound(request_id.to_string()))?;
+        if before.status == JoinRequestStatus::Rejected {
+            if before.rejection_reason.as_deref() != Some(reason) {
+                return Err(StoreError::EnrollmentRequestConflict {
+                    request_id: request_id.to_string(),
+                    detail: "request was already rejected for a different reason",
+                });
+            }
+            validate_join_rejection_audit_provenance_tx(&tx, request_id, actor, reason)?;
+            tx.commit()?;
+            return Ok(before);
+        }
+        if before.status != JoinRequestStatus::Pending {
+            return Err(StoreError::InvalidJoinRequestStatus {
+                request_id: request_id.to_string(),
+                status: before.status.as_str().to_string(),
+                expected: "pending",
+            });
+        }
+        validate_pending_join_for_approval(&before)?;
+        let affected = tx.execute(
+            "UPDATE join_requests
+             SET status = ?1, rejection_reason = ?2
+             WHERE request_id = ?3 AND status = ?4",
+            params![
+                JoinRequestStatus::Rejected.as_str(),
+                reason,
+                request_id,
+                JoinRequestStatus::Pending.as_str(),
+            ],
+        )?;
+        if affected != 1 {
+            return Err(StoreError::EnrollmentRequestConflict {
+                request_id: request_id.to_string(),
+                detail: "request state changed during rejection",
+            });
+        }
+        let after = get_join_request_tx(&tx, request_id)?.expect("rejected join request exists");
+        let mut event = AuditEvent::new(actor, "enrollment.reject");
+        event.ok = Some(true);
+        event.request_id = Some(request_id.to_string());
+        event.detail_json =
+            enrollment_request_transition_audit_json(request_id, &before, &after, reason);
+        insert_audit_tx(&tx, &event)?;
+        tx.commit()?;
+        Ok(after)
     }
 
     pub fn approve_join_request(
@@ -3157,6 +3480,34 @@ fn get_node_by_endpoint_tx(
     .map_err(StoreError::from)
 }
 
+fn get_enrollment_token_tx(
+    tx: &Transaction<'_>,
+    token_id: &str,
+) -> Result<Option<EnrollmentTokenRecord>, StoreError> {
+    tx.query_row(
+        "SELECT token_id, token_hash, created_at, created_by, expires_at, max_uses, used_count, status, description, labels_json, scope_json
+         FROM enrollment_tokens WHERE token_id = ?1",
+        [token_id],
+        enrollment_token_from_row,
+    )
+    .optional()
+    .map_err(StoreError::from)
+}
+
+fn get_enrollment_token_by_hash_tx(
+    tx: &Transaction<'_>,
+    token_hash: &str,
+) -> Result<Option<EnrollmentTokenRecord>, StoreError> {
+    tx.query_row(
+        "SELECT token_id, token_hash, created_at, created_by, expires_at, max_uses, used_count, status, description, labels_json, scope_json
+         FROM enrollment_tokens WHERE token_hash = ?1",
+        [token_hash],
+        enrollment_token_from_row,
+    )
+    .optional()
+    .map_err(StoreError::from)
+}
+
 fn insert_node_tx(tx: &Transaction<'_>, node: &NodeInsert) -> Result<(), StoreError> {
     tx.execute(
         "INSERT INTO nodes
@@ -3245,6 +3596,85 @@ fn enrollment_claim_audit_count_tx(
         |row| row.get(0),
     )?;
     Ok(i64_to_u64(count)?)
+}
+
+fn validate_enrollment_token_audit_provenance_tx(
+    tx: &Transaction<'_>,
+    event: &str,
+    token_id: &str,
+    actor: &str,
+    reason: Option<&str>,
+) -> Result<(), StoreError> {
+    let count: i64 = tx.query_row(
+        "SELECT COUNT(*)
+         FROM controller_audit_log
+         WHERE event = ?1
+           AND ok = 1
+           AND json_extract(detail_json, '$.target_id') = ?2
+           AND actor = ?3
+           AND (?4 IS NULL OR json_extract(detail_json, '$.reason') = ?4)",
+        params![event, token_id, actor, reason],
+        |row| row.get(0),
+    )?;
+    if count != 1 {
+        return Err(StoreError::EnrollmentTokenConflict {
+            token_id: token_id.to_string(),
+            detail: "token audit provenance is missing or ambiguous",
+        });
+    }
+    Ok(())
+}
+
+fn validate_join_submission_audit_provenance_tx(
+    tx: &Transaction<'_>,
+    join: &JoinRequestRecord,
+    actor: &str,
+) -> Result<(), StoreError> {
+    let count: i64 = tx.query_row(
+        "SELECT COUNT(*)
+         FROM controller_audit_log
+         WHERE event = 'enrollment.token.use'
+           AND request_id = ?1
+           AND ok = 1
+           AND json_extract(detail_json, '$.target_id') = ?1
+           AND actor = ?2",
+        params![join.request_id.as_str(), actor],
+        |row| row.get(0),
+    )?;
+    if count != 1 {
+        return Err(StoreError::EnrollmentRequestConflict {
+            request_id: join.request_id.clone(),
+            detail: "request submission audit provenance is missing or ambiguous",
+        });
+    }
+    Ok(())
+}
+
+fn validate_join_rejection_audit_provenance_tx(
+    tx: &Transaction<'_>,
+    request_id: &str,
+    actor: &str,
+    reason: &str,
+) -> Result<(), StoreError> {
+    let count: i64 = tx.query_row(
+        "SELECT COUNT(*)
+         FROM controller_audit_log
+         WHERE event = 'enrollment.reject'
+           AND request_id = ?1
+           AND ok = 1
+           AND json_extract(detail_json, '$.target_id') = ?1
+           AND actor = ?2
+           AND json_extract(detail_json, '$.reason') = ?3",
+        params![request_id, actor, reason],
+        |row| row.get(0),
+    )?;
+    if count != 1 {
+        return Err(StoreError::EnrollmentRequestConflict {
+            request_id: request_id.to_string(),
+            detail: "request rejection audit provenance is missing or ambiguous",
+        });
+    }
+    Ok(())
 }
 
 fn get_active_endpoint_trust_for_node_tx(
@@ -3352,7 +3782,90 @@ fn invalid_enrollment_binding(request_id: &str, detail: &'static str) -> StoreEr
 }
 
 fn validate_enrollment_request_id(request_id: &str) -> Result<(), StoreError> {
-    validate_audit_text(request_id, "join request_id", 128)
+    validate_audit_text(request_id, "join request_id", 128)?;
+    let Some(uuid) = request_id.strip_prefix("join-") else {
+        return Err(StoreError::InvalidInput(
+            "join request_id must use the join-<uuid> format".to_string(),
+        ));
+    };
+    Uuid::parse_str(uuid)
+        .map(|_| ())
+        .map_err(|_| StoreError::InvalidInput("join request_id must contain a UUID".to_string()))
+}
+
+fn validate_enrollment_token_id(token_id: &str) -> Result<(), StoreError> {
+    validate_audit_text(token_id, "enrollment token_id", 128)?;
+    if !token_id.starts_with("tok-") {
+        return Err(StoreError::InvalidInput(
+            "enrollment token_id must start with tok-".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_enrollment_token_input(token: &EnrollmentTokenInsert) -> Result<(), StoreError> {
+    validate_enrollment_token_id(&token.token_id)?;
+    if token.token_hash.len() != 64
+        || !token
+            .token_hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(StoreError::InvalidInput(
+            "enrollment token hash must be lowercase BLAKE3 hex".to_string(),
+        ));
+    }
+    if OffsetDateTime::parse(&token.expires_at, &Rfc3339).is_err() {
+        return Err(StoreError::InvalidInput(
+            "enrollment token expires_at must be RFC3339".to_string(),
+        ));
+    }
+    if token.max_uses == 0 || token.max_uses > MAX_ENROLLMENT_TOKEN_USES {
+        return Err(StoreError::InvalidInput(format!(
+            "enrollment token max_uses must be 1-{MAX_ENROLLMENT_TOKEN_USES}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_enrollment_token_plaintext(token: &str) -> Result<(), StoreError> {
+    if token.is_empty() || token.len() > 512 || !token.bytes().all(|byte| byte.is_ascii_graphic()) {
+        return Err(StoreError::InvalidInput(
+            "enrollment token must be 1-512 ASCII non-whitespace characters".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn enrollment_token_matches_create(
+    existing: &EnrollmentTokenRecord,
+    requested: &EnrollmentTokenInsert,
+    actor: &str,
+) -> bool {
+    existing.token_id == requested.token_id
+        && existing.token_hash == requested.token_hash
+        && existing.created_by == actor
+        && existing.expires_at == requested.expires_at
+        && existing.max_uses == requested.max_uses
+        && existing.description == requested.description
+        && existing.labels_json == requested.labels_json
+        && existing.scope_json == requested.scope_json
+}
+
+fn join_request_matches_submission(
+    existing: &JoinRequestRecord,
+    requested: &JoinRequestInsert,
+    token_id: &str,
+    requested_endpoint_id: Option<&str>,
+) -> bool {
+    existing.request_id == requested.request_id
+        && existing.token_id == token_id
+        && existing.agent_public_key == requested.agent_public_key
+        && existing.fingerprint == requested.fingerprint
+        && existing.requested_endpoint_id.as_deref() == requested_endpoint_id
+        && existing.hostname == requested.hostname
+        && existing.agent_version == requested.agent_version
+        && existing.requested_labels_json == requested.requested_labels_json
 }
 
 fn enrollment_node_insert(
@@ -3792,14 +4305,16 @@ fn transition_endpoint_status_tx(
 fn audit_join_rejection_tx(
     tx: &Transaction<'_>,
     actor: &str,
+    request_id: Option<&str>,
     token_id: Option<&str>,
     reason: &str,
 ) -> Result<(), StoreError> {
     let mut event = AuditEvent::new(actor, "enrollment.token.reject");
     event.ok = Some(false);
+    event.request_id = request_id.map(ToString::to_string);
     event.error_code = Some("ENROLLMENT_REJECTED".to_string());
     event.detail_json = serde_json::json!({
-        "actor_type": "agent",
+        "actor_type": "user",
         "action": "enrollment.token.reject",
         "target_type": "enrollment_token",
         "target_id": token_id,
@@ -3900,6 +4415,83 @@ fn enrollment_join_audit_json(join: &JoinRequestRecord) -> Value {
         "status": join.status.as_str(),
         "requested_endpoint_id_present": join.requested_endpoint_id.is_some(),
         "assigned_endpoint_id": join.assigned_endpoint_id.clone(),
+    })
+}
+
+fn enrollment_token_audit_json(token: &EnrollmentTokenRecord) -> Value {
+    serde_json::json!({
+        "token_id": token.token_id,
+        "status": token.status.as_str(),
+        "expires_at": token.expires_at,
+        "max_uses": token.max_uses,
+        "used_count": token.used_count,
+        "description_present": token.description.is_some(),
+        "label_count": token.labels_json.as_object().map_or(0, serde_json::Map::len),
+        "scope_count": token.scope_json.as_object().map_or(0, serde_json::Map::len),
+    })
+}
+
+fn enrollment_token_transition_audit_json(
+    token_id: &str,
+    before: Option<&EnrollmentTokenRecord>,
+    after: Option<&EnrollmentTokenRecord>,
+    reason: Option<&str>,
+) -> Value {
+    serde_json::json!({
+        "actor_type": "user",
+        "target_type": "enrollment_token",
+        "target_id": token_id,
+        "before": before.map(enrollment_token_audit_json),
+        "after": after.map(enrollment_token_audit_json),
+        "reason": reason,
+    })
+}
+
+fn enrollment_token_use_audit_json(
+    before: &EnrollmentTokenRecord,
+    after: &EnrollmentTokenRecord,
+    join: &JoinRequestRecord,
+) -> Value {
+    serde_json::json!({
+        "actor_type": "user",
+        "target_type": "join_request",
+        "target_id": join.request_id,
+        "before": {
+            "issuance": enrollment_token_audit_json(before),
+            "join_request": Value::Null,
+        },
+        "after": {
+            "issuance": enrollment_token_audit_json(after),
+            "join_request": {
+                "request_id": join.request_id,
+                "token_id": join.token_id,
+                "status": join.status.as_str(),
+                "fingerprint_present": !join.fingerprint.is_empty(),
+                "requested_endpoint_id_present": join.requested_endpoint_id.is_some(),
+                "requested_label_count": join
+                    .requested_labels_json
+                    .as_object()
+                    .map_or(0, serde_json::Map::len),
+                "correlation_id": join.audit_correlation_id,
+            },
+        },
+        "reason": Value::Null,
+    })
+}
+
+fn enrollment_request_transition_audit_json(
+    request_id: &str,
+    before: &JoinRequestRecord,
+    after: &JoinRequestRecord,
+    reason: &str,
+) -> Value {
+    serde_json::json!({
+        "actor_type": "user",
+        "target_type": "join_request",
+        "target_id": request_id,
+        "before": enrollment_join_audit_json(before),
+        "after": enrollment_join_audit_json(after),
+        "reason": reason,
     })
 }
 

@@ -28,7 +28,7 @@ printf '%s\n' \
   'mod tests {' \
   '    const FIXTURE_SQL: &str = "UPDATE nodes SET enabled = 0";' \
   '}' \
-  'pub fn reviewed(store: &Store, node: &NodeInsert, approval: &ApprovalInput, claim: &LegacyEnrollmentClaimInput) {' \
+  'pub fn reviewed(store: &Store, node: &NodeInsert, token: &EnrollmentTokenInsert, request: &JoinRequestInsert, approval: &ApprovalInput, claim: &LegacyEnrollmentClaimInput) {' \
   '    Store::add_node(store, node, "actor");' \
   '    store.enable_node("node", "actor");' \
   '    store.disable_node("node", "actor");' \
@@ -36,6 +36,10 @@ printf '%s\n' \
   '    store.rotate_endpoint("old", "new", "actor", "reason");' \
   '    store.revoke_endpoint("endpoint", "actor", "reason");' \
   '    store.quarantine_endpoint("endpoint", "actor", "reason");' \
+  '    store.create_enrollment_token(token, "actor");' \
+  '    store.revoke_enrollment_token("token", "actor", "reason");' \
+  '    store.submit_join_request(request, "actor");' \
+  '    store.reject_join_request("request", "actor", "reason");' \
   '    store.approve_join_request(approval, "actor");' \
   '    Store::claim_legacy_enrollment(store, claim, "actor");' \
   '}' \
@@ -158,7 +162,11 @@ done
 
 rm -f "$cli_src/unsafe_node_endpoint_mutator.rs"
 printf '%s\n' \
-  'pub fn bypass(store: &Store, approval: &ApprovalInput, claim: &LegacyEnrollmentClaimInput) {' \
+  'pub fn bypass(store: &Store, token: &EnrollmentTokenInsert, request: &JoinRequestInsert, approval: &ApprovalInput, claim: &LegacyEnrollmentClaimInput) {' \
+  '    store.create_enrollment_token(token, "actor");' \
+  '    Store::revoke_enrollment_token(store, "token", "actor", "reason");' \
+  '    store.submit_join_request(request, "actor");' \
+  '    Store::reject_join_request(store, "request", "actor", "reason");' \
   '    store.approve_join_request(approval, "actor");' \
   '    Store::claim_legacy_enrollment(store, claim, "actor");' \
   '}' \
@@ -170,8 +178,12 @@ if "$GUARD" --repo-root "$fixture_root" "$fixture_root" >"$enrollment_fail_outpu
   exit 1
 fi
 for expected in \
-  'unsafe_enrollment_mutator.rs:2: direct enrollment mutator call outside reviewed store/backend boundary: approve_join_request' \
-  'unsafe_enrollment_mutator.rs:3: direct enrollment mutator call outside reviewed store/backend boundary: claim_legacy_enrollment'
+  'unsafe_enrollment_mutator.rs:2: direct enrollment mutator call outside reviewed store/backend boundary: create_enrollment_token' \
+  'unsafe_enrollment_mutator.rs:3: direct enrollment mutator call outside reviewed store/backend boundary: revoke_enrollment_token' \
+  'unsafe_enrollment_mutator.rs:4: direct enrollment mutator call outside reviewed store/backend boundary: submit_join_request' \
+  'unsafe_enrollment_mutator.rs:5: direct enrollment mutator call outside reviewed store/backend boundary: reject_join_request' \
+  'unsafe_enrollment_mutator.rs:6: direct enrollment mutator call outside reviewed store/backend boundary: approve_join_request' \
+  'unsafe_enrollment_mutator.rs:7: direct enrollment mutator call outside reviewed store/backend boundary: claim_legacy_enrollment'
 do
   if ! grep -Fq "$expected" "$enrollment_fail_output"; then
     printf 'controller mutation guard did not report expected enrollment mutator violation: %s\n' "$expected" >&2

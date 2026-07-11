@@ -588,6 +588,8 @@ Networking must allow the controller to reach the agent through iroh using the r
   in-flight drain, claim release, and restart behavior.
 - `docs/adr/ADR-scheduler-timeout-jitter.md`: bounded attempt deadlines and
   deterministic post-run schedule spreading.
+- `docs/a3-scheduler-reliability-inventory.md`: A3 acceptance requirements,
+  implementation evidence, tests, and security-boundary completion gate.
 - `docs/a2-storage-inventory.md`: A2 payload-family closure inventory and
   migration/read-boundary evidence.
 - `docs/trust-policy.md`: trust policy as code schema, validation, and diff behavior.

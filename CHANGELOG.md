@@ -4,6 +4,8 @@
 
 ### Added
 
+- A3 scheduler reliability completion inventory mapping every acceptance
+  requirement to implementation, test, compatibility, and security evidence.
 - Scheduler lease heartbeats renew active claims every 30 seconds with a
   two-minute expiry and fail closed when fencing is lost.
 - Scheduler misfires coalesce any overdue backlog into one audited execution

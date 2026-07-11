@@ -886,6 +886,8 @@ async fn run_schedule_daemon_command(
 ) -> anyhow::Result<()> {
     validate_scheduler_concurrency(max_concurrency)?;
     validate_tick_seconds(tick_seconds)?;
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
     write_scheduler_audit(
         store,
         actor,
@@ -916,7 +918,7 @@ async fn run_schedule_daemon_command(
                 result?;
                 false
             }
-            _ = shutdown_signal() => {
+            _ = &mut shutdown => {
                 shutdown_requested.store(true, Ordering::SeqCst);
                 write_scheduler_audit(
                     store,
@@ -945,7 +947,7 @@ async fn run_schedule_daemon_command(
         )?;
         tokio::select! {
             _ = tokio::time::sleep(std::time::Duration::from_secs(tick_seconds)) => {}
-            _ = shutdown_signal() => {
+            _ = &mut shutdown => {
                 shutdown_requested.store(true, Ordering::SeqCst);
                 write_scheduler_audit(
                     store,
@@ -3504,20 +3506,23 @@ fn observation_id() -> String {
     format!("obs-{}", Uuid::new_v4().simple())
 }
 
-async fn shutdown_signal() {
-    #[cfg(unix)]
-    {
-        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("install SIGTERM handler");
+#[cfg(unix)]
+fn shutdown_signal() -> impl std::future::Future<Output = ()> {
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        .expect("install SIGINT handler");
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("install SIGTERM handler");
+    async move {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = term.recv() => {}
+            _ = interrupt.recv() => {}
+            _ = terminate.recv() => {}
         }
     }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
-    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 #[cfg(test)]

@@ -11,10 +11,10 @@ use time::{OffsetDateTime, macros::format_description};
 
 use crate::private_file::{self, PrivateFileError};
 use crate::storage_payloads::{
-    HEALTH_SUMMARY_SCHEMA_V1, HealthDegradedMethodsPayloadV1, HealthSummaryPayloadV1,
-    ObservationSummaryPayloadV1, RunSummaryPayloadV1, SchedulerPairPayloadV1,
-    SchedulerSelectorPayloadV1, TrustBundlePayloadV1, validate_health_payload_relationship,
-    validate_scheduler_payload_relationship,
+    AlertDetailPayloadV1, HEALTH_SUMMARY_SCHEMA_V1, HealthDegradedMethodsPayloadV1,
+    HealthSummaryPayloadV1, ObservationSummaryPayloadV1, RunSummaryPayloadV1,
+    SchedulerPairPayloadV1, SchedulerSelectorPayloadV1, TrustBundlePayloadV1,
+    validate_health_payload_relationship, validate_scheduler_payload_relationship,
 };
 use crate::store::{CURRENT_SCHEMA_VERSION, StoreError};
 
@@ -110,6 +110,12 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         name: "0013_versioned_trust_bundles",
         description: "Migrate endpoint trust bundles to closed versioned v1 payloads.",
         apply: apply_0013_versioned_trust_bundles,
+    },
+    Migration {
+        version: 14,
+        name: "0014_versioned_alert_details",
+        description: "Migrate alert details to closed versioned v1 payloads.",
+        apply: apply_0014_versioned_alert_details,
     },
 ];
 
@@ -959,6 +965,30 @@ fn apply_0013_versioned_trust_bundles(tx: &Transaction<'_>) -> Result<(), StoreE
         tx.execute(
             "UPDATE endpoint_trust SET trust_bundle_json = ?1 WHERE endpoint_id = ?2",
             (payload.to_value().to_string(), endpoint_id),
+        )?;
+    }
+    Ok(())
+}
+
+fn apply_0014_versioned_alert_details(tx: &Transaction<'_>) -> Result<(), StoreError> {
+    let rows = {
+        let mut stmt =
+            tx.prepare("SELECT alert_id, detail_json FROM alert_events ORDER BY alert_id")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    for (alert_id, detail_json) in rows {
+        let value: Value = serde_json::from_str(&detail_json).map_err(|_| {
+            StoreError::InvalidInput("legacy alert detail JSON is invalid".to_string())
+        })?;
+        let payload = AlertDetailPayloadV1::from_value(&value)
+            .or_else(|_| AlertDetailPayloadV1::from_legacy(&value))
+            .map_err(StoreError::InvalidInput)?;
+        tx.execute(
+            "UPDATE alert_events SET detail_json = ?1 WHERE alert_id = ?2",
+            (payload.to_value().to_string(), alert_id),
         )?;
     }
     Ok(())

@@ -18,6 +18,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::Semaphore;
@@ -739,6 +740,7 @@ async fn run_schedule_run_once_command(
         bail!("schedule run currently requires --once");
     }
     let owner_id = scheduler_owner_id();
+    let shutdown_requested = AtomicBool::new(false);
     let stats = if let Some(job_id) = job_id {
         run_target_job_once(
             store,
@@ -750,7 +752,15 @@ async fn run_schedule_run_once_command(
         )
         .await?
     } else {
-        run_due_jobs_once(store, secret_key_path, actor, &owner_id, max_concurrency).await?
+        run_due_jobs_once(
+            store,
+            secret_key_path,
+            actor,
+            &owner_id,
+            max_concurrency,
+            &shutdown_requested,
+        )
+        .await?
     };
     let alert_evaluation = evaluate_scheduler_alerts(store);
     write_scheduler_audit(
@@ -852,9 +862,42 @@ async fn run_schedule_daemon_command(
     )?;
 
     let owner_id = scheduler_owner_id();
+    let shutdown_requested = AtomicBool::new(false);
 
     loop {
-        run_due_jobs_once(store, secret_key_path, actor, &owner_id, max_concurrency).await?;
+        let tick = run_due_jobs_once(
+            store,
+            secret_key_path,
+            actor,
+            &owner_id,
+            max_concurrency,
+            &shutdown_requested,
+        );
+        tokio::pin!(tick);
+        let stop_after_tick = tokio::select! {
+            result = &mut tick => {
+                result?;
+                false
+            }
+            _ = shutdown_signal() => {
+                shutdown_requested.store(true, Ordering::SeqCst);
+                write_scheduler_audit(
+                    store,
+                    actor,
+                    "scheduler.daemon.shutdown.requested",
+                    true,
+                    json!({
+                        "state": "draining",
+                        "result_class": SCHEDULER_RESULT_CLASS,
+                    }),
+                )?;
+                tick.await?;
+                true
+            }
+        };
+        if stop_after_tick {
+            break;
+        }
         let alert_evaluation = evaluate_scheduler_alerts(store);
         write_scheduler_audit(
             store,
@@ -866,6 +909,17 @@ async fn run_schedule_daemon_command(
         tokio::select! {
             _ = tokio::time::sleep(std::time::Duration::from_secs(tick_seconds)) => {}
             _ = shutdown_signal() => {
+                shutdown_requested.store(true, Ordering::SeqCst);
+                write_scheduler_audit(
+                    store,
+                    actor,
+                    "scheduler.daemon.shutdown.requested",
+                    true,
+                    json!({
+                        "state": "idle",
+                        "result_class": SCHEDULER_RESULT_CLASS,
+                    }),
+                )?;
                 break;
             }
         }
@@ -879,6 +933,7 @@ async fn run_schedule_daemon_command(
         json!({
             "tick_seconds": tick_seconds,
             "max_concurrency": max_concurrency,
+            "state": "drained",
             "result_class": SCHEDULER_RESULT_CLASS,
         }),
     )?;
@@ -932,6 +987,7 @@ async fn run_due_jobs_once(
     actor: &str,
     owner_id: &str,
     max_concurrency: usize,
+    shutdown_requested: &AtomicBool,
 ) -> anyhow::Result<RunStats> {
     let limits = SchedulerLimits::from_max_concurrency(max_concurrency)?;
     let mut rpc_budget_remaining = limits.rpc_budget_per_tick;
@@ -985,6 +1041,9 @@ async fn run_due_jobs_once(
         return Ok(stats);
     }
     for job_load in jobs {
+        if shutdown_requested.load(Ordering::SeqCst) {
+            break;
+        }
         let job = match job_load {
             ObservabilityJobLoadResult::Valid(job) => job,
             ObservabilityJobLoadResult::Invalid(job) => {
@@ -3495,6 +3554,61 @@ mod tests {
             .expect("claim exists");
         assert!(renewed.lease_expires_at > claim.lease_expires_at);
         assert!(store.audit_count().expect("count renewed audits") >= audit_count_before + 2);
+    }
+
+    #[tokio::test]
+    async fn scheduler_shutdown_gate_stops_new_job_admission() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let database = dir.path().join("controller.sqlite");
+        let secret = dir.path().join("controller.secret");
+        let store = Store::open(&database).expect("open store");
+        let now = now_rfc3339();
+        let job = ObservabilityJobRecord {
+            job_id: "job-shutdown-gate".to_string(),
+            kind: "controller-ping".to_string(),
+            selector_json: SchedulerSelectorPayloadV1::new(
+                "node_id=missing-shutdown".to_string(),
+                None,
+            )
+            .expect("selector")
+            .to_value(),
+            pair_selector_json: None,
+            interval_seconds: MIN_INTERVAL_SECONDS,
+            jitter_seconds: 0,
+            timeout_ms: DEFAULT_DEADLINE_MS,
+            enabled: true,
+            next_run_at: Some(now.clone()),
+            last_run_at: None,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        StoreWriter::write_scheduler_job_add(&store, &job, "shutdown-test").expect("add job");
+        let shutdown = AtomicBool::new(true);
+
+        let stats = run_due_jobs_once(
+            &store,
+            &secret,
+            "shutdown-test",
+            "scheduler-shutdown-test",
+            1,
+            &shutdown,
+        )
+        .await
+        .expect("shutdown-gated tick");
+
+        assert_eq!(stats.executed_jobs, 0);
+        assert!(
+            store
+                .get_scheduler_job_claim(&job.job_id)
+                .expect("load claim")
+                .is_none()
+        );
+        assert!(
+            store
+                .list_observability_runs(10)
+                .expect("list runs")
+                .is_empty()
+        );
     }
 
     #[test]

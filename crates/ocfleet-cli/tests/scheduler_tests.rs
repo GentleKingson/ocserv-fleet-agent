@@ -882,6 +882,96 @@ fn scheduler_tests_daemon_alert_evaluation_failure_writes_warning_and_continues(
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn scheduler_tests_daemon_sigterm_audits_and_exits_after_drain() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let database_arg = database.to_string_lossy().into_owned();
+    let store = Store::open(&database).expect("open store");
+    drop(store);
+
+    let child = spawn_ocfleet(&[
+        "--database",
+        &database_arg,
+        "schedule",
+        "daemon",
+        "--tick-seconds",
+        "10",
+    ]);
+    wait_for_audit_event(&database, "scheduler.daemon.start", Duration::from_secs(30))
+        .expect("daemon start audit");
+    let pid = child.id().to_string();
+    let signal = Command::new("kill")
+        .args(["-TERM", pid.as_str()])
+        .output()
+        .expect("send SIGTERM");
+    assert!(signal.status.success());
+    let output = child.wait_with_output().expect("wait for graceful daemon");
+    assert!(
+        output.status.success(),
+        "daemon failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("status=stopped"));
+    let (_, requested) = wait_for_audit_event(
+        &database,
+        "scheduler.daemon.shutdown.requested",
+        Duration::from_secs(5),
+    )
+    .expect("shutdown requested audit");
+    assert!(matches!(
+        requested["state"].as_str(),
+        Some("idle" | "draining")
+    ));
+    let (_, stopped) =
+        wait_for_audit_event(&database, "scheduler.daemon.stop", Duration::from_secs(5))
+            .expect("daemon stop audit");
+    assert_eq!(stopped["state"], "drained");
+    assert_eq!(
+        Connection::open(&database)
+            .expect("open database")
+            .query_row(
+                "SELECT count(*) FROM scheduler_job_claims WHERE owner_id IS NOT NULL",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("active claim count"),
+        0
+    );
+
+    let restarted = spawn_ocfleet(&[
+        "--database",
+        &database_arg,
+        "schedule",
+        "daemon",
+        "--tick-seconds",
+        "10",
+    ]);
+    let started = Instant::now();
+    while scheduler_audit_count(&database, "scheduler.daemon.start") < 2 {
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "restart audit timeout"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    let restarted_pid = restarted.id().to_string();
+    assert!(
+        Command::new("kill")
+            .args(["-TERM", restarted_pid.as_str()])
+            .status()
+            .expect("signal restarted daemon")
+            .success()
+    );
+    let restarted_output = restarted
+        .wait_with_output()
+        .expect("wait for restarted daemon");
+    assert!(restarted_output.status.success());
+    assert_eq!(scheduler_audit_count(&database, "scheduler.daemon.stop"), 2);
+}
+
 #[test]
 fn scheduler_tests_run_once_disabled_job_skipped() {
     let dir = tempfile::tempdir().expect("temp dir");

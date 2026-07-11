@@ -107,7 +107,8 @@ transitions, and keeps token/submitted-identity material out of audit and
 `Debug`. It changes no schema, protocol, API route, agent capability, or default
 read-only boundary.
 Retention policy/apply atomicity is active on branch
-`codex/a1-retention-writers`. The slice keeps dry-run/explain read-only, moves
+`codex/a1-retention-writers` in pull request `#64`. The slice keeps
+dry-run/explain read-only, moves
 each non-dry-run scope deletion and its audit into one immediate transaction,
 and uses stable operation IDs for exact replay across multi-scope partial
 progress. It introduces no schema, protocol, API, agent-capability, or default

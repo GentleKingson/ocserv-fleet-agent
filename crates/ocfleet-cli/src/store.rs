@@ -28,14 +28,14 @@ use crate::input_validation::{
 use crate::migrations;
 use crate::private_file::{self, PrivateFileError};
 use crate::storage_payloads::{
-    AlertDetailPayloadV1, AlertHostAllowPayloadV1, EnrollmentMetadataKindV1,
-    EnrollmentMetadataPayloadV1, HealthDegradedMethodsPayloadV1, HealthSummaryPayloadV1,
-    ObservationSummaryPayloadV1, RunSummaryPayloadV1, SchedulerPairPayloadV1,
-    SchedulerSelectorPayloadV1, TrustBundlePayloadV1, validate_health_payload_relationship,
-    validate_scheduler_payload_relationship,
+    AlertDetailPayloadV1, AlertHostAllowPayloadV1, DeliveryAttemptDetailPayloadV1,
+    EnrollmentMetadataKindV1, EnrollmentMetadataPayloadV1, HealthDegradedMethodsPayloadV1,
+    HealthSummaryPayloadV1, ObservationSummaryPayloadV1, RunSummaryPayloadV1,
+    SchedulerPairPayloadV1, SchedulerSelectorPayloadV1, TrustBundlePayloadV1,
+    validate_health_payload_relationship, validate_scheduler_payload_relationship,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 16;
+pub const CURRENT_SCHEMA_VERSION: i64 = 17;
 pub const DEFAULT_HEALTH_STALE_WINDOW_SECONDS: u64 = 24 * 60 * 60;
 pub const DEFAULT_HEALTH_UNREACHABLE_FAILURES: u64 = 3;
 pub const DEFAULT_HEALTH_CERT_WARNING_DAYS: u64 = 30;
@@ -1926,7 +1926,7 @@ impl Store {
         &self,
     ) -> Result<Vec<AlertDeliveryAttemptRecord>, StoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT attempt_id, alert_id, hook_id, attempt_no, attempted_at, status, http_status_class, error_code, bytes_sent
+            "SELECT attempt_id, alert_id, hook_id, attempt_no, attempted_at, status, http_status_class, error_code, bytes_sent, detail_json
              FROM alert_delivery_attempts
              ORDER BY attempted_at DESC, attempt_id",
         )?;
@@ -5530,7 +5530,7 @@ fn alert_webhook_hook_from_row(
 fn alert_delivery_attempt_from_row(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<AlertDeliveryAttemptRecord> {
-    Ok(AlertDeliveryAttemptRecord {
+    let record = AlertDeliveryAttemptRecord {
         attempt_id: row.get(0)?,
         alert_id: row.get(1)?,
         hook_id: row.get(2)?,
@@ -5540,7 +5540,37 @@ fn alert_delivery_attempt_from_row(
         http_status_class: row.get(6)?,
         error_code: row.get(7)?,
         bytes_sent: i64_to_u64(row.get(8)?)?,
-    })
+    };
+    let detail_json: String = row.get(9)?;
+    let detail_json = parse_json_column(&detail_json, 9)?;
+    let payload = DeliveryAttemptDetailPayloadV1::from_value(&detail_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            9,
+            Type::Text,
+            Box::new(io::Error::new(io::ErrorKind::InvalidData, error)),
+        )
+    })?;
+    let expected = delivery_attempt_detail_payload(&record).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            9,
+            Type::Text,
+            Box::new(io::Error::new(
+                io::ErrorKind::InvalidData,
+                error.to_string(),
+            )),
+        )
+    })?;
+    if payload != expected {
+        return Err(rusqlite::Error::FromSqlConversionFailure(
+            9,
+            Type::Text,
+            Box::new(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "delivery attempt detail is inconsistent with relational columns",
+            )),
+        ));
+    }
+    Ok(record)
 }
 
 fn retention_policy_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RetentionPolicyRecord> {
@@ -5629,6 +5659,7 @@ fn validate_alert_delivery_attempt_record(
             "non-failed alert delivery attempt cannot have error_code".to_string(),
         ));
     }
+    delivery_attempt_detail_payload(attempt)?;
     Ok(())
 }
 
@@ -5756,10 +5787,11 @@ fn insert_alert_delivery_attempt_tx(
     tx: &Transaction<'_>,
     attempt: &AlertDeliveryAttemptRecord,
 ) -> Result<(), StoreError> {
+    let detail = delivery_attempt_detail_payload(attempt)?;
     tx.execute(
         "INSERT INTO alert_delivery_attempts
-         (attempt_id, alert_id, hook_id, attempt_no, attempted_at, status, http_status_class, error_code, bytes_sent)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+         (attempt_id, alert_id, hook_id, attempt_no, attempted_at, status, http_status_class, error_code, bytes_sent, detail_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             attempt.attempt_id.as_str(),
             attempt.alert_id.as_str(),
@@ -5770,9 +5802,26 @@ fn insert_alert_delivery_attempt_tx(
             attempt.http_status_class.as_deref(),
             attempt.error_code.as_deref(),
             u64_to_i64(attempt.bytes_sent)?,
+            compact_json(&detail.to_value()),
         ],
     )?;
     Ok(())
+}
+
+fn delivery_attempt_detail_payload(
+    attempt: &AlertDeliveryAttemptRecord,
+) -> Result<DeliveryAttemptDetailPayloadV1, StoreError> {
+    DeliveryAttemptDetailPayloadV1::new(
+        attempt.attempt_id.clone(),
+        attempt.alert_id.clone(),
+        attempt.hook_id.clone(),
+        attempt.attempt_no,
+        attempt.status.clone(),
+        attempt.http_status_class.clone(),
+        attempt.error_code.clone(),
+        attempt.bytes_sent,
+    )
+    .map_err(StoreError::InvalidInput)
 }
 
 fn validate_safe_id(field: &'static str, value: &str, max_len: usize) -> Result<(), StoreError> {

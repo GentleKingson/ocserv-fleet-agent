@@ -568,6 +568,8 @@ Networking must allow the controller to reach the agent through iroh using the r
   webhook host allowlists and endpoint-host relationship validation.
 - `docs/adr/ADR-versioned-enrollment-metadata-storage.md`: schema-v16 closed
   kind-bound enrollment label and scope storage.
+- `docs/adr/ADR-versioned-delivery-attempt-storage.md`: schema-v17 closed
+  delivery-attempt details bound to relational history.
 - `docs/trust-policy.md`: trust policy as code schema, validation, and diff behavior.
 - `docs/backend.md`: SQLite contract and optional Postgres backend plan.
 - `docs/archive-export.md`: long-term history archive and signed audit export guidance.

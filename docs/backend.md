@@ -101,6 +101,11 @@ token label/scope and join-request requested/approved-label storage over typed,
 kind-bound scalar maps. Writers persist closed envelopes; readers unwrap only
 validated public objects and reject kind, contamination, or decision mismatches.
 
+The ninth A2 slice advances SQLite to schema version 17 and adds a closed
+delivery-attempt detail payload bound to every relational attempt field. The
+table is rebuilt with its foreign keys and index; readers reject envelope or
+relational contamination before returning delivery history.
+
 The first production-hardening slice added node add/enable/disable/remove to this
 contract and removed the CLI's post-commit success audits. Audit-trigger failure
 tests prove both `nodes` and `endpoint_trust` changes roll back. The second slice

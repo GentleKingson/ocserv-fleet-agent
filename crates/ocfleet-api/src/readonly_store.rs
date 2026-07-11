@@ -423,7 +423,7 @@ fn open_read_only_connection(path: &Path) -> rusqlite::Result<Connection> {
     Ok(conn)
 }
 
-const REQUIRED_API_TABLES: [&str; 11] = [
+const REQUIRED_API_TABLES: [&str; 12] = [
     "schema_migrations",
     "nodes",
     "health_snapshots",
@@ -432,6 +432,7 @@ const REQUIRED_API_TABLES: [&str; 11] = [
     "scheduler_job_claims",
     "scheduler_maintenance",
     "health_evaluation_runs",
+    "alert_delivery_queue",
     "probe_observations",
     "alert_events",
     "controller_audit_log",

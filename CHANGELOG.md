@@ -4,6 +4,8 @@
 
 ### Added
 
+- Schema 22 adds a bounded fenced automatic alert delivery queue with durable
+  idempotency, grouping, retry, dead-letter, and terminal-state metadata.
 - A4 completion inventory mapping independent health evaluation, recovery,
   compatibility, and security requirements to exact evidence.
 - Schema 21 adds bounded durable health evaluation run metadata keyed by input

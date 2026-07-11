@@ -257,6 +257,15 @@ Atomic evaluator lifecycle and recovery are published in pull request `#89`.
 The independent graceful evaluator daemon is published in pull request `#90`.
 The A4 completion audit is published in pull request `#91`.
 
+The first A5 slice advances SQLite to migration `0022` and adds a bounded fenced
+automatic webhook delivery queue. Durable idempotency and group keys, monotonic
+claim fences, five-attempt retry bounds, explicit dead-letter and success state,
+and due/lease indexes establish the persistence contract. Queue writers, worker
+transport integration, recovery notification, rate limiting, and graceful
+shutdown remain active A5 work. JSONL paths remain operator supplied and are not
+persisted for daemon selection.
+Schema 22 delivery queue persistence is published in pull request `#92`.
+
 ### Baseline And Production Foundation
 
 | ID | Issue | Status | Depends on | Release target | Acceptance and required evidence |

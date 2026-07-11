@@ -12,6 +12,7 @@ use crate::args::{HealthCommand, HealthPolicyCommand, HealthSnapshotCommand};
 use crate::backend::StoreWriter;
 use crate::duration_args::parse_duration_seconds;
 use crate::input_validation::local_actor;
+use crate::observation::safe_observation_summary;
 use crate::storage_payloads::{HealthDegradedMethodsPayloadV1, HealthSummaryPayloadV1};
 use crate::store::{
     HealthPolicyRecord, HealthSnapshotRecord, HealthSnapshotWrite, NodeRecord,
@@ -446,7 +447,9 @@ fn degraded_methods(observations: &[ProbeObservationRecord]) -> Vec<String> {
             if record.ok == Some(false) || cert_observation_warns(record) {
                 methods.push(method.to_string());
             }
-            for degraded in degraded_methods_from_summary(&record.summary_json) {
+            for degraded in
+                degraded_methods_from_summary(&safe_observation_summary(&record.summary_json))
+            {
                 if !methods.contains(&degraded) {
                     methods.push(degraded);
                 }
@@ -473,11 +476,11 @@ fn cert_observation_warns(record: &ProbeObservationRecord) -> bool {
     if record.method != OCSERV_CERT_EXPIRY {
         return false;
     }
+    let summary = safe_observation_summary(&record.summary_json);
     if status_is_cert_warning(
-        record
-            .summary_json
+        summary
             .get("status")
-            .or_else(|| record.summary_json.get("cert_status"))
+            .or_else(|| summary.get("cert_status"))
             .and_then(Value::as_str),
     ) {
         return true;

@@ -21,6 +21,7 @@ use crate::args::{AlertCommand, AlertHookCommand, AlertSeverity, AlertState};
 use crate::backend::StoreWriter;
 use crate::duration_args::parse_duration_seconds;
 use crate::input_validation::{local_actor, validate_reason};
+use crate::observation::safe_observation_summary;
 use crate::storage_payloads::{HealthDegradedMethodsPayloadV1, HealthSummaryPayloadV1};
 use crate::store::{
     AlertDeliveryAttemptRecord, AlertDeliveryAttemptWrite, AlertDeliveryFinalizeWrite,
@@ -814,7 +815,8 @@ fn cert_expiry_candidates(
     }
     let mut candidates = Vec::new();
     for (node_id, observation) in latest_by_node {
-        let Some(days_remaining) = min_days_remaining(&observation.summary_json) else {
+        let summary = safe_observation_summary(&observation.summary_json);
+        let Some(days_remaining) = min_days_remaining(&summary) else {
             continue;
         };
         let (severity, reason_code, suffix) = if days_remaining <= critical_days {
@@ -836,7 +838,7 @@ fn cert_expiry_candidates(
             methods: vec![OCSERV_CERT_EXPIRY.to_string()],
             summary: json!({
                 "days_remaining": days_remaining,
-                "status": cert_status(&observation.summary_json),
+                "status": cert_status(&summary),
             }),
         });
     }

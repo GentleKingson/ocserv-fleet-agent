@@ -499,6 +499,51 @@ fn migration_tests_health_snapshot_v1_migrates_or_fails_closed() {
     assert_eq!(backup_files(bad_dir.path()).len(), 1);
 }
 
+#[test]
+fn migration_tests_observation_summary_v1_migrates_or_fails_closed() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("controller.sqlite");
+    create_legacy_fixture(&db, 10, 1);
+    let conn = Connection::open(&db).expect("open v10 db");
+    conn.execute(
+        "UPDATE probe_observations SET summary_json = ?1 WHERE observation_id = 'obs-0000'",
+        [r#"{"message":"pong","result_class":"controller_rpc_summary"}"#],
+    )
+    .expect("seed legacy observation summary");
+    drop(conn);
+
+    let store = Store::open(&db).expect("migrate v10 observation summary");
+    drop(store);
+    let conn = Connection::open(&db).expect("open migrated db");
+    let summary: String = conn
+        .query_row(
+            "SELECT summary_json FROM probe_observations WHERE observation_id = 'obs-0000'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read migrated observation summary");
+    let summary: serde_json::Value = serde_json::from_str(&summary).expect("summary json");
+    assert_eq!(summary["schema"], "ocfleet.observation.summary.v1");
+    assert_eq!(summary["method"], "probe.controller.ping");
+    assert_eq!(summary["result_class"], "controller_rpc_summary");
+    assert_eq!(summary["fields"]["message"], "pong");
+    drop(conn);
+
+    let bad_dir = tempfile::tempdir().expect("bad temp dir");
+    let bad_db = bad_dir.path().join("controller.sqlite");
+    create_legacy_fixture(&bad_db, 10, 1);
+    let conn = Connection::open(&bad_db).expect("open contaminated v10 db");
+    conn.execute(
+        "UPDATE probe_observations SET summary_json = ?1",
+        [r#"{"message":"pong","client_address":"10.0.0.2"}"#],
+    )
+    .expect("contaminate observation summary");
+    drop(conn);
+    make_private_database_file(&bad_db);
+    assert!(Store::open(&bad_db).is_err());
+    assert_eq!(backup_files(bad_dir.path()).len(), 1);
+}
+
 fn create_legacy_fixture(path: &Path, version: i64, rows: usize) {
     assert!((1..=CURRENT_SCHEMA_VERSION).contains(&version));
     let conn = Connection::open(path).expect("create fixture db");
@@ -610,6 +655,11 @@ fn insert_observability_rows(
     } else {
         ("[]", "{}")
     };
+    let observation_summary_json = if version >= 11 {
+        r#"{"schema":"ocfleet.observation.summary.v1","result_class":"controller_rpc_summary","method":"probe.controller.ping","fields":{}}"#
+    } else {
+        "{}"
+    };
     conn.execute(
         "INSERT INTO observability_jobs
          (job_id, kind, selector_json, pair_selector_json, interval_seconds, jitter_seconds, timeout_ms, enabled, next_run_at, last_run_at, created_at, updated_at)
@@ -627,8 +677,15 @@ fn insert_observability_rows(
     conn.execute(
         "INSERT INTO probe_observations
          (observation_id, run_id, node_id, endpoint_id, method, ok, error_code, duration_ms, observed_at, expires_at, result_class, summary_json)
-         VALUES (?1, ?2, ?3, ?4, 'probe.controller.ping', 1, NULL, 12, ?5, NULL, 'controller_rpc_summary', '{}')",
-        (&observation_id, &run_id, node_id, endpoint_id, NOW),
+         VALUES (?1, ?2, ?3, ?4, 'probe.controller.ping', 1, NULL, 12, ?5, NULL, 'controller_rpc_summary', ?6)",
+        (
+            &observation_id,
+            &run_id,
+            node_id,
+            endpoint_id,
+            NOW,
+            observation_summary_json,
+        ),
     )
     .expect("insert probe observation");
     conn.execute(

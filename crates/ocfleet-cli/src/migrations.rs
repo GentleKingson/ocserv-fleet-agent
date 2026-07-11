@@ -12,8 +12,8 @@ use time::{OffsetDateTime, macros::format_description};
 use crate::private_file::{self, PrivateFileError};
 use crate::storage_payloads::{
     HEALTH_SUMMARY_SCHEMA_V1, HealthDegradedMethodsPayloadV1, HealthSummaryPayloadV1,
-    SchedulerPairPayloadV1, SchedulerSelectorPayloadV1, validate_health_payload_relationship,
-    validate_scheduler_payload_relationship,
+    ObservationSummaryPayloadV1, SchedulerPairPayloadV1, SchedulerSelectorPayloadV1,
+    validate_health_payload_relationship, validate_scheduler_payload_relationship,
 };
 use crate::store::{CURRENT_SCHEMA_VERSION, StoreError};
 
@@ -91,6 +91,12 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         name: "0010_versioned_health_snapshots",
         description: "Migrate health snapshot JSON to closed versioned v1 payloads.",
         apply: apply_0010_versioned_health_snapshots,
+    },
+    Migration {
+        version: 11,
+        name: "0011_versioned_observation_summaries",
+        description: "Migrate observation summaries to closed versioned v1 payloads.",
+        apply: apply_0011_versioned_observation_summaries,
     },
 ];
 
@@ -822,6 +828,42 @@ fn migrate_health_summary_payload(raw: &str, status: &str) -> Result<String, Sto
     let payload = HealthSummaryPayloadV1::from_value(&value).map_err(StoreError::InvalidInput)?;
     validate_health_payload_relationship(status, &payload).map_err(StoreError::InvalidInput)?;
     serde_json::to_string(&payload).map_err(|error| StoreError::InvalidInput(error.to_string()))
+}
+
+fn apply_0011_versioned_observation_summaries(tx: &Transaction<'_>) -> Result<(), StoreError> {
+    let rows = {
+        let mut stmt = tx.prepare(
+            "SELECT observation_id, method, result_class, summary_json
+             FROM probe_observations ORDER BY observation_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    for (observation_id, method, result_class, summary_json) in rows {
+        let value: Value = serde_json::from_str(&summary_json).map_err(|_| {
+            StoreError::InvalidInput("legacy observation summary JSON is invalid".to_string())
+        })?;
+        let payload = ObservationSummaryPayloadV1::from_value(&value)
+            .or_else(|_| ObservationSummaryPayloadV1::from_legacy(&method, &result_class, &value))
+            .map_err(StoreError::InvalidInput)?;
+        if payload.method != method || payload.result_class != result_class {
+            return Err(StoreError::InvalidInput(
+                "observation summary does not match relational method/result class".to_string(),
+            ));
+        }
+        tx.execute(
+            "UPDATE probe_observations SET summary_json = ?1 WHERE observation_id = ?2",
+            (payload.to_value().to_string(), observation_id),
+        )?;
+    }
+    Ok(())
 }
 
 fn observability_tables_have_current_constraints(tx: &Transaction<'_>) -> Result<bool, StoreError> {

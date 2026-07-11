@@ -296,6 +296,12 @@ unsupported methods or versions, invalid bounds, malformed JSON, and status
 mismatches stop the upgrade and leave the version-9 database unchanged beside
 its private pre-migration backup.
 
+Schema version 11 canonicalizes probe observation summaries into closed
+method/result-class-bound payloads. Unknown or nested fields, sensitive/address
+content, unsupported versions, malformed JSON, and relational mismatches stop
+the upgrade and leave the version-10 database unchanged beside its private
+pre-migration backup.
+
 Before upgrades, keep an operator-managed backup as well:
 
 ```bash

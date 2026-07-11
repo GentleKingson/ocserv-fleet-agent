@@ -4,9 +4,9 @@
   "completed_phases": ["A1"],
   "active_branch": "codex/a2-observation-storage",
   "active_issue": 34,
-  "active_pr": null,
+  "active_pr": 71,
   "last_test_result": "passed",
   "last_updated_at": "2026-07-11T07:18:52Z",
   "blockers": [],
-  "next_action": "Finish verification and publish the schema-v11 observation summary storage slice, then continue the remaining A2 dynamic JSON inventory on issue #34."
+  "next_action": "Monitor pull request #71 CI, merge the schema-v11 observation summary storage slice when green, then continue the remaining A2 dynamic JSON inventory on issue #34."
 }

@@ -226,6 +226,7 @@ through `StoreWriter`; two SQLite connections cannot acquire one due job, and
 an expired owner cannot persist after takeover. Periodic renewal, retry/misfire
 and maintenance policy, graceful in-flight shutdown, and the remaining A3
 acceptance matrix are still active work.
+Published for review in pull request `#80`.
 
 ### Baseline And Production Foundation
 

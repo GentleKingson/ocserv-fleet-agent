@@ -189,6 +189,13 @@ writers and readers reject unknown, forbidden, malformed, noncanonical,
 future-version, or mismatched data before output or delivery. Publication is in
 pull request `#75`.
 
+The eighth A2 slice advances SQLite to migration `0016` and stores enrollment
+token labels/scope and join-request requested/approved labels in closed,
+kind-bound typed scalar maps. Exact legacy objects migrate; writers and readers
+reject unknown, nested, sensitive, malformed, future-version, wrong-kind, or
+decision-inconsistent data without changing enrollment identity or trust.
+The slice is published in pull request `#76`.
+
 ### Baseline And Production Foundation
 
 | ID | Issue | Status | Depends on | Release target | Acceptance and required evidence |

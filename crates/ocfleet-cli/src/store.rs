@@ -28,13 +28,14 @@ use crate::input_validation::{
 use crate::migrations;
 use crate::private_file::{self, PrivateFileError};
 use crate::storage_payloads::{
-    AlertDetailPayloadV1, AlertHostAllowPayloadV1, HealthDegradedMethodsPayloadV1,
-    HealthSummaryPayloadV1, ObservationSummaryPayloadV1, RunSummaryPayloadV1,
-    SchedulerPairPayloadV1, SchedulerSelectorPayloadV1, TrustBundlePayloadV1,
-    validate_health_payload_relationship, validate_scheduler_payload_relationship,
+    AlertDetailPayloadV1, AlertHostAllowPayloadV1, EnrollmentMetadataKindV1,
+    EnrollmentMetadataPayloadV1, HealthDegradedMethodsPayloadV1, HealthSummaryPayloadV1,
+    ObservationSummaryPayloadV1, RunSummaryPayloadV1, SchedulerPairPayloadV1,
+    SchedulerSelectorPayloadV1, TrustBundlePayloadV1, validate_health_payload_relationship,
+    validate_scheduler_payload_relationship,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 15;
+pub const CURRENT_SCHEMA_VERSION: i64 = 16;
 pub const DEFAULT_HEALTH_STALE_WINDOW_SECONDS: u64 = 24 * 60 * 60;
 pub const DEFAULT_HEALTH_UNREACHABLE_FAILURES: u64 = 3;
 pub const DEFAULT_HEALTH_CERT_WARNING_DAYS: u64 = 30;
@@ -2328,6 +2329,12 @@ impl Store {
         validate_label_json(&token.scope_json, "scope").map_err(StoreError::InvalidInput)?;
         validate_low_sensitive_json(&token.labels_json, "enrollment token labels")?;
         validate_low_sensitive_json(&token.scope_json, "enrollment token scope")?;
+        let labels = canonical_enrollment_metadata(
+            EnrollmentMetadataKindV1::TokenLabels,
+            &token.labels_json,
+        )?;
+        let scope =
+            canonical_enrollment_metadata(EnrollmentMetadataKindV1::TokenScope, &token.scope_json)?;
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         if let Some(existing) = get_enrollment_token_tx(&tx, &token.token_id)? {
             if enrollment_token_matches_create(&existing, token, actor) {
@@ -2364,8 +2371,8 @@ impl Store {
                 i64::from(token.max_uses),
                 EnrollmentTokenStatus::Active.as_str(),
                 token.description.as_deref(),
-                token.labels_json.to_string(),
-                token.scope_json.to_string(),
+                labels.to_string(),
+                scope.to_string(),
             ],
         )?;
         let after = get_enrollment_token_tx(&tx, &token.token_id)?
@@ -2486,6 +2493,14 @@ impl Store {
             &request.requested_labels_json,
             "enrollment requested labels",
         )?;
+        let requested_labels = canonical_enrollment_metadata(
+            EnrollmentMetadataKindV1::RequestedLabels,
+            &request.requested_labels_json,
+        )?;
+        let approved_labels = canonical_enrollment_metadata(
+            EnrollmentMetadataKindV1::ApprovedLabels,
+            &serde_json::json!({}),
+        )?;
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let token_hash = Self::hash_enrollment_token(&request.token_plaintext);
         let token = get_enrollment_token_by_hash_tx(&tx, &token_hash)?;
@@ -2579,7 +2594,7 @@ impl Store {
         tx.execute(
             "INSERT INTO join_requests
              (request_id, token_id, status, agent_public_key, fingerprint, requested_endpoint_id, assigned_endpoint_id, hostname, agent_version, requested_labels_json, approved_labels_json, created_at, approved_at, approved_by, rejection_reason, audit_correlation_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, ?9, '{}', strftime('%Y-%m-%dT%H:%M:%SZ','now'), NULL, NULL, NULL, ?10)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, ?9, ?10, strftime('%Y-%m-%dT%H:%M:%SZ','now'), NULL, NULL, NULL, ?11)",
             params![
                 request.request_id.as_str(),
                 token.token_id.as_str(),
@@ -2589,7 +2604,8 @@ impl Store {
                 requested_endpoint_id.as_deref(),
                 request.hostname.as_str(),
                 request.agent_version.as_str(),
-                request.requested_labels_json.to_string(),
+                requested_labels.to_string(),
+                approved_labels.to_string(),
                 correlation_id.as_str(),
             ],
         )?;
@@ -2712,6 +2728,10 @@ impl Store {
         )?;
         validate_label_json(&approval.approved_labels_json, "approved_labels")
             .map_err(StoreError::InvalidInput)?;
+        let approved_labels = canonical_enrollment_metadata(
+            EnrollmentMetadataKindV1::ApprovedLabels,
+            &approval.approved_labels_json,
+        )?;
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let before = get_join_request_tx(&tx, &approval.request_id)?
             .ok_or_else(|| StoreError::JoinRequestNotFound(approval.request_id.clone()))?;
@@ -2811,7 +2831,7 @@ impl Store {
             params![
                 JoinRequestStatus::Approved.as_str(),
                 node.endpoint_id.as_str(),
-                approval.approved_labels_json.to_string(),
+                approved_labels.to_string(),
                 actor,
                 approval.request_id.as_str(),
                 JoinRequestStatus::Pending.as_str(),
@@ -6415,6 +6435,16 @@ fn canonical_alert_detail(value: &Value) -> Result<Value, StoreError> {
     Ok(payload.to_value())
 }
 
+fn canonical_enrollment_metadata(
+    kind: EnrollmentMetadataKindV1,
+    value: &Value,
+) -> Result<Value, StoreError> {
+    let payload = EnrollmentMetadataPayloadV1::from_value(kind, value)
+        .or_else(|_| EnrollmentMetadataPayloadV1::from_legacy(kind, value))
+        .map_err(StoreError::InvalidInput)?;
+    Ok(payload.to_value())
+}
+
 fn normalize_optional_alert(
     alert: Option<&AlertEventRecord>,
 ) -> Result<Option<AlertEventRecord>, StoreError> {
@@ -6973,6 +7003,10 @@ fn enrollment_token_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Enroll
     let status: String = row.get(7)?;
     let labels_json: String = row.get(9)?;
     let scope_json: String = row.get(10)?;
+    let labels =
+        enrollment_metadata_from_column(&labels_json, 9, EnrollmentMetadataKindV1::TokenLabels)?;
+    let scope =
+        enrollment_metadata_from_column(&scope_json, 10, EnrollmentMetadataKindV1::TokenScope)?;
     Ok(EnrollmentTokenRecord {
         token_id: row.get(0)?,
         token_hash: row.get(1)?,
@@ -6983,32 +7017,68 @@ fn enrollment_token_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Enroll
         used_count: i64_to_u32(row.get(6)?)?,
         status: parse_status(&status, 7)?,
         description: row.get(8)?,
-        labels_json: parse_json_column(&labels_json, 9)?,
-        scope_json: parse_json_column(&scope_json, 10)?,
+        labels_json: labels.public_value(),
+        scope_json: scope.public_value(),
     })
 }
 
 fn join_request_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JoinRequestRecord> {
     let status: String = row.get(2)?;
+    let status = parse_status(&status, 2)?;
     let requested_labels_json: String = row.get(9)?;
     let approved_labels_json: String = row.get(10)?;
+    let requested_labels = enrollment_metadata_from_column(
+        &requested_labels_json,
+        9,
+        EnrollmentMetadataKindV1::RequestedLabels,
+    )?;
+    let approved_labels = enrollment_metadata_from_column(
+        &approved_labels_json,
+        10,
+        EnrollmentMetadataKindV1::ApprovedLabels,
+    )?;
+    if status != JoinRequestStatus::Approved && !approved_labels.values.is_empty() {
+        return Err(rusqlite::Error::FromSqlConversionFailure(
+            10,
+            Type::Text,
+            Box::new(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "non-approved enrollment request contains approved labels",
+            )),
+        ));
+    }
     Ok(JoinRequestRecord {
         request_id: row.get(0)?,
         token_id: row.get(1)?,
-        status: parse_status(&status, 2)?,
+        status,
         agent_public_key: row.get(3)?,
         fingerprint: row.get(4)?,
         requested_endpoint_id: row.get(5)?,
         assigned_endpoint_id: row.get(6)?,
         hostname: row.get(7)?,
         agent_version: row.get(8)?,
-        requested_labels_json: parse_json_column(&requested_labels_json, 9)?,
-        approved_labels_json: parse_json_column(&approved_labels_json, 10)?,
+        requested_labels_json: requested_labels.public_value(),
+        approved_labels_json: approved_labels.public_value(),
         created_at: row.get(11)?,
         approved_at: row.get(12)?,
         approved_by: row.get(13)?,
         rejection_reason: row.get(14)?,
         audit_correlation_id: row.get(15)?,
+    })
+}
+
+fn enrollment_metadata_from_column(
+    value: &str,
+    column: usize,
+    kind: EnrollmentMetadataKindV1,
+) -> rusqlite::Result<EnrollmentMetadataPayloadV1> {
+    let value = parse_json_column(value, column)?;
+    EnrollmentMetadataPayloadV1::from_value(kind, &value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            column,
+            Type::Text,
+            Box::new(io::Error::new(io::ErrorKind::InvalidData, error)),
+        )
     })
 }
 

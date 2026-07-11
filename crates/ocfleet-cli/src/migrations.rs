@@ -11,9 +11,10 @@ use time::{OffsetDateTime, macros::format_description};
 
 use crate::private_file::{self, PrivateFileError};
 use crate::storage_payloads::{
-    AlertDetailPayloadV1, AlertHostAllowPayloadV1, HEALTH_SUMMARY_SCHEMA_V1,
-    HealthDegradedMethodsPayloadV1, HealthSummaryPayloadV1, ObservationSummaryPayloadV1,
-    RunSummaryPayloadV1, SchedulerPairPayloadV1, SchedulerSelectorPayloadV1, TrustBundlePayloadV1,
+    AlertDetailPayloadV1, AlertHostAllowPayloadV1, EnrollmentMetadataKindV1,
+    EnrollmentMetadataPayloadV1, HEALTH_SUMMARY_SCHEMA_V1, HealthDegradedMethodsPayloadV1,
+    HealthSummaryPayloadV1, ObservationSummaryPayloadV1, RunSummaryPayloadV1,
+    SchedulerPairPayloadV1, SchedulerSelectorPayloadV1, TrustBundlePayloadV1,
     validate_health_payload_relationship, validate_scheduler_payload_relationship,
 };
 use crate::store::{CURRENT_SCHEMA_VERSION, StoreError};
@@ -122,6 +123,12 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         name: "0015_versioned_alert_host_allowlists",
         description: "Migrate alert host allowlists to closed versioned v1 payloads.",
         apply: apply_0015_versioned_alert_host_allowlists,
+    },
+    Migration {
+        version: 16,
+        name: "0016_versioned_enrollment_metadata",
+        description: "Migrate enrollment labels and scope to closed versioned v1 payloads.",
+        apply: apply_0016_versioned_enrollment_metadata,
     },
 ];
 
@@ -1030,6 +1037,84 @@ fn apply_0015_versioned_alert_host_allowlists(tx: &Transaction<'_>) -> Result<()
         )?;
     }
     Ok(())
+}
+
+fn apply_0016_versioned_enrollment_metadata(tx: &Transaction<'_>) -> Result<(), StoreError> {
+    let tokens = {
+        let mut stmt = tx.prepare(
+            "SELECT token_id, labels_json, scope_json FROM enrollment_tokens ORDER BY token_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    for (token_id, labels_json, scope_json) in tokens {
+        let labels =
+            migrate_enrollment_metadata(EnrollmentMetadataKindV1::TokenLabels, &labels_json)?;
+        let scope = migrate_enrollment_metadata(EnrollmentMetadataKindV1::TokenScope, &scope_json)?;
+        tx.execute(
+            "UPDATE enrollment_tokens SET labels_json = ?1, scope_json = ?2 WHERE token_id = ?3",
+            (labels.to_string(), scope.to_string(), token_id),
+        )?;
+    }
+
+    let requests = {
+        let mut stmt = tx.prepare(
+            "SELECT request_id, status, requested_labels_json, approved_labels_json FROM join_requests ORDER BY request_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    for (request_id, status, requested_labels_json, approved_labels_json) in requests {
+        let requested = migrate_enrollment_metadata(
+            EnrollmentMetadataKindV1::RequestedLabels,
+            &requested_labels_json,
+        )?;
+        let approved = migrate_enrollment_metadata(
+            EnrollmentMetadataKindV1::ApprovedLabels,
+            &approved_labels_json,
+        )?;
+        if status != "approved"
+            && approved
+                .get("values")
+                .and_then(Value::as_object)
+                .is_none_or(|values| !values.is_empty())
+        {
+            return Err(StoreError::InvalidInput(
+                "non-approved enrollment request contains approved labels".to_string(),
+            ));
+        }
+        tx.execute(
+            "UPDATE join_requests SET requested_labels_json = ?1, approved_labels_json = ?2 WHERE request_id = ?3",
+            (requested.to_string(), approved.to_string(), request_id),
+        )?;
+    }
+    Ok(())
+}
+
+fn migrate_enrollment_metadata(
+    kind: EnrollmentMetadataKindV1,
+    raw: &str,
+) -> Result<Value, StoreError> {
+    let value: Value = serde_json::from_str(raw).map_err(|_| {
+        StoreError::InvalidInput("legacy enrollment metadata JSON is invalid".to_string())
+    })?;
+    let payload = EnrollmentMetadataPayloadV1::from_value(kind, &value)
+        .or_else(|_| EnrollmentMetadataPayloadV1::from_legacy(kind, &value))
+        .map_err(StoreError::InvalidInput)?;
+    Ok(payload.to_value())
 }
 
 fn observability_tables_have_current_constraints(tx: &Transaction<'_>) -> Result<bool, StoreError> {

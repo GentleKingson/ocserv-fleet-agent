@@ -37,6 +37,10 @@
   job/kind/status/trigger-bound payload with bounded terminal counts. Migration,
   writers, and CLI/API readers reject unknown, contaminated, inconsistent, or
   future-version data.
+- SQLite schema version 13 stores endpoint trust bundles in a closed payload
+  bound to relational endpoint identity, generation, and lifecycle status.
+  Allowlists and explicit path pairs are bounded and unique; contaminated or
+  mismatched rows fail closed without creating trust.
 - Node add, enable, disable, and remove now take an explicit resolved actor and
   commit their registry/trust change and success audit in one SQLite
   transaction through `StoreWriter`.

@@ -308,6 +308,13 @@ sensitive fields, unsupported versions or job kinds, impossible counts,
 malformed JSON, and relational mismatches stop the upgrade and leave the
 version-11 database unchanged beside its private pre-migration backup.
 
+Schema version 13 canonicalizes endpoint trust bundles into closed payloads
+bound to relational endpoint identity, generation, and lifecycle status. Exact
+legacy empty bundles become empty allowlists; explicit allowlists and path pairs
+remain bounded and unique. Unknown fields, unsupported versions, malformed or
+duplicate entries, self-pairs, and relational mismatches stop the upgrade and
+leave the version-12 database unchanged beside its private backup.
+
 Before upgrades, keep an operator-managed backup as well:
 
 ```bash

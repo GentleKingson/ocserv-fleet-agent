@@ -191,7 +191,10 @@ fn doctor_reports_aggregate_endpoint_trust_binding_failures_without_identities()
     )
     .expect("make current binding unbound");
     conn.execute(
-        "UPDATE endpoint_trust SET status = 'revoked' WHERE endpoint_id = ?1",
+        "UPDATE endpoint_trust
+         SET status = 'revoked',
+             trust_bundle_json = json_set(trust_bundle_json, '$.status', 'revoked')
+         WHERE endpoint_id = ?1",
         [&inactive_endpoint],
     )
     .expect("make current endpoint inactive");
@@ -351,6 +354,7 @@ fn insert_endpoint_trust(
     status: &str,
 ) {
     let trust_bundle = serde_json::json!({
+        "schema": "ocfleet.trust.bundle.v1",
         "endpoint_id": endpoint_id,
         "generation": 1,
         "status": status,

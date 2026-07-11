@@ -167,6 +167,14 @@ future-version, or mismatched data. CLI and independent API readers validate
 the envelope and omit its storage wrapper. The slice is published in pull
 request `#72`.
 
+The fifth A2 slice advances SQLite to migration `0013` and stores endpoint
+trust bundles in a closed payload bound to relational endpoint ID, generation,
+and lifecycle status. Exact legacy empty bundles become empty allowlists;
+explicit controller/peer lists and path-probe pairs are bounded and unique.
+Migration, writers, and store readers reject unknown, future, malformed,
+duplicate, self-pair, or mismatched data without creating trust. The slice is
+published in pull request `#73`.
+
 ### Baseline And Production Foundation
 
 | ID | Issue | Status | Depends on | Release target | Acceptance and required evidence |

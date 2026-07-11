@@ -81,6 +81,11 @@ observability run summaries over fixed job, kind, status, trigger, and bounded
 count fields. Writers and both read adapters bind those fields to the
 relational run and never expose the persisted schema wrapper.
 
+The fifth A2 slice advances SQLite to schema version 13 and closes endpoint
+trust bundles over relational endpoint, generation, and lifecycle state plus
+bounded explicit controller, peer, and path-pair allowlists. Store readers
+validate the envelope and expose only the established public bundle fields.
+
 The first production-hardening slice added node add/enable/disable/remove to this
 contract and removed the CLI's post-commit success audits. Audit-trigger failure
 tests prove both `nodes` and `endpoint_trust` changes roll back. The second slice

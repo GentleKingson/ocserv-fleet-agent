@@ -13,7 +13,7 @@ use crate::private_file::{self, PrivateFileError};
 use crate::storage_payloads::{
     HEALTH_SUMMARY_SCHEMA_V1, HealthDegradedMethodsPayloadV1, HealthSummaryPayloadV1,
     ObservationSummaryPayloadV1, RunSummaryPayloadV1, SchedulerPairPayloadV1,
-    SchedulerSelectorPayloadV1, validate_health_payload_relationship,
+    SchedulerSelectorPayloadV1, TrustBundlePayloadV1, validate_health_payload_relationship,
     validate_scheduler_payload_relationship,
 };
 use crate::store::{CURRENT_SCHEMA_VERSION, StoreError};
@@ -104,6 +104,12 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         name: "0012_versioned_run_summaries",
         description: "Migrate observability run summaries to closed versioned v1 payloads.",
         apply: apply_0012_versioned_run_summaries,
+    },
+    Migration {
+        version: 13,
+        name: "0013_versioned_trust_bundles",
+        description: "Migrate endpoint trust bundles to closed versioned v1 payloads.",
+        apply: apply_0013_versioned_trust_bundles,
     },
 ];
 
@@ -914,6 +920,45 @@ fn apply_0012_versioned_run_summaries(tx: &Transaction<'_>) -> Result<(), StoreE
         tx.execute(
             "UPDATE observability_runs SET summary_json = ?1 WHERE run_id = ?2",
             (payload.to_value().to_string(), run_id),
+        )?;
+    }
+    Ok(())
+}
+
+fn apply_0013_versioned_trust_bundles(tx: &Transaction<'_>) -> Result<(), StoreError> {
+    let rows = {
+        let mut stmt = tx.prepare(
+            "SELECT endpoint_id, generation, status, trust_bundle_json
+             FROM endpoint_trust ORDER BY endpoint_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    for (endpoint_id, generation, status, trust_bundle_json) in rows {
+        let generation = u64::try_from(generation).map_err(|_| {
+            StoreError::InvalidInput("legacy trust bundle generation is invalid".to_string())
+        })?;
+        let value: Value = serde_json::from_str(&trust_bundle_json).map_err(|_| {
+            StoreError::InvalidInput("legacy trust bundle JSON is invalid".to_string())
+        })?;
+        let payload = TrustBundlePayloadV1::from_value(&value)
+            .or_else(|_| {
+                TrustBundlePayloadV1::from_legacy(&endpoint_id, generation, &status, &value)
+            })
+            .map_err(StoreError::InvalidInput)?;
+        payload
+            .validate_relationship(&endpoint_id, generation, &status)
+            .map_err(StoreError::InvalidInput)?;
+        tx.execute(
+            "UPDATE endpoint_trust SET trust_bundle_json = ?1 WHERE endpoint_id = ?2",
+            (payload.to_value().to_string(), endpoint_id),
         )?;
     }
     Ok(())

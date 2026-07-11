@@ -233,6 +233,7 @@ window that suppresses claims and RPC without advancing clocks. SIGINT/SIGTERM
 closes admission, drains the admitted job and claim, then supports restart with
 a fresh owner. Timeout/jitter and the remaining A3
 acceptance matrix are still active work.
+Graceful daemon drain and restart are published in pull request `#85`.
 The schema-v20 maintenance policy is published in pull request `#84`.
 The bounded retry policy is published in pull request `#83`.
 The bounded misfire policy is published in pull request `#82`.

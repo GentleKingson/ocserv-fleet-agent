@@ -1,12 +1,12 @@
 {
   "baseline_commit": "b3c906a94823b4620dc1a2077a44e7160c0848b2",
-  "current_phase": "A2",
-  "completed_phases": ["A1"],
-  "active_branch": "codex/a2-audit-detail-storage",
-  "active_issue": 34,
-  "active_pr": 78,
+  "current_phase": "A3",
+  "completed_phases": ["A1", "A2"],
+  "active_branch": "codex/a2-completion-audit",
+  "active_issue": 35,
+  "active_pr": null,
   "last_test_result": "passed",
-  "last_updated_at": "2026-07-11T15:59:25Z",
+  "last_updated_at": "2026-07-11T16:08:00Z",
   "blockers": [],
-  "next_action": "Monitor and merge pull request #78, then close the issue #34 typed-storage inventory."
+  "next_action": "Publish and merge the A2 completion inventory, close issue #34, then audit the existing A3 scheduler-reliability slice against issue #35."
 }

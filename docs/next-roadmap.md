@@ -228,6 +228,7 @@ two-minute lease every 30 seconds and fails closed if renewal loses its fence.
 Misfires coalesce arbitrarily old backlogs into one audited execution. Retry
 and maintenance policy, graceful in-flight shutdown, and the remaining A3
 acceptance matrix are still active work.
+The bounded misfire policy is published in pull request `#82`.
 The lease-heartbeat follow-up is published in pull request `#81`.
 Published for review in pull request `#80`.
 

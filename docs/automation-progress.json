@@ -4,9 +4,9 @@
   "completed_phases": ["A1", "A2"],
   "active_branch": "codex/a3-scheduler-misfire",
   "active_issue": 35,
-  "active_pr": null,
+  "active_pr": 82,
   "last_test_result": "passed",
   "last_updated_at": "2026-07-11T18:16:00Z",
   "blockers": [],
-  "next_action": "Validate and publish bounded misfire coalescing, then add retry/backoff and maintenance policy for issue #35."
+  "next_action": "Merge pull request #82, then add retry/backoff and maintenance policy for issue #35."
 }

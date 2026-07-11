@@ -1,5 +1,6 @@
 use rusqlite::backup::{Backup, StepResult};
 use rusqlite::{Connection, OptionalExtension, Transaction};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::ffi::OsString;
 use std::io::{Read, Write};
@@ -9,6 +10,9 @@ use std::time::{Duration, Instant};
 use time::{OffsetDateTime, macros::format_description};
 
 use crate::private_file::{self, PrivateFileError};
+use crate::storage_payloads::{
+    SchedulerPairPayloadV1, SchedulerSelectorPayloadV1, validate_scheduler_payload_relationship,
+};
 use crate::store::{CURRENT_SCHEMA_VERSION, StoreError};
 
 const BACKUP_PAGES_PER_STEP: i32 = 128;
@@ -73,6 +77,12 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         name: "0008_alert_webhooks",
         description: "Create controller-local alert webhook hooks and delivery attempts.",
         apply: apply_0008_alert_webhooks,
+    },
+    Migration {
+        version: 9,
+        name: "0009_versioned_scheduler_selectors",
+        description: "Migrate scheduler selector JSON to closed versioned v1 payloads.",
+        apply: apply_0009_versioned_scheduler_selectors,
     },
 ];
 
@@ -601,6 +611,119 @@ fn apply_0007_health_policy(tx: &Transaction<'_>) -> Result<(), StoreError> {
 fn apply_0008_alert_webhooks(tx: &Transaction<'_>) -> Result<(), StoreError> {
     tx.execute_batch(ALERT_WEBHOOK_SQL)?;
     Ok(())
+}
+
+fn apply_0009_versioned_scheduler_selectors(tx: &Transaction<'_>) -> Result<(), StoreError> {
+    let rows = {
+        let mut stmt = tx.prepare(
+            "SELECT job_id, kind, selector_json, pair_selector_json
+             FROM observability_jobs ORDER BY job_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    for (job_id, kind, selector_json, pair_selector_json) in rows {
+        let (selector, selector_payload, quarantine) =
+            migrate_scheduler_selector_payload(&selector_json)?;
+        let pair = pair_selector_json
+            .as_deref()
+            .map(migrate_scheduler_pair_payload)
+            .transpose()?;
+        validate_scheduler_payload_relationship(
+            &kind,
+            &selector_payload,
+            pair.as_ref().map(|(_, payload)| payload),
+        )
+        .map_err(StoreError::InvalidInput)?;
+        tx.execute(
+            "UPDATE observability_jobs
+             SET selector_json = ?1,
+                 pair_selector_json = ?2,
+                 enabled = CASE WHEN ?3 THEN 0 ELSE enabled END
+             WHERE job_id = ?4",
+            rusqlite::params![
+                selector,
+                pair.map(|(encoded, _)| encoded),
+                quarantine,
+                job_id
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn migrate_scheduler_selector_payload(
+    raw: &str,
+) -> Result<(String, SchedulerSelectorPayloadV1, bool), StoreError> {
+    let mut value: Value = serde_json::from_str(raw).map_err(|_| {
+        StoreError::InvalidInput("legacy scheduler selector JSON is invalid".to_string())
+    })?;
+    let object = value.as_object_mut().ok_or_else(|| {
+        StoreError::InvalidInput("legacy scheduler selector must be an object".to_string())
+    })?;
+    let quarantine = object.is_empty();
+    if quarantine {
+        object.insert(
+            "selector".to_string(),
+            Value::String("role=ocserv".to_string()),
+        );
+        object.insert("name".to_string(), Value::Null);
+    }
+    if !object.contains_key("schema") {
+        if object
+            .keys()
+            .any(|key| !matches!(key.as_str(), "selector" | "name"))
+        {
+            return Err(StoreError::InvalidInput(
+                "legacy scheduler selector contains unknown fields".to_string(),
+            ));
+        }
+        object.insert(
+            "schema".to_string(),
+            Value::String(crate::storage_payloads::SCHEDULER_SELECTOR_SCHEMA_V1.to_string()),
+        );
+    }
+    let payload =
+        SchedulerSelectorPayloadV1::from_value(&value).map_err(StoreError::InvalidInput)?;
+    let encoded = serde_json::to_string(&payload)
+        .map_err(|error| StoreError::InvalidInput(error.to_string()))?;
+    Ok((encoded, payload, quarantine))
+}
+
+fn migrate_scheduler_pair_payload(
+    raw: &str,
+) -> Result<(String, SchedulerPairPayloadV1), StoreError> {
+    let mut value: Value = serde_json::from_str(raw).map_err(|_| {
+        StoreError::InvalidInput("legacy scheduler pair JSON is invalid".to_string())
+    })?;
+    let object = value.as_object_mut().ok_or_else(|| {
+        StoreError::InvalidInput("legacy scheduler pair must be an object".to_string())
+    })?;
+    if !object.contains_key("schema") {
+        if object
+            .keys()
+            .any(|key| !matches!(key.as_str(), "source_node_id" | "target_node_id"))
+        {
+            return Err(StoreError::InvalidInput(
+                "legacy scheduler pair contains unknown fields".to_string(),
+            ));
+        }
+        object.insert(
+            "schema".to_string(),
+            Value::String(crate::storage_payloads::SCHEDULER_PAIR_SCHEMA_V1.to_string()),
+        );
+    }
+    let payload = SchedulerPairPayloadV1::from_value(&value).map_err(StoreError::InvalidInput)?;
+    let encoded = serde_json::to_string(&payload)
+        .map_err(|error| StoreError::InvalidInput(error.to_string()))?;
+    Ok((encoded, payload))
 }
 
 fn observability_tables_have_current_constraints(tx: &Transaction<'_>) -> Result<bool, StoreError> {

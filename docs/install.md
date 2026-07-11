@@ -282,6 +282,13 @@ target schema version, and UTC timestamp; the backup directory is kept at
 checksum sidecar is written next to each backup. Migration continues only after
 the backup and checksum are complete.
 
+Schema version 9 canonicalizes scheduler selector and path-pair JSON into
+closed versioned payloads. Exact valid legacy selectors are preserved. A legacy
+empty selector is converted to `role=ocserv` and its job is disabled for manual
+review; it is never silently re-enabled. Unknown fields, unsupported schemas,
+malformed JSON, or invalid selector/pair values stop the upgrade and leave the
+version-8 database unchanged beside its private pre-migration backup.
+
 Before upgrades, keep an operator-managed backup as well:
 
 ```bash

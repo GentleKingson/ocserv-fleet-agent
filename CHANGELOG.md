@@ -21,6 +21,11 @@
 ### Changed
 
 - Workspace packages now report version `0.2.0`.
+- SQLite schema version 9 stores scheduler selectors and explicit path pairs as
+  closed schema-tagged v1 payloads. Migration canonicalizes exact legacy rows,
+  disables ambiguous empty selectors, and rejects unknown or contaminated data
+  after creating the normal private backup. CLI/API readers fail closed and do
+  not expose the raw stored objects.
 - Node add, enable, disable, and remove now take an explicit resolved actor and
   commit their registry/trust change and success audit in one SQLite
   transaction through `StoreWriter`.

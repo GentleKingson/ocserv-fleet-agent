@@ -369,6 +369,81 @@ fn migration_tests_invalid_legacy_observability_data_is_refused_after_backup() {
     assert_eq!(table_count(&conn, "observability_jobs"), 1);
 }
 
+#[test]
+fn migration_tests_scheduler_selector_v1_migrates_or_fails_closed() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("controller.sqlite");
+    create_legacy_fixture(&db, 8, 1);
+    make_private_database_file(&db);
+    let store = Store::open(&db).expect("migrate v8 selector");
+    drop(store);
+    let conn = Connection::open(&db).expect("open migrated db");
+    let (selector, enabled): (String, i64) = conn
+        .query_row(
+            "SELECT selector_json, enabled FROM observability_jobs LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("read migrated selector");
+    let selector: serde_json::Value = serde_json::from_str(&selector).expect("selector json");
+    assert_eq!(
+        selector["schema"], "ocfleet.scheduler.selector.v1",
+        "migrated payload must be explicitly versioned"
+    );
+    assert_eq!(selector["selector"], "role=ocserv");
+    assert_eq!(enabled, 0, "empty legacy selector must be quarantined");
+    drop(conn);
+
+    let pair_dir = tempfile::tempdir().expect("pair temp dir");
+    let pair_db = pair_dir.path().join("controller.sqlite");
+    create_legacy_fixture(&pair_db, 8, 1);
+    let conn = Connection::open(&pair_db).expect("open v8 pair db");
+    conn.execute(
+        "UPDATE observability_jobs
+         SET kind = 'path-probe', selector_json = ?1, pair_selector_json = ?2
+         WHERE job_id = 'job-0000'",
+        (
+            r#"{"selector":"explicit-pair","name":"fixed path"}"#,
+            r#"{"source_node_id":"source-node","target_node_id":"target-node"}"#,
+        ),
+    )
+    .expect("seed legacy pair selector");
+    drop(conn);
+    let store = Store::open(&pair_db).expect("migrate legacy pair selector");
+    drop(store);
+    let conn = Connection::open(&pair_db).expect("open migrated pair db");
+    let (selector, pair, enabled): (String, String, i64) = conn
+        .query_row(
+            "SELECT selector_json, pair_selector_json, enabled
+             FROM observability_jobs WHERE job_id = 'job-0000'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("read migrated pair selector");
+    let selector: serde_json::Value = serde_json::from_str(&selector).expect("selector json");
+    let pair: serde_json::Value = serde_json::from_str(&pair).expect("pair json");
+    assert_eq!(selector["schema"], "ocfleet.scheduler.selector.v1");
+    assert_eq!(pair["schema"], "ocfleet.scheduler.pair.v1");
+    assert_eq!(pair["source_node_id"], "source-node");
+    assert_eq!(pair["target_node_id"], "target-node");
+    assert_eq!(enabled, 1, "valid legacy pair remains enabled");
+    drop(conn);
+
+    let bad_dir = tempfile::tempdir().expect("bad temp dir");
+    let bad_db = bad_dir.path().join("controller.sqlite");
+    create_legacy_fixture(&bad_db, 8, 1);
+    let conn = Connection::open(&bad_db).expect("open v8 db");
+    conn.execute(
+        "UPDATE observability_jobs SET selector_json = ?1",
+        [r#"{"selector":"role=ocserv","client_address":"10.0.0.2"}"#],
+    )
+    .expect("contaminate selector");
+    drop(conn);
+    make_private_database_file(&bad_db);
+    assert!(Store::open(&bad_db).is_err());
+    assert_eq!(backup_files(bad_dir.path()).len(), 1);
+}
+
 fn create_legacy_fixture(path: &Path, version: i64, rows: usize) {
     assert!((1..=CURRENT_SCHEMA_VERSION).contains(&version));
     let conn = Connection::open(path).expect("create fixture db");
@@ -452,20 +527,31 @@ fn insert_legacy_rows(conn: &Connection, version: i64, rows: usize) {
             .expect("insert endpoint trust");
         }
         if version >= 4 {
-            insert_observability_rows(conn, idx, &node_id, &endpoint_id);
+            insert_observability_rows(conn, version, idx, &node_id, &endpoint_id);
         }
     }
 }
 
-fn insert_observability_rows(conn: &Connection, idx: usize, node_id: &str, endpoint_id: &str) {
+fn insert_observability_rows(
+    conn: &Connection,
+    version: i64,
+    idx: usize,
+    node_id: &str,
+    endpoint_id: &str,
+) {
     let job_id = format!("job-{idx:04}");
     let run_id = format!("run-{idx:04}");
     let observation_id = format!("obs-{idx:04}");
+    let selector_json = if version >= 9 {
+        r#"{"schema":"ocfleet.scheduler.selector.v1","selector":"role=ocserv","name":null}"#
+    } else {
+        "{}"
+    };
     conn.execute(
         "INSERT INTO observability_jobs
          (job_id, kind, selector_json, pair_selector_json, interval_seconds, jitter_seconds, timeout_ms, enabled, next_run_at, last_run_at, created_at, updated_at)
-         VALUES (?1, 'controller-ping', '{}', NULL, 60, 0, 5000, 1, NULL, NULL, ?2, ?2)",
-        (&job_id, NOW),
+         VALUES (?1, 'controller-ping', ?2, NULL, 60, 0, 5000, 1, NULL, NULL, ?3, ?3)",
+        (&job_id, selector_json, NOW),
     )
     .expect("insert observability job");
     conn.execute(

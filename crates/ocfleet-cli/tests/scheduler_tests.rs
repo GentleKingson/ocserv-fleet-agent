@@ -498,7 +498,7 @@ fn scheduler_tests_path_probe_validate_requires_explicit_pair_without_mesh_enume
         conn.execute(
             "INSERT INTO observability_jobs
              (job_id, kind, selector_json, pair_selector_json, interval_seconds, jitter_seconds, timeout_ms, enabled, next_run_at, created_at, updated_at)
-             VALUES ('bad-path-job', 'path-probe', '{\"selector\":\"explicit_pair\"}', NULL, 60, 0, 5000, 1, '2026-07-08T00:00:00Z', '2026-07-08T00:00:00Z', '2026-07-08T00:00:00Z')",
+             VALUES ('bad-path-job', 'path-probe', '{\"schema\":\"ocfleet.scheduler.selector.v1\",\"selector\":\"explicit-pair\",\"name\":null}', NULL, 60, 0, 5000, 1, '2026-07-08T00:00:00Z', '2026-07-08T00:00:00Z', '2026-07-08T00:00:00Z')",
             [],
         )
         .expect("insert path-probe job without pair");

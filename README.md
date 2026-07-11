@@ -552,6 +552,8 @@ Networking must allow the controller to reach the agent through iroh using the r
   state transitions and webhook-hook creation.
 - `docs/adr/ADR-alert-delivery-persistence-atomicity.md`: durable delivery
   attempt and finalization boundaries around external I/O.
+- `docs/adr/ADR-versioned-scheduler-storage.md`: schema-v9 scheduler selector
+  and explicit-pair storage, migration, quarantine, and fail-closed decision.
 - `docs/trust-policy.md`: trust policy as code schema, validation, and diff behavior.
 - `docs/backend.md`: SQLite contract and optional Postgres backend plan.
 - `docs/archive-export.md`: long-term history archive and signed audit export guidance.

@@ -8,6 +8,7 @@ use axum::http::{Method, Request, StatusCode, header};
 use ocfleet_api::{ApiCli, ApiConfig, AppState, RedactionMode, build_router};
 use ocfleet_cli::audit::AuditEvent;
 use ocfleet_cli::backend::StoreWriter;
+use ocfleet_cli::storage_payloads::SchedulerSelectorPayloadV1;
 use ocfleet_cli::store::{
     AlertEventRecord, CURRENT_SCHEMA_VERSION, HealthSnapshotRecord, HealthSnapshotWrite,
     NodeInsert, ObservabilityJobRecord, ObservabilityRunInsert, ProbeObservationInsert, Store,
@@ -233,6 +234,22 @@ async fn get_routes_return_fixed_shapes() {
     )
     .await;
     assert_list_shape(&audit, 1);
+}
+
+#[tokio::test]
+async fn jobs_route_fails_closed_for_contaminated_versioned_selector() {
+    let fixture = Fixture::new();
+    Connection::open(&fixture.database)
+        .expect("open fixture")
+        .execute(
+            "UPDATE observability_jobs SET selector_json = ?1 WHERE job_id = 'job-a'",
+            [r#"{"schema":"ocfleet.scheduler.selector.v1","selector":"role=ocserv","name":null,"client_address":"10.0.0.2"}"#],
+        )
+        .expect("contaminate selector");
+
+    let (status, _, body) = raw_request(fixture.router(None), Method::GET, "/jobs", None).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(!body.contains("10.0.0.2"));
 }
 
 #[tokio::test]
@@ -921,7 +938,12 @@ fn seed_database(path: &Path) {
             &ObservabilityJobRecord {
                 job_id: "job-a".to_string(),
                 kind: "controller-ping".to_string(),
-                selector_json: json!({"selector": "role=ocserv", "name": "daily checks"}),
+                selector_json: SchedulerSelectorPayloadV1::new(
+                    "role=ocserv".to_string(),
+                    Some("daily checks".to_string()),
+                )
+                .expect("valid selector")
+                .to_value(),
                 pair_selector_json: None,
                 interval_seconds: 300,
                 jitter_seconds: 0,

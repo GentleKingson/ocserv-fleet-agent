@@ -27,8 +27,11 @@ use crate::input_validation::{
 };
 use crate::migrations;
 use crate::private_file::{self, PrivateFileError};
+use crate::storage_payloads::{
+    SchedulerPairPayloadV1, SchedulerSelectorPayloadV1, validate_scheduler_payload_relationship,
+};
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 8;
+pub const CURRENT_SCHEMA_VERSION: i64 = 9;
 pub const DEFAULT_HEALTH_STALE_WINDOW_SECONDS: u64 = 24 * 60 * 60;
 pub const DEFAULT_HEALTH_UNREACHABLE_FAILURES: u64 = 3;
 pub const DEFAULT_HEALTH_CERT_WARNING_DAYS: u64 = 30;
@@ -926,10 +929,17 @@ impl Store {
         actor: &str,
     ) -> Result<(), StoreError> {
         validate_actor(actor).map_err(StoreError::InvalidInput)?;
-        validate_low_sensitive_json(&job.selector_json, "observability job selector")?;
-        if let Some(pair) = &job.pair_selector_json {
-            validate_low_sensitive_json(pair, "observability job pair selector")?;
-        }
+        validate_scheduler_job_kind(&job.kind)?;
+        let selector = SchedulerSelectorPayloadV1::from_value(&job.selector_json)
+            .map_err(StoreError::InvalidInput)?;
+        let pair = job
+            .pair_selector_json
+            .as_ref()
+            .map(SchedulerPairPayloadV1::from_value)
+            .transpose()
+            .map_err(StoreError::InvalidInput)?;
+        validate_scheduler_payload_relationship(&job.kind, &selector, pair.as_ref())
+            .map_err(StoreError::InvalidInput)?;
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
             "INSERT INTO observability_jobs
@@ -5011,14 +5021,42 @@ fn audit_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuditRecor
 fn observability_job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ObservabilityJobRecord> {
     let selector_json: String = row.get(2)?;
     let pair_selector_json: Option<String> = row.get(3)?;
+    let selector_json = parse_json_column(&selector_json, 2)?;
+    let selector = SchedulerSelectorPayloadV1::from_value(&selector_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            2,
+            Type::Text,
+            Box::new(io::Error::new(io::ErrorKind::InvalidData, error)),
+        )
+    })?;
+    let pair_selector_json = pair_selector_json
+        .as_deref()
+        .map(|value| parse_json_column(value, 3))
+        .transpose()?;
+    let pair = pair_selector_json
+        .as_ref()
+        .map(SchedulerPairPayloadV1::from_value)
+        .transpose()
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                3,
+                Type::Text,
+                Box::new(io::Error::new(io::ErrorKind::InvalidData, error)),
+            )
+        })?;
+    let kind: String = row.get(1)?;
+    validate_scheduler_payload_relationship(&kind, &selector, pair.as_ref()).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            2,
+            Type::Text,
+            Box::new(io::Error::new(io::ErrorKind::InvalidData, error)),
+        )
+    })?;
     Ok(ObservabilityJobRecord {
         job_id: row.get(0)?,
-        kind: row.get(1)?,
-        selector_json: parse_json_column(&selector_json, 2)?,
-        pair_selector_json: pair_selector_json
-            .as_deref()
-            .map(|value| parse_json_column(value, 3))
-            .transpose()?,
+        kind,
+        selector_json,
+        pair_selector_json,
         interval_seconds: i64_to_u64(row.get(4)?)?,
         jitter_seconds: i64_to_u64(row.get(5)?)?,
         timeout_ms: i64_to_u64(row.get(6)?)?,
@@ -5079,6 +5117,10 @@ fn observability_job_load_from_raw(raw: RawObservabilityJobRow) -> Observability
         Ok(value) => value,
         Err(_) => return invalid(&raw, "INVALID_SELECTOR_JSON"),
     };
+    let selector = match SchedulerSelectorPayloadV1::from_value(&selector_json) {
+        Ok(value) => value,
+        Err(_) => return invalid(&raw, "UNSUPPORTED_SELECTOR_PAYLOAD"),
+    };
     let pair_selector_json = match raw
         .pair_selector_json
         .as_deref()
@@ -5088,6 +5130,22 @@ fn observability_job_load_from_raw(raw: RawObservabilityJobRow) -> Observability
         Ok(value) => value,
         Err(_) => return invalid(&raw, "INVALID_PAIR_SELECTOR_JSON"),
     };
+    let pair = match pair_selector_json
+        .as_ref()
+        .map(SchedulerPairPayloadV1::from_value)
+        .transpose()
+    {
+        Ok(value) => value,
+        Err(_) => return invalid(&raw, "UNSUPPORTED_PAIR_SELECTOR_PAYLOAD"),
+    };
+    if validate_scheduler_payload_relationship(&raw.kind, &selector, pair.as_ref()).is_err() {
+        let reason = if raw.kind == "path-probe" {
+            "INVALID_PATH_PAIR"
+        } else {
+            "INVALID_SELECTOR_RELATIONSHIP"
+        };
+        return invalid(&raw, reason);
+    }
     let interval_seconds = match i64_to_u64(raw.interval_seconds) {
         Ok(value) => value,
         Err(_) => return invalid(&raw, "INVALID_INTERVAL_SECONDS"),

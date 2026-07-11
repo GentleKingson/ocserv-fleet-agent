@@ -133,13 +133,23 @@ production call sites. A1 changes no schema, protocol, API route, agent
 capability, feature default, or network read-only boundary. The completion audit
 is published in pull request `#68`.
 
+The first A2 slice moves scheduler selector and explicit-pair storage to closed
+schema-tagged v1 payloads and advances SQLite to migration `0009`. New writes,
+CLI reads, and the independent API read adapter reject unknown fields,
+unsupported versions, malformed values, and contaminated data. Migration
+canonicalizes exact legacy payloads, disables the ambiguous historical empty
+selector for operator review, preserves exact valid legacy pairs, and aborts on
+all other contamination after the standard private backup. Other dynamic JSON
+families remain A2 work; the milestone is therefore an implemented slice, not
+operationally mature.
+
 ### Baseline And Production Foundation
 
 | ID | Issue | Status | Depends on | Release target | Acceptance and required evidence |
 | --- | --- | --- | --- | --- | --- |
 | N0 Baseline and authoritative roadmap | n/a | operationally mature | none | `v0.2.x` | Baseline commit, versions, schemas, crates, binaries, features, workflows, test results, incomplete code, and documentation drift are recorded. This DAG and progress file exist and contain no secret or host-specific path. |
 | A1 Atomic controller mutation audit | `#33` | operationally mature | N0 | `v0.2.x` | Every production mutation uses an actor-bound transactional writer; injected audit failure and crash-boundary tests prove rollback; direct mutation SQL and mutator bypasses outside approved store/backend boundaries are prevented; API remains read-only. `docs/a1-mutation-inventory.md` enumerates every family and its evidence. |
-| A2 Typed versioned storage | `#34` | scaffold | A1 | `v0.2.x` | New writes use closed, versioned payload types; legacy rows migrate or are quarantined/fail closed; contaminated fixtures cover oversize, unknown, secret-like, address, nesting, and method failures; CLI/API never expose raw persisted JSON. |
+| A2 Typed versioned storage | `#34` | implemented slice | A1 | `v0.2.x` | New writes use closed, versioned payload types; legacy rows migrate or are quarantined/fail closed; contaminated fixtures cover oversize, unknown, secret-like, address, nesting, and method failures; CLI/API never expose raw persisted JSON. Scheduler selector/pair payloads satisfy this contract; remaining dynamic JSON families do not yet. |
 | A3 Scheduler reliability | `#35` | implemented slice | A1, A2 | `v0.3.0` | SQLite lease, fencing, deterministic claim, bounded retry/backoff, misfire, jitter, timeout, recovery, maintenance, concurrency, budget, and shutdown semantics pass competing-instance, crash, skew, and duplicate-suppression tests. |
 | A4 Independent health evaluator | `#36` | implemented slice | A1, A2, A3 | `v0.3.0` | Idempotent evaluation runs record watermark, policy/computation versions, snapshots, and failures without agent RPC or trust/node/scheduler mutation; recovery and shutdown tests pass; dashboard freshness no longer depends on an interactive health command. |
 | A5 Safe alert delivery worker | `#37` | implemented slice | A1, A2, A3, A4 | `v0.3.0` | Fixed JSONL/HTTPS queues support claim, bounded retry, dead-letter, recovery, grouping, rate limit, idempotency, history, and shutdown. SSRF, HMAC, no-redirect, secret-redaction, and forbidden command/script/template tests pass. |

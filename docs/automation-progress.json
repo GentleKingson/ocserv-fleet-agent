@@ -2,11 +2,11 @@
   "baseline_commit": "b3c906a94823b4620dc1a2077a44e7160c0848b2",
   "current_phase": "A2",
   "completed_phases": ["A1"],
-  "active_branch": "codex/a1-final-mutation-inventory",
+  "active_branch": "codex/a2-scheduler-storage",
   "active_issue": 34,
-  "active_pr": 68,
+  "active_pr": 69,
   "last_test_result": "passed",
-  "last_updated_at": "2026-07-11T03:06:51Z",
+  "last_updated_at": "2026-07-11T05:50:39Z",
   "blockers": [],
-  "next_action": "Monitor pull request #68 CI, merge and close issue #33 when green, then begin A2 typed versioned storage discovery on issue #34."
+  "next_action": "Monitor pull request #69 CI, merge the schema-v9 scheduler payload slice when green, then continue the remaining A2 dynamic JSON inventory on issue #34."
 }

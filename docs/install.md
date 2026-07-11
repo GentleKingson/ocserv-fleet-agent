@@ -321,6 +321,12 @@ metadata. Unknown or nested fields, unsupported methods or versions, invalid
 bounds, malformed deadlines, and sensitive or address content stop the upgrade
 and leave the version-13 database unchanged beside its private backup.
 
+Schema version 15 canonicalizes alert webhook host allowlists into closed
+payloads bound to each relational endpoint host. Unknown fields, unsupported
+versions, forbidden or malformed hosts, empty or oversized lists, and endpoint
+mismatches stop the upgrade and leave the version-14 database unchanged beside
+its private backup.
+
 Before upgrades, keep an operator-managed backup as well:
 
 ```bash

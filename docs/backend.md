@@ -91,6 +91,11 @@ storage over fixed methods, bounded summary fields, and optional silence or
 resolution metadata. Writers canonicalize before persistence; CLI and API
 readers require the typed envelope and expose only its public projection.
 
+The seventh A2 slice advances SQLite to schema version 15 and closes alert
+webhook host-allow storage over a canonical bounded host list bound to the
+relational endpoint host. Writers persist the typed envelope; readers reject
+contamination or relationship mismatches before hook output or delivery.
+
 The first production-hardening slice added node add/enable/disable/remove to this
 contract and removed the CLI's post-commit success audits. Audit-trigger failure
 tests prove both `nodes` and `endpoint_trust` changes roll back. The second slice

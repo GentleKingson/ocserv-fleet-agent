@@ -182,6 +182,13 @@ writers and CLI/API readers reject unknown, nested, sensitive, malformed,
 future-version, or relationally unsafe data. Current-schema contamination fails
 closed without delivery or output. The slice is published in pull request `#74`.
 
+The seventh A2 slice advances SQLite to migration `0015` and stores alert
+webhook host allowlists in a closed payload with canonical, bounded, unique
+hosts bound to the relational endpoint host. Exact legacy arrays migrate;
+writers and readers reject unknown, forbidden, malformed, noncanonical,
+future-version, or mismatched data before output or delivery. Publication is in
+pull request `#75`.
+
 ### Baseline And Production Foundation
 
 | ID | Issue | Status | Depends on | Release target | Acceptance and required evidence |

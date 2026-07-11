@@ -672,6 +672,60 @@ fn migration_tests_alert_detail_v1_migrates_or_fails_closed() {
     assert_eq!(backup_files(bad_dir.path()).len(), 1);
 }
 
+#[test]
+fn migration_tests_alert_host_allow_v1_migrates_or_fails_closed() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("controller.sqlite");
+    create_legacy_fixture(&db, 14, 1);
+    let conn = Connection::open(&db).expect("open v14 db");
+    insert_legacy_alert_hook(&conn, r#"["alerts.example.com.","93.184.216.34"]"#);
+    drop(conn);
+    let store = Store::open(&db).expect("migrate v14 alert host allowlist");
+    let hook = store
+        .get_alert_webhook_hook("webhook-legacy")
+        .expect("read migrated hook")
+        .expect("migrated hook exists");
+    assert_eq!(hook.host_allow, vec!["93.184.216.34", "alerts.example.com"]);
+    drop(store);
+    let conn = Connection::open(&db).expect("open migrated db");
+    let hosts: String = conn
+        .query_row(
+            "SELECT host_allow_json FROM alert_hooks WHERE hook_id = 'webhook-legacy'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read typed host allowlist");
+    let hosts: serde_json::Value = serde_json::from_str(&hosts).expect("host allowlist JSON");
+    assert_eq!(hosts["schema"], "ocfleet.alert.host-allow.v1");
+    assert_eq!(
+        hosts["hosts"],
+        serde_json::json!(["93.184.216.34", "alerts.example.com"])
+    );
+
+    let bad_dir = tempfile::tempdir().expect("bad temp dir");
+    let bad_db = bad_dir.path().join("controller.sqlite");
+    create_legacy_fixture(&bad_db, 14, 1);
+    let conn = Connection::open(&bad_db).expect("open contaminated v14 db");
+    insert_legacy_alert_hook(
+        &conn,
+        r#"{"hosts":["93.184.216.34"],"client_address":"10.0.0.2"}"#,
+    );
+    drop(conn);
+    make_private_database_file(&bad_db);
+    assert!(Store::open(&bad_db).is_err());
+    assert_eq!(backup_files(bad_dir.path()).len(), 1);
+}
+
+fn insert_legacy_alert_hook(conn: &Connection, host_allow_json: &str) {
+    conn.execute(
+        "INSERT INTO alert_hooks
+         (hook_id, name, hook_type, endpoint_url, endpoint_url_redacted, endpoint_host, host_allow_json, hmac_key_id, enabled, max_attempts, timeout_ms, created_at, updated_at)
+         VALUES ('webhook-legacy', 'legacy', 'webhook', 'https://93.184.216.34/alerts', 'https://93.184.216.34/<redacted>', '93.184.216.34', ?1, 'abcd1234abcd1234', 1, 2, 1500, ?2, ?2)",
+        (host_allow_json, NOW),
+    )
+    .expect("insert legacy alert hook");
+}
+
 fn create_legacy_fixture(path: &Path, version: i64, rows: usize) {
     assert!((1..=CURRENT_SCHEMA_VERSION).contains(&version));
     let conn = Connection::open(path).expect("create fixture db");

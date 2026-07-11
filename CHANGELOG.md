@@ -45,6 +45,10 @@
   methods, bounded low-sensitive summary fields, and typed transition metadata.
   Migration canonicalizes exact legacy rows; writers and CLI/API readers reject
   unknown, contaminated, malformed, or future-version data.
+- SQLite schema version 15 stores alert webhook host allowlists in a closed
+  canonical payload bound to the relational endpoint host. Migration preserves
+  exact legacy meaning; writers and readers reject unknown, forbidden,
+  noncanonical, future-version, or mismatched data.
 - Node add, enable, disable, and remove now take an explicit resolved actor and
   commit their registry/trust change and success audit in one SQLite
   transaction through `StoreWriter`.

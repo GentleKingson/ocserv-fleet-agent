@@ -340,6 +340,51 @@ fn observability_store_tests_inserts_webhook_hook_and_delivery_attempt() {
 }
 
 #[test]
+fn observability_store_tests_alert_host_allow_is_closed_and_fails_closed() {
+    let (_dir, store, db) = open_temp_store();
+    let hook = AlertWebhookHookRecord {
+        hook_id: "webhook-typed".to_string(),
+        name: "typed".to_string(),
+        hook_type: "webhook".to_string(),
+        endpoint_url: "https://93.184.216.34/alerts".to_string(),
+        endpoint_url_redacted: "https://93.184.216.34/<redacted>".to_string(),
+        endpoint_host: "93.184.216.34".to_string(),
+        host_allow: vec!["93.184.216.34".to_string()],
+        hmac_key_id: "abcd1234abcd1234".to_string(),
+        enabled: true,
+        max_attempts: 2,
+        timeout_ms: 1_500,
+        created_at: "2026-07-08T07:00:00Z".to_string(),
+        updated_at: "2026-07-08T07:00:00Z".to_string(),
+    };
+    StoreWriter::write_alert_webhook_hook_create(&store, &hook, TEST_ACTOR)
+        .expect("insert typed webhook hook");
+    let conn = Connection::open(&db).expect("open fixture database");
+    let raw: String = conn
+        .query_row(
+            "SELECT host_allow_json FROM alert_hooks WHERE hook_id = 'webhook-typed'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read stored host allowlist");
+    let mut raw: Value = serde_json::from_str(&raw).expect("typed host allowlist");
+    assert_eq!(raw["schema"], "ocfleet.alert.host-allow.v1");
+    assert_eq!(raw["hosts"], json!(["93.184.216.34"]));
+    raw["client_address"] = json!("10.0.0.2");
+    conn.execute(
+        "UPDATE alert_hooks SET host_allow_json = ?1 WHERE hook_id = 'webhook-typed'",
+        [raw.to_string()],
+    )
+    .expect("contaminate stored host allowlist");
+
+    let error = store
+        .list_alert_webhook_hooks()
+        .expect_err("contaminated host allowlist must fail closed");
+    assert!(error.to_string().contains("host allowlist"));
+    assert!(!error.to_string().contains("10.0.0.2"));
+}
+
+#[test]
 fn observability_store_tests_inserts_and_lists_observability_job() {
     let (_dir, store, db) = open_temp_store();
     let job = sample_job("job-1", true);

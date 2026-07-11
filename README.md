@@ -564,6 +564,8 @@ Networking must allow the controller to reach the agent through iroh using the r
   bundles, bounded explicit allowlists, and relational lifecycle binding.
 - `docs/adr/ADR-versioned-alert-detail-storage.md`: schema-v14 closed alert
   details, legacy canonicalization, and fail-closed reader behavior.
+- `docs/adr/ADR-versioned-alert-host-allow-storage.md`: schema-v15 closed
+  webhook host allowlists and endpoint-host relationship validation.
 - `docs/trust-policy.md`: trust policy as code schema, validation, and diff behavior.
 - `docs/backend.md`: SQLite contract and optional Postgres backend plan.
 - `docs/archive-export.md`: long-term history archive and signed audit export guidance.

@@ -10,6 +10,7 @@ use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params, types::Type,
 };
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -34,6 +35,10 @@ pub const DEFAULT_HEALTH_CERT_WARNING_DAYS: u64 = 30;
 pub const DEFAULT_HEALTH_CERT_CRITICAL_DAYS: u64 = 7;
 pub const MAX_SCHEDULER_OUTCOME_ENTRIES: usize = 4;
 pub const MAX_ENROLLMENT_TOKEN_USES: u32 = 10_000;
+pub const MAX_RETENTION_APPLY_LIMIT: u64 = 100_000;
+pub const MAX_RETENTION_BATCH_SIZE: u64 = 1_000;
+pub const MAX_RETENTION_POLICY_AGE_DAYS: u64 = 36_500;
+pub const MAX_RETENTION_POLICY_ROWS: u64 = 10_000_000;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -81,6 +86,11 @@ pub enum StoreError {
     #[error("enrollment request conflict for {request_id}: {detail}")]
     EnrollmentRequestConflict {
         request_id: String,
+        detail: &'static str,
+    },
+    #[error("retention operation conflict for {operation_id}: {detail}")]
+    RetentionOperationConflict {
+        operation_id: String,
         detail: &'static str,
     },
     #[error("join request {request_id} is {status}, expected {expected}")]
@@ -345,6 +355,26 @@ pub struct RetentionCandidateReport {
     pub matched_count: u64,
     pub oldest_timestamp: Option<String>,
     pub newest_timestamp: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetentionApplyInput {
+    pub operation_id: String,
+    pub scope: String,
+    pub cutoff: Option<String>,
+    pub max_age_days: Option<u64>,
+    pub max_rows: Option<u64>,
+    pub limit: Option<u64>,
+    pub batch_size: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetentionApplyResult {
+    pub cutoff: Option<String>,
+    pub candidate_report: RetentionCandidateReport,
+    pub planned_delete_count: u64,
+    pub rows_deleted: u64,
+    pub batch_count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1635,8 +1665,22 @@ impl Store {
             .map_err(StoreError::from)
     }
 
-    pub fn set_retention_policy(&self, policy: &RetentionPolicyRecord) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+    pub fn set_retention_policy(
+        &self,
+        policy: &RetentionPolicyRecord,
+        actor: &str,
+    ) -> Result<RetentionPolicyRecord, StoreError> {
+        validate_actor(actor).map_err(StoreError::InvalidInput)?;
+        validate_retention_policy(policy)?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let before = get_retention_policy_tx(&tx, &policy.scope)?;
+        if let Some(existing) = &before
+            && existing.max_age_days == policy.max_age_days
+            && existing.max_rows == policy.max_rows
+        {
+            tx.commit()?;
+            return Ok(existing.clone());
+        }
         tx.execute(
             "INSERT INTO retention_policies
              (scope, max_age_days, max_rows, updated_at)
@@ -1652,8 +1696,21 @@ impl Store {
                 policy.updated_at.as_str(),
             ],
         )?;
+        let after = get_retention_policy_tx(&tx, &policy.scope)?
+            .expect("retention policy exists after upsert");
+        let mut event = AuditEvent::new(actor, "retention.set");
+        event.ok = Some(true);
+        event.detail_json = serde_json::json!({
+            "actor_type": "user",
+            "target_type": "retention_policy",
+            "target_id": policy.scope,
+            "before": before.as_ref().map(retention_policy_audit_json),
+            "after": retention_policy_audit_json(&after),
+            "reason": Value::Null,
+        });
+        insert_audit_tx(&tx, &event)?;
         tx.commit()?;
-        Ok(())
+        Ok(after)
     }
 
     pub fn default_health_policy() -> HealthPolicyRecord {
@@ -1749,63 +1806,72 @@ impl Store {
         retention_candidate_report_for_target(&self.conn, target, cutoff, max_rows)
     }
 
-    pub fn prune_retention_scope_batch(
+    pub fn apply_retention(
         &self,
-        scope: &str,
-        cutoff: Option<&str>,
-        max_rows: Option<u64>,
-        batch_size: u64,
-    ) -> Result<u64, StoreError> {
-        let target = retention_target(scope)?;
-        let tx = self.conn.unchecked_transaction()?;
-        let deleted = prune_retention_target_batch(&tx, target, cutoff, max_rows, batch_size)?;
+        input: &RetentionApplyInput,
+        actor: &str,
+    ) -> Result<RetentionApplyResult, StoreError> {
+        validate_actor(actor).map_err(StoreError::InvalidInput)?;
+        validate_retention_apply_input(input)?;
+        let target = retention_target(&input.scope)?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        if let Some(replayed) = retention_apply_replay_tx(&tx, input, actor)? {
+            tx.commit()?;
+            return Ok(replayed);
+        }
+        let cutoff = match (&input.cutoff, input.max_age_days) {
+            (Some(cutoff), _) => Some(cutoff.clone()),
+            (None, Some(days)) => Some(
+                (OffsetDateTime::now_utc()
+                    - time::Duration::days(i64::try_from(days).map_err(|_| {
+                        StoreError::InvalidInput("retention max_age_days is too large".to_string())
+                    })?))
+                .format(&Rfc3339)
+                .expect("RFC3339 formatting succeeds"),
+            ),
+            (None, None) => None,
+        };
+        let candidate_report =
+            retention_candidate_report_for_target(&tx, target, cutoff.as_deref(), input.max_rows)?;
+        let planned_delete_count = input
+            .limit
+            .map(|limit| candidate_report.matched_count.min(limit))
+            .unwrap_or(candidate_report.matched_count);
+        let mut rows_deleted = 0_u64;
+        let mut batch_count = 0_u64;
+        while rows_deleted < planned_delete_count {
+            let remaining = planned_delete_count - rows_deleted;
+            let deleted = prune_retention_target_batch(
+                &tx,
+                target,
+                cutoff.as_deref(),
+                input.max_rows,
+                remaining.min(input.batch_size),
+            )?;
+            if deleted == 0 {
+                break;
+            }
+            rows_deleted = rows_deleted.checked_add(deleted).ok_or_else(|| {
+                StoreError::InvalidInput("retention deleted row count overflow".to_string())
+            })?;
+            batch_count = batch_count.checked_add(1).ok_or_else(|| {
+                StoreError::InvalidInput("retention batch count overflow".to_string())
+            })?;
+        }
+        let result = RetentionApplyResult {
+            cutoff,
+            candidate_report,
+            planned_delete_count,
+            rows_deleted,
+            batch_count,
+        };
+        let mut event = AuditEvent::new(actor, "retention.apply");
+        event.ok = Some(true);
+        event.request_id = Some(input.operation_id.clone());
+        event.detail_json = retention_apply_audit_json(input, &result);
+        insert_audit_tx(&tx, &event)?;
         tx.commit()?;
-        Ok(deleted)
-    }
-
-    pub fn prune_probe_observations(
-        &self,
-        cutoff: Option<&str>,
-        max_rows: Option<u64>,
-    ) -> Result<u64, StoreError> {
-        self.prune_retention_scope("observations", cutoff, max_rows)
-    }
-
-    pub fn prune_observability_runs(
-        &self,
-        cutoff: Option<&str>,
-        max_rows: Option<u64>,
-    ) -> Result<u64, StoreError> {
-        self.prune_retention_scope("observability-runs", cutoff, max_rows)
-    }
-
-    pub fn prune_health_snapshots(
-        &self,
-        cutoff: Option<&str>,
-        max_rows: Option<u64>,
-    ) -> Result<u64, StoreError> {
-        self.prune_retention_scope("health-snapshots", cutoff, max_rows)
-    }
-
-    pub fn prune_alert_events(
-        &self,
-        cutoff: Option<&str>,
-        max_rows: Option<u64>,
-    ) -> Result<u64, StoreError> {
-        self.prune_retention_scope("alert-events", cutoff, max_rows)
-    }
-
-    fn prune_retention_scope(
-        &self,
-        scope: &str,
-        cutoff: Option<&str>,
-        max_rows: Option<u64>,
-    ) -> Result<u64, StoreError> {
-        let target = retention_target(scope)?;
-        let tx = self.conn.unchecked_transaction()?;
-        let deleted = prune_retention_target(&tx, target, cutoff, max_rows)?;
-        tx.commit()?;
-        Ok(deleted)
+        Ok(result)
     }
 
     pub fn disable_node(&self, node_id: &str, actor: &str) -> Result<(), StoreError> {
@@ -5297,6 +5363,236 @@ fn retention_target(scope: &str) -> Result<RetentionTarget, StoreError> {
     }
 }
 
+fn get_retention_policy_tx(
+    tx: &Transaction<'_>,
+    scope: &str,
+) -> Result<Option<RetentionPolicyRecord>, StoreError> {
+    tx.query_row(
+        "SELECT scope, max_age_days, max_rows, updated_at
+         FROM retention_policies
+         WHERE scope = ?1",
+        [scope],
+        retention_policy_from_row,
+    )
+    .optional()
+    .map_err(StoreError::from)
+}
+
+fn validate_retention_policy(policy: &RetentionPolicyRecord) -> Result<(), StoreError> {
+    retention_target(&policy.scope)?;
+    if policy
+        .max_age_days
+        .is_some_and(|days| days == 0 || days > MAX_RETENTION_POLICY_AGE_DAYS)
+    {
+        return Err(StoreError::InvalidInput(format!(
+            "retention max_age_days must be 1-{MAX_RETENTION_POLICY_AGE_DAYS}"
+        )));
+    }
+    if policy
+        .max_rows
+        .is_some_and(|rows| rows == 0 || rows > MAX_RETENTION_POLICY_ROWS)
+    {
+        return Err(StoreError::InvalidInput(format!(
+            "retention max_rows must be 1-{MAX_RETENTION_POLICY_ROWS}"
+        )));
+    }
+    if OffsetDateTime::parse(&policy.updated_at, &Rfc3339).is_err() {
+        return Err(StoreError::InvalidInput(
+            "retention updated_at must be RFC3339".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_retention_apply_input(input: &RetentionApplyInput) -> Result<(), StoreError> {
+    validate_audit_text(&input.operation_id, "retention operation_id", 96)?;
+    let Some(uuid) = input.operation_id.strip_prefix("retention-") else {
+        return Err(StoreError::InvalidInput(
+            "retention operation_id must use retention-<uuid> format".to_string(),
+        ));
+    };
+    Uuid::parse_str(uuid).map_err(|_| {
+        StoreError::InvalidInput("retention operation_id must contain a UUID".to_string())
+    })?;
+    retention_target(&input.scope)?;
+    if let Some(cutoff) = &input.cutoff
+        && OffsetDateTime::parse(cutoff, &Rfc3339).is_err()
+    {
+        return Err(StoreError::InvalidInput(
+            "retention cutoff must be RFC3339".to_string(),
+        ));
+    }
+    if input
+        .max_age_days
+        .is_some_and(|days| days == 0 || days > MAX_RETENTION_POLICY_AGE_DAYS)
+    {
+        return Err(StoreError::InvalidInput(format!(
+            "retention max_age_days must be 1-{MAX_RETENTION_POLICY_AGE_DAYS}"
+        )));
+    }
+    if input
+        .max_rows
+        .is_some_and(|rows| rows == 0 || rows > MAX_RETENTION_POLICY_ROWS)
+    {
+        return Err(StoreError::InvalidInput(format!(
+            "retention max_rows must be 1-{MAX_RETENTION_POLICY_ROWS}"
+        )));
+    }
+    if input
+        .limit
+        .is_some_and(|limit| limit == 0 || limit > MAX_RETENTION_APPLY_LIMIT)
+    {
+        return Err(StoreError::InvalidInput(format!(
+            "retention limit must be 1-{MAX_RETENTION_APPLY_LIMIT}"
+        )));
+    }
+    if input.batch_size == 0 || input.batch_size > MAX_RETENTION_BATCH_SIZE {
+        return Err(StoreError::InvalidInput(format!(
+            "retention batch_size must be 1-{MAX_RETENTION_BATCH_SIZE}"
+        )));
+    }
+    Ok(())
+}
+
+fn retention_policy_audit_json(policy: &RetentionPolicyRecord) -> Value {
+    serde_json::json!({
+        "scope": policy.scope,
+        "max_age_days": policy.max_age_days,
+        "max_rows": policy.max_rows,
+        "updated_at": policy.updated_at,
+    })
+}
+
+fn retention_apply_audit_json(input: &RetentionApplyInput, result: &RetentionApplyResult) -> Value {
+    let checksum_payload = serde_json::json!({
+        "scope": input.scope,
+        "dry_run": false,
+        "cutoff": result.cutoff,
+        "max_rows": input.max_rows,
+        "matched_count": result.candidate_report.matched_count,
+        "planned_delete_count": result.planned_delete_count,
+        "rows_deleted": result.rows_deleted,
+        "batch_count": result.batch_count,
+        "batch_size": input.batch_size,
+        "limit": input.limit,
+        "oldest_candidate": result.candidate_report.oldest_timestamp,
+        "newest_candidate": result.candidate_report.newest_timestamp,
+    });
+    let mut hasher = Sha256::new();
+    hasher
+        .update(serde_json::to_vec(&checksum_payload).expect("retention checksum JSON serializes"));
+    let report_checksum = format!("{:x}", hasher.finalize());
+    serde_json::json!({
+        "actor_type": "user",
+        "target_type": "retention_scope",
+        "target_id": input.scope,
+        "scope": input.scope,
+        "dry_run": false,
+        "requested_cutoff": input.cutoff,
+        "max_age_days": input.max_age_days,
+        "cutoff": result.cutoff,
+        "max_rows": input.max_rows,
+        "limit": input.limit,
+        "batch_size": input.batch_size,
+        "matched_count": result.candidate_report.matched_count,
+        "planned_delete_count": result.planned_delete_count,
+        "deleted_count": result.rows_deleted,
+        "batch_count": result.batch_count,
+        "oldest_candidate": result.candidate_report.oldest_timestamp,
+        "newest_candidate": result.candidate_report.newest_timestamp,
+        "report_checksum": report_checksum,
+        "reason": Value::Null,
+    })
+}
+
+fn retention_apply_replay_tx(
+    tx: &Transaction<'_>,
+    input: &RetentionApplyInput,
+    actor: &str,
+) -> Result<Option<RetentionApplyResult>, StoreError> {
+    let mut stmt = tx.prepare(
+        "SELECT actor, detail_json
+         FROM controller_audit_log
+         WHERE event = 'retention.apply'
+           AND request_id = ?1
+           AND json_extract(detail_json, '$.target_id') = ?2
+         ORDER BY id
+         LIMIT 2",
+    )?;
+    let rows = stmt.query_map(
+        params![input.operation_id.as_str(), input.scope.as_str()],
+        |row| {
+            let detail: String = row.get(1)?;
+            Ok((row.get::<_, String>(0)?, parse_json_column(&detail, 1)?))
+        },
+    )?;
+    let existing = rows.collect::<Result<Vec<_>, _>>()?;
+    if existing.is_empty() {
+        return Ok(None);
+    }
+    let conflict = || StoreError::RetentionOperationConflict {
+        operation_id: input.operation_id.clone(),
+        detail: "operation audit provenance is mismatched or ambiguous",
+    };
+    if existing.len() != 1 {
+        return Err(conflict());
+    }
+    let (existing_actor, detail) = &existing[0];
+    let required = [
+        "requested_cutoff",
+        "max_age_days",
+        "cutoff",
+        "max_rows",
+        "limit",
+        "batch_size",
+        "matched_count",
+        "planned_delete_count",
+        "deleted_count",
+        "batch_count",
+        "oldest_candidate",
+        "newest_candidate",
+    ];
+    if existing_actor != actor
+        || required.iter().any(|key| detail.get(*key).is_none())
+        || detail.get("requested_cutoff") != Some(&option_string_json(input.cutoff.as_deref()))
+        || detail.get("max_age_days") != Some(&option_u64_json(input.max_age_days))
+        || detail.get("max_rows") != Some(&option_u64_json(input.max_rows))
+        || detail.get("limit") != Some(&option_u64_json(input.limit))
+        || detail.get("batch_size").and_then(Value::as_u64) != Some(input.batch_size)
+    {
+        return Err(conflict());
+    }
+    let read_u64 = |key: &str| detail.get(key).and_then(Value::as_u64).ok_or_else(conflict);
+    let read_optional_string = |key: &str| -> Result<Option<String>, StoreError> {
+        match detail.get(key) {
+            Some(Value::Null) => Ok(None),
+            Some(Value::String(value)) => Ok(Some(value.clone())),
+            _ => Err(conflict()),
+        }
+    };
+    Ok(Some(RetentionApplyResult {
+        cutoff: read_optional_string("cutoff")?,
+        candidate_report: RetentionCandidateReport {
+            matched_count: read_u64("matched_count")?,
+            oldest_timestamp: read_optional_string("oldest_candidate")?,
+            newest_timestamp: read_optional_string("newest_candidate")?,
+        },
+        planned_delete_count: read_u64("planned_delete_count")?,
+        rows_deleted: read_u64("deleted_count")?,
+        batch_count: read_u64("batch_count")?,
+    }))
+}
+
+fn option_u64_json(value: Option<u64>) -> Value {
+    value.map(Value::from).unwrap_or(Value::Null)
+}
+
+fn option_string_json(value: Option<&str>) -> Value {
+    value
+        .map(|value| Value::String(value.to_string()))
+        .unwrap_or(Value::Null)
+}
+
 fn retention_candidate_report_for_target(
     conn: &Connection,
     target: RetentionTarget,
@@ -5365,27 +5661,6 @@ fn retention_candidate_report_for_target(
         oldest_timestamp: oldest,
         newest_timestamp: newest,
     })
-}
-
-fn prune_retention_target(
-    tx: &Transaction<'_>,
-    target: RetentionTarget,
-    cutoff: Option<&str>,
-    max_rows: Option<u64>,
-) -> Result<u64, StoreError> {
-    let mut total = 0_u64;
-    loop {
-        let deleted = prune_retention_target_batch(tx, target, cutoff, max_rows, 1_000)?;
-        if deleted == 0 {
-            break;
-        }
-        total = total.checked_add(deleted).ok_or_else(|| {
-            StoreError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(
-                io::Error::other("retention delete count overflow"),
-            )))
-        })?;
-    }
-    Ok(total)
 }
 
 fn prune_retention_target_batch(

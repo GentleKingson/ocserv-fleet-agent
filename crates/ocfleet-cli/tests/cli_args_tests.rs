@@ -325,7 +325,8 @@ fn parses_retention_apply_report_options() {
         "ocfleet",
         "retention",
         "apply",
-        "--dry-run",
+        "--operation-id",
+        "retention-00000000-0000-4000-8000-000000000001",
         "--scope",
         "observations",
         "--before",
@@ -341,6 +342,7 @@ fn parses_retention_apply_report_options() {
         command:
             RetentionCommand::Apply {
                 dry_run,
+                operation_id,
                 scope,
                 before,
                 limit,
@@ -352,12 +354,28 @@ fn parses_retention_apply_report_options() {
         panic!("expected retention apply command");
     };
 
-    assert!(dry_run);
+    assert!(!dry_run);
+    assert_eq!(
+        operation_id.as_deref(),
+        Some("retention-00000000-0000-4000-8000-000000000001")
+    );
     assert_eq!(scope, Some(RetentionScope::Observations));
     assert_eq!(before.as_deref(), Some("2026-07-01T00:00:00Z"));
     assert_eq!(limit, Some(25));
     assert_eq!(batch_size, 10);
     assert!(json);
+
+    assert!(
+        Cli::try_parse_from([
+            "ocfleet",
+            "retention",
+            "apply",
+            "--dry-run",
+            "--operation-id",
+            "retention-00000000-0000-4000-8000-000000000001",
+        ])
+        .is_err()
+    );
 }
 
 #[test]

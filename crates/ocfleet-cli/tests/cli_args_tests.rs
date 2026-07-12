@@ -1,14 +1,58 @@
 use clap::{CommandFactory, Parser};
 use ocfleet_cli::args::{
     AlertCommand, AlertHookCommand, AlertSeverity, AlertState, AlertWorkerCommand, AuditCommand,
-    AuditExportFormat, Cli, Command, EndpointCommand, EnrollCommand, EnrollRequestCommand,
-    EnrollTokenCommand, HealthCommand, HealthEvaluatorCommand, HealthPolicyCommand,
-    HealthSnapshotCommand, NodeCommand, ObservationCommand, OcservCommand, OcservSessionsCommand,
-    ProbeCommand, RedactionMode, RetentionCommand, RetentionScope, ScheduleCommand,
-    ScheduleJobCommand, ScheduleJobKind, ScheduleRunCommand, TrustCommand, TrustDiffFormat,
-    TrustPolicyDiffFormat,
+    AuditExportFormat, BackupCommand, Cli, Command, EndpointCommand, EnrollCommand,
+    EnrollRequestCommand, EnrollTokenCommand, HealthCommand, HealthEvaluatorCommand,
+    HealthPolicyCommand, HealthSnapshotCommand, NodeCommand, ObservationCommand, OcservCommand,
+    OcservSessionsCommand, ProbeCommand, RedactionMode, RetentionCommand, RetentionScope,
+    ScheduleCommand, ScheduleJobCommand, ScheduleJobKind, ScheduleRunCommand, TrustCommand,
+    TrustDiffFormat, TrustPolicyDiffFormat,
 };
 use std::path::PathBuf;
+
+#[test]
+fn parses_backup_commands() {
+    let create = Cli::parse_from([
+        "ocfleet",
+        "backup",
+        "create",
+        "--output-dir",
+        "/var/backups/ocfleet",
+        "--sign-with-key-file",
+        "backup.pk8",
+        "--json",
+    ]);
+    assert!(matches!(
+        create.command,
+        Command::Backup {
+            command: BackupCommand::Create { json: true, .. }
+        }
+    ));
+    let list = Cli::parse_from([
+        "ocfleet",
+        "backup",
+        "list",
+        "--backup-dir",
+        "/var/backups/ocfleet",
+        "--json",
+    ]);
+    assert!(matches!(
+        list.command,
+        Command::Backup {
+            command: BackupCommand::List { json: true, .. }
+        }
+    ));
+    for action in ["verify", "inspect"] {
+        Cli::try_parse_from([
+            "ocfleet",
+            "backup",
+            action,
+            "--manifest",
+            "backup.manifest.json",
+        ])
+        .expect("parse backup manifest command");
+    }
+}
 
 #[test]
 fn exposes_controller_version_flag() {

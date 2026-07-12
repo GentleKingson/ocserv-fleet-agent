@@ -274,7 +274,7 @@ fn backup_database_before_migrate_with_timestamp(
     }
 }
 
-fn run_sqlite_backup(conn: &Connection, backup_path: &Path) -> Result<(), StoreError> {
+pub(crate) fn run_sqlite_backup(conn: &Connection, backup_path: &Path) -> Result<(), StoreError> {
     let mut dst = Connection::open(backup_path).map_err(map_backup_sqlite_error)?;
     dst.pragma_update(None, "busy_timeout", 5_000)
         .map_err(map_backup_sqlite_error)?;
@@ -337,7 +337,7 @@ fn validate_backup_outputs(backup_path: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
-fn sha256_file_hex(path: &Path) -> Result<String, std::io::Error> {
+pub(crate) fn sha256_file_hex(path: &Path) -> Result<String, std::io::Error> {
     let mut file = private_file::open_existing_private_read(path).map_err(|err| match err {
         PrivateFileError::Io(err) => err,
         PrivateFileError::MissingParent

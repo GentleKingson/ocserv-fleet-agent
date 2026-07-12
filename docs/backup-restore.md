@@ -17,6 +17,27 @@ sudo install -d -m 0700 /var/backups/ocfleet
 
 ## Controller SQLite Backup
 
+The managed backup workflow uses SQLite online backup and never copies the
+controller SecretKey into its artifacts:
+
+```bash
+ocfleet --database /var/lib/ocfleet-controller/controller.sqlite \
+  --secret-key /var/lib/ocfleet-controller/controller.secret \
+  backup create --output-dir /var/backups/ocfleet --json
+ocfleet backup list --backup-dir /var/backups/ocfleet --json
+ocfleet backup inspect --manifest /var/backups/ocfleet/backup-ID.manifest.json --json
+ocfleet backup verify --manifest /var/backups/ocfleet/backup-ID.manifest.json --json
+```
+
+The output directory must already be owned by the operator, must not be a
+symlink, and must have mode `0700`. Database, checksum, manifest, and optional
+signature sidecars use mode `0600`. The manifest records schema, application and
+protocol versions, creation time, database checksum/size, and the expected
+controller EndpointID. It contains no SecretKey bytes. Add
+`--sign-with-key-file <private-ed25519-pkcs8>` to `backup create` when an
+independent authenticity signature is required. `backup verify` checks the
+checksum, SQLite integrity, schema binding, and any present signature.
+
 Run `doctor` before taking a backup:
 
 ```bash

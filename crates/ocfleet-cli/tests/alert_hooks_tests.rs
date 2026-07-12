@@ -3,7 +3,7 @@ use ocfleet_cli::alert_webhook::{
     WebhookHttpRequest, WebhookHttpResponse, WebhookHttpResult, WebhookSender, hmac_key_id,
     validate_webhook_endpoint, webhook_signature,
 };
-use ocfleet_cli::alerts::deliver_webhook_alerts_with_sender;
+use ocfleet_cli::alerts::{deliver_webhook_alerts_with_sender, run_alert_worker_once_with_sender};
 use ocfleet_cli::backend::StoreWriter;
 use ocfleet_cli::storage_payloads::{HealthDegradedMethodsPayloadV1, HealthSummaryPayloadV1};
 use ocfleet_cli::store::{
@@ -18,7 +18,9 @@ use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output, Stdio};
+use std::thread;
+use std::time::Duration as StdDuration;
 
 #[derive(Debug)]
 struct FakeWebhookSender {
@@ -63,6 +65,36 @@ fn run_ocfleet(args: &[&str]) -> Output {
         String::from_utf8_lossy(&output.stderr)
     );
     output
+}
+
+fn spawn_ocfleet(args: &[&str]) -> Child {
+    Command::new(env!("CARGO_BIN_EXE_ocfleet"))
+        .args(args)
+        .env("USER", "alert-user")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ocfleet")
+}
+
+fn wait_for_alert_evaluation_count(database: &Path, previous_count: i64, timeout: StdDuration) {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        let count = Connection::open(database)
+            .and_then(|conn| {
+                conn.query_row(
+                    "SELECT count(*) FROM controller_audit_log WHERE event = 'alert.evaluate'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+            })
+            .unwrap_or(0);
+        if count > previous_count {
+            return;
+        }
+        thread::sleep(StdDuration::from_millis(25));
+    }
+    panic!("timed out waiting for alert worker evaluation");
 }
 
 fn run_ocfleet_failure(args: &[&str]) -> Output {
@@ -1399,6 +1431,329 @@ fn alert_hooks_tests_webhook_delivery_writes_attempt_and_hmac_headers() {
     assert_eq!(attempts[0].status, "succeeded");
     assert_eq!(attempts[0].http_status_class.as_deref(), Some("2xx"));
     assert!(attempts[0].error_code.is_none());
+}
+
+#[test]
+#[cfg(unix)]
+fn alert_worker_rejects_non_private_or_symlink_secret_directory() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let secret_dir = dir.path().join("worker-secrets");
+    fs::create_dir(&secret_dir).expect("create secret directory");
+    fs::set_permissions(&secret_dir, fs::Permissions::from_mode(0o755))
+        .expect("chmod secret directory");
+    let store = Store::open(&database).expect("open store");
+    let sender = FakeWebhookSender::new(WebhookHttpResult::Completed(WebhookHttpResponse {
+        status_code: 200,
+        status_class: "2xx".to_string(),
+        response_bytes: 0,
+    }));
+
+    let unsafe_mode = run_alert_worker_once_with_sender(&store, &secret_dir, 10, &sender)
+        .expect_err("world-readable secret directory must fail");
+    assert!(unsafe_mode.to_string().contains("mode 0700"));
+
+    fs::set_permissions(&secret_dir, fs::Permissions::from_mode(0o700))
+        .expect("chmod secret directory");
+    let secret_link = dir.path().join("worker-secrets-link");
+    std::os::unix::fs::symlink(&secret_dir, &secret_link).expect("symlink secret directory");
+    let symlink = run_alert_worker_once_with_sender(&store, &secret_link, 10, &sender)
+        .expect_err("symlink secret directory must fail");
+    assert!(symlink.to_string().contains("non-symlink"));
+}
+
+#[test]
+#[cfg(unix)]
+fn alert_worker_enqueues_signs_delivers_and_rate_limits_replay() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let secret_dir = dir.path().join("worker-secrets");
+    fs::create_dir(&secret_dir).expect("create secret directory");
+    fs::set_permissions(&secret_dir, fs::Permissions::from_mode(0o700))
+        .expect("chmod secret directory");
+    let secret = b"0123456789abcdef0123456789abcdef";
+    let store = Store::open(&database).expect("open store");
+    seed_alert(&store, "node:hk-ocserv-01:node_stale");
+    let hook = seed_webhook_hook(
+        &store,
+        "webhook-worker-success",
+        "https://93.184.216.34/alerts",
+        secret,
+    );
+    write_private_secret(&secret_dir.join(format!("{}.key", hook.hook_id)), secret);
+    let sender = FakeWebhookSender::new(WebhookHttpResult::Completed(WebhookHttpResponse {
+        status_code: 200,
+        status_class: "2xx".to_string(),
+        response_bytes: 0,
+    }));
+
+    let summary = run_alert_worker_once_with_sender(&store, &secret_dir, 10, &sender)
+        .expect("run alert worker");
+    assert_eq!(summary.enqueued, 1);
+    assert_eq!(summary.attempted, 1);
+    assert_eq!(summary.succeeded, 1);
+    assert_eq!(sender.request_count(), 1);
+    let request = sender.requests().pop().expect("signed request");
+    assert!(
+        request
+            .headers
+            .iter()
+            .any(|(name, value)| { name == "X-Ocfleet-Signature" && value.starts_with("sha256=") })
+    );
+    let conn = Connection::open(&database).expect("open database");
+    assert_eq!(
+        conn.query_row("SELECT status FROM alert_delivery_queue", [], |row| {
+            row.get::<_, String>(0)
+        })
+        .expect("queue status"),
+        "succeeded"
+    );
+    assert!(
+        conn.query_row(
+            "SELECT last_sent_at FROM alert_events WHERE alert_id = 'alert-seeded'",
+            [],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .expect("last sent")
+        .is_some()
+    );
+    drop(conn);
+
+    let replay = run_alert_worker_once_with_sender(&store, &secret_dir, 10, &sender)
+        .expect("rate-limited replay");
+    assert_eq!(replay.enqueued, 0);
+    assert_eq!(replay.attempted, 0);
+    assert_eq!(sender.request_count(), 1);
+}
+
+#[test]
+#[cfg(unix)]
+fn alert_worker_retries_then_dead_letters_retryable_failure() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let secret_dir = dir.path().join("worker-secrets");
+    fs::create_dir(&secret_dir).expect("create secret directory");
+    fs::set_permissions(&secret_dir, fs::Permissions::from_mode(0o700))
+        .expect("chmod secret directory");
+    let secret = b"0123456789abcdef0123456789abcdef";
+    let store = Store::open(&database).expect("open store");
+    seed_alert(&store, "node:hk-ocserv-01:node_stale");
+    let hook = seed_webhook_hook(
+        &store,
+        "webhook-worker-retry",
+        "https://93.184.216.34/alerts",
+        secret,
+    );
+    write_private_secret(&secret_dir.join(format!("{}.key", hook.hook_id)), secret);
+    let sender = FakeWebhookSender::new(WebhookHttpResult::Completed(WebhookHttpResponse {
+        status_code: 503,
+        status_class: "5xx".to_string(),
+        response_bytes: 0,
+    }));
+
+    let first = run_alert_worker_once_with_sender(&store, &secret_dir, 10, &sender)
+        .expect("first worker attempt");
+    assert_eq!(first.retried, 1);
+    let conn = Connection::open(&database).expect("open database");
+    conn.execute(
+        "UPDATE alert_delivery_queue SET next_attempt_at = '2020-01-01T00:00:00Z'",
+        [],
+    )
+    .expect("make retry due");
+    drop(conn);
+
+    let second = run_alert_worker_once_with_sender(&store, &secret_dir, 10, &sender)
+        .expect("second worker attempt");
+    assert_eq!(second.dead_lettered, 1);
+    assert_eq!(sender.request_count(), 2);
+    let conn = Connection::open(&database).expect("open database");
+    let (status, attempts, error): (String, i64, Option<String>) = conn
+        .query_row(
+            "SELECT status, attempt_count, last_error_code FROM alert_delivery_queue",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("queue terminal state");
+    assert_eq!(status, "dead_letter");
+    assert_eq!(attempts, 2);
+    assert_eq!(error.as_deref(), Some("WEBHOOK_HTTP_5XX"));
+}
+
+#[test]
+#[cfg(unix)]
+fn alert_worker_missing_secret_dead_letters_without_request_or_path_audit() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let secret_dir = dir.path().join("worker-secrets");
+    fs::create_dir(&secret_dir).expect("create secret directory");
+    fs::set_permissions(&secret_dir, fs::Permissions::from_mode(0o700))
+        .expect("chmod secret directory");
+    let store = Store::open(&database).expect("open store");
+    seed_alert(&store, "node:hk-ocserv-01:node_stale");
+    seed_webhook_hook(
+        &store,
+        "webhook-worker-missing-secret",
+        "https://93.184.216.34/alerts",
+        b"0123456789abcdef0123456789abcdef",
+    );
+    let sender = FakeWebhookSender::new(WebhookHttpResult::Completed(WebhookHttpResponse {
+        status_code: 200,
+        status_class: "2xx".to_string(),
+        response_bytes: 0,
+    }));
+
+    let summary = run_alert_worker_once_with_sender(&store, &secret_dir, 10, &sender)
+        .expect("worker records preflight failure");
+    assert_eq!(summary.dead_lettered, 1);
+    assert_eq!(sender.request_count(), 0);
+    let conn = Connection::open(&database).expect("open database");
+    let (status, error): (String, Option<String>) = conn
+        .query_row(
+            "SELECT status, last_error_code FROM alert_delivery_queue",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("queue failure state");
+    assert_eq!(status, "dead_letter");
+    assert_eq!(error.as_deref(), Some("ALERT_DELIVERY_PREFLIGHT_FAILED"));
+    let audit: String = conn
+        .query_row(
+            "SELECT detail_json FROM controller_audit_log
+             WHERE event = 'alert.delivery.queue.outcome'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("outcome audit");
+    assert!(!audit.contains("worker-secrets"));
+    assert!(!audit.contains(&secret_dir.to_string_lossy().to_string()));
+}
+
+#[test]
+#[cfg(unix)]
+fn alert_worker_caps_each_group_without_starving_another_group() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let secret_dir = dir.path().join("worker-secrets");
+    fs::create_dir(&secret_dir).expect("create secret directory");
+    fs::set_permissions(&secret_dir, fs::Permissions::from_mode(0o700))
+        .expect("chmod secret directory");
+    let secret = b"0123456789abcdef0123456789abcdef";
+    let store = Store::open(&database).expect("open store");
+    for index in 0..5 {
+        let critical = index == 4;
+        store
+            .upsert_alert_event(&AlertEventRecord {
+                alert_id: format!("alert-group-{index}"),
+                dedupe_key: format!("node:group-{index}:state"),
+                node_id: Some(format!("group-{index}")),
+                severity: if critical { "critical" } else { "warning" }.to_string(),
+                state: "open".to_string(),
+                reason_code: if critical {
+                    "NODE_UNREACHABLE"
+                } else {
+                    "NODE_STALE"
+                }
+                .to_string(),
+                first_seen_at: "2026-07-08T00:00:00Z".to_string(),
+                last_seen_at: "2026-07-08T00:00:00Z".to_string(),
+                last_sent_at: None,
+                resolved_at: None,
+                detail_json: json!({"methods": [], "summary": {}}),
+            })
+            .expect("seed grouped alert");
+    }
+    let hook = seed_webhook_hook(
+        &store,
+        "webhook-worker-groups",
+        "https://93.184.216.34/alerts",
+        secret,
+    );
+    write_private_secret(&secret_dir.join(format!("{}.key", hook.hook_id)), secret);
+    let sender = FakeWebhookSender::new(WebhookHttpResult::Completed(WebhookHttpResponse {
+        status_code: 200,
+        status_class: "2xx".to_string(),
+        response_bytes: 0,
+    }));
+
+    let summary = run_alert_worker_once_with_sender(&store, &secret_dir, 10, &sender)
+        .expect("run grouped worker");
+    assert_eq!(summary.succeeded, 4);
+    assert_eq!(summary.deferred, 1);
+    assert_eq!(sender.request_count(), 4);
+    let conn = Connection::open(&database).expect("open database");
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM alert_delivery_queue WHERE status = 'succeeded'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("succeeded queue count"),
+        4
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM alert_delivery_queue WHERE status = 'retry' AND attempt_count = 0",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("deferred queue count"),
+        1
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn alert_worker_daemon_drains_on_sigterm_and_restarts() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let database_arg = database.to_string_lossy().into_owned();
+    let secret_dir = dir.path().join("worker-secrets");
+    let secret_dir_arg = secret_dir.to_string_lossy().into_owned();
+    fs::create_dir(&secret_dir).expect("create secret directory");
+    fs::set_permissions(&secret_dir, fs::Permissions::from_mode(0o700))
+        .expect("chmod secret directory");
+    let store = Store::open(&database).expect("open store");
+    seed_stale_health_snapshot(&store);
+    drop(store);
+
+    for previous_count in 0..2 {
+        let child = spawn_ocfleet(&[
+            "--database",
+            &database_arg,
+            "alert",
+            "worker",
+            "daemon",
+            "--hmac-secret-dir",
+            &secret_dir_arg,
+            "--interval-seconds",
+            "10",
+        ]);
+        wait_for_alert_evaluation_count(&database, previous_count, StdDuration::from_secs(30));
+        let signal = Command::new("kill")
+            .args(["-TERM", child.id().to_string().as_str()])
+            .output()
+            .expect("signal worker daemon");
+        assert!(signal.status.success());
+        let output = child.wait_with_output().expect("wait for worker daemon");
+        assert!(
+            output.status.success(),
+            "worker failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("status=stopped"));
+    }
+    assert_eq!(
+        Connection::open(&database)
+            .expect("open database")
+            .query_row(
+                "SELECT count(*) FROM alert_delivery_queue WHERE status = 'claimed'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("claimed count"),
+        0
+    );
 }
 
 #[test]

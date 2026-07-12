@@ -38,6 +38,14 @@ monotonic fences, and stale owners cannot renew or persist outcomes after
 takeover. Retry timestamps are explicit, bounded to one hour, and permitted only
 for retryable failures below the hook attempt cap.
 
+The worker reuses the hardened request builder and sender. It revalidates the
+hook and reads only `<hook-id>.key` below one explicit operator directory. A
+tick attempts at most 100 items and at most three items per group; excess group
+work is atomically deferred without consuming an attempt. Successful alert
+versions are suppressed for five minutes. Signal handlers are installed before
+the first evaluation, and shutdown completes the admitted blocking attempt and
+its fenced outcome before returning.
+
 ## Compatibility And Rollback
 
 The migration creates an empty queue and three indexes. It does not enqueue old

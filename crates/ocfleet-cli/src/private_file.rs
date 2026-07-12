@@ -41,6 +41,10 @@ pub fn validate_existing_private_file(path: &Path) -> Result<(), PrivateFileErro
     Ok(())
 }
 
+pub fn validate_existing_private_directory_strict(path: &Path) -> Result<(), PrivateFileError> {
+    validate_existing_private_directory_strict_impl(path)
+}
+
 #[cfg(unix)]
 fn open_private_create_new_impl(path: &Path) -> Result<File, PrivateFileError> {
     use std::os::unix::fs::OpenOptionsExt;
@@ -217,6 +221,21 @@ fn validate_private_parent(parent: &Path) -> Result<(), PrivateFileError> {
 }
 
 #[cfg(unix)]
+fn validate_existing_private_directory_strict_impl(path: &Path) -> Result<(), PrivateFileError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let metadata = fs::symlink_metadata(path)?;
+    let current_euid = unsafe { libc::geteuid() };
+    if !metadata.file_type().is_dir()
+        || metadata.uid() != current_euid
+        || metadata.permissions().mode() & 0o777 != 0o700
+    {
+        return Err(PrivateFileError::UnsafeParent);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
 fn validate_private_file_handle(file: &File) -> Result<(), PrivateFileError> {
     use std::mem::MaybeUninit;
     use std::os::fd::AsRawFd;
@@ -258,6 +277,12 @@ fn open_private_append_create_impl(path: &Path) -> Result<File, PrivateFileError
 
 #[cfg(not(unix))]
 fn open_existing_private_read_impl(path: &Path) -> Result<File, PrivateFileError> {
+    let _ = path;
+    Err(PrivateFileError::UnsupportedPlatform)
+}
+
+#[cfg(not(unix))]
+fn validate_existing_private_directory_strict_impl(path: &Path) -> Result<(), PrivateFileError> {
     let _ = path;
     Err(PrivateFileError::UnsupportedPlatform)
 }

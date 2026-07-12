@@ -203,6 +203,13 @@ pub trait StoreWriter {
         outcome: &AlertDeliveryQueueOutcome,
         actor: &str,
     ) -> Result<(), Self::Error>;
+    fn write_alert_delivery_queue_defer(
+        &self,
+        claim: &AlertDeliveryQueueClaim,
+        deferred_at: &str,
+        next_attempt_at: &str,
+        actor: &str,
+    ) -> Result<(), Self::Error>;
     fn write_alert_delivery_finalize(
         &self,
         write: &AlertDeliveryFinalizeWrite,
@@ -624,6 +631,16 @@ impl StoreWriter for Store {
         actor: &str,
     ) -> Result<(), Self::Error> {
         Store::write_alert_delivery_queue_outcome(self, outcome, actor)
+    }
+
+    fn write_alert_delivery_queue_defer(
+        &self,
+        claim: &AlertDeliveryQueueClaim,
+        deferred_at: &str,
+        next_attempt_at: &str,
+        actor: &str,
+    ) -> Result<(), Self::Error> {
+        Store::write_alert_delivery_queue_defer(self, claim, deferred_at, next_attempt_at, actor)
     }
 
     fn write_alert_delivery_finalize(

@@ -653,6 +653,30 @@ pub enum AlertCommand {
         #[arg(long)]
         reason: String,
     },
+    Worker {
+        #[command(subcommand)]
+        command: AlertWorkerCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AlertWorkerCommand {
+    Run {
+        #[arg(long, value_name = "DIR")]
+        hmac_secret_dir: PathBuf,
+        #[arg(long, default_value_t = 10)]
+        max_deliveries: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    Daemon {
+        #[arg(long, value_name = "DIR")]
+        hmac_secret_dir: PathBuf,
+        #[arg(long, default_value_t = 60)]
+        interval_seconds: u64,
+        #[arg(long, default_value_t = 10)]
+        max_deliveries: usize,
+    },
 }
 
 #[derive(Debug, Subcommand)]

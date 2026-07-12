@@ -486,6 +486,8 @@ target/debug/ocfleet backup inspect --manifest ./controller-backups/backup-<id>.
 target/debug/ocfleet restore plan --manifest ./controller-backups/backup-<id>.manifest.json --json
 target/debug/ocfleet restore apply --manifest ./controller-backups/backup-<id>.manifest.json --yes --json
 curl --fail http://127.0.0.1:8080/metrics
+target/debug/ocfleet-agent --config ./agent.toml --metrics-listen 127.0.0.1:9090
+curl --fail http://127.0.0.1:9090/metrics
 target/debug/ocfleet retention show
 target/debug/ocfleet retention explain --scope observations --json
 target/debug/ocfleet retention apply \

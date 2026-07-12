@@ -2371,6 +2371,7 @@ name = "ocfleet-agent"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "axum",
  "base64",
  "blake3",
  "clap",
@@ -2387,6 +2388,7 @@ dependencies = [
  "time",
  "tokio",
  "toml",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "uuid",

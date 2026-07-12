@@ -2,7 +2,7 @@
   "openapi": "3.1.1",
   "info": {
     "title": "ocfleet read-only observation API",
-    "version": "0.2.0",
+    "version": "0.3.0",
     "description": "Read-only, low-sensitive observation API over an existing controller SQLite database. It does not call agents, run scheduler jobs, change trust, mutate retention, or expose raw logs/config/cert/session/user/client data."
   },
   "servers": [

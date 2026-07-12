@@ -17,6 +17,7 @@ repository contains automated evidence and the release path verifies it.
 | Distro/architecture smoke | Debian trixie and Ubuntu 24.04 on x86_64/aarch64 run install smoke in `.github/workflows/install-smoke.yml`. | complete |
 | Action pinning and least privilege | Remote actions are commit-SHA pinned; workflows default to `contents: read`; `scripts/check-github-actions-pinning.sh` enforces pinning. | complete |
 | Rollback runbook | `docs/release-rollback-runbook.md` covers preflight, staged upgrade, rollback triggers, atomic restore, trust review, restart order, observation, and failed rollback. | complete |
+| Tagged release matrix | Workspace, OpenAPI, workflows, scripts, install guide, lockfiles, and `v0.3.0` notes are consistency-checked. The tag-bound SBOM/signature/provenance workflow must pass before A8 closes. | active |
 
 ## Current Slice
 

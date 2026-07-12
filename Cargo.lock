@@ -2368,7 +2368,7 @@ dependencies = [
 
 [[package]]
 name = "ocfleet-agent"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -2396,7 +2396,7 @@ dependencies = [
 
 [[package]]
 name = "ocfleet-api"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -2421,7 +2421,7 @@ dependencies = [
 
 [[package]]
 name = "ocfleet-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -2450,7 +2450,7 @@ dependencies = [
 
 [[package]]
 name = "ocfleet-config"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "iroh",
  "libc",
@@ -2461,7 +2461,7 @@ dependencies = [
 
 [[package]]
 name = "ocfleet-protocol"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64",
  "blake3",

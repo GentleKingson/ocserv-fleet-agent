@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.3.0 - 2026-07-12
+
+- Release metadata, OpenAPI, lockfiles, workflows, scripts, install examples,
+  and notes are aligned to the `v0.3.0` Stage A release candidate and guarded
+  by a consistency check.
+
 ### Added
 
 - A8 protocol/frame/config libFuzzer smoke targets, seed corpora, pinned CI, and

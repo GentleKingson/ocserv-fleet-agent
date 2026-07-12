@@ -15,7 +15,7 @@ automatic trust, automatic peer mesh, or automatic path-probe authorization.
 | Item | Audited state |
 | --- | --- |
 | Baseline commit | `b3c906a94823b4620dc1a2077a44e7160c0848b2` |
-| Workspace | Version `0.2.0`, Rust edition `2024`, Rust toolchain `1.96.1` |
+| Workspace | Version `0.3.0`, Rust edition `2024`, Rust toolchain `1.96.1` |
 | Workspace crates | Five: `ocfleet-protocol`, `ocfleet-config`, `ocfleet-agent`, `ocfleet-cli`, and `ocfleet-api` |
 | Release binaries | Four: `ocfleet`, `ocfleet-agent`, `ocfleet-api`, and `ocfleet-ocserv-collector` |
 | Controller schema | SQLite schema version `8`; migrations `0001` through `0008` |
@@ -23,7 +23,7 @@ automatic trust, automatic peer mesh, or automatic path-probe authorization.
 | Other schemas | Config version `1`; trust-policy version `1`; collector snapshot `ocfleet.ocserv.snapshot.v2`; OpenAPI `3.1.1` |
 | Features | Every crate has an empty default feature set. `controlled-writes` exists in protocol/config/agent and is propagated by the agent. `postgres-backend` exists in the CLI. Both tracks are default-off. |
 | Runtime backends | SQLite only. The Postgres feature is a non-connecting scaffold. |
-| HTTP API | Experimental version `0.2.0`; fourteen declared `GET` paths including the dashboard root; API data access is SQLite read-only. |
+| HTTP API | Read-only version `0.3.0`; fourteen declared `GET` paths including the dashboard root; API data access is SQLite read-only. |
 
 The baseline audit found no failing required check. These commands passed at the
 baseline commit:
@@ -429,7 +429,7 @@ all affected documents:
 | OpenAPI low-sensitive prose excludes selectors while the job schema requires and returns a controller-local selector; runtime also supports `HEAD` and structured 405/500 responses not fully described by the contract. | B3 `#43` | Distinguish safe controller selectors from forbidden agent-local selectors and make method/error/header behavior explicit. |
 | `scripts/check-doc-claims.sh` checks a small README phrase set rather than schema/protocol/feature/CLI/API drift. | A8 `#40` | Add source-derived checks for versions, features, routes, CLI examples, migrations, and safety claims. |
 | README and Phase 12 development commands omit all-feature and repository-script gates; examples also contain version/toolchain drift. | A8 `#40` | Publish one canonical local/CI verification matrix and keep examples tied to workspace/toolchain versions. |
-| Workspace/OpenAPI report `0.2.0`, while its changelog entries remain under `Unreleased`. | A8 `#40` | Explicitly mark `0.2.0` as an unreleased candidate or cut a dated release section and matching tag. |
+| Workspace/OpenAPI version and release-note filename must match the tag and compiled binaries. | A8 `#40` | `v0.3.0` is the Stage A release candidate; CI and the tag-bound workflow reject mismatches. |
 
 ## Progress Updates
 

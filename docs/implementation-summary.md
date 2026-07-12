@@ -1,7 +1,7 @@
 # Implementation Summary
 
 This roadmap automation pass advances the repository toward a conservative
-`v0.2.0` read-only release candidate. Source code and tests remain the authority
+`v0.3.0` production-foundation read-only release candidate. Source code and tests remain the authority
 for every status below.
 
 ## Safety Boundary Confirmation
@@ -55,8 +55,8 @@ can distinguish source checks from CI-only runtime checks:
 - `bash scripts/tests/test-controller-mutation-guard.sh`
 - `./scripts/check-github-actions-pinning.sh`
 - `./scripts/test-release-version-validation.sh`
-- `CARGO="$HOME/.cargo/bin/cargo" ./scripts/build-release.sh v0.2.0`
-- `./scripts/verify-checksums.sh dist/v0.2.0/SHA256SUMS`
+- `CARGO="$HOME/.cargo/bin/cargo" ./scripts/build-release.sh v0.3.0`
+- `./scripts/verify-checksums.sh dist/v0.3.0/SHA256SUMS`
 - `CARGO="$HOME/.cargo/bin/cargo" ./scripts/check-trust-policy.sh examples/trust-policy.toml`
 - `actionlint .github/workflows/*.yml`
 - `shellcheck` for the changed release, smoke, trust, and workflow-check scripts

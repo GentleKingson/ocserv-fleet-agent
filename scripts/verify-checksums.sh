@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -eu
 
-checksum_file="${1:-dist/v0.2.0/SHA256SUMS}"
+checksum_file="${1:-dist/v0.3.0/SHA256SUMS}"
 
 if [ ! -f "$checksum_file" ]; then
   printf 'checksum file not found: %s\n' "$checksum_file" >&2

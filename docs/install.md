@@ -1,6 +1,6 @@
 # Install Guide
 
-This guide installs the `v0.2.x` read-only MVP baseline on Linux with systemd. Commands assume two hosts:
+This guide installs the `v0.3.x` production-foundation read-only release on Linux with systemd. Commands assume two hosts:
 
 - controller host: runs the `ocfleet` CLI and stores controller SQLite state.
 - agent host: runs `ocfleet-agent` on an ocserv node.
@@ -35,9 +35,9 @@ The script builds the workspace, creates a private temp controller state, genera
 ```bash
 git clone https://github.com/GentleKingson/ocserv-fleet-agent.git
 cd ocserv-fleet-agent
-./scripts/build-release.sh v0.2.0
-./scripts/verify-checksums.sh dist/v0.2.0/SHA256SUMS
-cat dist/v0.2.0/SHA256SUMS
+./scripts/build-release.sh v0.3.0
+./scripts/verify-checksums.sh dist/v0.3.0/SHA256SUMS
+cat dist/v0.3.0/SHA256SUMS
 ```
 
 Each supported architecture produces four binaries: `ocfleet`,
@@ -54,10 +54,10 @@ Install binaries:
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
 ARCH="$(uname -m)"
 case "$ARCH" in arm64) ARCH="aarch64";; amd64) ARCH="x86_64";; esac
-sudo install -m 0755 "dist/v0.2.0/ocfleet-v0.2.0-$OS-$ARCH" /usr/local/bin/ocfleet
-sudo install -m 0755 "dist/v0.2.0/ocfleet-agent-v0.2.0-$OS-$ARCH" /usr/local/bin/ocfleet-agent
-sudo install -m 0755 "dist/v0.2.0/ocfleet-api-v0.2.0-$OS-$ARCH" /usr/local/bin/ocfleet-api
-sudo install -m 0755 "dist/v0.2.0/ocfleet-ocserv-collector-v0.2.0-$OS-$ARCH" /usr/local/bin/ocfleet-ocserv-collector
+sudo install -m 0755 "dist/v0.3.0/ocfleet-v0.3.0-$OS-$ARCH" /usr/local/bin/ocfleet
+sudo install -m 0755 "dist/v0.3.0/ocfleet-agent-v0.3.0-$OS-$ARCH" /usr/local/bin/ocfleet-agent
+sudo install -m 0755 "dist/v0.3.0/ocfleet-api-v0.3.0-$OS-$ARCH" /usr/local/bin/ocfleet-api
+sudo install -m 0755 "dist/v0.3.0/ocfleet-ocserv-collector-v0.3.0-$OS-$ARCH" /usr/local/bin/ocfleet-ocserv-collector
 for binary in ocfleet ocfleet-agent ocfleet-api ocfleet-ocserv-collector; do
   "$binary" --version
 done
@@ -393,10 +393,10 @@ sudo systemctl stop ocfleet-agent
 sudo install -d -m 0700 /var/backups/ocfleet
 sqlite3 /var/lib/ocfleet-controller/controller.sqlite 'PRAGMA integrity_check;'
 sudo cp -a /var/lib/ocfleet-controller/controller.sqlite /var/backups/ocfleet/controller.sqlite.pre-upgrade.$(date -u +%Y%m%dT%H%M%SZ)
-sudo install -m 0755 "dist/v0.2.0/ocfleet-v0.2.0-$OS-$ARCH" /usr/local/bin/ocfleet
-sudo install -m 0755 "dist/v0.2.0/ocfleet-agent-v0.2.0-$OS-$ARCH" /usr/local/bin/ocfleet-agent
-sudo install -m 0755 "dist/v0.2.0/ocfleet-api-v0.2.0-$OS-$ARCH" /usr/local/bin/ocfleet-api
-sudo install -m 0755 "dist/v0.2.0/ocfleet-ocserv-collector-v0.2.0-$OS-$ARCH" /usr/local/bin/ocfleet-ocserv-collector
+sudo install -m 0755 "dist/v0.3.0/ocfleet-v0.3.0-$OS-$ARCH" /usr/local/bin/ocfleet
+sudo install -m 0755 "dist/v0.3.0/ocfleet-agent-v0.3.0-$OS-$ARCH" /usr/local/bin/ocfleet-agent
+sudo install -m 0755 "dist/v0.3.0/ocfleet-api-v0.3.0-$OS-$ARCH" /usr/local/bin/ocfleet-api
+sudo install -m 0755 "dist/v0.3.0/ocfleet-ocserv-collector-v0.3.0-$OS-$ARCH" /usr/local/bin/ocfleet-ocserv-collector
 ocfleet --database /var/lib/ocfleet-controller/controller.sqlite --secret-key /var/lib/ocfleet-controller/controller.secret doctor
 sudo systemctl start ocfleet-agent
 ```

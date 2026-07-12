@@ -2176,7 +2176,7 @@ dependencies = [
 
 [[package]]
 name = "ocfleet-config"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "iroh",
  "libc",
@@ -2198,7 +2198,7 @@ dependencies = [
 
 [[package]]
 name = "ocfleet-protocol"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64",
  "blake3",

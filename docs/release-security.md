@@ -35,7 +35,7 @@ directory, then run:
 
 ```bash
 scripts/verify-checksums.sh ./release-files/SHA256SUMS
-scripts/verify-release-supply-chain.sh ./release-files v0.2.0
+scripts/verify-release-supply-chain.sh ./release-files v0.3.0
 for artifact in ./release-files/ocfleet-*; do
   case "$artifact" in *.sigstore.json) continue ;; esac
   gh attestation verify "$artifact" \

@@ -12,7 +12,7 @@ on:
       version:
         description: Release version to build and smoke test
         required: false
-        default: v0.2.0
+        default: v0.3.0
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -67,7 +67,7 @@ jobs:
           elif [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
             version="$INPUT_VERSION"
           else
-            version="v0.2.0"
+            version="v0.3.0"
           fi
           case "$version" in
             v*) ;;

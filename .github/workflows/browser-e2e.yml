@@ -1,0 +1,49 @@
+name: Browser E2E
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'crates/ocfleet-api/**'
+      - 'crates/ocfleet-cli/**'
+      - 'tests/e2e/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'playwright.config.js'
+      - 'scripts/run-dashboard-e2e-server.sh'
+      - '.github/workflows/browser-e2e.yml'
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  dashboard:
+    name: read-only dashboard
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install 1.96.1 --profile minimal
+
+      - name: Install locked browser dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Run dashboard E2E
+        run: npm run test:e2e

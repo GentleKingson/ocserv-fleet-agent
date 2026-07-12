@@ -3,3 +3,6 @@ docs/superpowers/
 target/
 dist/
 tmp/pdfs/
+node_modules/
+playwright-report/
+test-results/

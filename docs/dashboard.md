@@ -53,3 +53,12 @@ beacon or XHR path.
 - Alert views do not evaluate rules or deliver hooks.
 - Audit export remains available through the read-only JSON API route and the
   local CLI file export.
+
+## Browser Verification
+
+`npm run test:e2e` starts an isolated, initialized controller database and the
+read-only API on loopback, then runs Chromium checks at desktop and narrow
+viewports. The suite verifies CSP, all dashboard views, refresh, audit preview,
+empty-state rendering, console cleanliness, and that every browser request uses
+`GET`. CI installs dependencies from `package-lock.json` and does not upload
+traces or controller state.

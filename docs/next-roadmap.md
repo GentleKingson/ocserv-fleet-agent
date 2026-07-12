@@ -309,6 +309,7 @@ The A7 completion audit maps every agent and controller requirement to its
 metric, runtime instrumentation, exposure protection, cardinality contract, and
 test evidence. It confirms that no identity, request, session, or address value
 is a label and that scrapes cannot mutate controller state.
+The A7 acceptance completion audit is published in pull request `#102`.
 
 ### Baseline And Production Foundation
 

@@ -11,6 +11,7 @@ controlled-writes = ["ocfleet-config/controlled-writes", "ocfleet-protocol/contr
 
 [dependencies]
 anyhow.workspace = true
+axum.workspace = true
 base64.workspace = true
 blake3.workspace = true
 clap.workspace = true
@@ -32,3 +33,4 @@ uuid.workspace = true
 [dev-dependencies]
 ocfleet-cli = { path = "../ocfleet-cli" }
 tempfile.workspace = true
+tower.workspace = true

@@ -294,6 +294,12 @@ identity, request, session, address, token, path, and other data-derived labels.
 Agent runtime instrumentation and exposition remain subsequent A7 work.
 The controller metrics foundation is published in pull request `#99`.
 
+The second A7 slice adds live agent admission, RPC duration/result class, nonce,
+and audit durability instrumentation plus a loopback-default metrics listener.
+Non-loopback startup requires a private bearer token; the exporter exposes no
+identity, address, request, session, token, path, or raw error labels.
+The agent metrics exporter is published in pull request `#100`.
+
 ### Baseline And Production Foundation
 
 | ID | Issue | Status | Depends on | Release target | Acceptance and required evidence |

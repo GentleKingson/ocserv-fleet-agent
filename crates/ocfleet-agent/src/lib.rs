@@ -3,6 +3,8 @@ pub mod audit_limiter;
 pub mod authz;
 pub mod enrollment;
 pub mod identity;
+pub mod metrics;
+pub mod metrics_http;
 pub mod node_info;
 pub mod nonce;
 pub mod ocserv;

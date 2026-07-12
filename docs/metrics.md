@@ -49,9 +49,42 @@ Every scrape opens SQLite read-only with query-only and untrusted-schema modes.
 The endpoint performs fixed aggregate queries and does not trigger RPC,
 scheduler, evaluator, delivery, retention, export, or any controller mutation.
 
-## Agent Status
+## Agent Exposure
 
-The existing agent audit durability JSON snapshot remains private local state;
-it is not the A7 Prometheus exporter. Agent transport/RPC/nonce/audit catalog and
-loopback-by-default protected exposition are the next A7 slice.
+`ocfleet-agent` serves Prometheus text on `127.0.0.1:9090` by default:
 
+```bash
+ocfleet-agent --config /etc/ocfleet-agent/config.toml \
+  --metrics-listen 127.0.0.1:9090
+curl --fail http://127.0.0.1:9090/metrics
+```
+
+A non-loopback `--metrics-listen` is rejected unless
+`--metrics-auth-token-file <private-file>` is supplied. The token file uses the
+same owner, regular-file, `0600`, no-symlink, no-hardlink, private-parent rules
+as other secrets. The exporter is plain HTTP; non-loopback operation additionally
+requires a TLS reverse proxy and network restriction. Only `/metrics` exists.
+
+## Agent Catalog
+
+| Metric | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `ocfleet_agent_handshakes` | gauge | `state=active,rejected` | Active handshake tasks and bounded admission/authentication rejections. |
+| `ocfleet_agent_connections` | gauge | `state=active,rejected` | Active admitted connections and limit rejections. |
+| `ocfleet_agent_streams` | gauge | `state=active,rejected` | Active RPC streams and limit rejections. |
+| `ocfleet_agent_rpc_calls_total` | counter | `state=succeeded,failed` | RPC responses by fixed result. |
+| `ocfleet_agent_rpc_results_total` | counter | `state=success,validation,authorization,resource,timeout,dependency,internal` | RPC responses by closed result-code class. |
+| `ocfleet_agent_rpc_duration_milliseconds_sum` | counter | none | Cumulative RPC duration. |
+| `ocfleet_agent_rpc_duration_milliseconds_count` | counter | none | RPC duration sample count. |
+| `ocfleet_agent_nonce_cache_size` | gauge | none | Current live nonce count. |
+| `ocfleet_agent_nonce_rejections_total` | counter | `state=replay,resource_exhausted` | Replay and bounded-capacity nonce rejections. |
+| `ocfleet_agent_audit_queue_events` | gauge | none | Events waiting in the durable audit spool. |
+| `ocfleet_agent_audit_dropped_total` | counter | none | Events dropped after bounded spool exhaustion. |
+| `ocfleet_agent_audit_replayed_total` | counter | none | Events replayed from the spool. |
+| `ocfleet_agent_audit_write_failures_total` | counter | none | Primary/spool write failures. |
+| `ocfleet_agent_audit_oldest_age_seconds` | gauge | none | Oldest queued event age, or zero when empty. |
+
+Admission permits decrement active gauges on every drop. RPC result classes are
+closed mappings from the protocol `ErrorCode` enum; raw error text or codes do
+not become labels. The existing private audit JSON snapshot remains available
+for local durability troubleshooting but is not served verbatim.

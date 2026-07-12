@@ -29,6 +29,7 @@ use crate::AGENT_VERSION;
 use crate::audit::{AgentAuditEvent, JsonlAuditWriter};
 use crate::audit_limiter::{AuditLimitDecision, RejectedAuditLimiter};
 use crate::authz::{AgentAuthorization, CallerClass, PathProbeDecision};
+use crate::metrics::{AgentMetrics, Resource as MetricResource};
 use crate::node_info::collect_node_info;
 use crate::nonce::{NonceCache, NonceDecision, NonceLimitScope};
 use crate::ocserv::{OcservReadonlyError, provider_from_config};
@@ -80,6 +81,7 @@ impl PathTargetResolver {
 
 #[derive(Debug)]
 pub struct ServerLimiters {
+    metrics: Arc<AgentMetrics>,
     handshake_global: Arc<Semaphore>,
     connections_global: Arc<Semaphore>,
     connections_per_controller_limit: usize,
@@ -93,12 +95,38 @@ pub struct ServerLimiters {
 pub struct ConnectionPermits {
     _global: OwnedSemaphorePermit,
     _per_controller: OwnedSemaphorePermit,
+    metrics: Arc<AgentMetrics>,
 }
 
 #[derive(Debug)]
 pub struct StreamPermits {
     _global: OwnedSemaphorePermit,
     _per_controller: OwnedSemaphorePermit,
+    metrics: Arc<AgentMetrics>,
+}
+
+#[derive(Debug)]
+pub struct HandshakePermit {
+    _permit: OwnedSemaphorePermit,
+    metrics: Arc<AgentMetrics>,
+}
+
+impl Drop for HandshakePermit {
+    fn drop(&mut self) {
+        self.metrics.admission_finished(MetricResource::Handshake);
+    }
+}
+
+impl Drop for ConnectionPermits {
+    fn drop(&mut self) {
+        self.metrics.admission_finished(MetricResource::Connection);
+    }
+}
+
+impl Drop for StreamPermits {
+    fn drop(&mut self) {
+        self.metrics.admission_finished(MetricResource::Stream);
+    }
 }
 
 impl ServerLimiters {
@@ -120,6 +148,7 @@ impl ServerLimiters {
         max_streams_per_controller: usize,
     ) -> Self {
         Self {
+            metrics: Arc::new(AgentMetrics::default()),
             handshake_global: Arc::new(Semaphore::new(max_handshake_tasks_global)),
             connections_global: Arc::new(Semaphore::new(max_connections_global)),
             connections_per_controller_limit: max_connections_per_controller,
@@ -130,31 +159,61 @@ impl ServerLimiters {
         }
     }
 
-    pub fn try_acquire_handshake(&self) -> Option<OwnedSemaphorePermit> {
-        self.handshake_global.clone().try_acquire_owned().ok()
+    pub fn metrics(&self) -> Arc<AgentMetrics> {
+        self.metrics.clone()
+    }
+
+    pub fn try_acquire_handshake(&self) -> Option<HandshakePermit> {
+        let Some(permit) = self.handshake_global.clone().try_acquire_owned().ok() else {
+            self.metrics.admission_rejected(MetricResource::Handshake);
+            return None;
+        };
+        self.metrics.admission_started(MetricResource::Handshake);
+        Some(HandshakePermit {
+            _permit: permit,
+            metrics: self.metrics.clone(),
+        })
     }
 
     pub fn try_acquire_connection(&self, remote_endpoint_id: &str) -> Option<ConnectionPermits> {
-        let global = self.connections_global.clone().try_acquire_owned().ok()?;
+        let Some(global) = self.connections_global.clone().try_acquire_owned().ok() else {
+            self.metrics.admission_rejected(MetricResource::Connection);
+            return None;
+        };
         let per_controller = self
             .connection_controller_semaphore(remote_endpoint_id)
             .try_acquire_owned()
-            .ok()?;
+            .ok();
+        let Some(per_controller) = per_controller else {
+            self.metrics.admission_rejected(MetricResource::Connection);
+            return None;
+        };
+        self.metrics.admission_started(MetricResource::Connection);
         Some(ConnectionPermits {
             _global: global,
             _per_controller: per_controller,
+            metrics: self.metrics.clone(),
         })
     }
 
     pub fn try_acquire_stream(&self, remote_endpoint_id: &str) -> Option<StreamPermits> {
-        let global = self.streams_global.clone().try_acquire_owned().ok()?;
+        let Some(global) = self.streams_global.clone().try_acquire_owned().ok() else {
+            self.metrics.admission_rejected(MetricResource::Stream);
+            return None;
+        };
         let per_controller = self
             .stream_controller_semaphore(remote_endpoint_id)
             .try_acquire_owned()
-            .ok()?;
+            .ok();
+        let Some(per_controller) = per_controller else {
+            self.metrics.admission_rejected(MetricResource::Stream);
+            return None;
+        };
+        self.metrics.admission_started(MetricResource::Stream);
         Some(StreamPermits {
             _global: global,
             _per_controller: per_controller,
+            metrics: self.metrics.clone(),
         })
     }
 
@@ -207,6 +266,7 @@ pub struct AllowlistHook {
     authz: Arc<AgentAuthorization>,
     audit: JsonlAuditWriter,
     audit_limiter: Arc<Mutex<RejectedAuditLimiter>>,
+    metrics: Arc<AgentMetrics>,
 }
 
 impl AllowlistHook {
@@ -214,11 +274,13 @@ impl AllowlistHook {
         authz: Arc<AgentAuthorization>,
         audit: JsonlAuditWriter,
         audit_limiter: Arc<Mutex<RejectedAuditLimiter>>,
+        metrics: Arc<AgentMetrics>,
     ) -> Self {
         Self {
             authz,
             audit,
             audit_limiter,
+            metrics,
         }
     }
 }
@@ -236,6 +298,7 @@ impl EndpointHooks for AllowlistHook {
         }
 
         let alpn = String::from_utf8_lossy(conn.alpn());
+        self.metrics.admission_rejected(MetricResource::Handshake);
         let reason = match caller_class {
             CallerClass::DisabledPeer => format!("disabled peer not allowed for ALPN {alpn}"),
             CallerClass::Unknown => format!("endpoint not allowed for ALPN {alpn}"),
@@ -277,8 +340,9 @@ pub async fn bind_agent_endpoint(
     secret_key: SecretKey,
     audit: JsonlAuditWriter,
     audit_limiter: Arc<Mutex<RejectedAuditLimiter>>,
+    metrics: Arc<AgentMetrics>,
 ) -> Result<Endpoint> {
-    agent_endpoint_builder(config, secret_key, audit, audit_limiter)?
+    agent_endpoint_builder(config, secret_key, audit, audit_limiter, metrics)?
         .bind()
         .await
         .context("failed to bind agent iroh endpoint")
@@ -290,15 +354,21 @@ pub async fn bind_agent_endpoint_local_only(
     audit: JsonlAuditWriter,
     audit_limiter: Arc<Mutex<RejectedAuditLimiter>>,
 ) -> Result<Endpoint> {
-    agent_endpoint_builder(config, secret_key, audit, audit_limiter)?
-        .relay_mode(RelayMode::Disabled)
-        .clear_address_lookup()
-        .clear_ip_transports()
-        .bind_addr((Ipv4Addr::LOCALHOST, 0))
-        .context("failed to configure local-only agent endpoint bind address")?
-        .bind()
-        .await
-        .context("failed to bind local-only agent iroh endpoint")
+    agent_endpoint_builder(
+        config,
+        secret_key,
+        audit,
+        audit_limiter,
+        Arc::new(AgentMetrics::default()),
+    )?
+    .relay_mode(RelayMode::Disabled)
+    .clear_address_lookup()
+    .clear_ip_transports()
+    .bind_addr((Ipv4Addr::LOCALHOST, 0))
+    .context("failed to configure local-only agent endpoint bind address")?
+    .bind()
+    .await
+    .context("failed to bind local-only agent iroh endpoint")
 }
 
 pub fn parse_endpoint_id(value: &str) -> Result<EndpointId> {
@@ -524,6 +594,7 @@ fn agent_endpoint_builder(
     secret_key: SecretKey,
     audit: JsonlAuditWriter,
     audit_limiter: Arc<Mutex<RejectedAuditLimiter>>,
+    metrics: Arc<AgentMetrics>,
 ) -> Result<iroh::endpoint::Builder> {
     let authz = Arc::new(AgentAuthorization::from_security_config(&config.security)?);
 
@@ -532,7 +603,7 @@ fn agent_endpoint_builder(
         .relay_mode(RelayMode::Disabled)
         .clear_address_lookup()
         .alpns(vec![config.iroh.alpn.as_bytes().to_vec()])
-        .hooks(AllowlistHook::new(authz, audit, audit_limiter)))
+        .hooks(AllowlistHook::new(authz, audit, audit_limiter, metrics)))
 }
 
 async fn serve_connection(
@@ -740,6 +811,10 @@ where
     };
 
     sync_audit_event_with_response(&mut event, &response, payload.len());
+    state.limiters.metrics().record_rpc(
+        response.error.as_ref().map(|error| &error.code),
+        event.duration_ms.unwrap_or(response.duration_ms),
+    );
     if let Err(err) = state.audit.write_async(&event).await {
         tracing::warn!(error = %err, "failed to write agent audit event");
         let audit_response = error_response(
@@ -955,6 +1030,7 @@ async fn validate_and_dispatch_request(
     match nonce_decision {
         NonceDecision::Accepted => {}
         NonceDecision::Replay => {
+            state.limiters.metrics().nonce_rejected(false);
             return Err(RequestDispatchError::new(
                 Some(request_id),
                 ErrorCode::ReplayedNonce,
@@ -963,6 +1039,7 @@ async fn validate_and_dispatch_request(
             ));
         }
         NonceDecision::ResourceExhausted { scope, limit } => {
+            state.limiters.metrics().nonce_rejected(true);
             return Err(RequestDispatchError::new(
                 Some(request_id),
                 ErrorCode::ResourceExhausted,
@@ -1751,6 +1828,20 @@ mod tests {
         assert!(limiters.try_acquire_stream("controller-1").is_none());
         drop(stream);
         assert!(limiters.try_acquire_stream("controller-1").is_some());
+
+        let rendered = limiters.metrics().render(
+            0,
+            &crate::audit::AuditMetricsSnapshot {
+                audit_queued: 0,
+                audit_dropped: 0,
+                audit_replayed: 0,
+                audit_flush_failures: 0,
+                audit_oldest_age_seconds: None,
+            },
+        );
+        assert!(rendered.contains("ocfleet_agent_handshakes{state=\"rejected\"} 1"));
+        assert!(rendered.contains("ocfleet_agent_connections{state=\"rejected\"} 1"));
+        assert!(rendered.contains("ocfleet_agent_streams{state=\"rejected\"} 1"));
     }
 
     #[tokio::test]
@@ -1797,6 +1888,18 @@ mod tests {
                 .expect("response bytes")
                 <= 512
         );
+        let metrics = state.limiters.metrics().render(
+            0,
+            &crate::audit::AuditMetricsSnapshot {
+                audit_queued: 0,
+                audit_dropped: 0,
+                audit_replayed: 0,
+                audit_flush_failures: 0,
+                audit_oldest_age_seconds: None,
+            },
+        );
+        assert!(metrics.contains("ocfleet_agent_rpc_calls_total{state=\"failed\"} 1"));
+        assert!(metrics.contains("ocfleet_agent_rpc_results_total{state=\"validation\"} 1"));
     }
 
     #[tokio::test]

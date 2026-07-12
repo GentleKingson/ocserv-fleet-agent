@@ -147,8 +147,7 @@ impl NonceCache {
         popped
     }
 
-    #[cfg(test)]
-    fn live_len(&self) -> usize {
+    pub fn live_len(&self) -> usize {
         self.live_total
     }
 

@@ -349,8 +349,8 @@ The B1 history foundation is published in pull request `#109`.
 The second B1 slice adds schema 24 deterministic 5-minute, hourly, and daily
 health rollups. Aligned bounded recomputation preserves missing coverage,
 records input watermarks, supports exact audited replay, and has independent
-long-term retention. Bounded 24-hour, 7-day, and 30-day SLO projections remain
-the next B1 slice.
+long-term retention. It is published in pull request `#110`. Bounded 24-hour,
+7-day, and 30-day SLO projections remain the next B1 slice.
 
 The A8 completion audit records the successful tag-bound matrix, publication
 of 38 `v0.3.0` assets, and independent checksum, Sigstore, SBOM, and provenance

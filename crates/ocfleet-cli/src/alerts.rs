@@ -17,7 +17,7 @@ use crate::alert_webhook::{
     is_retryable_webhook_error, read_hmac_secret_file, validate_webhook_endpoint,
     webhook_error_for_status, webhook_payload_bytes,
 };
-use crate::args::{AlertCommand, AlertHookCommand, AlertSeverity, AlertState};
+use crate::args::{AlertCommand, AlertHookCommand, AlertSeverity, AlertState, AlertWorkerCommand};
 use crate::backend::StoreWriter;
 use crate::duration_args::parse_duration_seconds;
 use crate::input_validation::{local_actor, validate_reason};
@@ -25,8 +25,9 @@ use crate::observation::safe_observation_summary;
 use crate::storage_payloads::{HealthDegradedMethodsPayloadV1, HealthSummaryPayloadV1};
 use crate::store::{
     AlertDeliveryAttemptRecord, AlertDeliveryAttemptWrite, AlertDeliveryFinalizeWrite,
-    AlertEvaluationEntry, AlertEvaluationWrite, AlertEventRecord, AlertStateTransition,
-    AlertWebhookHookRecord, HealthPolicyRecord, ProbeObservationRecord, Store,
+    AlertDeliveryQueueEnqueue, AlertDeliveryQueueOutcome, AlertEvaluationEntry,
+    AlertEvaluationWrite, AlertEventRecord, AlertStateTransition, AlertWebhookHookRecord,
+    HealthPolicyRecord, ProbeObservationRecord, Store,
 };
 use std::path::Path;
 use std::thread;
@@ -62,7 +63,7 @@ struct DeliveryAttemptOutcome<'a> {
     bytes_sent: usize,
 }
 
-pub fn run_alert_command(store: &Store, command: AlertCommand) -> anyhow::Result<()> {
+pub async fn run_alert_command(store: &Store, command: AlertCommand) -> anyhow::Result<()> {
     match command {
         AlertCommand::Hook { command } => run_alert_hook_command(store, command),
         AlertCommand::List {
@@ -86,7 +87,353 @@ pub fn run_alert_command(store: &Store, command: AlertCommand) -> anyhow::Result
         AlertCommand::Resolve { dedupe_key, reason } => {
             run_alert_resolve(store, &dedupe_key, &reason)
         }
+        AlertCommand::Worker { command } => run_alert_worker_command(store, command).await,
     }
+}
+
+const ALERT_WORKER_LEASE_SECONDS: u64 = 60;
+const MAX_ALERT_WORKER_DELIVERIES: usize = 100;
+const ALERT_WORKER_REPEAT_SECONDS: i64 = 300;
+const MAX_ALERT_WORKER_PER_GROUP: usize = 3;
+const ALERT_WORKER_GROUP_DEFER_SECONDS: i64 = 60;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AlertWorkerSummary {
+    pub enqueued: usize,
+    pub attempted: usize,
+    pub succeeded: usize,
+    pub retried: usize,
+    pub dead_lettered: usize,
+    pub deferred: usize,
+}
+
+async fn run_alert_worker_command(
+    store: &Store,
+    command: AlertWorkerCommand,
+) -> anyhow::Result<()> {
+    match command {
+        AlertWorkerCommand::Run {
+            hmac_secret_dir,
+            max_deliveries,
+            json,
+        } => {
+            let sender = ReqwestWebhookSender::new()?;
+            let summary = run_alert_worker_once_with_sender(
+                store,
+                &hmac_secret_dir,
+                max_deliveries,
+                &sender,
+            )?;
+            print_alert_worker_summary(summary, json)?;
+            Ok(())
+        }
+        AlertWorkerCommand::Daemon {
+            hmac_secret_dir,
+            interval_seconds,
+            max_deliveries,
+        } => {
+            if !(10..=3_600).contains(&interval_seconds) {
+                anyhow::bail!("--interval-seconds must be between 10 and 3600");
+            }
+            validate_alert_worker_max_deliveries(max_deliveries)?;
+            let sender = ReqwestWebhookSender::new()?;
+            let shutdown = alert_worker_shutdown_signal();
+            tokio::pin!(shutdown);
+            loop {
+                run_alert_worker_once_with_sender(
+                    store,
+                    &hmac_secret_dir,
+                    max_deliveries,
+                    &sender,
+                )?;
+                tokio::select! {
+                    _ = tokio::time::sleep(StdDuration::from_secs(interval_seconds)) => {}
+                    _ = &mut shutdown => break,
+                }
+            }
+            println!("status=stopped");
+            Ok(())
+        }
+    }
+}
+
+pub fn run_alert_worker_once_with_sender(
+    store: &Store,
+    hmac_secret_dir: &Path,
+    max_deliveries: usize,
+    sender: &dyn WebhookSender,
+) -> anyhow::Result<AlertWorkerSummary> {
+    validate_alert_worker_max_deliveries(max_deliveries)?;
+    crate::private_file::validate_existing_private_directory_strict(hmac_secret_dir)
+        .context("--hmac-secret-dir must be an owned, non-symlink directory with mode 0700")?;
+    evaluate_alerts_and_audit(store)?;
+    let now = now_rfc3339();
+    let now_instant = OffsetDateTime::parse(&now, &Rfc3339).expect("current timestamp parses");
+    let hooks = store
+        .list_alert_webhook_hooks()?
+        .into_iter()
+        .filter(|hook| hook.enabled)
+        .collect::<Vec<_>>();
+    let alerts = store
+        .list_alert_events()?
+        .into_iter()
+        .filter(|alert| alert.state == "open")
+        .map(|alert| alert_worker_alert_due(&alert, now_instant).map(|due| (alert, due)))
+        .collect::<anyhow::Result<Vec<_>>>()?
+        .into_iter()
+        .filter_map(|(alert, due)| due.then_some(alert))
+        .collect::<Vec<_>>();
+    let mut enqueued = 0;
+    for hook in &hooks {
+        for alert in &alerts {
+            let idempotency_key = alert_queue_idempotency_key(alert, hook);
+            StoreWriter::write_alert_delivery_queue_enqueue(
+                store,
+                &AlertDeliveryQueueEnqueue {
+                    queue_id: alert_queue_id(&idempotency_key),
+                    alert_id: alert.alert_id.clone(),
+                    hook_id: hook.hook_id.clone(),
+                    idempotency_key,
+                    group_key: format!("{}:{}", alert.severity, alert.reason_code)
+                        .to_ascii_lowercase(),
+                    enqueued_at: now.clone(),
+                },
+                &local_actor(),
+            )?;
+            enqueued += 1;
+        }
+    }
+
+    let owner_id = format!("alert-worker-{}", Uuid::new_v4().simple());
+    let mut summary = AlertWorkerSummary {
+        enqueued,
+        attempted: 0,
+        succeeded: 0,
+        retried: 0,
+        dead_lettered: 0,
+        deferred: 0,
+    };
+    let mut group_counts = BTreeMap::<String, usize>::new();
+    for _ in 0..max_deliveries.saturating_mul(2).min(200) {
+        if summary.attempted >= max_deliveries {
+            break;
+        }
+        let claim_now = now_rfc3339();
+        let Some(claim) = StoreWriter::write_alert_delivery_queue_claim_next(
+            store,
+            &owner_id,
+            &claim_now,
+            ALERT_WORKER_LEASE_SECONDS,
+            &local_actor(),
+        )?
+        else {
+            break;
+        };
+        let group_count = group_counts.entry(claim.group_key.clone()).or_default();
+        if *group_count >= MAX_ALERT_WORKER_PER_GROUP {
+            let deferred_at = now_rfc3339();
+            let next_attempt_at = (OffsetDateTime::now_utc()
+                + Duration::seconds(ALERT_WORKER_GROUP_DEFER_SECONDS))
+            .format(&Rfc3339)
+            .expect("group defer timestamp formats");
+            StoreWriter::write_alert_delivery_queue_defer(
+                store,
+                &claim,
+                &deferred_at,
+                &next_attempt_at,
+                &local_actor(),
+            )?;
+            summary.deferred += 1;
+            continue;
+        }
+        *group_count += 1;
+        let alert = store
+            .list_alert_events()?
+            .into_iter()
+            .find(|alert| alert.alert_id == claim.alert_id)
+            .context("claimed delivery alert disappeared")?;
+        let hook = load_webhook_hook(store, &claim.hook_id)?;
+        let result =
+            deliver_alert_queue_attempt(store, hmac_secret_dir, sender, &claim, &alert, &hook)?;
+        summary.attempted += 1;
+        match result {
+            "succeeded" => summary.succeeded += 1,
+            "retry" => summary.retried += 1,
+            "dead_letter" => summary.dead_lettered += 1,
+            _ => unreachable!("fixed queue outcome"),
+        }
+    }
+    Ok(summary)
+}
+
+fn deliver_alert_queue_attempt(
+    store: &Store,
+    hmac_secret_dir: &Path,
+    sender: &dyn WebhookSender,
+    claim: &crate::store::AlertDeliveryQueueClaim,
+    alert: &AlertEventRecord,
+    hook: &AlertWebhookHookRecord,
+) -> anyhow::Result<&'static str> {
+    let attempted_at = now_rfc3339();
+    let attempt_no = claim.attempt_count + 1;
+    let secret_path = hmac_secret_dir.join(format!("{}.key", hook.hook_id));
+    let preflight = read_hmac_secret_file(&secret_path).and_then(|secret| {
+        if !hook.enabled {
+            anyhow::bail!("webhook hook is disabled");
+        }
+        if hmac_key_id(&secret) != hook.hmac_key_id {
+            anyhow::bail!("webhook HMAC secret does not match hook key id");
+        }
+        validate_webhook_endpoint(&hook.endpoint_url, &hook.host_allow)?;
+        let delivery_id = format!("delivery-{}-{attempt_no}", claim.queue_id);
+        build_webhook_request(hook, alert, &secret, &attempted_at, &delivery_id)
+    });
+    let (status, status_class, error_code, bytes_sent) = match preflight {
+        Ok(request) => {
+            let bytes_sent = request.body.len();
+            match sender.send(&request) {
+                WebhookHttpResult::Completed(response) => {
+                    let error_code = webhook_error_for_status(response.status_code);
+                    (
+                        if error_code.is_none() {
+                            "succeeded"
+                        } else {
+                            "failed"
+                        },
+                        Some(response.status_class),
+                        error_code,
+                        bytes_sent,
+                    )
+                }
+                WebhookHttpResult::Failed(failure) => {
+                    ("failed", None, Some(failure.error_code), bytes_sent)
+                }
+            }
+        }
+        Err(_) => ("failed", None, Some("ALERT_DELIVERY_PREFLIGHT_FAILED"), 0),
+    };
+    let completed_at = now_rfc3339();
+    let retryable = error_code.is_some_and(is_retryable_webhook_error);
+    let should_retry = status == "failed" && retryable && attempt_no < hook.max_attempts;
+    let retry_at = should_retry.then(|| {
+        let delay = 1_u64 << attempt_no.saturating_sub(1).min(8);
+        (OffsetDateTime::now_utc() + Duration::seconds(delay as i64))
+            .format(&Rfc3339)
+            .expect("retry timestamp formats")
+    });
+    StoreWriter::write_alert_delivery_queue_outcome(
+        store,
+        &AlertDeliveryQueueOutcome {
+            claim: claim.clone(),
+            attempt: AlertDeliveryAttemptRecord {
+                attempt_id: format!("attempt-{}-{attempt_no}", claim.queue_id),
+                alert_id: claim.alert_id.clone(),
+                hook_id: claim.hook_id.clone(),
+                attempt_no,
+                attempted_at,
+                status: status.to_string(),
+                http_status_class: status_class,
+                error_code: error_code.map(str::to_string),
+                bytes_sent: u64::try_from(bytes_sent).context("delivery body too large")?,
+            },
+            completed_at,
+            retry_at,
+            retryable,
+            max_attempts: hook.max_attempts,
+        },
+        &local_actor(),
+    )?;
+    Ok(if status == "succeeded" {
+        "succeeded"
+    } else if should_retry {
+        "retry"
+    } else {
+        "dead_letter"
+    })
+}
+
+fn validate_alert_worker_max_deliveries(max_deliveries: usize) -> anyhow::Result<()> {
+    if !(1..=MAX_ALERT_WORKER_DELIVERIES).contains(&max_deliveries) {
+        anyhow::bail!("--max-deliveries must be between 1 and {MAX_ALERT_WORKER_DELIVERIES}");
+    }
+    Ok(())
+}
+
+fn alert_worker_alert_due(alert: &AlertEventRecord, now: OffsetDateTime) -> anyhow::Result<bool> {
+    let Some(last_sent) = alert.last_sent_at.as_deref() else {
+        return Ok(true);
+    };
+    let last_sent = OffsetDateTime::parse(last_sent, &Rfc3339)
+        .context("stored alert last_sent_at is invalid")?;
+    Ok(now - last_sent >= Duration::seconds(ALERT_WORKER_REPEAT_SECONDS))
+}
+
+fn alert_queue_idempotency_key(alert: &AlertEventRecord, hook: &AlertWebhookHookRecord) -> String {
+    blake3::hash(
+        format!(
+            "{}:{}:{}:{}:{}",
+            alert.alert_id, alert.last_seen_at, alert.reason_code, alert.state, hook.hook_id
+        )
+        .as_bytes(),
+    )
+    .to_hex()
+    .to_string()
+}
+
+fn alert_queue_id(idempotency_key: &str) -> String {
+    let digest = blake3::hash(idempotency_key.as_bytes());
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest.as_bytes()[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    format!("delivery-queue-{}", Uuid::from_bytes(bytes))
+}
+
+fn print_alert_worker_summary(
+    summary: AlertWorkerSummary,
+    json_output: bool,
+) -> anyhow::Result<()> {
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "schema": "ocfleet.alert_worker.v1",
+                "enqueued": summary.enqueued,
+                "attempted": summary.attempted,
+                "succeeded": summary.succeeded,
+                "retried": summary.retried,
+                "dead_lettered": summary.dead_lettered,
+                "deferred": summary.deferred,
+            }))?
+        );
+    } else {
+        println!("enqueued={}", summary.enqueued);
+        println!("attempted={}", summary.attempted);
+        println!("succeeded={}", summary.succeeded);
+        println!("retried={}", summary.retried);
+        println!("dead_lettered={}", summary.dead_lettered);
+        println!("deferred={}", summary.deferred);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn alert_worker_shutdown_signal() -> impl std::future::Future<Output = ()> {
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        .expect("install SIGINT handler");
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("install SIGTERM handler");
+    async move {
+        tokio::select! {
+            _ = interrupt.recv() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn alert_worker_shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 pub fn evaluate_alerts(store: &Store) -> anyhow::Result<Vec<AlertEventRecord>> {

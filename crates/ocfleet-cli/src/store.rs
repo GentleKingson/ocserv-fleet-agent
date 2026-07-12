@@ -2556,7 +2556,7 @@ impl Store {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let existing = tx
             .query_row(
-                "SELECT queue_id, alert_id, hook_id, idempotency_key, group_key, created_at
+                "SELECT queue_id, alert_id, hook_id, idempotency_key, group_key
                  FROM alert_delivery_queue
                  WHERE queue_id = ?1 OR idempotency_key = ?4",
                 params![
@@ -2572,21 +2572,16 @@ impl Store {
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
                         row.get::<_, String>(4)?,
-                        row.get::<_, String>(5)?,
                     ))
                 },
             )
             .optional()?;
         if let Some(existing) = existing {
-            if existing
-                == (
-                    enqueue.queue_id.clone(),
-                    enqueue.alert_id.clone(),
-                    enqueue.hook_id.clone(),
-                    enqueue.idempotency_key.clone(),
-                    enqueue.group_key.clone(),
-                    enqueue.enqueued_at.clone(),
-                )
+            if existing.0 == enqueue.queue_id
+                && existing.1 == enqueue.alert_id
+                && existing.2 == enqueue.hook_id
+                && existing.3 == enqueue.idempotency_key
+                && existing.4 == enqueue.group_key
             {
                 let audit_actor = tx
                     .query_row(
@@ -2846,6 +2841,18 @@ impl Store {
             });
         }
         insert_alert_delivery_attempt_tx(&tx, &outcome.attempt)?;
+        if succeeded {
+            let changed = tx.execute(
+                "UPDATE alert_events SET last_sent_at = ?2 WHERE alert_id = ?1",
+                params![outcome.claim.alert_id, outcome.completed_at],
+            )?;
+            if changed != 1 {
+                return Err(StoreError::AlertMutationConflict {
+                    operation_id: outcome.claim.queue_id.clone(),
+                    detail: "delivery alert disappeared before success finalization",
+                });
+            }
+        }
         insert_alert_delivery_queue_audit_tx(
             &tx,
             actor,
@@ -2860,6 +2867,66 @@ impl Store {
                 "attempt_no": next_attempt,
                 "state": status,
                 "next_attempt_at": should_retry.then_some(next_attempt_at),
+            }),
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn write_alert_delivery_queue_defer(
+        &self,
+        claim: &AlertDeliveryQueueClaim,
+        deferred_at: &str,
+        next_attempt_at: &str,
+        actor: &str,
+    ) -> Result<(), StoreError> {
+        validate_actor(actor).map_err(StoreError::InvalidInput)?;
+        validate_alert_delivery_queue_claim(claim)?;
+        validate_rfc3339(deferred_at, "delivery deferred_at")?;
+        validate_rfc3339(next_attempt_at, "delivery next_attempt_at")?;
+        let deferred = OffsetDateTime::parse(deferred_at, &Rfc3339)
+            .expect("validated delivery deferred timestamp");
+        let next = OffsetDateTime::parse(next_attempt_at, &Rfc3339)
+            .expect("validated delivery next timestamp");
+        if next <= deferred || next - deferred > time::Duration::hours(1) {
+            return Err(StoreError::InvalidInput(
+                "delivery defer must be within one hour after deferral".to_string(),
+            ));
+        }
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "UPDATE alert_delivery_queue
+             SET status = 'retry', owner_id = NULL, claimed_at = NULL,
+                 lease_expires_at = NULL, next_attempt_at = ?4, updated_at = ?3
+             WHERE queue_id = ?1 AND status = 'claimed' AND owner_id = ?2
+               AND fence_token = ?5 AND lease_expires_at > ?3",
+            params![
+                claim.queue_id,
+                claim.owner_id,
+                deferred_at,
+                next_attempt_at,
+                u64_to_i64(claim.fence_token)?
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::AlertMutationConflict {
+                operation_id: claim.queue_id.clone(),
+                detail: "delivery queue lease or fence was lost before deferral",
+            });
+        }
+        insert_alert_delivery_queue_audit_tx(
+            &tx,
+            actor,
+            "alert.delivery.queue.defer",
+            &claim.queue_id,
+            true,
+            None,
+            json!({
+                "queue_id": claim.queue_id,
+                "hook_id": claim.hook_id,
+                "group_key": claim.group_key,
+                "state": "retry",
+                "next_attempt_at": next_attempt_at,
             }),
         )?;
         tx.commit()?;

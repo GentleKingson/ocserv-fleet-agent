@@ -2,11 +2,11 @@
   "baseline_commit": "b3c906a94823b4620dc1a2077a44e7160c0848b2",
   "current_phase": "A5",
   "completed_phases": ["A1", "A2", "A3", "A4"],
-  "active_branch": "codex/a5-alert-delivery-queue-writers",
+  "active_branch": "codex/a5-alert-delivery-daemon",
   "active_issue": 37,
-  "active_pr": 93,
+  "active_pr": null,
   "last_test_result": "passed",
-  "last_updated_at": "2026-07-12T00:05:00Z",
+  "last_updated_at": "2026-07-12T00:30:00Z",
   "blockers": [],
-  "next_action": "Publish audited queue writers and fenced claims, then integrate the hardened webhook transport worker."
+  "next_action": "Publish the hardened automatic webhook worker, then run the requirement-by-requirement A5 completion audit."
 }

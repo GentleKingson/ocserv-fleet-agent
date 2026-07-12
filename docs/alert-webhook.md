@@ -120,6 +120,29 @@ mismatches. Rotate the secret by creating a new private secret file, adding a
 new hook or updating operational delivery to the matching hook key id, testing
 with `--dry-run`, and disabling the old receiver path outside ocfleet.
 
+## Automatic Worker Secrets
+
+The automatic worker accepts one explicit private directory rather than an
+arbitrary path per queued item. For each enabled hook, place its matching secret
+at `<directory>/<hook-id>.key`, as a private regular file accepted by the same
+secret-file validator used by manual delivery. Hook IDs are validated bounded
+identifiers and cannot contain path separators.
+
+```bash
+install -d -m 0700 /etc/ocfleet/alert-worker-secrets
+install -m 0600 ./webhook.secret \
+  /etc/ocfleet/alert-worker-secrets/<hook-id>.key
+ocfleet alert worker daemon \
+  --hmac-secret-dir /etc/ocfleet/alert-worker-secrets \
+  --interval-seconds 60 \
+  --max-deliveries 10
+```
+
+The directory is operator authority; queue rows cannot select a directory,
+absolute path, JSONL target, or alternate filename. Missing, mismatched, or
+unsafe secret files produce the fixed `ALERT_DELIVERY_PREFLIGHT_FAILED` code
+without a network request or path disclosure.
+
 ## Receiver Example
 
 Pseudo-code for a receiver:

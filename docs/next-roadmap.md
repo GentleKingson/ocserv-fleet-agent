@@ -263,8 +263,10 @@ claim fences, five-attempt retry bounds, explicit dead-letter and success state,
 and due/lease indexes establish the persistence contract. Actor-bound atomic
 enqueue, deterministic claim, renewal, bounded expiry recovery, retry/DLQ,
 success, attempt-history, and audit writers are implemented with stale-fence
-rejection. Worker transport integration, grouping/rate limiting, and graceful
-shutdown remain active A5 work. JSONL paths remain operator supplied and are not
+rejection. The worker reuses hardened HTTPS/HMAC dispatch with per-hook derived
+private secret files, a global tick cap, per-group deferral, five-minute repeat
+suppression, bounded retry, typed preflight failure, and graceful drain/restart.
+The final A5 acceptance audit remains active work. JSONL paths remain operator supplied and are not
 persisted for daemon selection.
 Schema 22 delivery queue persistence is published in pull request `#92`.
 Atomic delivery queue writers are published in pull request `#93`.

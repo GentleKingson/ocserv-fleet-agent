@@ -473,6 +473,8 @@ target/debug/ocfleet alert hook add-webhook \
   --host-allow alerts.example.com
 target/debug/ocfleet alert hook list --json
 target/debug/ocfleet alert deliver --hook webhook:<hook-id> --limit 100 --dry-run
+target/debug/ocfleet alert worker run --hmac-secret-dir ./webhook-secrets --json
+target/debug/ocfleet alert worker daemon --hmac-secret-dir ./webhook-secrets --interval-seconds 60
 target/debug/ocfleet retention show
 target/debug/ocfleet retention explain --scope observations --json
 target/debug/ocfleet retention apply \

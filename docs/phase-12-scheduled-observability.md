@@ -512,6 +512,8 @@ ocfleet alert hook list --json
 ocfleet alert hook test <hook-id> --dry-run --hmac-secret-file ./webhook.secret
 ocfleet alert deliver --hook webhook:<hook-id> --limit 100 --dry-run
 ocfleet alert deliver --hook webhook:<hook-id> --limit 100 --hmac-secret-file ./webhook.secret
+ocfleet alert worker run --hmac-secret-dir ./webhook-secrets --json
+ocfleet alert worker daemon --hmac-secret-dir ./webhook-secrets --interval-seconds 60
 ocfleet alert silence <dedupe-key> --for-duration 24h --reason "maintenance"
 ocfleet alert resolve <dedupe-key> --reason "certificate renewed"
 ```
@@ -527,6 +529,17 @@ attempts, public resolved IPs, and disabled redirects. These commands must not
 call agents, expand shell syntax, execute local scripts, or perform remediation.
 See `docs/alert-delivery-jsonl.md` for the JSONL payload schema and
 `docs/alert-webhook.md` for webhook signing and SSRF boundaries.
+
+The automatic worker evaluates current controller-local signals, enqueues one
+idempotent alert/hook version, and sends at most the configured bounded number
+per tick. Each secret is the private `<hook-id>.key` file beneath the one
+operator-supplied directory. Dispatch reloads and revalidates the persisted
+hook, HTTPS public endpoint, allowlist, and HMAC key ID before every request.
+The worker permits at most three deliveries from one severity/reason group per
+tick, defers excess work without consuming an attempt, and suppresses repeated
+successful notifications for five minutes. Retry backoff is durable and bounded;
+SIGINT/SIGTERM drains the current synchronous attempt before exit. JSONL paths
+remain manual and are never selected by the worker.
 
 ### Audit Export
 

@@ -1,11 +1,12 @@
 use clap::{CommandFactory, Parser};
 use ocfleet_cli::args::{
-    AlertCommand, AlertHookCommand, AlertSeverity, AlertState, AuditCommand, AuditExportFormat,
-    Cli, Command, EndpointCommand, EnrollCommand, EnrollRequestCommand, EnrollTokenCommand,
-    HealthCommand, HealthEvaluatorCommand, HealthPolicyCommand, HealthSnapshotCommand, NodeCommand,
-    ObservationCommand, OcservCommand, OcservSessionsCommand, ProbeCommand, RedactionMode,
-    RetentionCommand, RetentionScope, ScheduleCommand, ScheduleJobCommand, ScheduleJobKind,
-    ScheduleRunCommand, TrustCommand, TrustDiffFormat, TrustPolicyDiffFormat,
+    AlertCommand, AlertHookCommand, AlertSeverity, AlertState, AlertWorkerCommand, AuditCommand,
+    AuditExportFormat, Cli, Command, EndpointCommand, EnrollCommand, EnrollRequestCommand,
+    EnrollTokenCommand, HealthCommand, HealthEvaluatorCommand, HealthPolicyCommand,
+    HealthSnapshotCommand, NodeCommand, ObservationCommand, OcservCommand, OcservSessionsCommand,
+    ProbeCommand, RedactionMode, RetentionCommand, RetentionScope, ScheduleCommand,
+    ScheduleJobCommand, ScheduleJobKind, ScheduleRunCommand, TrustCommand, TrustDiffFormat,
+    TrustPolicyDiffFormat,
 };
 use std::path::PathBuf;
 
@@ -195,6 +196,54 @@ fn parses_alert_deliver_command() {
     assert_eq!(limit, 25);
     assert!(dry_run);
     assert!(hmac_secret_file.is_none());
+}
+
+#[test]
+fn parses_alert_worker_commands() {
+    let cli = Cli::parse_from([
+        "ocfleet",
+        "alert",
+        "worker",
+        "run",
+        "--hmac-secret-dir",
+        "/run/ocfleet-alert-secrets",
+        "--max-deliveries",
+        "25",
+        "--json",
+    ]);
+    assert!(matches!(
+        cli.command,
+        Command::Alert {
+            command: AlertCommand::Worker {
+                command: AlertWorkerCommand::Run {
+                    max_deliveries: 25,
+                    json: true,
+                    ..
+                }
+            }
+        }
+    ));
+    let cli = Cli::parse_from([
+        "ocfleet",
+        "alert",
+        "worker",
+        "daemon",
+        "--hmac-secret-dir",
+        "/run/ocfleet-alert-secrets",
+        "--interval-seconds",
+        "30",
+    ]);
+    assert!(matches!(
+        cli.command,
+        Command::Alert {
+            command: AlertCommand::Worker {
+                command: AlertWorkerCommand::Daemon {
+                    interval_seconds: 30,
+                    ..
+                }
+            }
+        }
+    ));
 }
 
 #[test]

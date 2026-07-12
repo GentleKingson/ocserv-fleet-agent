@@ -8,6 +8,8 @@
   idempotency, grouping, retry, dead-letter, and terminal-state metadata.
 - Alert delivery queue writers atomically audit idempotent enqueue, deterministic
   claim/renewal, bounded expiry recovery, attempt history, retry/DLQ, and success.
+- An automatic webhook worker adds deterministic enqueue, hardened HMAC dispatch,
+  global and per-group rate limits, repeat suppression, and graceful restart.
 - A4 completion inventory mapping independent health evaluation, recovery,
   compatibility, and security requirements to exact evidence.
 - Schema 21 adds bounded durable health evaluation run metadata keyed by input

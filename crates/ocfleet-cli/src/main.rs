@@ -393,7 +393,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Alert { command } => {
             let store = Store::open(&cli.database).context("failed to open controller database")?;
-            run_alert_command(&store, command)?;
+            run_alert_command(&store, command).await?;
         }
     }
 

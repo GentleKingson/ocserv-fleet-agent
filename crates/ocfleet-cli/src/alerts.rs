@@ -88,6 +88,13 @@ pub async fn run_alert_command(store: &Store, command: AlertCommand) -> anyhow::
             run_alert_resolve(store, &dedupe_key, &reason)
         }
         AlertCommand::Worker { command } => run_alert_worker_command(store, command).await,
+        AlertCommand::DeliveryDaemon {
+            hmac_secret_dir,
+            interval_seconds,
+            max_deliveries,
+        } => {
+            run_alert_worker_daemon(store, &hmac_secret_dir, interval_seconds, max_deliveries).await
+        }
     }
 }
 
@@ -132,29 +139,74 @@ async fn run_alert_worker_command(
             interval_seconds,
             max_deliveries,
         } => {
-            if !(10..=3_600).contains(&interval_seconds) {
-                anyhow::bail!("--interval-seconds must be between 10 and 3600");
-            }
-            validate_alert_worker_max_deliveries(max_deliveries)?;
-            let sender = ReqwestWebhookSender::new()?;
-            let shutdown = alert_worker_shutdown_signal();
-            tokio::pin!(shutdown);
-            loop {
-                run_alert_worker_once_with_sender(
-                    store,
-                    &hmac_secret_dir,
-                    max_deliveries,
-                    &sender,
-                )?;
-                tokio::select! {
-                    _ = tokio::time::sleep(StdDuration::from_secs(interval_seconds)) => {}
-                    _ = &mut shutdown => break,
-                }
-            }
-            println!("status=stopped");
-            Ok(())
+            run_alert_worker_daemon(store, &hmac_secret_dir, interval_seconds, max_deliveries).await
+        }
+        AlertWorkerCommand::Status { json } => run_alert_worker_status(store, json),
+    }
+}
+
+async fn run_alert_worker_daemon(
+    store: &Store,
+    hmac_secret_dir: &Path,
+    interval_seconds: u64,
+    max_deliveries: usize,
+) -> anyhow::Result<()> {
+    if !(10..=3_600).contains(&interval_seconds) {
+        anyhow::bail!("--interval-seconds must be between 10 and 3600");
+    }
+    validate_alert_worker_max_deliveries(max_deliveries)?;
+    let sender = ReqwestWebhookSender::new()?;
+    let shutdown = alert_worker_shutdown_signal();
+    tokio::pin!(shutdown);
+    loop {
+        run_alert_worker_once_with_sender(store, hmac_secret_dir, max_deliveries, &sender)?;
+        tokio::select! {
+            _ = tokio::time::sleep(StdDuration::from_secs(interval_seconds)) => {}
+            _ = &mut shutdown => break,
         }
     }
+    println!("status=stopped");
+    Ok(())
+}
+
+fn run_alert_worker_status(store: &Store, json_output: bool) -> anyhow::Result<()> {
+    let generated_at = now_rfc3339();
+    let health = store.alert_delivery_queue_health(&generated_at)?;
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "generated_at": generated_at,
+                "pending": health.pending,
+                "claimed": health.claimed,
+                "retry": health.retry,
+                "dead_letter": health.dead_letter,
+                "succeeded": health.succeeded,
+                "due": health.due,
+                "expired_claims": health.expired_claims,
+                "oldest_due_at": health.oldest_due_at,
+                "last_attempt_at": health.last_attempt_at,
+            }))?
+        );
+    } else {
+        println!("generated_at={generated_at}");
+        println!("pending={}", health.pending);
+        println!("claimed={}", health.claimed);
+        println!("retry={}", health.retry);
+        println!("dead_letter={}", health.dead_letter);
+        println!("succeeded={}", health.succeeded);
+        println!("due={}", health.due);
+        println!("expired_claims={}", health.expired_claims);
+        println!(
+            "oldest_due_at={}",
+            health.oldest_due_at.as_deref().unwrap_or("none")
+        );
+        println!(
+            "last_attempt_at={}",
+            health.last_attempt_at.as_deref().unwrap_or("none")
+        );
+    }
+    Ok(())
 }
 
 pub fn run_alert_worker_once_with_sender(
@@ -556,7 +608,23 @@ fn run_alert_hook_command(store: &Store, command: AlertHookCommand) -> anyhow::R
             dry_run,
             hmac_secret_file,
         } => run_alert_hook_test(store, &hook_id, dry_run, hmac_secret_file.as_deref()),
+        AlertHookCommand::Enable { hook_id } => run_alert_hook_enabled(store, &hook_id, true),
+        AlertHookCommand::Disable { hook_id } => run_alert_hook_enabled(store, &hook_id, false),
     }
+}
+
+fn run_alert_hook_enabled(store: &Store, hook_id: &str, enabled: bool) -> anyhow::Result<()> {
+    let changed = StoreWriter::write_alert_webhook_hook_enabled(
+        store,
+        hook_id,
+        enabled,
+        &now_rfc3339(),
+        &local_actor(),
+    )?;
+    println!("hook_id={hook_id}");
+    println!("enabled={enabled}");
+    println!("changed={changed}");
+    Ok(())
 }
 
 fn run_alert_hook_add_webhook(

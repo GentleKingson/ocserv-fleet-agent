@@ -174,6 +174,13 @@ pub trait StoreWriter {
         hook: &AlertWebhookHookRecord,
         actor: &str,
     ) -> Result<(), Self::Error>;
+    fn write_alert_webhook_hook_enabled(
+        &self,
+        hook_id: &str,
+        enabled: bool,
+        updated_at: &str,
+        actor: &str,
+    ) -> Result<bool, Self::Error>;
     fn write_alert_delivery_attempt(
         &self,
         write: &AlertDeliveryAttemptWrite,
@@ -587,6 +594,16 @@ impl StoreWriter for Store {
         actor: &str,
     ) -> Result<(), Self::Error> {
         Store::write_alert_webhook_hook_create(self, hook, actor)
+    }
+
+    fn write_alert_webhook_hook_enabled(
+        &self,
+        hook_id: &str,
+        enabled: bool,
+        updated_at: &str,
+        actor: &str,
+    ) -> Result<bool, Self::Error> {
+        Store::write_alert_webhook_hook_enabled(self, hook_id, enabled, updated_at, actor)
     }
 
     fn write_alert_delivery_attempt(

@@ -79,7 +79,7 @@ scaffold, implemented slice, operational maturity, and release verification.
 
 ## Execution DAG
 
-The current execution node is **A5** on issue `#37`. A1 through A4 are
+The current execution node is the **A5 completion audit** on issue `#37`. A1 through A4 are
 operationally mature for the current production controller mutation, storage,
 and scheduler reliability inventories. The node-lifecycle slice
 merged through pull request `#57`, the scheduler-job configuration slice merged
@@ -266,10 +266,13 @@ success, attempt-history, and audit writers are implemented with stale-fence
 rejection. The worker reuses hardened HTTPS/HMAC dispatch with per-hook derived
 private secret files, a global tick cap, per-group deferral, five-minute repeat
 suppression, bounded retry, typed preflight failure, and graceful drain/restart.
-The final A5 acceptance audit remains active work. JSONL paths remain operator supplied and are not
+The final A5 acceptance audit adds per-hook enable/disable, delivery health,
+the required `alert delivery-daemon` compatibility spelling, and the evidence
+inventory. JSONL paths remain operator supplied and are not
 persisted for daemon selection.
 Schema 22 delivery queue persistence is published in pull request `#92`.
 Atomic delivery queue writers are published in pull request `#93`.
+The automatic delivery worker is published in pull request `#94`.
 
 ### Baseline And Production Foundation
 
@@ -280,7 +283,7 @@ Atomic delivery queue writers are published in pull request `#93`.
 | A2 Typed versioned storage | `#34` | operationally mature | A1 | `v0.2.x` | New writes use closed, versioned payload types; legacy rows migrate or fail closed after private backup; contaminated fixtures cover oversize, unknown, secret-like, address, nesting, version, relationship, and method failures; CLI/API never expose raw persisted JSON. `docs/a2-storage-inventory.md` enumerates every requested family and its evidence. |
 | A3 Scheduler reliability | `#35` | operationally mature | A1, A2 | `v0.3.0` | SQLite lease, fencing, deterministic claim, bounded retry/backoff, misfire, jitter, timeout, recovery, maintenance, concurrency, budget, and shutdown semantics pass competing-instance, crash, skew, and duplicate-suppression tests. `docs/a3-scheduler-reliability-inventory.md` records the completion evidence. |
 | A4 Independent health evaluator | `#36` | operationally mature | A1, A2, A3 | `v0.3.0` | Idempotent evaluation runs record watermark, policy/computation versions, snapshots, and failures without agent RPC or trust/node/scheduler mutation; recovery and shutdown tests pass; dashboard freshness no longer depends on an interactive health command. `docs/a4-health-evaluator-inventory.md` records the completion evidence. |
-| A5 Safe alert delivery worker | `#37` | implemented slice | A1, A2, A3, A4 | `v0.3.0` | Fixed JSONL/HTTPS queues support claim, bounded retry, dead-letter, recovery, grouping, rate limit, idempotency, history, and shutdown. SSRF, HMAC, no-redirect, secret-redaction, and forbidden command/script/template tests pass. |
+| A5 Safe alert delivery worker | `#37` | completion audit active | A1, A2, A3, A4 | `v0.3.0` | Fixed JSONL/HTTPS delivery supports per-hook control, claim, bounded retry, dead-letter, recovery, grouping, rate limit, delivery health, idempotency, history, and shutdown. SSRF, HMAC, no-redirect, secret-redaction, and forbidden command/script/template tests pass. `docs/a5-alert-delivery-inventory.md` records the completion evidence. |
 | A6 Backup, restore, and disaster recovery | `#38` | implemented slice | A1, A2 | `v0.3.0` | Create/list/verify/inspect and plan/apply workflows use private artifacts, checksums and optional signatures; restore checks schema, integrity, controller identity and WAL/SHM, backs up before overwrite, replaces atomically, rolls back on failure, and passes a restore drill. |
 | A7 Low-cardinality metrics | `#39` | scaffold | A3, A4, A5 | `v0.3.0` | Agent/controller Prometheus or OpenTelemetry metrics have documented sensitivity and cardinality; labels are fixed and bounded; non-loopback exposure is authenticated or explicitly protected; metric tests reject identity/request/session/address labels. |
 | A8 Supply-chain and release hardening | `#40` | implemented slice | N0; final verification after A1-A7 | `v0.2.x` and every later release | Fuzzing, migration corpus, failure injection, browser E2E, SBOM, provenance, artifact signing, verification tooling, upgrade/rollback matrix, support policy, distro smoke, Linux architectures, CodeQL, dependency policy, and rollback runbook pass without weakening pinned actions or least privilege. |

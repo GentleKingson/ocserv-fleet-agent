@@ -12,8 +12,10 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
 use crate::CLI_VERSION;
-use crate::args::BackupCommand;
+use crate::args::{BackupCommand, RestoreCommand};
+use crate::audit::AuditEvent;
 use crate::identity::load_secret_key;
+use crate::input_validation::local_actor;
 use crate::migrations::{read_schema_version, run_sqlite_backup, sha256_file_hex};
 use crate::private_file;
 use crate::store::CURRENT_SCHEMA_VERSION;
@@ -58,6 +60,35 @@ pub struct BackupVerification {
     pub checksum_ok: bool,
     pub signature_present: bool,
     pub signature_ok: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RestorePlan {
+    pub backup_id: String,
+    pub source_database: String,
+    pub target_database: String,
+    pub schema_version: i64,
+    pub checksum_ok: bool,
+    pub integrity_ok: bool,
+    pub signature_present: bool,
+    pub identity_match: bool,
+    pub target_exists: bool,
+    pub target_wal_exists: bool,
+    pub target_shm_exists: bool,
+    pub requires_confirmation: bool,
+    pub will_prebackup_existing: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RestoreResult {
+    pub backup_id: String,
+    pub restored_database: String,
+    pub prebackup_manifest: Option<String>,
+    pub removed_stale_wal: bool,
+    pub removed_stale_shm: bool,
+    pub checksum_ok: bool,
+    pub integrity_ok: bool,
+    pub identity_match: bool,
 }
 
 pub fn run_backup_command(
@@ -113,6 +144,240 @@ pub fn run_backup_command(
             print_manifest(&manifest, json)
         }
     }
+}
+
+pub fn run_restore_command(
+    database: &Path,
+    secret_key: &Path,
+    command: RestoreCommand,
+) -> anyhow::Result<()> {
+    match command {
+        RestoreCommand::Plan { manifest, json } => {
+            let plan = plan_restore(database, secret_key, &manifest)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&plan)?);
+            } else {
+                println!("backup_id={}", plan.backup_id);
+                println!("source_database={}", plan.source_database);
+                println!("target_database={}", plan.target_database);
+                println!("schema_version={}", plan.schema_version);
+                println!("checksum_ok={}", plan.checksum_ok);
+                println!("integrity_ok={}", plan.integrity_ok);
+                println!("signature_present={}", plan.signature_present);
+                println!("identity_match={}", plan.identity_match);
+                println!("target_exists={}", plan.target_exists);
+                println!("target_wal_exists={}", plan.target_wal_exists);
+                println!("target_shm_exists={}", plan.target_shm_exists);
+                println!("requires_confirmation={}", plan.requires_confirmation);
+                println!("will_prebackup_existing={}", plan.will_prebackup_existing);
+            }
+            Ok(())
+        }
+        RestoreCommand::Apply {
+            manifest,
+            yes,
+            json,
+        } => {
+            let result = apply_restore(database, secret_key, &manifest, yes)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!("backup_id={}", result.backup_id);
+                println!("restored_database={}", result.restored_database);
+                println!(
+                    "prebackup_manifest={}",
+                    result.prebackup_manifest.as_deref().unwrap_or("none")
+                );
+                println!("removed_stale_wal={}", result.removed_stale_wal);
+                println!("removed_stale_shm={}", result.removed_stale_shm);
+                println!("checksum_ok={}", result.checksum_ok);
+                println!("integrity_ok={}", result.integrity_ok);
+                println!("identity_match={}", result.identity_match);
+            }
+            Ok(())
+        }
+    }
+}
+
+pub fn plan_restore(
+    database: &Path,
+    secret_key_path: &Path,
+    manifest_path: &Path,
+) -> anyhow::Result<RestorePlan> {
+    let verification = verify_backup(manifest_path)?;
+    if verification.manifest.schema_version != CURRENT_SCHEMA_VERSION {
+        bail!(
+            "restore requires current schema version {CURRENT_SCHEMA_VERSION}, backup has {}",
+            verification.manifest.schema_version
+        );
+    }
+    let secret_key = load_secret_key(secret_key_path, true)
+        .context("failed to load controller identity for restore binding")?;
+    let identity_match =
+        secret_key.public().to_string() == verification.manifest.expected_controller_endpoint_id;
+    let target_exists = database.exists();
+    if target_exists {
+        private_file::validate_existing_private_file(database)
+            .context("restore target database must be a private regular file")?;
+    }
+    let wal = sqlite_sidecar_path(database, "wal");
+    let shm = sqlite_sidecar_path(database, "shm");
+    let source_database = backup_database_path(manifest_path, &verification.manifest)
+        .to_string_lossy()
+        .into_owned();
+    Ok(RestorePlan {
+        backup_id: verification.manifest.backup_id,
+        source_database,
+        target_database: database.to_string_lossy().into_owned(),
+        schema_version: verification.manifest.schema_version,
+        checksum_ok: verification.checksum_ok,
+        integrity_ok: verification.integrity_ok,
+        signature_present: verification.signature_present,
+        identity_match,
+        target_exists,
+        target_wal_exists: wal.exists(),
+        target_shm_exists: shm.exists(),
+        requires_confirmation: true,
+        will_prebackup_existing: target_exists,
+    })
+}
+
+pub fn apply_restore(
+    database: &Path,
+    secret_key_path: &Path,
+    manifest_path: &Path,
+    yes: bool,
+) -> anyhow::Result<RestoreResult> {
+    apply_restore_inner(database, secret_key_path, manifest_path, yes, |_| Ok(()))
+}
+
+fn apply_restore_inner<F>(
+    database: &Path,
+    secret_key_path: &Path,
+    manifest_path: &Path,
+    yes: bool,
+    after_replace: F,
+) -> anyhow::Result<RestoreResult>
+where
+    F: FnOnce(&Path) -> anyhow::Result<()>,
+{
+    if !yes {
+        bail!("restore apply requires explicit --yes confirmation");
+    }
+    let plan = plan_restore(database, secret_key_path, manifest_path)?;
+    if !plan.identity_match {
+        bail!("backup controller EndpointID does not match the current controller identity");
+    }
+    let verification = verify_backup(manifest_path)?;
+    let source_database = backup_database_path(manifest_path, &verification.manifest);
+    let parent = database.parent().unwrap_or_else(|| Path::new("."));
+    private_file::validate_existing_private_directory_strict(parent)
+        .context("restore target directory must be owned, non-symlink, and mode 0700")?;
+    let operation_id = Uuid::new_v4().simple().to_string();
+    let stage_path = parent.join(format!(".ocfleet-restore-{operation_id}.sqlite"));
+    let rollback_path = parent.join(format!(".ocfleet-restore-rollback-{operation_id}.sqlite"));
+    let target_wal = sqlite_sidecar_path(database, "wal");
+    let target_shm = sqlite_sidecar_path(database, "shm");
+    let rollback_wal = sqlite_sidecar_path(&rollback_path, "wal");
+    let rollback_shm = sqlite_sidecar_path(&rollback_path, "shm");
+    let lock_path = parent.join(format!(
+        ".ocfleet-restore-{}.lock",
+        database_file_token(database)
+    ));
+    let lock = private_file::open_private_create_new_strict(&lock_path)
+        .context("another restore may already be active")?;
+    lock.sync_all()?;
+
+    let mut prebackup_manifest = None;
+    let result = (|| -> anyhow::Result<RestoreResult> {
+        if plan.target_exists {
+            let prebackup_dir = parent.join(".ocfleet-pre-restore-backups");
+            private_file::ensure_private_parent(&prebackup_dir.join("placeholder"))?;
+            private_file::validate_existing_private_directory_strict(&prebackup_dir)?;
+            let prebackup = create_backup(database, secret_key_path, &prebackup_dir, None)
+                .context("failed to back up existing database before restore")?;
+            prebackup_manifest = Some(
+                prebackup_dir
+                    .join(format!("{}.manifest.json", prebackup.backup_id))
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+
+        copy_private_file(&source_database, &stage_path)?;
+        append_restore_audit(&stage_path, &verification.manifest, &local_actor())?;
+        validate_sqlite_integrity(&stage_path)?;
+        let staged = Connection::open_with_flags(&stage_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        if read_schema_version(&staged)? != CURRENT_SCHEMA_VERSION {
+            bail!("staged restore database schema changed during copy");
+        }
+        drop(staged);
+
+        let move_result = (|| -> anyhow::Result<()> {
+            if plan.target_exists {
+                fs::rename(database, &rollback_path)?;
+            }
+            if target_wal.exists() {
+                fs::rename(&target_wal, &rollback_wal)?;
+            }
+            if target_shm.exists() {
+                fs::rename(&target_shm, &rollback_shm)?;
+            }
+            fs::rename(&stage_path, database)?;
+            Ok(())
+        })();
+        if let Err(error) = move_result {
+            restore_original_files(
+                database,
+                &rollback_path,
+                &target_wal,
+                &rollback_wal,
+                &target_shm,
+                &rollback_shm,
+            )?;
+            sync_directory(parent)?;
+            return Err(error.context("restore replacement failed; original state restored"));
+        }
+        let verify_result = (|| -> anyhow::Result<()> {
+            sync_directory(parent)?;
+            after_replace(database)?;
+            validate_sqlite_integrity(database)?;
+            let restored = Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            if read_schema_version(&restored)? != CURRENT_SCHEMA_VERSION {
+                bail!("restored database schema verification failed");
+            }
+            Ok(())
+        })();
+        if let Err(error) = verify_result {
+            restore_original_files(
+                database,
+                &rollback_path,
+                &target_wal,
+                &rollback_wal,
+                &target_shm,
+                &rollback_shm,
+            )?;
+            sync_directory(parent)?;
+            return Err(error.context("restore failed after replacement; original state restored"));
+        }
+        let _ = fs::remove_file(&rollback_path);
+        let removed_stale_wal = remove_if_exists(&rollback_wal)?;
+        let removed_stale_shm = remove_if_exists(&rollback_shm)?;
+        sync_directory(parent)?;
+        Ok(RestoreResult {
+            backup_id: verification.manifest.backup_id,
+            restored_database: database.to_string_lossy().into_owned(),
+            prebackup_manifest: prebackup_manifest.clone(),
+            removed_stale_wal,
+            removed_stale_shm,
+            checksum_ok: true,
+            integrity_ok: true,
+            identity_match: true,
+        })
+    })();
+    let _ = fs::remove_file(&stage_path);
+    let _ = fs::remove_file(&lock_path);
+    result
 }
 
 pub fn create_backup(
@@ -227,7 +492,7 @@ pub fn verify_backup(manifest_path: &Path) -> anyhow::Result<BackupVerification>
     let parent = manifest_path.parent().unwrap_or_else(|| Path::new("."));
     private_file::validate_existing_private_directory_strict(parent)
         .context("backup directory must be owned, non-symlink, and mode 0700")?;
-    let database_path = parent.join(&manifest.database_file);
+    let database_path = backup_database_path(manifest_path, &manifest);
     private_file::validate_existing_private_file(&database_path)
         .context("backup database is not private")?;
     let actual_bytes = fs::metadata(&database_path)?.len();
@@ -267,6 +532,107 @@ fn read_manifest(path: &Path) -> anyhow::Result<BackupManifest> {
         serde_json::from_slice(&bytes).context("backup manifest is invalid")?;
     validate_manifest(&manifest)?;
     Ok(manifest)
+}
+
+fn backup_database_path(manifest_path: &Path, manifest: &BackupManifest) -> PathBuf {
+    manifest_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(&manifest.database_file)
+}
+
+fn append_restore_audit(
+    staged_database: &Path,
+    manifest: &BackupManifest,
+    actor: &str,
+) -> anyhow::Result<()> {
+    let connection = Connection::open(staged_database)?;
+    connection.pragma_update(None, "journal_mode", "DELETE")?;
+    drop(connection);
+    let store = crate::store::Store::open(staged_database)?;
+    let mut event = AuditEvent::new(actor, "controller.restore.apply");
+    event.ok = Some(true);
+    event.request_id = Some(manifest.backup_id.clone());
+    event.params_hash = Some(
+        blake3::hash(
+            format!(
+                "{}:{}:{}",
+                manifest.backup_id,
+                manifest.database_sha256,
+                manifest.expected_controller_endpoint_id
+            )
+            .as_bytes(),
+        )
+        .to_hex()
+        .to_string(),
+    );
+    event.detail_json = json!({
+        "actor_type": "user",
+        "target_type": "controller_backup",
+        "target_id": manifest.backup_id,
+        "schema_version": manifest.schema_version,
+        "reason": "explicit restore apply",
+    });
+    store.insert_audit(&event)?;
+    drop(store);
+    fs::OpenOptions::new()
+        .read(true)
+        .open(staged_database)?
+        .sync_all()?;
+    Ok(())
+}
+
+fn sqlite_sidecar_path(database: &Path, suffix: &str) -> PathBuf {
+    let mut value = database.as_os_str().to_os_string();
+    value.push(format!("-{suffix}"));
+    PathBuf::from(value)
+}
+
+fn database_file_token(database: &Path) -> String {
+    let name = database
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("controller.sqlite");
+    blake3::hash(name.as_bytes()).to_hex()[..16].to_string()
+}
+
+fn copy_private_file(source: &Path, destination: &Path) -> anyhow::Result<()> {
+    let mut source = private_file::open_existing_private_read(source)?;
+    let mut destination = private_file::open_private_create_new_strict(destination)?;
+    std::io::copy(&mut source, &mut destination)?;
+    destination.sync_all()?;
+    Ok(())
+}
+
+fn remove_if_exists(path: &Path) -> anyhow::Result<bool> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn restore_original_files(
+    database: &Path,
+    rollback_database: &Path,
+    target_wal: &Path,
+    rollback_wal: &Path,
+    target_shm: &Path,
+    rollback_shm: &Path,
+) -> anyhow::Result<()> {
+    let _ = remove_if_exists(database)?;
+    if rollback_database.exists() {
+        fs::rename(rollback_database, database)?;
+    }
+    if rollback_wal.exists() {
+        let _ = remove_if_exists(target_wal)?;
+        fs::rename(rollback_wal, target_wal)?;
+    }
+    if rollback_shm.exists() {
+        let _ = remove_if_exists(target_shm)?;
+        fs::rename(rollback_shm, target_shm)?;
+    }
+    Ok(())
 }
 
 fn validate_manifest(manifest: &BackupManifest) -> anyhow::Result<()> {
@@ -455,4 +821,59 @@ fn print_verification(verification: &BackupVerification, json_output: bool) -> a
         );
     }
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::backend::StoreWriter;
+    use crate::identity::load_or_create_secret_key;
+    use crate::store::{NodeInsert, Store};
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn post_replace_failure_restores_original_database() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).expect("chmod temp dir");
+        let database = dir.path().join("controller.sqlite");
+        let secret = dir.path().join("controller.secret");
+        let backup_dir = dir.path().join("backups");
+        fs::create_dir(&backup_dir).expect("create backup dir");
+        fs::set_permissions(&backup_dir, fs::Permissions::from_mode(0o700))
+            .expect("chmod backup dir");
+        load_or_create_secret_key(&secret, true).expect("create identity");
+        let store = Store::open(&database).expect("create database");
+        let endpoint_id = iroh::SecretKey::generate().public().to_string();
+        StoreWriter::write_node_add(
+            &store,
+            &NodeInsert {
+                node_id: "rollback-node".to_string(),
+                endpoint_id,
+                name: "rollback-node".to_string(),
+                region: "test".to_string(),
+                role: "ocserv".to_string(),
+            },
+            "test-actor",
+        )
+        .expect("seed backup state");
+        drop(store);
+        let manifest = create_backup(&database, &secret, &backup_dir, None).expect("create backup");
+        let manifest_path = backup_dir.join(format!("{}.manifest.json", manifest.backup_id));
+        let store = Store::open(&database).expect("open live database");
+        StoreWriter::write_node_disable(&store, "rollback-node", "test-actor")
+            .expect("mutate original");
+        drop(store);
+
+        let error = apply_restore_inner(&database, &secret, &manifest_path, true, |_| {
+            bail!("injected post-replace failure")
+        })
+        .expect_err("injected failure must roll back");
+        assert!(error.to_string().contains("original state restored"));
+        let node = Store::open(&database)
+            .expect("open rolled back database")
+            .get_node("rollback-node")
+            .expect("read rolled back node")
+            .expect("node exists");
+        assert!(!node.enabled);
+    }
 }

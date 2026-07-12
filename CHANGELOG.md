@@ -6,6 +6,8 @@
 
 - Controller backup create/list/verify/inspect commands use SQLite online backup,
   private artifacts, identity-bound manifests, SHA-256, and optional Ed25519 signatures.
+- Restore plan/apply verifies backup identity, schema, integrity and checksum,
+  pre-backs up live state, atomically replaces SQLite, handles WAL/SHM, and rolls back failures.
 - Schema 22 adds a bounded fenced automatic alert delivery queue with durable
   idempotency, grouping, retry, dead-letter, and terminal-state metadata.
 - Alert delivery queue writers atomically audit idempotent enqueue, deterministic

@@ -4,9 +4,9 @@ use ocfleet_cli::args::{
     AuditExportFormat, BackupCommand, Cli, Command, EndpointCommand, EnrollCommand,
     EnrollRequestCommand, EnrollTokenCommand, HealthCommand, HealthEvaluatorCommand,
     HealthPolicyCommand, HealthSnapshotCommand, NodeCommand, ObservationCommand, OcservCommand,
-    OcservSessionsCommand, ProbeCommand, RedactionMode, RetentionCommand, RetentionScope,
-    ScheduleCommand, ScheduleJobCommand, ScheduleJobKind, ScheduleRunCommand, TrustCommand,
-    TrustDiffFormat, TrustPolicyDiffFormat,
+    OcservSessionsCommand, ProbeCommand, RedactionMode, RestoreCommand, RetentionCommand,
+    RetentionScope, ScheduleCommand, ScheduleJobCommand, ScheduleJobKind, ScheduleRunCommand,
+    TrustCommand, TrustDiffFormat, TrustPolicyDiffFormat,
 };
 use std::path::PathBuf;
 
@@ -52,6 +52,43 @@ fn parses_backup_commands() {
         ])
         .expect("parse backup manifest command");
     }
+}
+
+#[test]
+fn parses_restore_commands() {
+    let plan = Cli::parse_from([
+        "ocfleet",
+        "restore",
+        "plan",
+        "--manifest",
+        "backup.manifest.json",
+        "--json",
+    ]);
+    assert!(matches!(
+        plan.command,
+        Command::Restore {
+            command: RestoreCommand::Plan { json: true, .. }
+        }
+    ));
+    let apply = Cli::parse_from([
+        "ocfleet",
+        "restore",
+        "apply",
+        "--manifest",
+        "backup.manifest.json",
+        "--yes",
+        "--json",
+    ]);
+    assert!(matches!(
+        apply.command,
+        Command::Restore {
+            command: RestoreCommand::Apply {
+                yes: true,
+                json: true,
+                ..
+            }
+        }
+    ));
 }
 
 #[test]

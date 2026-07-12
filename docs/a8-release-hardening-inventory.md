@@ -9,7 +9,7 @@ repository contains automated evidence and the release path verifies it.
 | Protocol/frame/config fuzzing | `fuzz/` contains bounded libFuzzer targets and seed corpora; `.github/workflows/fuzz.yml` runs both with pinned `cargo-fuzz`. | complete |
 | Migration corpus | `crates/ocfleet-cli/tests/migration_tests.rs` constructs legacy schemas and contamination cases, but versioned binary corpus artifacts and a corpus manifest remain to be audited. | active |
 | Failure injection | Scheduler, evaluator, alert delivery, audit spool, migration, and restore suites contain targeted injected failures; a requirement-to-test inventory remains. | active |
-| Browser dashboard E2E | No Playwright workflow currently exercises the dashboard. | missing |
+| Browser dashboard E2E | `tests/e2e/dashboard.spec.js` verifies desktop/narrow rendering, CSP, refresh, audit preview, empty states, console cleanliness, and GET-only traffic in Chromium; `.github/workflows/browser-e2e.yml` runs it. | complete |
 | SBOM | Release workflow does not yet generate or verify an SBOM. | missing |
 | Provenance | Release workflow is tag-bound and checksum-verified but does not emit attestations. | missing |
 | Artifact signing and verification | Backup/audit signatures exist, but release artifacts are not signed and independently verified. | missing |

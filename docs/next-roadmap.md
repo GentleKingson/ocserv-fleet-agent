@@ -292,6 +292,7 @@ the existing read-only API `/metrics` route. Scrapes share loopback-default and
 non-loopback bearer protection, use fixed aggregate SQLite reads, and prohibit
 identity, request, session, address, token, path, and other data-derived labels.
 Agent runtime instrumentation and exposition remain subsequent A7 work.
+The controller metrics foundation is published in pull request `#99`.
 
 ### Baseline And Production Foundation
 

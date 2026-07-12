@@ -275,6 +275,11 @@ Atomic delivery queue writers are published in pull request `#93`.
 The automatic delivery worker is published in pull request `#94`.
 The A5 acceptance completion audit is published in pull request `#95`.
 
+The first A6 slice adds managed SQLite online backup create/list/verify/inspect,
+closed identity-bound manifests, private artifacts, SHA-256 integrity, and
+optional Ed25519 signatures in pull request `#96`. Restore plan/apply and the
+automated restore drill remain active work.
+
 ### Baseline And Production Foundation
 
 | ID | Issue | Status | Depends on | Release target | Acceptance and required evidence |

@@ -311,6 +311,12 @@ test evidence. It confirms that no identity, request, session, or address value
 is a label and that scrapes cannot mutate controller state.
 The A7 acceptance completion audit is published in pull request `#102`.
 
+The first A8 completion slice adds bounded protocol/frame/config libFuzzer
+targets, curated seeds, and a least-privilege workflow with pinned toolchains.
+The live A8 inventory records completed evidence and the remaining browser,
+SBOM, provenance, signing, policy, and rollback gaps. This slice is published in
+pull request `#103`.
+
 ### Baseline And Production Foundation
 
 | ID | Issue | Status | Depends on | Release target | Acceptance and required evidence |

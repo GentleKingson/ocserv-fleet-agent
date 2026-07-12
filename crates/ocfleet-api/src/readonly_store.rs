@@ -1,3 +1,4 @@
+use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -24,6 +25,22 @@ pub struct ReadOnlyStore {
 pub struct NodeHealthRecord {
     pub node: NodeRecord,
     pub snapshot: Option<HealthSnapshotRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControllerMetricsSnapshot {
+    pub scheduler_jobs_due: u64,
+    pub scheduler_claims_active: u64,
+    pub scheduler_runs: [u64; 4],
+    pub health_nodes: [u64; 4],
+    pub alerts: [u64; 3],
+    pub delivery_attempts: [u64; 2],
+    pub delivery_queue: [u64; 5],
+    pub rpc_calls: [u64; 2],
+    pub observations_total: u64,
+    pub observation_freshness_seconds: u64,
+    pub sqlite_bytes: u64,
+    pub audit_exports: [u64; 2],
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -78,6 +95,7 @@ pub trait ApiReadStore: Send + Sync {
         to: &str,
         limit: u64,
     ) -> rusqlite::Result<Vec<AuditRecord>>;
+    fn controller_metrics(&self, now: &str) -> rusqlite::Result<ControllerMetricsSnapshot>;
 }
 
 impl ReadOnlyStore {
@@ -151,6 +169,82 @@ impl ReadOnlyStore {
             node_health_from_row,
         )
         .optional()
+    }
+
+    pub fn controller_metrics(&self, now: &str) -> rusqlite::Result<ControllerMetricsSnapshot> {
+        let conn = self.open_conn()?;
+        let scheduler_jobs_due = count_where(
+            &conn,
+            "SELECT count(*) FROM observability_jobs WHERE enabled = 1 AND next_run_at <= ?1",
+            now,
+        )?;
+        let scheduler_claims_active = count_where(
+            &conn,
+            "SELECT count(*) FROM scheduler_job_claims WHERE owner_id IS NOT NULL AND lease_expires_at > ?1",
+            now,
+        )?;
+        let scheduler_runs = fixed_counts(
+            &conn,
+            "observability_runs",
+            "status",
+            &["running", "succeeded", "failed", "skipped"],
+        )?;
+        let health_nodes = fixed_counts(
+            &conn,
+            "health_snapshots",
+            "status",
+            &["healthy", "degraded", "unreachable", "unknown"],
+        )?;
+        let alerts = fixed_counts(
+            &conn,
+            "alert_events",
+            "state",
+            &["open", "silenced", "resolved"],
+        )?;
+        let delivery_attempts = fixed_counts(
+            &conn,
+            "alert_delivery_attempts",
+            "status",
+            &["succeeded", "failed"],
+        )?;
+        let delivery_queue = fixed_counts(
+            &conn,
+            "alert_delivery_queue",
+            "status",
+            &["pending", "claimed", "retry", "dead_letter", "succeeded"],
+        )?;
+        let rpc_calls = [
+            count_rpc_outcome(&conn, true)?,
+            count_rpc_outcome(&conn, false)?,
+        ];
+        let observations_total = count_all(&conn, "probe_observations")?;
+        let observation_freshness_seconds = conn.query_row(
+            "SELECT COALESCE(MAX(0, CAST((julianday(?1) - julianday(MAX(observed_at))) * 86400 AS INTEGER)), 0)
+             FROM probe_observations",
+            [now],
+            |row| i64_to_u64(row.get(0)?, 0),
+        )?;
+        let sqlite_bytes = fs::metadata(&self.database)
+            .map(|metadata| metadata.len())
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        let audit_exports = [
+            count_audit_event_outcome(&conn, "audit.export", true)?,
+            count_audit_event_outcome(&conn, "audit.export", false)?,
+        ];
+        Ok(ControllerMetricsSnapshot {
+            scheduler_jobs_due,
+            scheduler_claims_active,
+            scheduler_runs,
+            health_nodes,
+            alerts,
+            delivery_attempts,
+            delivery_queue,
+            rpc_calls,
+            observations_total,
+            observation_freshness_seconds,
+            sqlite_bytes,
+            audit_exports,
+        })
     }
 
     pub fn list_jobs(&self, limit: u64) -> rusqlite::Result<Vec<ObservabilityJobRecord>> {
@@ -411,6 +505,65 @@ impl ApiReadStore for ReadOnlyStore {
     ) -> rusqlite::Result<Vec<AuditRecord>> {
         Self::list_audit_window(self, from, to, limit)
     }
+
+    fn controller_metrics(&self, now: &str) -> rusqlite::Result<ControllerMetricsSnapshot> {
+        Self::controller_metrics(self, now)
+    }
+}
+
+fn count_where(conn: &Connection, sql: &str, value: &str) -> rusqlite::Result<u64> {
+    conn.query_row(sql, [value], |row| i64_to_u64(row.get(0)?, 0))
+}
+
+fn count_all(conn: &Connection, table: &str) -> rusqlite::Result<u64> {
+    let sql = match table {
+        "probe_observations" => "SELECT count(*) FROM probe_observations",
+        _ => return Err(rusqlite::Error::InvalidQuery),
+    };
+    conn.query_row(sql, [], |row| i64_to_u64(row.get(0)?, 0))
+}
+
+fn fixed_counts<const N: usize>(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    values: &[&str; N],
+) -> rusqlite::Result<[u64; N]> {
+    let sql = match (table, column) {
+        ("observability_runs", "status") => {
+            "SELECT count(*) FROM observability_runs WHERE status = ?1"
+        }
+        ("health_snapshots", "status") => "SELECT count(*) FROM health_snapshots WHERE status = ?1",
+        ("alert_events", "state") => "SELECT count(*) FROM alert_events WHERE state = ?1",
+        ("alert_delivery_attempts", "status") => {
+            "SELECT count(*) FROM alert_delivery_attempts WHERE status = ?1"
+        }
+        ("alert_delivery_queue", "status") => {
+            "SELECT count(*) FROM alert_delivery_queue WHERE status = ?1"
+        }
+        _ => return Err(rusqlite::Error::InvalidQuery),
+    };
+    let mut counts = [0_u64; N];
+    for (index, value) in values.iter().enumerate() {
+        counts[index] = count_where(conn, sql, value)?;
+    }
+    Ok(counts)
+}
+
+fn count_rpc_outcome(conn: &Connection, ok: bool) -> rusqlite::Result<u64> {
+    conn.query_row(
+        "SELECT count(*) FROM controller_audit_log WHERE event = 'rpc.completed' AND ok = ?1",
+        [ok],
+        |row| i64_to_u64(row.get(0)?, 0),
+    )
+}
+
+fn count_audit_event_outcome(conn: &Connection, event: &str, ok: bool) -> rusqlite::Result<u64> {
+    conn.query_row(
+        "SELECT count(*) FROM controller_audit_log WHERE event = ?1 AND ok = ?2",
+        params![event, ok],
+        |row| i64_to_u64(row.get(0)?, 0),
+    )
 }
 
 fn open_read_only_connection(path: &Path) -> rusqlite::Result<Connection> {
@@ -423,7 +576,7 @@ fn open_read_only_connection(path: &Path) -> rusqlite::Result<Connection> {
     Ok(conn)
 }
 
-const REQUIRED_API_TABLES: [&str; 12] = [
+const REQUIRED_API_TABLES: [&str; 13] = [
     "schema_migrations",
     "nodes",
     "health_snapshots",
@@ -433,6 +586,7 @@ const REQUIRED_API_TABLES: [&str; 12] = [
     "scheduler_maintenance",
     "health_evaluation_runs",
     "alert_delivery_queue",
+    "alert_delivery_attempts",
     "probe_observations",
     "alert_events",
     "controller_audit_log",

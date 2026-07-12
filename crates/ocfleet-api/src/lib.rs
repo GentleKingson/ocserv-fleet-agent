@@ -1,5 +1,6 @@
 pub mod args;
 pub mod auth;
+pub mod metrics;
 pub mod projections;
 pub mod readonly_store;
 pub mod responses;

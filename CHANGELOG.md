@@ -4,6 +4,9 @@
 
 ### Added
 
+- A protected read-only Prometheus controller endpoint exports a closed,
+  low-cardinality scheduler, health, alert, delivery, RPC, observation, SQLite,
+  and audit-export catalog.
 - Controller backup create/list/verify/inspect commands use SQLite online backup,
   private artifacts, identity-bound manifests, SHA-256, and optional Ed25519 signatures.
 - Restore plan/apply verifies backup identity, schema, integrity and checksum,

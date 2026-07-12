@@ -73,6 +73,7 @@ fn openapi_contract_is_get_only_and_matches_router_paths() {
     let expected = [
         "/",
         "/healthz",
+        "/metrics",
         "/health/summary",
         "/health/nodes",
         "/health/nodes/{node_id}",
@@ -93,6 +94,7 @@ fn openapi_contract_is_get_only_and_matches_router_paths() {
     let router_paths = [
         "/",
         "/healthz",
+        "/metrics",
         "/health/summary",
         "/health/nodes",
         "/health/nodes/{node_id}",
@@ -673,6 +675,46 @@ async fn bearer_auth_accepts_configured_token_and_rejects_others() {
     let (status, body) = json_request(router, Method::GET, "/healthz", Some(TOKEN)).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["auth_enabled"], true);
+}
+
+#[tokio::test]
+async fn metrics_are_prometheus_compatible_bounded_and_read_only() {
+    let fixture = Fixture::new();
+    let before = table_counts(&fixture.database);
+    let router = fixture.router(None);
+    let (status, headers, body) = raw_request(router, Method::GET, "/metrics", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers.get(header::CONTENT_TYPE).expect("content type"),
+        "text/plain; version=0.0.4; charset=utf-8"
+    );
+    assert!(body.contains("# TYPE ocfleet_controller_health_nodes gauge"));
+    assert!(body.contains("ocfleet_controller_alerts{state=\"open\"}"));
+    assert!(body.len() < 8_192);
+    for forbidden in [
+        "node_id",
+        "endpoint_id",
+        "request_id",
+        "session_id",
+        "client_ip",
+        "token",
+        "cookie",
+    ] {
+        assert!(!body.contains(forbidden), "metrics leaked {forbidden}");
+    }
+    assert_eq!(table_counts(&fixture.database), before);
+}
+
+#[tokio::test]
+async fn metrics_require_the_configured_bearer_token() {
+    let fixture = Fixture::new();
+    let token_file = fixture.write_token_file(TOKEN);
+    let router = fixture.router(Some(token_file));
+    let (status, _, _) = raw_request(router.clone(), Method::GET, "/metrics", None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _, body) = raw_request(router, Method::GET, "/metrics", Some(TOKEN)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("ocfleet_controller_sqlite_bytes"));
 }
 
 #[tokio::test]

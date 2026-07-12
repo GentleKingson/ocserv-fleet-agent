@@ -1,0 +1,46 @@
+name: Fuzz Smoke
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '**/*.rs'
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - 'fuzz/**'
+      - '.github/workflows/fuzz.yml'
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz-smoke:
+    name: protocol/frame/config
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Install pinned nightly Rust
+        run: rustup toolchain install nightly-2026-07-12 --profile minimal
+
+      - name: Install pinned cargo-fuzz
+        run: cargo install cargo-fuzz --version 0.13.2 --locked
+
+      - name: Fuzz protocol and frame parsing
+        run: cargo +nightly-2026-07-12 fuzz run protocol_frame -- -max_total_time=30 -rss_limit_mb=2048
+
+      - name: Fuzz configuration parsing
+        run: cargo +nightly-2026-07-12 fuzz run config_parse -- -max_total_time=30 -rss_limit_mb=2048

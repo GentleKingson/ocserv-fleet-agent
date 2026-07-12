@@ -1,0 +1,12 @@
+[node]
+id = "node-a"
+region = "test"
+role = "vpn"
+
+[iroh]
+secret_key_path = "/run/ocfleet/agent.key"
+
+[security]
+
+[audit]
+path = "/var/lib/ocfleet/audit.jsonl"

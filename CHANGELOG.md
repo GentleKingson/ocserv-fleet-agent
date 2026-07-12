@@ -4,6 +4,8 @@
 
 ### Added
 
+- A8 protocol/frame/config libFuzzer smoke targets, seed corpora, pinned CI, and
+  a live release-hardening gap inventory.
 - A protected read-only Prometheus controller endpoint exports a closed,
   low-cardinality scheduler, health, alert, delivery, RPC, observation, SQLite,
   and audit-export catalog.

@@ -1,12 +1,12 @@
 {
   "baseline_commit": "b3c906a94823b4620dc1a2077a44e7160c0848b2",
-  "current_phase": "A7",
-  "completed_phases": ["A1", "A2", "A3", "A4", "A5", "A6"],
-  "active_branch": "codex/a7-completion-inventory",
-  "active_issue": 39,
-  "active_pr": 102,
+  "current_phase": "A8",
+  "completed_phases": ["A1", "A2", "A3", "A4", "A5", "A6", "A7"],
+  "active_branch": "codex/a8-release-hardening-audit",
+  "active_issue": 40,
+  "active_pr": 103,
   "last_test_result": "passed",
-  "last_updated_at": "2026-07-12T01:00:00Z",
+  "last_updated_at": "2026-07-12T02:00:00Z",
   "blockers": [],
-  "next_action": "Publish the A7 completion inventory, close issue 39, then begin the A8 release-hardening audit."
+  "next_action": "Publish A8 fuzz smoke and the live gap inventory, then implement browser E2E and release attestations."
 }

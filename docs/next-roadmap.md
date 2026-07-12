@@ -317,6 +317,11 @@ The live A8 inventory records completed evidence and the remaining browser,
 SBOM, provenance, signing, policy, and rollback gaps. This slice is published in
 pull request `#103`.
 
+The second A8 slice runs the read-only dashboard in Chromium against an
+isolated controller database. It covers desktop and narrow viewports, CSP,
+refresh and audit preview, console errors, and rejects every non-GET browser
+request. This slice is published in pull request `#104`.
+
 ### Baseline And Production Foundation
 
 | ID | Issue | Status | Depends on | Release target | Acceptance and required evidence |

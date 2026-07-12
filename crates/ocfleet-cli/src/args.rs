@@ -568,6 +568,8 @@ pub enum RetentionScope {
     ObservabilityRuns,
     #[value(name = "health-snapshots")]
     HealthSnapshots,
+    #[value(name = "health-history")]
+    HealthHistory,
     #[value(name = "alert-events")]
     AlertEvents,
 }
@@ -624,6 +626,18 @@ pub enum HealthCommand {
     Snapshot {
         #[command(subcommand)]
         command: HealthSnapshotCommand,
+    },
+    History {
+        #[arg(long)]
+        from: String,
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        node: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        limit: u64,
+        #[arg(long)]
+        json: bool,
     },
     Evaluator {
         #[command(subcommand)]

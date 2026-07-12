@@ -18,7 +18,7 @@ automatic trust, automatic peer mesh, or automatic path-probe authorization.
 | Workspace | Version `0.3.0`, Rust edition `2024`, Rust toolchain `1.96.1` |
 | Workspace crates | Five: `ocfleet-protocol`, `ocfleet-config`, `ocfleet-agent`, `ocfleet-cli`, and `ocfleet-api` |
 | Release binaries | Four: `ocfleet`, `ocfleet-agent`, `ocfleet-api`, and `ocfleet-ocserv-collector` |
-| Controller schema | SQLite schema version `8`; migrations `0001` through `0008` |
+| Controller schema | SQLite schema version `23`; migrations `0001` through `0023` |
 | RPC protocol | Protocol version `1`; ALPN `/com.github.gentlekingson.ocfleet.mgmt/1` |
 | Other schemas | Config version `1`; trust-policy version `1`; collector snapshot `ocfleet.ocserv.snapshot.v2`; OpenAPI `3.1.1` |
 | Features | Every crate has an empty default feature set. `controlled-writes` exists in protocol/config/agent and is propagated by the agent. `postgres-backend` exists in the CLI. Both tracks are default-off. |
@@ -339,6 +339,12 @@ defaults, scripts, install guide, and release notes to `v0.3.0`. A CI contract
 rejects version drift before the signed tag-bound matrix runs. This gate is
 published in pull request `#107`.
 
+The first B1 slice adds schema 23 append-only per-evaluation health history.
+Evaluator and interactive health writers atomically commit latest projection,
+history, durable evaluation state where applicable, and audit; exact replay
+does not duplicate history. Bounded half-open CLI queries and independent
+history retention are the foundation for subsequent rollups and API views.
+
 The A8 completion audit records the successful tag-bound matrix, publication
 of 38 `v0.3.0` assets, and independent checksum, Sigstore, SBOM, and provenance
 verification. It is published in pull request `#108`.
@@ -362,7 +368,7 @@ verification. It is published in pull request `#108`.
 
 | ID | Issue | Status | Depends on | Release target | Acceptance and required evidence |
 | --- | --- | --- | --- | --- | --- |
-| B1 Health history, rollups, and SLOs | `#41` | scaffold | A2, A4 | `v0.3.0` | Append-only history and reproducible 5m/1h/1d rollups provide bounded 24h/7d/30d availability, duration, latency, error, coverage, certificate, and drift views without inventing missing data; retention is independently configurable. |
+| B1 Health history, rollups, and SLOs | `#41` | active implementation | A2, A4 | `v0.3.x` | Schema 23 append-only history, bounded CLI query, atomic evaluator integration, replay protection, and independent retention are implemented. Reproducible 5m/1h/1d rollups must provide bounded 24h/7d/30d availability, duration, latency, error, coverage, certificate, and drift views without inventing missing data. |
 | B2 Labels, environment, and maintenance | `#42` | implemented slice | A1, A2, A3 | `v0.4.0` | Bounded audited metadata and selectors have a maximum match count; maintenance affects scheduling/presentation only; tests prove labels cannot create trust, peers, or path authorization. |
 | B3 Versioned API and query contract | `#43` | implemented slice | A2, B1, B2 | `v0.4.0` | `/api/v1` has a compatibility plan, bounded tamper-resistant cursor pagination, time/metadata filters, ETag/conditional GET, stable errors/request IDs, exact OpenAPI/runtime validation, and no RPC-trigger route. Existing API drift listed below is resolved. |
 | B4 Local producer SDK | `#44` | scaffold | A2 | `v0.4.0` | A snapshot-schema crate, validator, Rust SDK, machine schema, version negotiation, compatibility suite, and least-privilege sample producer emit fixed aggregates only and remain unreachable from controller RPC/API/scheduler paths. |

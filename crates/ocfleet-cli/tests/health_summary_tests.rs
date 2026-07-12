@@ -647,6 +647,14 @@ fn health_evaluator_run_is_independent_idempotent_and_persists_snapshots() {
         1
     );
     assert_eq!(
+        conn.query_row("SELECT count(*) FROM health_history", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .expect("history count"),
+        1,
+        "idempotent evaluator replay must not duplicate history"
+    );
+    assert_eq!(
         conn.query_row(
             "SELECT count(*) FROM controller_audit_log
              WHERE event IN ('health.evaluation.start', 'health.evaluation.finish')",
@@ -656,6 +664,31 @@ fn health_evaluator_run_is_independent_idempotent_and_persists_snapshots() {
         .expect("evaluator audit count"),
         2
     );
+    drop(conn);
+
+    let history = run_ocfleet(&[
+        "--database",
+        &database_arg,
+        "health",
+        "history",
+        "--from",
+        "2020-01-01T00:00:00Z",
+        "--to",
+        "2030-01-01T00:00:00Z",
+        "--node",
+        "hk-ocserv-01",
+        "--limit",
+        "10",
+        "--json",
+    ]);
+    let history: Value = serde_json::from_slice(&history.stdout).expect("valid history JSON");
+    assert_eq!(history["schema"], "ocfleet.health_history.v1");
+    assert_eq!(history["sample_count"], 1);
+    assert_eq!(history["samples"][0]["snapshot"]["node_id"], "hk-ocserv-01");
+    let encoded = history.to_string().to_ascii_lowercase();
+    for forbidden in ["password", "client_ip", "session_id", "/etc/"] {
+        assert!(!encoded.contains(forbidden), "history leaked {forbidden}");
+    }
 }
 
 #[test]

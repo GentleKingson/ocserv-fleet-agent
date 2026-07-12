@@ -2,11 +2,11 @@
   "baseline_commit": "b3c906a94823b4620dc1a2077a44e7160c0848b2",
   "current_phase": "B1",
   "completed_phases": ["A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8", "A-READY"],
-  "active_branch": "codex/a8-completion-evidence",
+  "active_branch": "codex/b1-health-history-foundation",
   "active_issue": 41,
-  "active_pr": 108,
+  "active_pr": null,
   "last_test_result": "passed",
-  "last_updated_at": "2026-07-12T08:00:00Z",
+  "last_updated_at": "2026-07-12T09:00:00Z",
   "blockers": [],
-  "next_action": "Publish A8 completion evidence and close issue 40, then audit and implement B1 health history, rollups, and SLOs."
+  "next_action": "Publish schema 23 append-only health history and independent retention, then implement reproducible rollups and bounded SLO projections."
 }

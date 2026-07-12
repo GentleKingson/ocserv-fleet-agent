@@ -89,6 +89,35 @@ fn parses_restore_commands() {
             }
         }
     ));
+
+    let cli = Cli::parse_from([
+        "ocfleet",
+        "health",
+        "history",
+        "--from",
+        "2026-07-11T00:00:00Z",
+        "--to",
+        "2026-07-12T00:00:00Z",
+        "--node",
+        "hk-ocserv-01",
+        "--limit",
+        "25",
+        "--json",
+    ]);
+    assert!(matches!(
+        cli.command,
+        Command::Health {
+            command: HealthCommand::History {
+                from,
+                to,
+                node: Some(node),
+                limit: 25,
+                json: true,
+            }
+        } if from == "2026-07-11T00:00:00Z"
+            && to == "2026-07-12T00:00:00Z"
+            && node == "hk-ocserv-01"
+    ));
 }
 
 #[test]

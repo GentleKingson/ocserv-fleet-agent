@@ -35,7 +35,7 @@ use crate::storage_payloads::{
     validate_health_payload_relationship, validate_scheduler_payload_relationship,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 22;
+pub const CURRENT_SCHEMA_VERSION: i64 = 23;
 pub const DEFAULT_HEALTH_STALE_WINDOW_SECONDS: u64 = 24 * 60 * 60;
 pub const DEFAULT_HEALTH_UNREACHABLE_FAILURES: u64 = 3;
 pub const DEFAULT_HEALTH_CERT_WARNING_DAYS: u64 = 30;
@@ -350,6 +350,12 @@ pub struct HealthSnapshotWrite {
     pub evaluation_id: String,
     pub event: String,
     pub snapshots: Vec<HealthSnapshotRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HealthHistoryRecord {
+    pub evaluation_id: String,
+    pub snapshot: HealthSnapshotRecord,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1978,6 +1984,7 @@ impl Store {
         }
         for snapshot in &write.snapshots {
             upsert_health_snapshot_tx(&tx, snapshot)?;
+            insert_health_history_tx(&tx, &write.evaluation_id, snapshot)?;
         }
         let mut status_counts = serde_json::Map::new();
         for status in [
@@ -2039,6 +2046,57 @@ impl Store {
              LIMIT ?1",
         )?;
         let rows = stmt.query_map([limit], health_snapshot_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub fn list_health_history(
+        &self,
+        node_id: Option<&str>,
+        from: &str,
+        to: &str,
+        limit: u64,
+    ) -> Result<Vec<HealthHistoryRecord>, StoreError> {
+        if let Some(node_id) = node_id {
+            validate_node_id(node_id)
+                .map_err(|error| StoreError::InvalidInput(error.to_string()))?;
+        }
+        let from_instant = OffsetDateTime::parse(from, &Rfc3339).map_err(|_| {
+            StoreError::InvalidInput("health history from must be RFC3339".to_string())
+        })?;
+        let to_instant = OffsetDateTime::parse(to, &Rfc3339).map_err(|_| {
+            StoreError::InvalidInput("health history to must be RFC3339".to_string())
+        })?;
+        if from_instant >= to_instant {
+            return Err(StoreError::InvalidInput(
+                "health history from must precede to".to_string(),
+            ));
+        }
+        let from = from_instant.format(&Rfc3339).map_err(|_| {
+            StoreError::InvalidInput("health history from cannot be normalized".to_string())
+        })?;
+        let to = to_instant.format(&Rfc3339).map_err(|_| {
+            StoreError::InvalidInput("health history to cannot be normalized".to_string())
+        })?;
+        if limit == 0 || limit > 1_000 {
+            return Err(StoreError::InvalidInput(
+                "health history limit must be between 1 and 1000".to_string(),
+            ));
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT evaluation_id, node_id, endpoint_id, computed_at, status,
+                    freshness_seconds, last_success_at, last_failure_at,
+                    last_error_code, degraded_methods_json, summary_json
+             FROM health_history
+             WHERE (?1 IS NULL OR node_id = ?1)
+               AND computed_at >= ?2 AND computed_at < ?3
+             ORDER BY computed_at DESC, node_id, evaluation_id
+             LIMIT ?4",
+        )?;
+        let rows = stmt.query_map(
+            params![node_id, from, to, u64_to_i64(limit)?],
+            health_history_from_row,
+        )?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(StoreError::from)
     }
@@ -2168,6 +2226,7 @@ impl Store {
         }
         for snapshot in &finish.snapshots {
             upsert_health_snapshot_tx(&tx, snapshot)?;
+            insert_health_history_tx(&tx, &finish.evaluation_id, snapshot)?;
         }
         insert_health_evaluation_audit_tx(
             &tx,
@@ -7007,6 +7066,51 @@ fn health_snapshot_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HealthS
     })
 }
 
+fn health_history_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HealthHistoryRecord> {
+    let freshness_seconds: Option<i64> = row.get(5)?;
+    let degraded_methods_text: String = row.get(9)?;
+    let summary_text: String = row.get(10)?;
+    let degraded_methods_json = parse_json_column(&degraded_methods_text, 9)?;
+    HealthDegradedMethodsPayloadV1::from_value(&degraded_methods_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            9,
+            Type::Text,
+            Box::new(io::Error::new(io::ErrorKind::InvalidData, error)),
+        )
+    })?;
+    let summary_json = parse_json_column(&summary_text, 10)?;
+    let summary = HealthSummaryPayloadV1::from_value(&summary_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            10,
+            Type::Text,
+            Box::new(io::Error::new(io::ErrorKind::InvalidData, error)),
+        )
+    })?;
+    let status: String = row.get(4)?;
+    validate_health_payload_relationship(&status, &summary).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            10,
+            Type::Text,
+            Box::new(io::Error::new(io::ErrorKind::InvalidData, error)),
+        )
+    })?;
+    Ok(HealthHistoryRecord {
+        evaluation_id: row.get(0)?,
+        snapshot: HealthSnapshotRecord {
+            node_id: row.get(1)?,
+            endpoint_id: row.get(2)?,
+            computed_at: row.get(3)?,
+            status,
+            freshness_seconds: freshness_seconds.map(i64_to_u64).transpose()?,
+            last_success_at: row.get(6)?,
+            last_failure_at: row.get(7)?,
+            last_error_code: row.get(8)?,
+            degraded_methods_json,
+            summary_json,
+        },
+    })
+}
+
 fn health_evaluation_run_from_row(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<HealthEvaluationRunRecord> {
@@ -7914,6 +8018,10 @@ fn retention_target(scope: &str) -> Result<RetentionTarget, StoreError> {
             table: "health_snapshots",
             timestamp_column: "computed_at",
         }),
+        "health-history" => Ok(RetentionTarget {
+            table: "health_history",
+            timestamp_column: "computed_at",
+        }),
         "alert-events" => Ok(RetentionTarget {
             table: "alert_events",
             timestamp_column: "last_seen_at",
@@ -8204,6 +8312,34 @@ fn upsert_health_snapshot_tx(
            degraded_methods_json = excluded.degraded_methods_json,
            summary_json = excluded.summary_json",
         params![
+            snapshot.node_id.as_str(),
+            snapshot.endpoint_id.as_deref(),
+            snapshot.computed_at.as_str(),
+            snapshot.status.as_str(),
+            option_u64_to_i64(snapshot.freshness_seconds)?,
+            snapshot.last_success_at.as_deref(),
+            snapshot.last_failure_at.as_deref(),
+            snapshot.last_error_code.as_deref(),
+            compact_json(&snapshot.degraded_methods_json),
+            compact_json(&snapshot.summary_json),
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_health_history_tx(
+    tx: &Transaction<'_>,
+    evaluation_id: &str,
+    snapshot: &HealthSnapshotRecord,
+) -> Result<(), StoreError> {
+    tx.execute(
+        "INSERT INTO health_history
+         (evaluation_id, node_id, endpoint_id, computed_at, status,
+          freshness_seconds, last_success_at, last_failure_at, last_error_code,
+          degraded_methods_json, summary_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![
+            evaluation_id,
             snapshot.node_id.as_str(),
             snapshot.endpoint_id.as_deref(),
             snapshot.computed_at.as_str(),

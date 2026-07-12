@@ -31,6 +31,13 @@ pub async fn run_health_command(store: &Store, command: HealthCommand) -> anyhow
         HealthCommand::Node { node_id, json } => run_health_node(store, &node_id, json),
         HealthCommand::Policy { command } => run_health_policy_command(store, command),
         HealthCommand::Snapshot { command } => run_health_snapshot_command(store, command),
+        HealthCommand::History {
+            from,
+            to,
+            node,
+            limit,
+            json,
+        } => run_health_history(store, &from, &to, node.as_deref(), limit, json),
         HealthCommand::Evaluator { command } => run_health_evaluator_command(store, command).await,
     }
 }
@@ -519,6 +526,51 @@ fn run_health_snapshot_command(
             Ok(())
         }
     }
+}
+
+fn run_health_history(
+    store: &Store,
+    from: &str,
+    to: &str,
+    node: Option<&str>,
+    limit: u64,
+    json_output: bool,
+) -> anyhow::Result<()> {
+    let history = store.list_health_history(node, from, to, limit)?;
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "schema": "ocfleet.health_history.v1",
+                "from": from,
+                "to": to,
+                "node_id": node,
+                "limit": limit,
+                "sample_count": history.len(),
+                "samples": history.iter().map(|record| json!({
+                    "evaluation_id": record.evaluation_id,
+                    "snapshot": snapshot_to_json(&record.snapshot),
+                })).collect::<Vec<_>>(),
+            }))?
+        );
+    } else {
+        println!("from={from}");
+        println!("to={to}");
+        println!("node_id={}", node.unwrap_or("<all>"));
+        println!("limit={limit}");
+        println!("sample_count={}", history.len());
+        for record in &history {
+            println!(
+                "evaluation_id={} node_id={} computed_at={} status={} freshness_seconds={}",
+                record.evaluation_id,
+                record.snapshot.node_id,
+                record.snapshot.computed_at,
+                record.snapshot.status,
+                option_u64(record.snapshot.freshness_seconds),
+            );
+        }
+    }
+    Ok(())
 }
 
 fn print_health_policy(policy: &HealthPolicyRecord) {

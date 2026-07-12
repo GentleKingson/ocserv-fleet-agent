@@ -37,10 +37,13 @@ pub struct ControllerMetricsSnapshot {
     pub delivery_attempts: [u64; 2],
     pub delivery_queue: [u64; 5],
     pub rpc_calls: [u64; 2],
+    pub rpc_duration_ms_sum: u64,
+    pub rpc_duration_count: u64,
     pub observations_total: u64,
     pub observation_freshness_seconds: u64,
     pub sqlite_bytes: u64,
     pub audit_exports: [u64; 2],
+    pub retention_deleted_rows: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -217,6 +220,12 @@ impl ReadOnlyStore {
             count_rpc_outcome(&conn, true)?,
             count_rpc_outcome(&conn, false)?,
         ];
+        let (rpc_duration_ms_sum, rpc_duration_count) = conn.query_row(
+            "SELECT COALESCE(SUM(duration_ms), 0), count(duration_ms)
+             FROM controller_audit_log WHERE event = 'rpc.completed'",
+            [],
+            |row| Ok((i64_to_u64(row.get(0)?, 0)?, i64_to_u64(row.get(1)?, 1)?)),
+        )?;
         let observations_total = count_all(&conn, "probe_observations")?;
         let observation_freshness_seconds = conn.query_row(
             "SELECT COALESCE(MAX(0, CAST((julianday(?1) - julianday(MAX(observed_at))) * 86400 AS INTEGER)), 0)
@@ -231,6 +240,12 @@ impl ReadOnlyStore {
             count_audit_event_outcome(&conn, "audit.export", true)?,
             count_audit_event_outcome(&conn, "audit.export", false)?,
         ];
+        let retention_deleted_rows = conn.query_row(
+            "SELECT COALESCE(SUM(CAST(json_extract(detail_json, '$.deleted_count') AS INTEGER)), 0)
+             FROM controller_audit_log WHERE event = 'retention.apply' AND ok = 1",
+            [],
+            |row| i64_to_u64(row.get(0)?, 0),
+        )?;
         Ok(ControllerMetricsSnapshot {
             scheduler_jobs_due,
             scheduler_claims_active,
@@ -240,10 +255,13 @@ impl ReadOnlyStore {
             delivery_attempts,
             delivery_queue,
             rpc_calls,
+            rpc_duration_ms_sum,
+            rpc_duration_count,
             observations_total,
             observation_freshness_seconds,
             sqlite_bytes,
             audit_exports,
+            retention_deleted_rows,
         })
     }
 

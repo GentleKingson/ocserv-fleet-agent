@@ -40,10 +40,13 @@ information.
 | `ocfleet_controller_delivery_attempts_total` | counter | `result=succeeded,failed` | Persisted delivery attempts. |
 | `ocfleet_controller_delivery_queue` | gauge | `state=pending,claimed,retry,dead_letter,succeeded` | Delivery queue rows. |
 | `ocfleet_controller_rpc_calls_total` | counter | `result=succeeded,failed` | Completed audited controller RPCs. |
+| `ocfleet_controller_rpc_duration_milliseconds_sum` | counter | none | Cumulative audited RPC duration. |
+| `ocfleet_controller_rpc_duration_milliseconds_count` | counter | none | Audited RPC duration sample count. |
 | `ocfleet_controller_observations_total` | counter | none | Persisted observations. |
 | `ocfleet_controller_observation_freshness_seconds` | gauge | none | Age of the newest observation. |
 | `ocfleet_controller_sqlite_bytes` | gauge | none | Main SQLite database file size. |
 | `ocfleet_controller_audit_exports_total` | counter | `result=succeeded,failed` | Audited export attempts. |
+| `ocfleet_controller_retention_deleted_rows_total` | counter | none | Rows deleted by successful retention operations. |
 
 Every scrape opens SQLite read-only with query-only and untrusted-schema modes.
 The endpoint performs fixed aggregate queries and does not trigger RPC,

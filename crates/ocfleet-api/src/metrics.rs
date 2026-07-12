@@ -65,6 +65,16 @@ pub const CONTROLLER_CATALOG: &[MetricDescriptor] = &[
         &["succeeded", "failed"],
     ),
     descriptor(
+        "ocfleet_controller_rpc_duration_milliseconds_sum",
+        "Cumulative audited controller RPC duration in milliseconds.",
+        "counter",
+    ),
+    descriptor(
+        "ocfleet_controller_rpc_duration_milliseconds_count",
+        "Number of audited controller RPC duration observations.",
+        "counter",
+    ),
+    descriptor(
         "ocfleet_controller_observations_total",
         "Persisted probe observations.",
         "counter",
@@ -85,6 +95,11 @@ pub const CONTROLLER_CATALOG: &[MetricDescriptor] = &[
         "counter",
         "result",
         &["succeeded", "failed"],
+    ),
+    descriptor(
+        "ocfleet_controller_retention_deleted_rows_total",
+        "Rows deleted by successful retention operations.",
+        "counter",
     ),
 ];
 
@@ -151,18 +166,33 @@ pub fn render_controller(snapshot: &ControllerMetricsSnapshot) -> String {
     scalar(
         &mut output,
         &CONTROLLER_CATALOG[8],
-        snapshot.observations_total,
+        snapshot.rpc_duration_ms_sum,
     );
     scalar(
         &mut output,
         &CONTROLLER_CATALOG[9],
-        snapshot.observation_freshness_seconds,
+        snapshot.rpc_duration_count,
     );
-    scalar(&mut output, &CONTROLLER_CATALOG[10], snapshot.sqlite_bytes);
-    family(
+    scalar(
+        &mut output,
+        &CONTROLLER_CATALOG[10],
+        snapshot.observations_total,
+    );
+    scalar(
         &mut output,
         &CONTROLLER_CATALOG[11],
+        snapshot.observation_freshness_seconds,
+    );
+    scalar(&mut output, &CONTROLLER_CATALOG[12], snapshot.sqlite_bytes);
+    family(
+        &mut output,
+        &CONTROLLER_CATALOG[13],
         &snapshot.audit_exports,
+    );
+    scalar(
+        &mut output,
+        &CONTROLLER_CATALOG[14],
+        snapshot.retention_deleted_rows,
     );
     output
 }
@@ -255,10 +285,13 @@ mod tests {
             delivery_attempts: [14, 15],
             delivery_queue: [16, 17, 18, 19, 20],
             rpc_calls: [21, 22],
-            observations_total: 23,
-            observation_freshness_seconds: 24,
-            sqlite_bytes: 25,
-            audit_exports: [26, 27],
+            rpc_duration_ms_sum: 23,
+            rpc_duration_count: 24,
+            observations_total: 25,
+            observation_freshness_seconds: 26,
+            sqlite_bytes: 27,
+            audit_exports: [28, 29],
+            retention_deleted_rows: 30,
         };
         let text = render_controller(&snapshot);
         assert!(text.contains("ocfleet_controller_health_nodes{status=\"healthy\"} 7"));

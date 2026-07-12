@@ -9,6 +9,8 @@
   and audit-export catalog.
 - The agent exports protected loopback-default Prometheus transport, RPC
   duration/result-class, nonce, and audit durability metrics with fixed labels.
+- Controller metrics include audited RPC duration and successful retention
+  deleted-row totals without adding labels.
 - Controller backup create/list/verify/inspect commands use SQLite online backup,
   private artifacts, identity-bound manifests, SHA-256, and optional Ed25519 signatures.
 - Restore plan/apply verifies backup identity, schema, integrity and checksum,

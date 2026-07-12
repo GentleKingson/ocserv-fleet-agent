@@ -300,6 +300,10 @@ Non-loopback startup requires a private bearer token; the exporter exposes no
 identity, address, request, session, token, path, or raw error labels.
 The agent metrics exporter is published in pull request `#100`.
 
+The final controller catalog slice adds audited RPC duration sum/count and
+successful retention deleted-row totals without new labels. The A7 acceptance
+inventory remains the final phase gate.
+
 ### Baseline And Production Foundation
 
 | ID | Issue | Status | Depends on | Release target | Acceptance and required evidence |

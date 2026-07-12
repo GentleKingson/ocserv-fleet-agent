@@ -285,6 +285,7 @@ apply, controller identity/schema/integrity verification, managed pre-backup,
 WAL/SHM handling, staged atomic replacement, restore audit, and injected-failure
 rollback. Its pull request is the current A6 publication task.
 The restore workflow is published in pull request `#97`.
+The A6 acceptance completion inventory is published in pull request `#98`.
 
 ### Baseline And Production Foundation
 

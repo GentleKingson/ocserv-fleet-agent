@@ -8,6 +8,8 @@
   private artifacts, identity-bound manifests, SHA-256, and optional Ed25519 signatures.
 - Restore plan/apply verifies backup identity, schema, integrity and checksum,
   pre-backs up live state, atomically replaces SQLite, handles WAL/SHM, and rolls back failures.
+- A6 completion inventory maps every backup, restore, rollback, identity,
+  private-artifact, and disaster-recovery acceptance requirement to evidence.
 - Schema 22 adds a bounded fenced automatic alert delivery queue with durable
   idempotency, grouping, retry, dead-letter, and terminal-state metadata.
 - Alert delivery queue writers atomically audit idempotent enqueue, deterministic

@@ -74,6 +74,40 @@ pub enum Command {
         #[command(subcommand)]
         command: AlertCommand,
     },
+    Backup {
+        #[command(subcommand)]
+        command: BackupCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum BackupCommand {
+    Create {
+        #[arg(long, value_name = "DIR")]
+        output_dir: PathBuf,
+        #[arg(long, value_name = "PATH")]
+        sign_with_key_file: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    List {
+        #[arg(long, value_name = "DIR")]
+        backup_dir: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    Verify {
+        #[arg(long, value_name = "PATH")]
+        manifest: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    Inspect {
+        #[arg(long, value_name = "PATH")]
+        manifest: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]

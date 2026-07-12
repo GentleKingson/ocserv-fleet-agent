@@ -6,6 +6,7 @@ pub mod args;
 pub mod audit;
 pub mod audit_export;
 pub mod backend;
+pub mod backup;
 pub mod controller_rpc;
 pub mod doctor;
 pub mod duration_args;

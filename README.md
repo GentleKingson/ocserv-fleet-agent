@@ -479,6 +479,10 @@ target/debug/ocfleet alert delivery-daemon --hmac-secret-dir ./webhook-secrets -
 target/debug/ocfleet alert worker status --json
 target/debug/ocfleet alert hook disable <hook-id>
 target/debug/ocfleet alert hook enable <hook-id>
+target/debug/ocfleet backup create --output-dir ./controller-backups --json
+target/debug/ocfleet backup list --backup-dir ./controller-backups --json
+target/debug/ocfleet backup verify --manifest ./controller-backups/backup-<id>.manifest.json --json
+target/debug/ocfleet backup inspect --manifest ./controller-backups/backup-<id>.manifest.json --json
 target/debug/ocfleet retention show
 target/debug/ocfleet retention explain --scope observations --json
 target/debug/ocfleet retention apply \

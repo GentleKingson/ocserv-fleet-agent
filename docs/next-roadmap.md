@@ -298,6 +298,7 @@ The second A7 slice adds live agent admission, RPC duration/result class, nonce,
 and audit durability instrumentation plus a loopback-default metrics listener.
 Non-loopback startup requires a private bearer token; the exporter exposes no
 identity, address, request, session, token, path, or raw error labels.
+The agent metrics exporter is published in pull request `#100`.
 
 ### Baseline And Production Foundation
 

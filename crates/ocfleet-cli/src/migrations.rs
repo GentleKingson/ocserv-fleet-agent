@@ -167,6 +167,12 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         description: "Add the fenced automatic alert delivery queue.",
         apply: apply_0022_alert_delivery_queue,
     },
+    Migration {
+        version: 23,
+        name: "0023_append_only_health_history",
+        description: "Add append-only evaluator health history with bounded query indexes.",
+        apply: apply_0023_append_only_health_history,
+    },
 ];
 
 pub(crate) fn migrate_to_current(
@@ -1494,6 +1500,50 @@ CREATE INDEX idx_alert_delivery_queue_due
   ON alert_delivery_queue(status, next_attempt_at, queue_id);
 CREATE INDEX idx_alert_delivery_queue_lease
   ON alert_delivery_queue(lease_expires_at, queue_id);
+"#,
+    )?;
+    Ok(())
+}
+
+fn apply_0023_append_only_health_history(tx: &Transaction<'_>) -> Result<(), StoreError> {
+    tx.execute_batch(
+        r#"
+CREATE TABLE health_history (
+  evaluation_id TEXT NOT NULL CHECK (length(evaluation_id) BETWEEN 1 AND 96),
+  node_id TEXT NOT NULL CHECK (length(node_id) BETWEEN 1 AND 128),
+  endpoint_id TEXT CHECK (endpoint_id IS NULL OR length(endpoint_id) BETWEEN 1 AND 256),
+  computed_at TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('healthy', 'degraded', 'unreachable', 'stale', 'disabled', 'unknown')),
+  freshness_seconds INTEGER CHECK (freshness_seconds IS NULL OR freshness_seconds >= 0),
+  last_success_at TEXT,
+  last_failure_at TEXT,
+  last_error_code TEXT CHECK (last_error_code IS NULL OR length(last_error_code) BETWEEN 1 AND 64),
+  degraded_methods_json TEXT NOT NULL CHECK (json_valid(degraded_methods_json) AND length(degraded_methods_json) <= 65536),
+  summary_json TEXT NOT NULL CHECK (json_valid(summary_json) AND length(summary_json) <= 65536),
+  PRIMARY KEY(evaluation_id, node_id)
+);
+CREATE INDEX idx_health_history_node_computed
+  ON health_history(node_id, computed_at DESC, evaluation_id);
+CREATE INDEX idx_health_history_computed
+  ON health_history(computed_at DESC, node_id, evaluation_id);
+CREATE TRIGGER health_history_reject_update
+BEFORE UPDATE ON health_history
+BEGIN
+  SELECT RAISE(ABORT, 'health history is append-only');
+END;
+
+ALTER TABLE retention_policies RENAME TO retention_policies_legacy_v22;
+CREATE TABLE retention_policies (
+  scope TEXT PRIMARY KEY CHECK (scope IN ('observations', 'observability-runs', 'health-snapshots', 'health-history', 'alert-events')),
+  max_age_days INTEGER CHECK (max_age_days IS NULL OR max_age_days >= 1),
+  max_rows INTEGER CHECK (max_rows IS NULL OR max_rows >= 1),
+  updated_at TEXT NOT NULL
+);
+INSERT INTO retention_policies
+  (scope, max_age_days, max_rows, updated_at)
+SELECT scope, max_age_days, max_rows, updated_at
+FROM retention_policies_legacy_v22;
+DROP TABLE retention_policies_legacy_v22;
 "#,
     )?;
     Ok(())

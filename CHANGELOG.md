@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Schema 23 adds append-only, replay-safe health history with bounded half-open
+  CLI queries and independent retention from the latest health projection.
+
 ## 0.3.0 - 2026-07-12
 
 - Release metadata, OpenAPI, lockfiles, workflows, scripts, install examples,
@@ -12,6 +15,8 @@
 
 ### Added
 
+- Schema 23 adds append-only per-evaluation health history with bounded node/time
+  indexes and atomic latest/history/evaluation/audit writes.
 - A8 protocol/frame/config libFuzzer smoke targets, seed corpora, pinned CI, and
   a live release-hardening gap inventory.
 - Playwright dashboard E2E verifies desktop and narrow layouts, security

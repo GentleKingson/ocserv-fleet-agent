@@ -37,6 +37,7 @@ fn migration_tests_new_database_creates_all_current_tables_and_indexes() {
         "scheduler_maintenance",
         "health_evaluation_runs",
         "alert_delivery_queue",
+        "health_history",
     ] {
         assert_schema_object_exists(&conn, "table", table);
     }
@@ -53,6 +54,8 @@ fn migration_tests_new_database_creates_all_current_tables_and_indexes() {
         "idx_alert_delivery_queue_alert_hook_key",
         "idx_alert_delivery_queue_due",
         "idx_alert_delivery_queue_lease",
+        "idx_health_history_node_computed",
+        "idx_health_history_computed",
     ] {
         assert_schema_object_exists(&conn, "index", index);
     }
@@ -984,6 +987,35 @@ fn migration_tests_alert_delivery_queue_upgrades_schema_21() {
         assert_schema_object_exists(&conn, "index", index);
     }
     assert_eq!(backup_files(dir.path()).len(), 1);
+    assert_sqlite_checks_pass(&conn);
+}
+
+#[test]
+fn migration_tests_health_history_upgrades_schema_22() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("controller.sqlite");
+    create_legacy_fixture(&db, 22, 0);
+
+    let store = Store::open(&db).expect("migrate v22 health history");
+    assert_eq!(
+        store.current_schema_version().expect("schema version"),
+        CURRENT_SCHEMA_VERSION
+    );
+    drop(store);
+
+    let conn = Connection::open(&db).expect("open migrated db");
+    assert_schema_object_exists(&conn, "table", "health_history");
+    assert_schema_object_exists(&conn, "index", "idx_health_history_node_computed");
+    assert_schema_object_exists(&conn, "index", "idx_health_history_computed");
+    assert_schema_object_exists(&conn, "trigger", "health_history_reject_update");
+    conn.execute(
+        "INSERT INTO retention_policies
+         (scope, max_age_days, max_rows, updated_at)
+         VALUES ('health-history', 90, 1000000, ?1)",
+        [NOW],
+    )
+    .expect("health history has independent retention policy");
+    assert_eq!(table_count(&conn, "retention_policies"), 1);
     assert_sqlite_checks_pass(&conn);
 }
 

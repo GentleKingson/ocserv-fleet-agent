@@ -370,6 +370,12 @@ It does not enqueue historical alerts, enable hooks, read HMAC secrets, or start
 network delivery. Upgrade failure leaves the version-21 database unchanged
 beside its private backup.
 
+Schema version 23 adds an empty append-only `health_history` table and bounded
+node/time indexes. It does not synthesize historical samples from the latest
+snapshot. New evaluator completions atomically update the latest projection,
+append history, finish the evaluation run, and audit. Upgrade failure leaves
+the version-22 database unchanged beside its private backup.
+
 Before upgrades, keep an operator-managed backup as well:
 
 ```bash

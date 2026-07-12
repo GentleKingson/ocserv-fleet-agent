@@ -156,7 +156,11 @@ fn observation_count(database: &Path) -> i64 {
 fn table_count(database: &Path, table: &str) -> i64 {
     assert!(matches!(
         table,
-        "probe_observations" | "observability_runs" | "health_snapshots" | "alert_events"
+        "probe_observations"
+            | "observability_runs"
+            | "health_snapshots"
+            | "health_history"
+            | "alert_events"
     ));
     Connection::open(database)
         .expect("open db")
@@ -220,6 +224,7 @@ fn retention_tests_show_outputs_default_policies() {
     assert!(stdout.contains("max_rows=100000"));
     assert!(stdout.contains("scope=observability-runs"));
     assert!(stdout.contains("scope=health-snapshots"));
+    assert!(stdout.contains("scope=health-history"));
     assert!(stdout.contains("scope=alert-events"));
     assert!(stdout.contains("max_age_days=180"));
     assert!(stdout.contains("scope=controller_audit_log"));
@@ -395,11 +400,12 @@ fn retention_tests_multiscope_retry_resumes_after_audited_partial_progress() {
         "probe_observations",
         "observability_runs",
         "health_snapshots",
+        "health_history",
         "alert_events",
     ] {
         assert_eq!(table_count(&database, table), 0);
     }
-    assert_eq!(audit_event_count(&database, "retention.apply"), 4);
+    assert_eq!(audit_event_count(&database, "retention.apply"), 5);
 }
 
 #[test]

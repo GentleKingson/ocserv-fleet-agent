@@ -18,6 +18,7 @@ const RETENTION_SCOPES: &[&str] = &[
     "observations",
     "observability-runs",
     "health-snapshots",
+    "health-history",
     "alert-events",
 ];
 #[derive(Debug, Serialize)]
@@ -403,6 +404,7 @@ fn retention_scope_name(scope: RetentionScope) -> &'static str {
         RetentionScope::Observations => "observations",
         RetentionScope::ObservabilityRuns => "observability-runs",
         RetentionScope::HealthSnapshots => "health-snapshots",
+        RetentionScope::HealthHistory => "health-history",
         RetentionScope::AlertEvents => "alert-events",
     }
 }
@@ -412,6 +414,7 @@ fn default_retention_policy(scope: &str) -> RetentionPolicyRecord {
         "observations" => (Some(30), Some(100_000)),
         "observability-runs" => (Some(30), Some(100_000)),
         "health-snapshots" => (Some(30), None),
+        "health-history" => (Some(90), Some(1_000_000)),
         "alert-events" => (Some(180), None),
         _ => (None, None),
     };

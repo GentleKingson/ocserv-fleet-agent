@@ -1987,6 +1987,10 @@ fn health_snapshot_writer_is_atomic_idempotent_and_actor_bound() {
     StoreWriter::write_health_snapshots(&store, &write, TEST_ACTOR).expect("exact health retry");
     assert_eq!(store.audit_count().expect("audit count"), audit_count);
     assert_eq!(store.list_health_snapshots().expect("snapshots"), snapshots);
+    let history = store
+        .list_health_history(None, "2026-07-11T00:00:00Z", "2026-07-11T02:00:00Z", 100)
+        .expect("history");
+    assert_eq!(history.len(), 2, "exact replay must not append duplicates");
     assert!(matches!(
         StoreWriter::write_health_snapshots(&store, &write, "different-actor"),
         Err(StoreError::HealthEvaluationConflict { .. })
@@ -2031,6 +2035,12 @@ fn health_snapshot_writer_rolls_back_every_row_when_audit_fails() {
         &store, &write, TEST_ACTOR,
     ));
     assert!(store.list_health_snapshots().expect("snapshots").is_empty());
+    assert!(
+        store
+            .list_health_history(None, "2026-07-11T00:00:00Z", "2026-07-11T02:00:00Z", 100,)
+            .expect("history")
+            .is_empty()
+    );
 }
 
 fn health_evaluation_start(evaluation_id: &str, watermark: char) -> HealthEvaluationStart {
@@ -2045,7 +2055,7 @@ fn health_evaluation_start(evaluation_id: &str, watermark: char) -> HealthEvalua
 
 #[test]
 fn health_evaluation_lifecycle_is_atomic_idempotent_and_actor_bound() {
-    let (_dir, store, _db) = open_temp_store();
+    let (_dir, store, db) = open_temp_store();
     let evaluation_id = "health-eval-00000000-0000-4000-8000-000000000010";
     let start = health_evaluation_start(evaluation_id, 'a');
     StoreWriter::write_health_evaluation_start(&store, &start, TEST_ACTOR)
@@ -2095,8 +2105,42 @@ fn health_evaluation_lifecycle_is_atomic_idempotent_and_actor_bound() {
     assert_eq!(run.snapshot_count, 1);
     assert_eq!(
         store.list_health_snapshots().expect("snapshots"),
-        vec![snapshot]
+        vec![snapshot.clone()]
     );
+    let history = store
+        .list_health_history(
+            Some("health-evaluator-node"),
+            "2026-07-11T00:00:00Z",
+            "2026-07-11T02:00:00Z",
+            100,
+        )
+        .expect("history");
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].evaluation_id, evaluation_id);
+    assert_eq!(history[0].snapshot, snapshot);
+    assert!(
+        store
+            .list_health_history(None, "2026-07-11T01:00:00Z", "2026-07-11T01:00:01Z", 100,)
+            .expect("half-open history")
+            .is_empty(),
+        "sample at the end boundary must be excluded"
+    );
+    assert!(matches!(
+        store.list_health_history(None, "2026-07-11T01:00:00Z", "2026-07-11T01:00:00Z", 100,),
+        Err(StoreError::InvalidInput(_))
+    ));
+    assert!(matches!(
+        store.list_health_history(None, "2026-07-11T00:00:00Z", "2026-07-11T02:00:00Z", 1_001,),
+        Err(StoreError::InvalidInput(_))
+    ));
+    let update_error = Connection::open(&db)
+        .expect("open history database")
+        .execute(
+            "UPDATE health_history SET status = 'degraded' WHERE evaluation_id = ?1",
+            [evaluation_id],
+        )
+        .expect_err("append-only history rejects update");
+    assert!(update_error.to_string().contains("append-only"));
     assert!(matches!(
         StoreWriter::write_health_evaluation_failure(
             &store,
@@ -2156,6 +2200,12 @@ fn health_evaluation_mutations_roll_back_when_audit_fails() {
             .expect("run exists")
             .status,
         "running"
+    );
+    assert!(
+        store
+            .list_health_history(None, "2026-07-11T00:00:00Z", "2026-07-11T02:00:00Z", 100,)
+            .expect("history after finish rollback")
+            .is_empty()
     );
     Connection::open(&db)
         .expect("open database")

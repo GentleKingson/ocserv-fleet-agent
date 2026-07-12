@@ -1,4 +1,6 @@
-use ocfleet_cli::backup::{create_backup, list_backups, verify_backup};
+use ocfleet_cli::backup::{
+    apply_restore, create_backup, list_backups, plan_restore, verify_backup,
+};
 use ocfleet_cli::identity::load_or_create_secret_key;
 use ocfleet_cli::store::{CURRENT_SCHEMA_VERSION, Store};
 use ring::rand::SystemRandom;
@@ -110,4 +112,87 @@ fn backup_rejects_unsafe_output_directory() {
             .to_string()
             .contains("mode 0700")
     );
+}
+
+#[test]
+#[cfg(unix)]
+fn restore_plan_is_read_only_and_apply_runs_a_prebacked_restore_drill() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).expect("chmod temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let secret = dir.path().join("controller.secret");
+    let wrong_secret = dir.path().join("wrong.secret");
+    let backup_dir = dir.path().join("backups");
+    fs::create_dir(&backup_dir).expect("create backup dir");
+    fs::set_permissions(&backup_dir, fs::Permissions::from_mode(0o700)).expect("chmod backup dir");
+    load_or_create_secret_key(&secret, true).expect("create identity");
+    load_or_create_secret_key(&wrong_secret, true).expect("create wrong identity");
+    drop(Store::open(&database).expect("create database"));
+    let conn = rusqlite::Connection::open(&database).expect("open database");
+    conn.execute_batch(
+        "CREATE TABLE restore_probe(value TEXT); INSERT INTO restore_probe VALUES ('backup');",
+    )
+    .expect("seed backup state");
+    drop(conn);
+    let manifest = create_backup(&database, &secret, &backup_dir, None).expect("create backup");
+    let manifest_path = backup_dir.join(format!("{}.manifest.json", manifest.backup_id));
+    let conn = rusqlite::Connection::open(&database).expect("open live database");
+    conn.execute("UPDATE restore_probe SET value = 'live'", [])
+        .expect("mutate live state");
+    drop(conn);
+    let before_plan = fs::read(&database).expect("read before plan");
+
+    let plan = plan_restore(&database, &secret, &manifest_path).expect("plan restore");
+    assert!(plan.identity_match);
+    assert!(plan.target_exists);
+    assert!(plan.will_prebackup_existing);
+    assert_eq!(fs::read(&database).expect("read after plan"), before_plan);
+    assert!(
+        !plan_restore(&database, &wrong_secret, &manifest_path)
+            .expect("plan mismatch")
+            .identity_match
+    );
+    assert!(apply_restore(&database, &secret, &manifest_path, false).is_err());
+    assert!(apply_restore(&database, &wrong_secret, &manifest_path, true).is_err());
+
+    let wal = std::path::PathBuf::from(format!("{}-wal", database.to_string_lossy()));
+    let shm = std::path::PathBuf::from(format!("{}-shm", database.to_string_lossy()));
+    fs::write(&wal, []).expect("create stale wal");
+    fs::write(&shm, []).expect("create stale shm");
+    fs::set_permissions(&wal, fs::Permissions::from_mode(0o600)).expect("chmod wal");
+    fs::set_permissions(&shm, fs::Permissions::from_mode(0o600)).expect("chmod shm");
+
+    let result = apply_restore(&database, &secret, &manifest_path, true).expect("apply restore");
+    assert!(result.identity_match);
+    assert!(result.removed_stale_wal);
+    assert!(result.removed_stale_shm);
+    let value: String = rusqlite::Connection::open(&database)
+        .expect("open restored database")
+        .query_row("SELECT value FROM restore_probe", [], |row| row.get(0))
+        .expect("read restored value");
+    assert_eq!(value, "backup");
+    assert_eq!(
+        rusqlite::Connection::open(&database)
+            .expect("open restored audit")
+            .query_row(
+                "SELECT count(*) FROM controller_audit_log WHERE event = 'controller.restore.apply'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("read restore audit"),
+        1
+    );
+    let prebackup = result.prebackup_manifest.expect("prebackup manifest");
+    let prebackup_verification =
+        verify_backup(std::path::Path::new(&prebackup)).expect("verify automatic prebackup");
+    let prebackup_value: String = rusqlite::Connection::open(
+        std::path::Path::new(&prebackup)
+            .parent()
+            .expect("prebackup parent")
+            .join(&prebackup_verification.manifest.database_file),
+    )
+    .expect("open prebackup")
+    .query_row("SELECT value FROM restore_probe", [], |row| row.get(0))
+    .expect("read prebackup value");
+    assert_eq!(prebackup_value, "live");
 }

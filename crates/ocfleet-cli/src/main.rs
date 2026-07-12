@@ -9,7 +9,7 @@ use ocfleet_cli::args::{
 use ocfleet_cli::audit::AuditEvent;
 use ocfleet_cli::audit_export::run_audit_command;
 use ocfleet_cli::backend::StoreWriter;
-use ocfleet_cli::backup::run_backup_command;
+use ocfleet_cli::backup::{run_backup_command, run_restore_command};
 use ocfleet_cli::controller_rpc::{
     FixedControllerRpc, OcservCommandAudit, RpcAuditRecord, RpcCommandFailure, elapsed_ms,
     endpoint_trust_rejection, error_code_from_name, execute_fixed_node_rpc, execute_ocserv_rpc,
@@ -98,6 +98,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Backup { command } => {
             run_backup_command(&cli.database, &cli.secret_key, command)?;
+        }
+        Command::Restore { command } => {
+            run_restore_command(&cli.database, &cli.secret_key, command)?;
         }
         Command::Ping { node_id } => {
             let store = Store::open(&cli.database).context("failed to open controller database")?;

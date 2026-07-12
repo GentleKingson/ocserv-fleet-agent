@@ -2,11 +2,11 @@
   "baseline_commit": "b3c906a94823b4620dc1a2077a44e7160c0848b2",
   "current_phase": "A6",
   "completed_phases": ["A1", "A2", "A3", "A4", "A5"],
-  "active_branch": "codex/a6-completion-audit",
+  "active_branch": "codex/a6-restore-workflow",
   "active_issue": 38,
-  "active_pr": 96,
+  "active_pr": 97,
   "last_test_result": "passed",
   "last_updated_at": "2026-07-12T00:30:00Z",
   "blockers": [],
-  "next_action": "Publish the managed backup artifact slice, then implement restore plan/apply and the automated disaster-recovery drill."
+  "next_action": "Publish restore plan/apply and the automated disaster-recovery drill, then run the A6 completion audit."
 }

@@ -84,6 +84,35 @@ Stop processes that could touch controller state:
 sudo systemctl stop ocfleet-agent || true
 ```
 
+Create a read-only restore plan first. It verifies the managed backup and reports
+identity match, target existence, and WAL/SHM state without changing any file:
+
+```bash
+ocfleet --database /var/lib/ocfleet-controller/controller.sqlite \
+  --secret-key /var/lib/ocfleet-controller/controller.secret \
+  restore plan --manifest /var/backups/ocfleet/backup-ID.manifest.json --json
+```
+
+After reviewing the plan and stopping every controller process that can open the
+database, apply with explicit confirmation:
+
+```bash
+ocfleet --database /var/lib/ocfleet-controller/controller.sqlite \
+  --secret-key /var/lib/ocfleet-controller/controller.secret \
+  restore apply --manifest /var/backups/ocfleet/backup-ID.manifest.json --yes --json
+```
+
+Apply refuses to run without `--yes`. It rejects checksum, signature, integrity,
+schema, or controller EndpointID mismatches. If the target exists, apply first
+creates a managed online backup under `.ocfleet-pre-restore-backups/`. It stages
+and verifies the replacement in the target directory, moves the database and
+any WAL/SHM files aside, atomically renames the stage, verifies it again, and
+restores the original database plus sidecars if any post-replacement step fails.
+The per-database private restore lock prevents concurrent restore invocations;
+operators must still stop other controller processes before apply. The staged
+database receives the actor-bound `controller.restore.apply` audit row before
+the atomic rename, so audit failure prevents replacement.
+
 Verify the backup checksum before restore:
 
 ```bash

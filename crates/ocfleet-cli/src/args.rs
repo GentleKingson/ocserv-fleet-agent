@@ -78,6 +78,10 @@ pub enum Command {
         #[command(subcommand)]
         command: BackupCommand,
     },
+    Restore {
+        #[command(subcommand)]
+        command: RestoreCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -105,6 +109,24 @@ pub enum BackupCommand {
     Inspect {
         #[arg(long, value_name = "PATH")]
         manifest: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RestoreCommand {
+    Plan {
+        #[arg(long, value_name = "PATH")]
+        manifest: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    Apply {
+        #[arg(long, value_name = "PATH")]
+        manifest: PathBuf,
+        #[arg(long)]
+        yes: bool,
         #[arg(long)]
         json: bool,
     },

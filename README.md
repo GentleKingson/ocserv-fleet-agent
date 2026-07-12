@@ -483,6 +483,8 @@ target/debug/ocfleet backup create --output-dir ./controller-backups --json
 target/debug/ocfleet backup list --backup-dir ./controller-backups --json
 target/debug/ocfleet backup verify --manifest ./controller-backups/backup-<id>.manifest.json --json
 target/debug/ocfleet backup inspect --manifest ./controller-backups/backup-<id>.manifest.json --json
+target/debug/ocfleet restore plan --manifest ./controller-backups/backup-<id>.manifest.json --json
+target/debug/ocfleet restore apply --manifest ./controller-backups/backup-<id>.manifest.json --yes --json
 target/debug/ocfleet retention show
 target/debug/ocfleet retention explain --scope observations --json
 target/debug/ocfleet retention apply \

@@ -284,6 +284,7 @@ The second A6 slice implements read-only restore planning, explicit confirmed
 apply, controller identity/schema/integrity verification, managed pre-backup,
 WAL/SHM handling, staged atomic replacement, restore audit, and injected-failure
 rollback. Its pull request is the current A6 publication task.
+The restore workflow is published in pull request `#97`.
 
 ### Baseline And Production Foundation
 

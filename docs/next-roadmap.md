@@ -355,7 +355,8 @@ long-term retention. It is published in pull request `#110`. Bounded 24-hour,
 The third B1 slice adds schema 25 unbiased five-minute slot semantics and
 fixed 24-hour, 7-day, and 30-day CLI/API SLO projections. Coverage, status
 duration, availability eligibility, error, latency-range, certificate, and
-drift fields remain bounded and distinguish missing data.
+drift fields remain bounded and distinguish missing data. It is published in
+pull request `#111`.
 
 The A8 completion audit records the successful tag-bound matrix, publication
 of 38 `v0.3.0` assets, and independent checksum, Sigstore, SBOM, and provenance

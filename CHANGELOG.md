@@ -7,6 +7,8 @@
 - Release metadata, OpenAPI, lockfiles, workflows, scripts, install examples,
   and notes are aligned to the `v0.3.0` Stage A release candidate and guarded
   by a consistency check.
+- A8 completion records the successful tag-bound release matrix and independent
+  verification of all 38 published `v0.3.0` assets.
 
 ### Added
 

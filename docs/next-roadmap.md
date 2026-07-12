@@ -79,9 +79,9 @@ scaffold, implemented slice, operational maturity, and release verification.
 
 ## Execution DAG
 
-The current execution node is **A7** on issue `#39`. A1 through A6 are
-operationally mature for the current production controller mutation, storage,
-and scheduler reliability inventories. The node-lifecycle slice
+The current execution node is **B1** on issue `#41`. A1 through A8 and the
+A-READY production-foundation gate are operationally mature, with `v0.3.0`
+published from the verified tag-bound release matrix. The node-lifecycle slice
 merged through pull request `#57`, the scheduler-job configuration slice merged
 through pull request `#58`, and the endpoint-trust fail-closed slice merged
 through pull request `#59`. Atomic scheduler run, outcome, observation, audit,
@@ -339,6 +339,10 @@ defaults, scripts, install guide, and release notes to `v0.3.0`. A CI contract
 rejects version drift before the signed tag-bound matrix runs. This gate is
 published in pull request `#107`.
 
+The A8 completion audit records the successful tag-bound matrix, publication
+of 38 `v0.3.0` assets, and independent checksum, Sigstore, SBOM, and provenance
+verification. It is published in pull request `#108`.
+
 ### Baseline And Production Foundation
 
 | ID | Issue | Status | Depends on | Release target | Acceptance and required evidence |
@@ -351,8 +355,8 @@ published in pull request `#107`.
 | A5 Safe alert delivery worker | `#37` | operationally mature | A1, A2, A3, A4 | `v0.3.0` | Fixed JSONL/HTTPS delivery supports per-hook control, claim, bounded retry, dead-letter, recovery, grouping, rate limit, delivery health, idempotency, history, and shutdown. SSRF, HMAC, no-redirect, secret-redaction, and forbidden command/script/template tests pass. `docs/a5-alert-delivery-inventory.md` records the completion evidence. |
 | A6 Backup, restore, and disaster recovery | `#38` | operationally mature | A1, A2 | `v0.3.0` | Create/list/verify/inspect and plan/apply workflows use private artifacts, checksums and optional signatures; restore checks schema, integrity, controller identity and WAL/SHM, backs up before overwrite, replaces atomically, rolls back on failure, and passes a restore drill. `docs/a6-backup-restore-inventory.md` records the completion evidence. |
 | A7 Low-cardinality metrics | `#39` | operationally mature | A3, A4, A5 | `v0.3.0` | Agent/controller Prometheus metrics have documented sensitivity and cardinality; labels are fixed and bounded; non-loopback exposure is authenticated and explicitly protected; metric tests reject identity/request/session/address labels. `docs/a7-metrics-inventory.md` records the completion evidence. |
-| A8 Supply-chain and release hardening | `#40` | implemented slice | N0; final verification after A1-A7 | `v0.2.x` and every later release | Fuzzing, migration corpus, failure injection, browser E2E, SBOM, provenance, artifact signing, verification tooling, upgrade/rollback matrix, support policy, distro smoke, Linux architectures, CodeQL, dependency policy, and rollback runbook pass without weakening pinned actions or least privilege. |
-| A-READY Production-foundation gate | n/a | planned | A1, A2, A3, A4, A5, A6, A7, A8 | `v0.3.0` | All Stage A issues meet at least operational maturity, A8 supplies release evidence, the default/all-feature matrices pass, and the read-only boundary is re-audited. This gate unlocks Stage D. |
+| A8 Supply-chain and release hardening | `#40` | operationally mature | N0; final verification after A1-A7 | `v0.2.x` and every later release | Fuzzing, migration corpus, failure injection, browser E2E, SBOM, provenance, artifact signing, verification tooling, upgrade/rollback matrix, support policy, distro smoke, Linux architectures, CodeQL, dependency policy, and rollback runbook pass without weakening pinned actions or least privilege. `docs/a8-release-hardening-inventory.md` records the completion evidence. |
+| A-READY Production-foundation gate | n/a | operationally mature | A1, A2, A3, A4, A5, A6, A7, A8 | `v0.3.0` | All Stage A issues are operationally mature; the published 38-asset release passed default/all-feature, fuzz, browser, install, signing, provenance, and read-only boundary gates. Stage D is dependency-unlocked but remains default-off and unimplemented until its own gates pass. |
 
 ### Read-only Product Capability
 

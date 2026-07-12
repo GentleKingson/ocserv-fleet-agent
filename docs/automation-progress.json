@@ -1,12 +1,12 @@
 {
   "baseline_commit": "b3c906a94823b4620dc1a2077a44e7160c0848b2",
-  "current_phase": "A8",
-  "completed_phases": ["A1", "A2", "A3", "A4", "A5", "A6", "A7"],
-  "active_branch": "codex/a8-v0-3-release-candidate",
-  "active_issue": 40,
-  "active_pr": 107,
+  "current_phase": "B1",
+  "completed_phases": ["A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8", "A-READY"],
+  "active_branch": "codex/a8-completion-evidence",
+  "active_issue": 41,
+  "active_pr": 108,
   "last_test_result": "passed",
-  "last_updated_at": "2026-07-12T07:00:00Z",
+  "last_updated_at": "2026-07-12T08:00:00Z",
   "blockers": [],
-  "next_action": "Merge the v0.3.0 version gate, create the signed tag, run the tag-bound release matrix, and audit its assets before closing A8."
+  "next_action": "Publish A8 completion evidence and close issue 40, then audit and implement B1 health history, rollups, and SLOs."
 }

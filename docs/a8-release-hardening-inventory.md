@@ -17,7 +17,7 @@ repository contains automated evidence and the release path verifies it.
 | Distro/architecture smoke | Debian trixie and Ubuntu 24.04 on x86_64/aarch64 run install smoke in `.github/workflows/install-smoke.yml`. | complete |
 | Action pinning and least privilege | Remote actions are commit-SHA pinned; workflows default to `contents: read`; `scripts/check-github-actions-pinning.sh` enforces pinning. | complete |
 | Rollback runbook | `docs/release-rollback-runbook.md` covers preflight, staged upgrade, rollback triggers, atomic restore, trust review, restart order, observation, and failed rollback. | complete |
-| Tagged release matrix | Workspace, OpenAPI, workflows, scripts, install guide, lockfiles, and `v0.3.0` notes are consistency-checked. The tag-bound SBOM/signature/provenance workflow must pass before A8 closes. | active |
+| Tagged release matrix | Tag-bound run `29179909322` passed both architecture builds, SBOM generation, keyless signing, provenance, independent assembly verification, and draft creation. The 38 assets were downloaded and reverified before `v0.3.0` publication. | complete |
 
 ## Current Slice
 
@@ -30,3 +30,19 @@ secret value is uploaded as an artifact.
 The release supply-chain slice is documented in `docs/release-security.md`.
 Its trust boundary uses ephemeral GitHub OIDC credentials, never repository
 signing secrets, and the draft release job independently rechecks every output.
+
+## Completion Evidence
+
+The `v0.3.0` tag points at merged pull request `#107`. Release Draft workflow
+run `29179909322` passed Linux x86_64 and aarch64 build jobs and the independent
+assembly job. The published release contains exactly 38 assets: eight binaries,
+ten CycloneDX SBOMs, eighteen adjacent Sigstore bundles, `SHA256SUMS`, and its
+Sigstore bundle.
+
+Before publication, all assets were downloaded into a fresh directory. The
+combined manifest verified every covered file; all eighteen binary/SBOM
+signatures verified against this repository's tag-bound `release.yml` identity
+and GitHub's OIDC issuer; the checksum signature verified under the same
+constraints; and `gh attestation verify` accepted all eighteen provenance
+subjects against `GentleKingson/ocserv-fleet-agent`. The release was then
+published at `https://github.com/GentleKingson/ocserv-fleet-agent/releases/tag/v0.3.0`.

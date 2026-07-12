@@ -334,6 +334,11 @@ and procedures, and requirement-level migration/failure-injection evidence.
 CI enforces the critical policy clauses. This slice is published in pull
 request `#106`.
 
+The A8 release gate aligns the workspace and lockfiles, OpenAPI, workflow
+defaults, scripts, install guide, and release notes to `v0.3.0`. A CI contract
+rejects version drift before the signed tag-bound matrix runs. This gate is
+published in pull request `#107`.
+
 ### Baseline And Production Foundation
 
 | ID | Issue | Status | Depends on | Release target | Acceptance and required evidence |

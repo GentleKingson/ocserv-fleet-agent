@@ -12,6 +12,9 @@
   expose explicit coverage and missing time, distinct status durations,
   availability, observation errors, per-bucket latency ranges, certificate
   risk, and configuration fingerprint changes.
+- A deterministic `health rollup refresh` operation and hardened five-minute
+  systemd timer maintain only closed 5m/1h/1d buckets without network access,
+  duplicate audits, or fabricated catch-up data.
 
 ## 0.3.0 - 2026-07-12
 

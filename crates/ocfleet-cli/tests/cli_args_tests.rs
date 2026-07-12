@@ -1684,6 +1684,27 @@ fn ocserv_commands_reject_dangerous_selector_flags() {
 
 #[test]
 fn parses_bounded_health_rollup_commands() {
+    let refresh = Cli::parse_from([
+        "ocfleet",
+        "health",
+        "rollup",
+        "refresh",
+        "--at",
+        "2026-07-12T00:01:00Z",
+        "--json",
+    ]);
+    let Command::Health {
+        command:
+            HealthCommand::Rollup {
+                command: HealthRollupCommand::Refresh { at, json },
+            },
+    } = refresh.command
+    else {
+        panic!("expected health rollup refresh");
+    };
+    assert_eq!(at.as_deref(), Some("2026-07-12T00:01:00Z"));
+    assert!(json);
+
     let recompute = Cli::parse_from([
         "ocfleet",
         "health",

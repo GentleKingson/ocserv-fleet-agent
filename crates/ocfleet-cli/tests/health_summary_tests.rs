@@ -1,5 +1,9 @@
 use ocfleet_cli::audit::AuditEvent;
-use ocfleet_cli::store::{NodeInsert, ProbeObservationInsert, Store};
+use ocfleet_cli::backend::StoreWriter;
+use ocfleet_cli::storage_payloads::{HealthDegradedMethodsPayloadV1, HealthSummaryPayloadV1};
+use ocfleet_cli::store::{
+    HealthSnapshotRecord, HealthSnapshotWrite, NodeInsert, ProbeObservationInsert, Store,
+};
 use ocfleet_protocol::enrollment::EndpointStatus;
 use ocfleet_protocol::method::{
     OCSERV_CERT_EXPIRY, OCSERV_SERVICE_SUMMARY, OCSERV_VERSION, PROBE_CONTROLLER_PING,
@@ -83,6 +87,157 @@ fn old_rfc3339() -> String {
     (OffsetDateTime::now_utc() - Duration::days(10))
         .format(&Rfc3339)
         .expect("format timestamp")
+}
+
+#[test]
+fn health_rollup_refresh_writes_only_closed_buckets_and_replays_idempotently() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let store = Store::open(&database).expect("open store");
+    add_node(&store, "refresh-node");
+    StoreWriter::write_health_snapshots(
+        &store,
+        &HealthSnapshotWrite {
+            evaluation_id: "health-eval-00000000-0000-4000-8000-000000000777".into(),
+            event: "health.summary".into(),
+            snapshots: vec![HealthSnapshotRecord {
+                node_id: "refresh-node".into(),
+                endpoint_id: None,
+                computed_at: "2026-07-11T00:02:00Z".into(),
+                status: "healthy".into(),
+                freshness_seconds: Some(0),
+                last_success_at: Some("2026-07-11T00:02:00Z".into()),
+                last_failure_at: None,
+                last_error_code: None,
+                degraded_methods_json: HealthDegradedMethodsPayloadV1::new(vec![])
+                    .expect("methods")
+                    .to_value(),
+                summary_json: HealthSummaryPayloadV1::new(None, None, "healthy".into(), None, None)
+                    .expect("summary")
+                    .to_value(),
+            }],
+        },
+        "health-refresh-test",
+    )
+    .expect("write history");
+    let audit_before = store.audit_count().expect("audit count");
+    drop(store);
+
+    let database_arg = database.to_str().expect("database path");
+    let args = [
+        "--database",
+        database_arg,
+        "health",
+        "rollup",
+        "refresh",
+        "--at",
+        "2026-07-11T01:02:00Z",
+        "--json",
+    ];
+    let first: Value = serde_json::from_slice(&run_ocfleet(&args).stdout).expect("refresh JSON");
+    assert_eq!(first["schema"], "ocfleet.health_rollup_refresh.v1");
+    assert_eq!(first["results"][0]["row_count"], 0);
+    assert_eq!(first["results"][1]["row_count"], 1);
+    assert_eq!(first["results"][2]["row_count"], 0);
+
+    let store = Store::open(&database).expect("reopen store");
+    let audit_after_first = store.audit_count().expect("audit count");
+    assert_eq!(audit_after_first, audit_before + 1);
+    assert_eq!(
+        store
+            .list_health_rollups(
+                Some("refresh-node"),
+                3_600,
+                "2026-07-11T00:00:00Z",
+                "2026-07-11T02:00:00Z",
+                10,
+            )
+            .expect("hourly rollups")
+            .len(),
+        1
+    );
+    drop(store);
+
+    let second: Value = serde_json::from_slice(&run_ocfleet(&args).stdout).expect("replay JSON");
+    assert_eq!(
+        second["results"][1]["operation_id"],
+        first["results"][1]["operation_id"]
+    );
+    let store = Store::open(&database).expect("reopen replayed store");
+    assert_eq!(store.audit_count().expect("audit count"), audit_after_first);
+    StoreWriter::write_health_snapshots(
+        &store,
+        &HealthSnapshotWrite {
+            evaluation_id: "health-eval-00000000-0000-4000-8000-000000000778".into(),
+            event: "health.summary".into(),
+            snapshots: vec![HealthSnapshotRecord {
+                node_id: "refresh-node".into(),
+                endpoint_id: None,
+                computed_at: "2026-07-11T00:04:00Z".into(),
+                status: "degraded".into(),
+                freshness_seconds: Some(0),
+                last_success_at: Some("2026-07-11T00:02:00Z".into()),
+                last_failure_at: Some("2026-07-11T00:04:00Z".into()),
+                last_error_code: Some("RPC_TIMEOUT".into()),
+                degraded_methods_json: HealthDegradedMethodsPayloadV1::new(vec![
+                    OCSERV_SERVICE_SUMMARY.into(),
+                ])
+                .expect("methods")
+                .to_value(),
+                summary_json: HealthSummaryPayloadV1::new(
+                    None,
+                    None,
+                    "degraded".into(),
+                    None,
+                    None,
+                )
+                .expect("summary")
+                .to_value(),
+            }],
+        },
+        "health-refresh-test",
+    )
+    .expect("write late history");
+    let audit_before_late_refresh = store.audit_count().expect("audit count");
+    drop(store);
+
+    let third: Value = serde_json::from_slice(&run_ocfleet(&args).stdout).expect("late refresh");
+    assert_ne!(
+        third["results"][1]["operation_id"],
+        first["results"][1]["operation_id"]
+    );
+    let store = Store::open(&database).expect("reopen late-refreshed store");
+    assert_eq!(
+        store.audit_count().expect("audit count"),
+        audit_before_late_refresh + 1
+    );
+    let rows = store
+        .list_health_rollups(
+            Some("refresh-node"),
+            3_600,
+            "2026-07-11T00:00:00Z",
+            "2026-07-11T02:00:00Z",
+            10,
+        )
+        .expect("late rollup");
+    assert_eq!(rows[0].healthy_count, 0);
+    assert_eq!(rows[0].degraded_count, 1);
+}
+
+#[test]
+fn health_rollup_refresh_systemd_units_are_bounded_and_network_isolated() {
+    let service = include_str!("../../../deploy/systemd/ocfleet-health-rollup-refresh.service");
+    let timer = include_str!("../../../deploy/systemd/ocfleet-health-rollup-refresh.timer");
+    assert!(service.contains("PrivateNetwork=true"));
+    assert!(service.contains("NoNewPrivileges=true"));
+    assert!(service.contains("ProtectSystem=strict"));
+    assert!(service.contains("CapabilityBoundingSet="));
+    assert!(service.contains("health rollup refresh"));
+    assert!(!service.contains("/bin/sh"));
+    assert!(!service.contains("curl"));
+    assert!(!service.contains("systemctl"));
+    assert!(timer.contains("OnCalendar=*:0/5"));
+    assert!(timer.contains("Persistent=true"));
 }
 
 struct ObservationFixture<'a> {

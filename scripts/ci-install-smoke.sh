@@ -122,6 +122,8 @@ test "$(stat -c '%U:%G %a' /var/log/ocfleet)" = "ocfleet:ocfleet 700"
 
 systemd_units=(
   "$repo_root/deploy/systemd/ocfleet-agent.service"
+  "$repo_root/deploy/systemd/ocfleet-health-rollup-refresh.service"
+  "$repo_root/deploy/systemd/ocfleet-health-rollup-refresh.timer"
   "$repo_root/deploy/systemd/ocserv-metadata-collector.service"
   "$repo_root/deploy/systemd/ocserv-metadata-collector.timer"
 )

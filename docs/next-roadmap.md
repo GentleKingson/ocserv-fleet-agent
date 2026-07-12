@@ -79,9 +79,9 @@ scaffold, implemented slice, operational maturity, and release verification.
 
 ## Execution DAG
 
-The current execution node is **A7** on issue `#39`. A1 through A6 are
-operationally mature for the current production controller mutation, storage,
-and scheduler reliability inventories. The node-lifecycle slice
+The current execution node is **B1** on issue `#41`. A1 through A8 and the
+A-READY production-foundation gate are operationally mature, with `v0.3.0`
+published from the verified tag-bound release matrix. The node-lifecycle slice
 merged through pull request `#57`, the scheduler-job configuration slice merged
 through pull request `#58`, and the endpoint-trust fail-closed slice merged
 through pull request `#59`. Atomic scheduler run, outcome, observation, audit,
@@ -338,6 +338,10 @@ The A8 release gate aligns the workspace and lockfiles, OpenAPI, workflow
 defaults, scripts, install guide, and release notes to `v0.3.0`. A CI contract
 rejects version drift before the signed tag-bound matrix runs. This gate is
 published in pull request `#107`.
+
+The A8 completion audit records the successful tag-bound matrix, publication
+of 38 `v0.3.0` assets, and independent checksum, Sigstore, SBOM, and provenance
+verification. It is published in pull request `#108`.
 
 ### Baseline And Production Foundation
 

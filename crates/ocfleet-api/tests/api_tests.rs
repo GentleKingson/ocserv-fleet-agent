@@ -690,6 +690,8 @@ async fn metrics_are_prometheus_compatible_bounded_and_read_only() {
     );
     assert!(body.contains("# TYPE ocfleet_controller_health_nodes gauge"));
     assert!(body.contains("ocfleet_controller_alerts{state=\"open\"}"));
+    assert!(body.contains("ocfleet_controller_rpc_duration_milliseconds_count"));
+    assert!(body.contains("ocfleet_controller_retention_deleted_rows_total"));
     assert!(body.len() < 8_192);
     for forbidden in [
         "node_id",

@@ -2,11 +2,11 @@
   "baseline_commit": "b3c906a94823b4620dc1a2077a44e7160c0848b2",
   "current_phase": "A7",
   "completed_phases": ["A1", "A2", "A3", "A4", "A5", "A6"],
-  "active_branch": "codex/a7-agent-metrics",
+  "active_branch": "codex/a7-controller-metrics-completion",
   "active_issue": 39,
-  "active_pr": 100,
+  "active_pr": 101,
   "last_test_result": "passed",
   "last_updated_at": "2026-07-12T00:30:00Z",
   "blockers": [],
-  "next_action": "Publish protected agent metrics, then complete controller retention/RPC duration metrics and the A7 acceptance audit."
+  "next_action": "Publish the final controller metrics, then run the A7 requirement-by-requirement completion audit."
 }

@@ -4,7 +4,7 @@
   "completed_phases": ["A1", "A2", "A3", "A4"],
   "active_branch": "codex/a5-completion-audit",
   "active_issue": 37,
-  "active_pr": null,
+  "active_pr": 95,
   "last_test_result": "passed",
   "last_updated_at": "2026-07-12T00:30:00Z",
   "blockers": [],

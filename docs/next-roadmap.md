@@ -273,6 +273,7 @@ persisted for daemon selection.
 Schema 22 delivery queue persistence is published in pull request `#92`.
 Atomic delivery queue writers are published in pull request `#93`.
 The automatic delivery worker is published in pull request `#94`.
+The A5 acceptance completion audit is published in pull request `#95`.
 
 ### Baseline And Production Foundation
 

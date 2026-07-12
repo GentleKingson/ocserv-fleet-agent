@@ -35,7 +35,7 @@ use crate::storage_payloads::{
     validate_health_payload_relationship, validate_scheduler_payload_relationship,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 23;
+pub const CURRENT_SCHEMA_VERSION: i64 = 24;
 pub const DEFAULT_HEALTH_STALE_WINDOW_SECONDS: u64 = 24 * 60 * 60;
 pub const DEFAULT_HEALTH_UNREACHABLE_FAILURES: u64 = 3;
 pub const DEFAULT_HEALTH_CERT_WARNING_DAYS: u64 = 30;
@@ -47,6 +47,7 @@ pub const MAX_RETENTION_BATCH_SIZE: u64 = 1_000;
 pub const MAX_RETENTION_POLICY_AGE_DAYS: u64 = 36_500;
 pub const MAX_RETENTION_POLICY_ROWS: u64 = 10_000_000;
 pub const MAX_HEALTH_SNAPSHOT_WRITE_RECORDS: usize = 1_000;
+pub const MAX_HEALTH_ROLLUP_WRITE_RECORDS: usize = 100_000;
 pub const MAX_ALERT_EVALUATION_RECORDS: usize = 1_000;
 pub const MAX_ALERT_DELIVERY_FINALIZE_RECORDS: usize = 1_000;
 
@@ -356,6 +357,46 @@ pub struct HealthSnapshotWrite {
 pub struct HealthHistoryRecord {
     pub evaluation_id: String,
     pub snapshot: HealthSnapshotRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct HealthRollupRecord {
+    pub node_id: String,
+    pub bucket_seconds: u64,
+    pub bucket_start: String,
+    pub bucket_end: String,
+    pub input_watermark: String,
+    pub health_samples: u64,
+    pub covered_slots: u64,
+    pub expected_slots: u64,
+    pub healthy_count: u64,
+    pub degraded_count: u64,
+    pub unreachable_count: u64,
+    pub stale_count: u64,
+    pub disabled_count: u64,
+    pub unknown_count: u64,
+    pub observation_count: u64,
+    pub observation_error_count: u64,
+    pub duration_sample_count: u64,
+    pub duration_p50_ms: Option<u64>,
+    pub duration_p95_ms: Option<u64>,
+    pub cert_warning_count: u64,
+    pub cert_critical_count: u64,
+    pub fingerprint_sample_count: u64,
+    pub fingerprint_change_count: u64,
+    pub computed_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HealthRollupWrite {
+    pub operation_id: String,
+    pub rows: Vec<HealthRollupRecord>,
+}
+
+#[derive(Debug, Clone)]
+pub struct HealthRollupSource {
+    pub history: Vec<HealthHistoryRecord>,
+    pub observations: Vec<ProbeObservationRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2096,6 +2137,166 @@ impl Store {
         let rows = stmt.query_map(
             params![node_id, from, to, u64_to_i64(limit)?],
             health_history_from_row,
+        )?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub fn health_rollup_source(
+        &self,
+        node_id: &str,
+        from: &str,
+        to: &str,
+    ) -> Result<HealthRollupSource, StoreError> {
+        validate_node_id(node_id).map_err(|error| StoreError::InvalidInput(error.to_string()))?;
+        let (from, to) = normalize_half_open_window(from, to, "health rollup source")?;
+        const SOURCE_LIMIT: i64 = 100_001;
+        let mut history_stmt = self.conn.prepare(
+            "SELECT evaluation_id, node_id, endpoint_id, computed_at, status,
+                    freshness_seconds, last_success_at, last_failure_at,
+                    last_error_code, degraded_methods_json, summary_json
+             FROM health_history
+             WHERE node_id = ?1 AND computed_at >= ?2 AND computed_at < ?3
+             ORDER BY computed_at, evaluation_id
+             LIMIT ?4",
+        )?;
+        let history = history_stmt
+            .query_map(
+                params![node_id, from, to, SOURCE_LIMIT],
+                health_history_from_row,
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut observation_stmt = self.conn.prepare(
+            "SELECT observation_id, run_id, node_id, endpoint_id, method, ok,
+                    error_code, duration_ms, observed_at, expires_at,
+                    result_class, summary_json
+             FROM probe_observations
+             WHERE node_id = ?1 AND observed_at >= ?2 AND observed_at < ?3
+             ORDER BY observed_at, observation_id
+             LIMIT ?4",
+        )?;
+        let observations = observation_stmt
+            .query_map(
+                params![node_id, from, to, SOURCE_LIMIT],
+                probe_observation_from_row,
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        if history.len() >= SOURCE_LIMIT as usize || observations.len() >= SOURCE_LIMIT as usize {
+            return Err(StoreError::InvalidInput(
+                "health rollup source exceeds 100000 rows in one bucket".to_string(),
+            ));
+        }
+        Ok(HealthRollupSource {
+            history,
+            observations,
+        })
+    }
+
+    pub fn health_rollup_node_ids(&self, from: &str, to: &str) -> Result<Vec<String>, StoreError> {
+        let (from, to) = normalize_half_open_window(from, to, "health rollup nodes")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT node_id FROM (
+               SELECT node_id FROM health_history
+               WHERE computed_at >= ?1 AND computed_at < ?2
+               UNION
+               SELECT node_id FROM probe_observations
+               WHERE node_id IS NOT NULL AND observed_at >= ?1 AND observed_at < ?2
+             )
+             ORDER BY node_id
+             LIMIT 1001",
+        )?;
+        let nodes = stmt
+            .query_map(params![from, to], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        if nodes.len() > 1_000 {
+            return Err(StoreError::InvalidInput(
+                "health rollup window exceeds 1000 nodes".to_string(),
+            ));
+        }
+        Ok(nodes)
+    }
+
+    pub fn write_health_rollups(
+        &self,
+        write: &HealthRollupWrite,
+        actor: &str,
+    ) -> Result<(), StoreError> {
+        validate_actor(actor).map_err(StoreError::InvalidInput)?;
+        validate_health_rollup_write(write)?;
+        let params_hash = health_rollup_write_hash(write);
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        if audit_request_replay_tx(
+            &tx,
+            &write.operation_id,
+            "health.rollup.recompute",
+            actor,
+            &params_hash,
+        )? {
+            tx.commit()?;
+            return Ok(());
+        }
+        for row in &write.rows {
+            upsert_health_rollup_tx(&tx, row)?;
+        }
+        let mut event = AuditEvent::new(actor, "health.rollup.recompute");
+        event.ok = Some(true);
+        event.request_id = Some(write.operation_id.clone());
+        event.params_hash = Some(params_hash);
+        event.detail_json = json!({
+            "actor_type": "system",
+            "target_type": "health_rollup_batch",
+            "target_id": write.operation_id,
+            "batch_count": write.rows.len(),
+            "reason": Value::Null,
+        });
+        insert_audit_tx(&tx, &event)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn list_health_rollups(
+        &self,
+        node_id: Option<&str>,
+        bucket_seconds: u64,
+        from: &str,
+        to: &str,
+        limit: u64,
+    ) -> Result<Vec<HealthRollupRecord>, StoreError> {
+        if let Some(node_id) = node_id {
+            validate_node_id(node_id)
+                .map_err(|error| StoreError::InvalidInput(error.to_string()))?;
+        }
+        validate_health_rollup_bucket(bucket_seconds)?;
+        let (from, to) = normalize_half_open_window(from, to, "health rollup")?;
+        if limit == 0 || limit > 100_000 {
+            return Err(StoreError::InvalidInput(
+                "health rollup limit must be between 1 and 100000".to_string(),
+            ));
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT node_id, bucket_seconds, bucket_start, bucket_end,
+                    input_watermark, health_samples, covered_slots, expected_slots,
+                    healthy_count, degraded_count, unreachable_count, stale_count,
+                    disabled_count, unknown_count, observation_count,
+                    observation_error_count, duration_sample_count, duration_p50_ms,
+                    duration_p95_ms, cert_warning_count, cert_critical_count,
+                    fingerprint_sample_count, fingerprint_change_count, computed_at
+             FROM health_rollups
+             WHERE (?1 IS NULL OR node_id = ?1)
+               AND bucket_seconds = ?2
+               AND bucket_start >= ?3 AND bucket_start < ?4
+             ORDER BY bucket_start, node_id
+             LIMIT ?5",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                node_id,
+                u64_to_i64(bucket_seconds)?,
+                from,
+                to,
+                u64_to_i64(limit)?
+            ],
+            health_rollup_from_row,
         )?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(StoreError::from)
@@ -7111,6 +7312,41 @@ fn health_history_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HealthHi
     })
 }
 
+fn health_rollup_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HealthRollupRecord> {
+    let value = |index| -> rusqlite::Result<u64> { i64_to_u64(row.get(index)?) };
+    let optional = |index| -> rusqlite::Result<Option<u64>> {
+        row.get::<_, Option<i64>>(index)?
+            .map(i64_to_u64)
+            .transpose()
+    };
+    Ok(HealthRollupRecord {
+        node_id: row.get(0)?,
+        bucket_seconds: value(1)?,
+        bucket_start: row.get(2)?,
+        bucket_end: row.get(3)?,
+        input_watermark: row.get(4)?,
+        health_samples: value(5)?,
+        covered_slots: value(6)?,
+        expected_slots: value(7)?,
+        healthy_count: value(8)?,
+        degraded_count: value(9)?,
+        unreachable_count: value(10)?,
+        stale_count: value(11)?,
+        disabled_count: value(12)?,
+        unknown_count: value(13)?,
+        observation_count: value(14)?,
+        observation_error_count: value(15)?,
+        duration_sample_count: value(16)?,
+        duration_p50_ms: optional(17)?,
+        duration_p95_ms: optional(18)?,
+        cert_warning_count: value(19)?,
+        cert_critical_count: value(20)?,
+        fingerprint_sample_count: value(21)?,
+        fingerprint_change_count: value(22)?,
+        computed_at: row.get(23)?,
+    })
+}
+
 fn health_evaluation_run_from_row(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<HealthEvaluationRunRecord> {
@@ -8022,6 +8258,10 @@ fn retention_target(scope: &str) -> Result<RetentionTarget, StoreError> {
             table: "health_history",
             timestamp_column: "computed_at",
         }),
+        "health-rollups" => Ok(RetentionTarget {
+            table: "health_rollups",
+            timestamp_column: "bucket_start",
+        }),
         "alert-events" => Ok(RetentionTarget {
             table: "alert_events",
             timestamp_column: "last_seen_at",
@@ -8119,6 +8359,121 @@ fn validate_health_snapshot_write(write: &HealthSnapshotWrite) -> Result<(), Sto
             .map_err(StoreError::InvalidInput)?;
         validate_health_payload_relationship(&snapshot.status, &summary)
             .map_err(StoreError::InvalidInput)?;
+    }
+    Ok(())
+}
+
+fn validate_health_rollup_bucket(bucket_seconds: u64) -> Result<(), StoreError> {
+    if matches!(bucket_seconds, 300 | 3_600 | 86_400) {
+        Ok(())
+    } else {
+        Err(StoreError::InvalidInput(
+            "health rollup bucket must be 300, 3600, or 86400 seconds".to_string(),
+        ))
+    }
+}
+
+fn normalize_half_open_window(
+    from: &str,
+    to: &str,
+    field: &str,
+) -> Result<(String, String), StoreError> {
+    let from = OffsetDateTime::parse(from, &Rfc3339)
+        .map_err(|_| StoreError::InvalidInput(format!("{field} from must be RFC3339")))?;
+    let to = OffsetDateTime::parse(to, &Rfc3339)
+        .map_err(|_| StoreError::InvalidInput(format!("{field} to must be RFC3339")))?;
+    if from >= to {
+        return Err(StoreError::InvalidInput(format!(
+            "{field} from must precede to"
+        )));
+    }
+    Ok((
+        from.format(&Rfc3339)
+            .map_err(|_| StoreError::InvalidInput(format!("{field} from cannot normalize")))?,
+        to.format(&Rfc3339)
+            .map_err(|_| StoreError::InvalidInput(format!("{field} to cannot normalize")))?,
+    ))
+}
+
+fn validate_health_rollup_write(write: &HealthRollupWrite) -> Result<(), StoreError> {
+    validate_audit_text(&write.operation_id, "health rollup operation_id", 96)?;
+    let Some(uuid) = write.operation_id.strip_prefix("health-rollup-") else {
+        return Err(StoreError::InvalidInput(
+            "health rollup operation_id must use health-rollup-<uuid> format".to_string(),
+        ));
+    };
+    Uuid::parse_str(uuid).map_err(|_| {
+        StoreError::InvalidInput("health rollup operation_id must contain a UUID".to_string())
+    })?;
+    if write.rows.len() > MAX_HEALTH_ROLLUP_WRITE_RECORDS {
+        return Err(StoreError::InvalidInput(format!(
+            "health rollup batch exceeds {MAX_HEALTH_ROLLUP_WRITE_RECORDS} rows"
+        )));
+    }
+    let mut keys = std::collections::BTreeSet::new();
+    for row in &write.rows {
+        validate_node_id(&row.node_id)
+            .map_err(|error| StoreError::InvalidInput(error.to_string()))?;
+        validate_health_rollup_bucket(row.bucket_seconds)?;
+        let (start, end) =
+            normalize_half_open_window(&row.bucket_start, &row.bucket_end, "health rollup bucket")?;
+        if start != row.bucket_start || end != row.bucket_end {
+            return Err(StoreError::InvalidInput(
+                "health rollup bucket timestamps must be canonical RFC3339".to_string(),
+            ));
+        }
+        let start = OffsetDateTime::parse(&row.bucket_start, &Rfc3339).map_err(|_| {
+            StoreError::InvalidInput("health rollup bucket start is invalid".to_string())
+        })?;
+        let end = OffsetDateTime::parse(&row.bucket_end, &Rfc3339).map_err(|_| {
+            StoreError::InvalidInput("health rollup bucket end is invalid".to_string())
+        })?;
+        if u64::try_from((end - start).whole_seconds()).ok() != Some(row.bucket_seconds) {
+            return Err(StoreError::InvalidInput(
+                "health rollup bucket duration is inconsistent".to_string(),
+            ));
+        }
+        if !keys.insert((
+            row.node_id.as_str(),
+            row.bucket_seconds,
+            row.bucket_start.as_str(),
+        )) {
+            return Err(StoreError::InvalidInput(
+                "health rollup batch contains a duplicate key".to_string(),
+            ));
+        }
+        validate_sha256_hex(&row.input_watermark, "health rollup input watermark")?;
+        validate_rfc3339(&row.computed_at, "health rollup computed_at")?;
+        let status_total = [
+            row.healthy_count,
+            row.degraded_count,
+            row.unreachable_count,
+            row.stale_count,
+            row.disabled_count,
+            row.unknown_count,
+        ]
+        .into_iter()
+        .try_fold(0_u64, u64::checked_add);
+        let duration_invalid = if row.duration_sample_count == 0 {
+            row.duration_p50_ms.is_some() || row.duration_p95_ms.is_some()
+        } else {
+            row.duration_p50_ms.is_none() || row.duration_p95_ms.is_none()
+        };
+        if row.expected_slots != row.bucket_seconds / 300
+            || row.covered_slots > row.expected_slots
+            || status_total != Some(row.health_samples)
+            || row.observation_error_count > row.observation_count
+            || row.fingerprint_change_count > row.fingerprint_sample_count
+            || duration_invalid
+            || row
+                .duration_p50_ms
+                .zip(row.duration_p95_ms)
+                .is_some_and(|(p50, p95)| p50 > p95)
+        {
+            return Err(StoreError::InvalidInput(
+                "health rollup counters are inconsistent".to_string(),
+            ));
+        }
     }
     Ok(())
 }
@@ -8293,6 +8648,83 @@ fn health_snapshot_replay_tx(
     })
 }
 
+fn audit_request_replay_tx(
+    tx: &Transaction<'_>,
+    request_id: &str,
+    event: &str,
+    actor: &str,
+    params_hash: &str,
+) -> Result<bool, StoreError> {
+    let mut stmt = tx.prepare(
+        "SELECT event, actor, params_hash
+         FROM controller_audit_log
+         WHERE request_id = ?1
+         ORDER BY id
+         LIMIT 2",
+    )?;
+    let existing = stmt
+        .query_map([request_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    if existing.is_empty() {
+        return Ok(false);
+    }
+    if existing.len() == 1
+        && existing[0].0 == event
+        && existing[0].1 == actor
+        && existing[0].2.as_deref() == Some(params_hash)
+    {
+        return Ok(true);
+    }
+    Err(StoreError::HealthEvaluationConflict {
+        evaluation_id: request_id.to_string(),
+        detail: "rollup operation audit provenance is mismatched or ambiguous",
+    })
+}
+
+fn health_rollup_write_hash(write: &HealthRollupWrite) -> String {
+    let rows = write
+        .rows
+        .iter()
+        .map(|row| {
+            json!({
+                "node_id": row.node_id,
+                "bucket_seconds": row.bucket_seconds,
+                "bucket_start": row.bucket_start,
+                "bucket_end": row.bucket_end,
+                "input_watermark": row.input_watermark,
+                "health_samples": row.health_samples,
+                "covered_slots": row.covered_slots,
+                "expected_slots": row.expected_slots,
+                "healthy_count": row.healthy_count,
+                "degraded_count": row.degraded_count,
+                "unreachable_count": row.unreachable_count,
+                "stale_count": row.stale_count,
+                "disabled_count": row.disabled_count,
+                "unknown_count": row.unknown_count,
+                "observation_count": row.observation_count,
+                "observation_error_count": row.observation_error_count,
+                "duration_sample_count": row.duration_sample_count,
+                "duration_p50_ms": row.duration_p50_ms,
+                "duration_p95_ms": row.duration_p95_ms,
+                "cert_warning_count": row.cert_warning_count,
+                "cert_critical_count": row.cert_critical_count,
+                "fingerprint_sample_count": row.fingerprint_sample_count,
+                "fingerprint_change_count": row.fingerprint_change_count,
+                "computed_at": row.computed_at,
+            })
+        })
+        .collect::<Vec<_>>();
+    blake3::hash(&serde_json::to_vec(&rows).expect("health rollup hash JSON serializes"))
+        .to_hex()
+        .to_string()
+}
+
 fn upsert_health_snapshot_tx(
     tx: &Transaction<'_>,
     snapshot: &HealthSnapshotRecord,
@@ -8350,6 +8782,73 @@ fn insert_health_history_tx(
             snapshot.last_error_code.as_deref(),
             compact_json(&snapshot.degraded_methods_json),
             compact_json(&snapshot.summary_json),
+        ],
+    )?;
+    Ok(())
+}
+
+fn upsert_health_rollup_tx(
+    tx: &Transaction<'_>,
+    row: &HealthRollupRecord,
+) -> Result<(), StoreError> {
+    tx.execute(
+        "INSERT INTO health_rollups
+         (node_id, bucket_seconds, bucket_start, bucket_end, input_watermark,
+          health_samples, covered_slots, expected_slots, healthy_count,
+          degraded_count, unreachable_count, stale_count, disabled_count,
+          unknown_count, observation_count, observation_error_count,
+          duration_sample_count, duration_p50_ms, duration_p95_ms,
+          cert_warning_count, cert_critical_count, fingerprint_sample_count,
+          fingerprint_change_count, computed_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                 ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)
+         ON CONFLICT(node_id, bucket_seconds, bucket_start) DO UPDATE SET
+           bucket_end = excluded.bucket_end,
+           input_watermark = excluded.input_watermark,
+           health_samples = excluded.health_samples,
+           covered_slots = excluded.covered_slots,
+           expected_slots = excluded.expected_slots,
+           healthy_count = excluded.healthy_count,
+           degraded_count = excluded.degraded_count,
+           unreachable_count = excluded.unreachable_count,
+           stale_count = excluded.stale_count,
+           disabled_count = excluded.disabled_count,
+           unknown_count = excluded.unknown_count,
+           observation_count = excluded.observation_count,
+           observation_error_count = excluded.observation_error_count,
+           duration_sample_count = excluded.duration_sample_count,
+           duration_p50_ms = excluded.duration_p50_ms,
+           duration_p95_ms = excluded.duration_p95_ms,
+           cert_warning_count = excluded.cert_warning_count,
+           cert_critical_count = excluded.cert_critical_count,
+           fingerprint_sample_count = excluded.fingerprint_sample_count,
+           fingerprint_change_count = excluded.fingerprint_change_count,
+           computed_at = excluded.computed_at",
+        params![
+            row.node_id,
+            u64_to_i64(row.bucket_seconds)?,
+            row.bucket_start,
+            row.bucket_end,
+            row.input_watermark,
+            u64_to_i64(row.health_samples)?,
+            u64_to_i64(row.covered_slots)?,
+            u64_to_i64(row.expected_slots)?,
+            u64_to_i64(row.healthy_count)?,
+            u64_to_i64(row.degraded_count)?,
+            u64_to_i64(row.unreachable_count)?,
+            u64_to_i64(row.stale_count)?,
+            u64_to_i64(row.disabled_count)?,
+            u64_to_i64(row.unknown_count)?,
+            u64_to_i64(row.observation_count)?,
+            u64_to_i64(row.observation_error_count)?,
+            u64_to_i64(row.duration_sample_count)?,
+            option_u64_to_i64(row.duration_p50_ms)?,
+            option_u64_to_i64(row.duration_p95_ms)?,
+            u64_to_i64(row.cert_warning_count)?,
+            u64_to_i64(row.cert_critical_count)?,
+            u64_to_i64(row.fingerprint_sample_count)?,
+            u64_to_i64(row.fingerprint_change_count)?,
+            row.computed_at,
         ],
     )?;
     Ok(())

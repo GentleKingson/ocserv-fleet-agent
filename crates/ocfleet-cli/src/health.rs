@@ -6,10 +6,12 @@ use ocfleet_protocol::method::{
     OCSERV_VERSION, PROBE_CONTROLLER_PING,
 };
 use serde_json::{Value, json};
-use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use std::collections::BTreeSet;
+use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::args::{
-    HealthCommand, HealthEvaluatorCommand, HealthPolicyCommand, HealthSnapshotCommand,
+    HealthCommand, HealthEvaluatorCommand, HealthPolicyCommand, HealthRollupBucket,
+    HealthRollupCommand, HealthSnapshotCommand,
 };
 use crate::backend::StoreWriter;
 use crate::duration_args::parse_duration_seconds;
@@ -18,7 +20,8 @@ use crate::observation::safe_observation_summary;
 use crate::storage_payloads::{HealthDegradedMethodsPayloadV1, HealthSummaryPayloadV1};
 use crate::store::{
     HealthEvaluationFailure, HealthEvaluationFinish, HealthEvaluationStart, HealthPolicyRecord,
-    HealthSnapshotRecord, HealthSnapshotWrite, NodeRecord, ProbeObservationRecord, Store,
+    HealthRollupRecord, HealthRollupSource, HealthRollupWrite, HealthSnapshotRecord,
+    HealthSnapshotWrite, NodeRecord, ProbeObservationRecord, Store,
 };
 use uuid::Uuid;
 
@@ -38,6 +41,7 @@ pub async fn run_health_command(store: &Store, command: HealthCommand) -> anyhow
             limit,
             json,
         } => run_health_history(store, &from, &to, node.as_deref(), limit, json),
+        HealthCommand::Rollup { command } => run_health_rollup(store, command),
         HealthCommand::Evaluator { command } => run_health_evaluator_command(store, command).await,
     }
 }
@@ -573,6 +577,343 @@ fn run_health_history(
     Ok(())
 }
 
+fn run_health_rollup(store: &Store, command: HealthRollupCommand) -> anyhow::Result<()> {
+    match command {
+        HealthRollupCommand::Recompute {
+            from,
+            to,
+            node,
+            bucket,
+            operation_id,
+            json,
+        } => recompute_health_rollups(
+            store,
+            &from,
+            &to,
+            node.as_deref(),
+            rollup_bucket_seconds(bucket),
+            operation_id,
+            json,
+        ),
+        HealthRollupCommand::List {
+            from,
+            to,
+            node,
+            bucket,
+            limit,
+            json,
+        } => list_health_rollups(
+            store,
+            &from,
+            &to,
+            node.as_deref(),
+            rollup_bucket_seconds(bucket),
+            limit,
+            json,
+        ),
+    }
+}
+
+fn rollup_bucket_seconds(bucket: HealthRollupBucket) -> u64 {
+    match bucket {
+        HealthRollupBucket::FiveMinutes => 300,
+        HealthRollupBucket::OneHour => 3_600,
+        HealthRollupBucket::OneDay => 86_400,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn recompute_health_rollups(
+    store: &Store,
+    from: &str,
+    to: &str,
+    node: Option<&str>,
+    bucket_seconds: u64,
+    operation_id: Option<String>,
+    json_output: bool,
+) -> anyhow::Result<()> {
+    let (from, to) = validate_rollup_window(from, to, bucket_seconds)?;
+    let node_ids = if let Some(node_id) = node {
+        validate_node_id(node_id)?;
+        vec![node_id.to_string()]
+    } else {
+        store.health_rollup_node_ids(&from.format(&Rfc3339)?, &to.format(&Rfc3339)?)?
+    };
+    let bucket_count = u64::try_from((to - from).whole_seconds())? / bucket_seconds;
+    let row_count = bucket_count
+        .checked_mul(u64::try_from(node_ids.len())?)
+        .context("health rollup row count overflow")?;
+    if row_count > 100_000 {
+        bail!("health rollup recompute exceeds 100000 rows");
+    }
+    let mut rows = Vec::with_capacity(usize::try_from(row_count)?);
+    for bucket_index in 0..bucket_count {
+        let seconds = i64::try_from(
+            bucket_index
+                .checked_mul(bucket_seconds)
+                .context("health rollup bucket offset overflow")?,
+        )?;
+        let bucket_start = from + Duration::seconds(seconds);
+        let bucket_end = bucket_start + Duration::seconds(i64::try_from(bucket_seconds)?);
+        let bucket_start_text = bucket_start.format(&Rfc3339)?;
+        let bucket_end_text = bucket_end.format(&Rfc3339)?;
+        for node_id in &node_ids {
+            let source =
+                store.health_rollup_source(node_id, &bucket_start_text, &bucket_end_text)?;
+            rows.push(build_health_rollup(
+                node_id,
+                bucket_seconds,
+                &bucket_start_text,
+                &bucket_end_text,
+                source,
+            )?);
+        }
+    }
+    let operation_id = operation_id.unwrap_or_else(|| format!("health-rollup-{}", Uuid::new_v4()));
+    StoreWriter::write_health_rollups(
+        store,
+        &HealthRollupWrite {
+            operation_id: operation_id.clone(),
+            rows,
+        },
+        &local_actor(),
+    )?;
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "schema": "ocfleet.health_rollup_recompute.v1",
+                "operation_id": operation_id,
+                "from": from.format(&Rfc3339)?,
+                "to": to.format(&Rfc3339)?,
+                "bucket_seconds": bucket_seconds,
+                "node_count": node_ids.len(),
+                "row_count": row_count,
+            }))?
+        );
+    } else {
+        println!("operation_id={operation_id}");
+        println!("node_count={}", node_ids.len());
+        println!("row_count={row_count}");
+    }
+    Ok(())
+}
+
+fn validate_rollup_window(
+    from: &str,
+    to: &str,
+    bucket_seconds: u64,
+) -> anyhow::Result<(OffsetDateTime, OffsetDateTime)> {
+    let from = OffsetDateTime::parse(from, &Rfc3339)?;
+    let to = OffsetDateTime::parse(to, &Rfc3339)?;
+    if from >= to {
+        bail!("--from must precede --to");
+    }
+    if from.unix_timestamp() % i64::try_from(bucket_seconds)? != 0
+        || to.unix_timestamp() % i64::try_from(bucket_seconds)? != 0
+    {
+        bail!("rollup window must align to bucket boundaries");
+    }
+    let duration = to - from;
+    if duration > Duration::days(31) {
+        bail!("rollup recompute window must not exceed 31 days");
+    }
+    Ok((from, to))
+}
+
+fn build_health_rollup(
+    node_id: &str,
+    bucket_seconds: u64,
+    bucket_start: &str,
+    bucket_end: &str,
+    source: HealthRollupSource,
+) -> anyhow::Result<HealthRollupRecord> {
+    let mut status_counts = [0_u64; 6];
+    let mut covered_slots = BTreeSet::new();
+    for record in &source.history {
+        let index = match record.snapshot.status.as_str() {
+            "healthy" => 0,
+            "degraded" => 1,
+            "unreachable" => 2,
+            "stale" => 3,
+            "disabled" => 4,
+            "unknown" => 5,
+            _ => bail!("stored health history status is invalid"),
+        };
+        status_counts[index] += 1;
+        let timestamp = OffsetDateTime::parse(&record.snapshot.computed_at, &Rfc3339)?;
+        covered_slots.insert(timestamp.unix_timestamp().div_euclid(300));
+    }
+
+    let classified = source
+        .observations
+        .iter()
+        .filter_map(|observation| observation.ok)
+        .collect::<Vec<_>>();
+    let observation_count = u64::try_from(classified.len())?;
+    let observation_error_count = u64::try_from(classified.iter().filter(|ok| !**ok).count())?;
+    let mut durations = source
+        .observations
+        .iter()
+        .filter_map(|observation| observation.duration_ms)
+        .collect::<Vec<_>>();
+    durations.sort_unstable();
+    let duration_p50_ms = percentile(&durations, 50);
+    let duration_p95_ms = percentile(&durations, 95);
+
+    let mut cert_warning_count = 0_u64;
+    let mut cert_critical_count = 0_u64;
+    let mut fingerprints = Vec::new();
+    for observation in &source.observations {
+        let summary = safe_observation_summary(&observation.summary_json);
+        if observation.method == OCSERV_CERT_EXPIRY {
+            let days = summary
+                .get("cert_min_days_remaining")
+                .or_else(|| summary.get("days_remaining"))
+                .and_then(Value::as_i64);
+            let status = summary.get("status").and_then(Value::as_str);
+            if days.is_some_and(|days| days <= 7) || matches!(status, Some("critical" | "expired"))
+            {
+                cert_critical_count += 1;
+            } else if days.is_some_and(|days| days <= 30)
+                || matches!(status, Some("warning" | "expiring_soon"))
+            {
+                cert_warning_count += 1;
+            }
+        }
+        if observation.method == OCSERV_CONFIG_FINGERPRINT
+            && let Some(fingerprint) = summary
+                .get("config_fingerprint_prefix")
+                .and_then(Value::as_str)
+        {
+            fingerprints.push(fingerprint.to_string());
+        }
+    }
+    let fingerprint_change_count = fingerprints
+        .windows(2)
+        .filter(|pair| pair[0] != pair[1])
+        .count();
+    let watermark = blake3::hash(&serde_json::to_vec(&json!({
+        "history": source.history.iter().map(|record| json!({
+            "evaluation_id": record.evaluation_id,
+            "node_id": record.snapshot.node_id,
+            "computed_at": record.snapshot.computed_at,
+            "status": record.snapshot.status,
+            "summary": record.snapshot.summary_json,
+        })).collect::<Vec<_>>(),
+        "observations": source.observations.iter().map(|record| json!({
+            "observation_id": record.observation_id,
+            "method": record.method,
+            "ok": record.ok,
+            "duration_ms": record.duration_ms,
+            "observed_at": record.observed_at,
+            "summary": record.summary_json,
+        })).collect::<Vec<_>>(),
+    }))?)
+    .to_hex()
+    .to_string();
+    Ok(HealthRollupRecord {
+        node_id: node_id.to_string(),
+        bucket_seconds,
+        bucket_start: bucket_start.to_string(),
+        bucket_end: bucket_end.to_string(),
+        input_watermark: watermark,
+        health_samples: u64::try_from(source.history.len())?,
+        covered_slots: u64::try_from(covered_slots.len())?,
+        expected_slots: bucket_seconds / 300,
+        healthy_count: status_counts[0],
+        degraded_count: status_counts[1],
+        unreachable_count: status_counts[2],
+        stale_count: status_counts[3],
+        disabled_count: status_counts[4],
+        unknown_count: status_counts[5],
+        observation_count,
+        observation_error_count,
+        duration_sample_count: u64::try_from(durations.len())?,
+        duration_p50_ms,
+        duration_p95_ms,
+        cert_warning_count,
+        cert_critical_count,
+        fingerprint_sample_count: u64::try_from(fingerprints.len())?,
+        fingerprint_change_count: u64::try_from(fingerprint_change_count)?,
+        computed_at: bucket_end.to_string(),
+    })
+}
+
+fn percentile(values: &[u64], percentile: usize) -> Option<u64> {
+    if values.is_empty() {
+        return None;
+    }
+    let rank = percentile
+        .checked_mul(values.len())?
+        .checked_add(99)?
+        .checked_div(100)?;
+    values.get(rank.saturating_sub(1)).copied()
+}
+
+fn list_health_rollups(
+    store: &Store,
+    from: &str,
+    to: &str,
+    node: Option<&str>,
+    bucket_seconds: u64,
+    limit: u64,
+    json_output: bool,
+) -> anyhow::Result<()> {
+    let rows = store.list_health_rollups(node, bucket_seconds, from, to, limit)?;
+    let values = rows.iter().map(health_rollup_to_json).collect::<Vec<_>>();
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "schema": "ocfleet.health_rollups.v1",
+                "from": from,
+                "to": to,
+                "node_id": node,
+                "bucket_seconds": bucket_seconds,
+                "limit": limit,
+                "row_count": rows.len(),
+                "rollups": values,
+            }))?
+        );
+    } else {
+        println!("row_count={}", rows.len());
+        for row in values {
+            println!("{}", serde_json::to_string(&row)?);
+        }
+    }
+    Ok(())
+}
+
+fn health_rollup_to_json(row: &HealthRollupRecord) -> Value {
+    json!({
+        "node_id": row.node_id,
+        "bucket_seconds": row.bucket_seconds,
+        "bucket_start": row.bucket_start,
+        "bucket_end": row.bucket_end,
+        "input_watermark": row.input_watermark,
+        "health_samples": row.health_samples,
+        "covered_slots": row.covered_slots,
+        "expected_slots": row.expected_slots,
+        "healthy_count": row.healthy_count,
+        "degraded_count": row.degraded_count,
+        "unreachable_count": row.unreachable_count,
+        "stale_count": row.stale_count,
+        "disabled_count": row.disabled_count,
+        "unknown_count": row.unknown_count,
+        "observation_count": row.observation_count,
+        "observation_error_count": row.observation_error_count,
+        "duration_sample_count": row.duration_sample_count,
+        "duration_p50_ms": row.duration_p50_ms,
+        "duration_p95_ms": row.duration_p95_ms,
+        "cert_warning_count": row.cert_warning_count,
+        "cert_critical_count": row.cert_critical_count,
+        "fingerprint_sample_count": row.fingerprint_sample_count,
+        "fingerprint_change_count": row.fingerprint_change_count,
+        "computed_at": row.computed_at,
+    })
+}
+
 fn print_health_policy(policy: &HealthPolicyRecord) {
     println!("stale_window_seconds={}", policy.stale_window_seconds);
     println!(
@@ -951,4 +1292,151 @@ fn now_rfc3339() -> String {
     OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .expect("RFC3339 formatting succeeds")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::HealthHistoryRecord;
+
+    fn observation(
+        id: &str,
+        method: &str,
+        ok: Option<bool>,
+        duration_ms: Option<u64>,
+        observed_at: &str,
+        summary: Value,
+    ) -> ProbeObservationRecord {
+        ProbeObservationRecord {
+            observation_id: id.to_string(),
+            run_id: None,
+            node_id: Some("rollup-node".to_string()),
+            endpoint_id: None,
+            method: method.to_string(),
+            ok,
+            error_code: None,
+            duration_ms,
+            observed_at: observed_at.to_string(),
+            expires_at: None,
+            result_class: "low_sensitive_summary".to_string(),
+            summary_json: summary,
+        }
+    }
+
+    fn history(id: &str, computed_at: &str, status: &str) -> HealthHistoryRecord {
+        HealthHistoryRecord {
+            evaluation_id: id.to_string(),
+            snapshot: HealthSnapshotRecord {
+                node_id: "rollup-node".to_string(),
+                endpoint_id: None,
+                computed_at: computed_at.to_string(),
+                status: status.to_string(),
+                freshness_seconds: None,
+                last_success_at: None,
+                last_failure_at: None,
+                last_error_code: None,
+                degraded_methods_json: HealthDegradedMethodsPayloadV1::new(vec![])
+                    .expect("methods")
+                    .to_value(),
+                summary_json: HealthSummaryPayloadV1::new(
+                    None,
+                    None,
+                    status.to_string(),
+                    None,
+                    None,
+                )
+                .expect("summary")
+                .to_value(),
+            },
+        }
+    }
+
+    #[test]
+    fn rollup_distinguishes_absence_and_recomputes_deterministically() {
+        let source = HealthRollupSource {
+            history: vec![
+                history("eval-a", "2026-07-11T01:00:10Z", "healthy"),
+                history("eval-b", "2026-07-11T01:04:10Z", "unreachable"),
+            ],
+            observations: vec![
+                observation(
+                    "obs-a",
+                    PROBE_CONTROLLER_PING,
+                    Some(true),
+                    Some(10),
+                    "2026-07-11T01:00:20Z",
+                    json!({}),
+                ),
+                observation(
+                    "obs-b",
+                    PROBE_CONTROLLER_PING,
+                    Some(false),
+                    Some(20),
+                    "2026-07-11T01:01:20Z",
+                    json!({}),
+                ),
+                observation(
+                    "obs-c",
+                    OCSERV_CERT_EXPIRY,
+                    None,
+                    Some(100),
+                    "2026-07-11T01:02:20Z",
+                    json!({"days_remaining": 5}),
+                ),
+                observation(
+                    "obs-d",
+                    OCSERV_CONFIG_FINGERPRINT,
+                    Some(true),
+                    None,
+                    "2026-07-11T01:03:20Z",
+                    json!({"config_fingerprint_prefix": "aaaaaaaaaaaa"}),
+                ),
+                observation(
+                    "obs-e",
+                    OCSERV_CONFIG_FINGERPRINT,
+                    Some(true),
+                    None,
+                    "2026-07-11T01:04:20Z",
+                    json!({"config_fingerprint_prefix": "bbbbbbbbbbbb"}),
+                ),
+            ],
+        };
+        let first = build_health_rollup(
+            "rollup-node",
+            300,
+            "2026-07-11T01:00:00Z",
+            "2026-07-11T01:05:00Z",
+            source.clone(),
+        )
+        .expect("rollup");
+        let second = build_health_rollup(
+            "rollup-node",
+            300,
+            "2026-07-11T01:00:00Z",
+            "2026-07-11T01:05:00Z",
+            source,
+        )
+        .expect("repeat rollup");
+        assert_eq!(first, second);
+        assert_eq!(first.health_samples, 2);
+        assert_eq!(first.healthy_count, 1);
+        assert_eq!(first.unreachable_count, 1);
+        assert_eq!(first.unknown_count, 0, "missing is not an unknown sample");
+        assert_eq!(first.covered_slots, 1);
+        assert_eq!(first.expected_slots, 1);
+        assert_eq!(first.observation_count, 4);
+        assert_eq!(first.observation_error_count, 1);
+        assert_eq!(first.duration_p50_ms, Some(20));
+        assert_eq!(first.duration_p95_ms, Some(100));
+        assert_eq!(first.cert_critical_count, 1);
+        assert_eq!(first.fingerprint_sample_count, 2);
+        assert_eq!(first.fingerprint_change_count, 1);
+    }
+
+    #[test]
+    fn percentile_preserves_missing_duration() {
+        assert_eq!(percentile(&[], 95), None);
+        assert_eq!(percentile(&[7], 95), Some(7));
+        assert_eq!(percentile(&[1, 2, 3, 4], 50), Some(2));
+    }
 }

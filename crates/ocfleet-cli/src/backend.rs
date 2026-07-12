@@ -4,11 +4,12 @@ use crate::store::{
     AlertDeliveryQueueEnqueue, AlertDeliveryQueueOutcome, AlertEvaluationWrite, AlertEventRecord,
     AlertStateTransition, AlertWebhookHookRecord, ApprovalInput, AuditRecord, EndpointTrustRecord,
     EnrollmentTokenInsert, EnrollmentTokenRecord, HealthEvaluationFailure, HealthEvaluationFinish,
-    HealthEvaluationStart, HealthPolicyRecord, HealthSnapshotRecord, HealthSnapshotWrite,
-    JoinRequestInsert, JoinRequestRecord, LegacyEnrollmentClaimInput, NodeInsert, NodeRecord,
-    ObservabilityJobRecord, ObservabilityRunRecord, ProbeObservationRecord, RetentionApplyInput,
-    RetentionApplyResult, RetentionPolicyRecord, SchedulerJobClaim, SchedulerMaintenanceWindow,
-    SchedulerOutcomeWrite, SchedulerRunFinish, SchedulerRunStart, Store, StoreError,
+    HealthEvaluationStart, HealthPolicyRecord, HealthRollupWrite, HealthSnapshotRecord,
+    HealthSnapshotWrite, JoinRequestInsert, JoinRequestRecord, LegacyEnrollmentClaimInput,
+    NodeInsert, NodeRecord, ObservabilityJobRecord, ObservabilityRunRecord, ProbeObservationRecord,
+    RetentionApplyInput, RetentionApplyResult, RetentionPolicyRecord, SchedulerJobClaim,
+    SchedulerMaintenanceWindow, SchedulerOutcomeWrite, SchedulerRunFinish, SchedulerRunStart,
+    Store, StoreError,
 };
 
 pub const MAX_STORE_READER_ROWS: u64 = 1_000;
@@ -159,6 +160,11 @@ pub trait StoreWriter {
         recovered_at: &str,
         actor: &str,
     ) -> Result<usize, Self::Error>;
+    fn write_health_rollups(
+        &self,
+        write: &HealthRollupWrite,
+        actor: &str,
+    ) -> Result<(), Self::Error>;
     fn write_alert_evaluation(
         &self,
         write: &AlertEvaluationWrite,
@@ -570,6 +576,14 @@ impl StoreWriter for Store {
         actor: &str,
     ) -> Result<usize, Self::Error> {
         Store::write_health_evaluation_recovery(self, cutoff, recovered_at, actor)
+    }
+
+    fn write_health_rollups(
+        &self,
+        write: &HealthRollupWrite,
+        actor: &str,
+    ) -> Result<(), Self::Error> {
+        Store::write_health_rollups(self, write, actor)
     }
 
     fn write_alert_evaluation(

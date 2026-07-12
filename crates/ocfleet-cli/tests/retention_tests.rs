@@ -160,6 +160,7 @@ fn table_count(database: &Path, table: &str) -> i64 {
             | "observability_runs"
             | "health_snapshots"
             | "health_history"
+            | "health_rollups"
             | "alert_events"
     ));
     Connection::open(database)
@@ -401,11 +402,12 @@ fn retention_tests_multiscope_retry_resumes_after_audited_partial_progress() {
         "observability_runs",
         "health_snapshots",
         "health_history",
+        "health_rollups",
         "alert_events",
     ] {
         assert_eq!(table_count(&database, table), 0);
     }
-    assert_eq!(audit_event_count(&database, "retention.apply"), 5);
+    assert_eq!(audit_event_count(&database, "retention.apply"), 6);
 }
 
 #[test]

@@ -8,9 +8,10 @@ use ocfleet_cli::store::{
     AlertDeliveryQueueEnqueue, AlertDeliveryQueueOutcome, AlertEvaluationEntry,
     AlertEvaluationWrite, AlertEventRecord, AlertStateTransition, AlertWebhookHookRecord,
     CURRENT_SCHEMA_VERSION, HealthEvaluationFailure, HealthEvaluationFinish, HealthEvaluationStart,
-    HealthSnapshotRecord, HealthSnapshotWrite, ObservabilityJobRecord, ObservabilityRunInsert,
-    ProbeObservationInsert, RetentionPolicyRecord, SchedulerJobClockUpdate, SchedulerOutcomeEntry,
-    SchedulerOutcomeWrite, SchedulerRunFinish, SchedulerRunStart, Store, StoreError,
+    HealthRollupRecord, HealthRollupWrite, HealthSnapshotRecord, HealthSnapshotWrite,
+    ObservabilityJobRecord, ObservabilityRunInsert, ProbeObservationInsert, RetentionPolicyRecord,
+    SchedulerJobClockUpdate, SchedulerOutcomeEntry, SchedulerOutcomeWrite, SchedulerRunFinish,
+    SchedulerRunStart, Store, StoreError,
 };
 use ocfleet_protocol::method::{
     OCSERV_CONFIG_FINGERPRINT, OCSERV_SERVICE_SUMMARY, OCSERV_SESSIONS_SUMMARY, OCSERV_VERSION,
@@ -2041,6 +2042,87 @@ fn health_snapshot_writer_rolls_back_every_row_when_audit_fails() {
             .expect("history")
             .is_empty()
     );
+}
+
+fn sample_health_rollup() -> HealthRollupRecord {
+    HealthRollupRecord {
+        node_id: "health-rollup-node".to_string(),
+        bucket_seconds: 300,
+        bucket_start: "2026-07-11T01:00:00Z".to_string(),
+        bucket_end: "2026-07-11T01:05:00Z".to_string(),
+        input_watermark: "a".repeat(64),
+        health_samples: 2,
+        covered_slots: 1,
+        expected_slots: 1,
+        healthy_count: 1,
+        degraded_count: 1,
+        unreachable_count: 0,
+        stale_count: 0,
+        disabled_count: 0,
+        unknown_count: 0,
+        observation_count: 3,
+        observation_error_count: 1,
+        duration_sample_count: 3,
+        duration_p50_ms: Some(20),
+        duration_p95_ms: Some(30),
+        cert_warning_count: 1,
+        cert_critical_count: 0,
+        fingerprint_sample_count: 2,
+        fingerprint_change_count: 1,
+        computed_at: "2026-07-11T01:05:00Z".to_string(),
+    }
+}
+
+#[test]
+fn health_rollup_writer_is_idempotent_bounded_and_atomic() {
+    let (_dir, store, db) = open_temp_store();
+    let operation_id = "health-rollup-00000000-0000-4000-8000-000000000001";
+    let write = HealthRollupWrite {
+        operation_id: operation_id.to_string(),
+        rows: vec![sample_health_rollup()],
+    };
+    StoreWriter::write_health_rollups(&store, &write, TEST_ACTOR).expect("write rollup");
+    let audit_count = store.audit_count().expect("audit count");
+    StoreWriter::write_health_rollups(&store, &write, TEST_ACTOR).expect("exact replay");
+    assert_eq!(store.audit_count().expect("audit count"), audit_count);
+    assert_eq!(
+        store
+            .list_health_rollups(
+                Some("health-rollup-node"),
+                300,
+                "2026-07-11T01:00:00Z",
+                "2026-07-11T01:10:00Z",
+                10,
+            )
+            .expect("rollups"),
+        vec![sample_health_rollup()]
+    );
+
+    let mut invalid = write.clone();
+    invalid.operation_id = "health-rollup-00000000-0000-4000-8000-000000000002".to_string();
+    invalid.rows[0].healthy_count = 2;
+    assert!(matches!(
+        StoreWriter::write_health_rollups(&store, &invalid, TEST_ACTOR),
+        Err(StoreError::InvalidInput(_))
+    ));
+
+    inject_job_audit_failure(&db, "health.rollup.recompute");
+    let mut rollback = write;
+    rollback.operation_id = "health-rollup-00000000-0000-4000-8000-000000000003".to_string();
+    rollback.rows[0].input_watermark = "b".repeat(64);
+    assert_injected_job_audit_failure(StoreWriter::write_health_rollups(
+        &store, &rollback, TEST_ACTOR,
+    ));
+    let stored = store
+        .list_health_rollups(
+            Some("health-rollup-node"),
+            300,
+            "2026-07-11T01:00:00Z",
+            "2026-07-11T01:10:00Z",
+            10,
+        )
+        .expect("rollup after rollback");
+    assert_eq!(stored[0].input_watermark, "a".repeat(64));
 }
 
 fn health_evaluation_start(evaluation_id: &str, watermark: char) -> HealthEvaluationStart {

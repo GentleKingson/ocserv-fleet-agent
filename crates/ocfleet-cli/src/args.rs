@@ -161,6 +161,48 @@ pub enum ProbeCommand {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum HealthRollupBucket {
+    #[value(name = "5m")]
+    FiveMinutes,
+    #[value(name = "1h")]
+    OneHour,
+    #[value(name = "1d")]
+    OneDay,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum HealthRollupCommand {
+    Recompute {
+        #[arg(long)]
+        from: String,
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        node: Option<String>,
+        #[arg(long, value_enum)]
+        bucket: HealthRollupBucket,
+        #[arg(long)]
+        operation_id: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    List {
+        #[arg(long)]
+        from: String,
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        node: Option<String>,
+        #[arg(long, value_enum)]
+        bucket: HealthRollupBucket,
+        #[arg(long, default_value_t = 1000)]
+        limit: u64,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 #[derive(Debug, Subcommand)]
 pub enum NodeCommand {
     Info {
@@ -570,6 +612,8 @@ pub enum RetentionScope {
     HealthSnapshots,
     #[value(name = "health-history")]
     HealthHistory,
+    #[value(name = "health-rollups")]
+    HealthRollups,
     #[value(name = "alert-events")]
     AlertEvents,
 }
@@ -638,6 +682,10 @@ pub enum HealthCommand {
         limit: u64,
         #[arg(long)]
         json: bool,
+    },
+    Rollup {
+        #[command(subcommand)]
+        command: HealthRollupCommand,
     },
     Evaluator {
         #[command(subcommand)]

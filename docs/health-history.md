@@ -36,9 +36,38 @@ and 1,000,000 rows. Existing retention dry-run, stable-operation-ID,
 bounded-batch, and atomic-audit behavior applies. Expired history deletion does
 not delete the latest projection or controller audit evidence.
 
+## Reproducible Rollups
+
+Schema 24 adds bounded, deterministic 5-minute, 1-hour, and 1-day rollups.
+Recomputation reads append-only health history and stored probe observations;
+it never converts a missing five-minute slot into an `unknown` sample. Each row
+therefore reports both `covered_slots` and `expected_slots`, alongside distinct
+healthy, degraded, unreachable, stale, disabled, and unknown sample counts.
+
+```console
+ocfleet health rollup recompute \
+  --from 2026-07-01T00:00:00Z \
+  --to 2026-07-02T00:00:00Z \
+  --bucket 1h \
+  --json
+
+ocfleet health rollup list \
+  --from 2026-07-01T00:00:00Z \
+  --to 2026-07-02T00:00:00Z \
+  --bucket 1h \
+  --limit 1000 \
+  --json
+```
+
+Recompute windows must be aligned to the requested bucket, cannot exceed 31
+days, and cannot produce more than 100,000 rows. Supplying an operation ID in
+`health-rollup-<uuid>` form makes an exact retry audit-idempotent. Rows include
+a deterministic input watermark and use the bucket end as `computed_at`, so
+the same stored inputs produce the same row. Rollups have independent
+`health-rollups` retention, defaulting to 1,095 days and 5,000,000 rows.
+
 ## Remaining B1 Work
 
-Reproducible 5-minute, 1-hour, and 1-day rollups and bounded 24-hour, 7-day,
-and 30-day SLO CLI/API projections remain. They must distinguish unknown,
+Bounded 24-hour, 7-day, and 30-day SLO CLI/API projections remain. They must distinguish unknown,
 stale, unreachable, and missing duration and derive latency, error, certificate
 risk, and drift only from present typed observations.

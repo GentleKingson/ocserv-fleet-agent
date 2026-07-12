@@ -173,6 +173,12 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         description: "Add append-only evaluator health history with bounded query indexes.",
         apply: apply_0023_append_only_health_history,
     },
+    Migration {
+        version: 24,
+        name: "0024_health_rollups",
+        description: "Add reproducible bounded 5-minute, hourly, and daily health rollups.",
+        apply: apply_0024_health_rollups,
+    },
 ];
 
 pub(crate) fn migrate_to_current(
@@ -1544,6 +1550,70 @@ INSERT INTO retention_policies
 SELECT scope, max_age_days, max_rows, updated_at
 FROM retention_policies_legacy_v22;
 DROP TABLE retention_policies_legacy_v22;
+"#,
+    )?;
+    Ok(())
+}
+
+fn apply_0024_health_rollups(tx: &Transaction<'_>) -> Result<(), StoreError> {
+    tx.execute_batch(
+        r#"
+CREATE TABLE health_rollups (
+  node_id TEXT NOT NULL CHECK (length(node_id) BETWEEN 1 AND 128),
+  bucket_seconds INTEGER NOT NULL CHECK (bucket_seconds IN (300, 3600, 86400)),
+  bucket_start TEXT NOT NULL,
+  bucket_end TEXT NOT NULL,
+  input_watermark TEXT NOT NULL CHECK (length(input_watermark) = 64),
+  health_samples INTEGER NOT NULL CHECK (health_samples >= 0),
+  covered_slots INTEGER NOT NULL CHECK (covered_slots >= 0),
+  expected_slots INTEGER NOT NULL CHECK (expected_slots > 0),
+  healthy_count INTEGER NOT NULL CHECK (healthy_count >= 0),
+  degraded_count INTEGER NOT NULL CHECK (degraded_count >= 0),
+  unreachable_count INTEGER NOT NULL CHECK (unreachable_count >= 0),
+  stale_count INTEGER NOT NULL CHECK (stale_count >= 0),
+  disabled_count INTEGER NOT NULL CHECK (disabled_count >= 0),
+  unknown_count INTEGER NOT NULL CHECK (unknown_count >= 0),
+  observation_count INTEGER NOT NULL CHECK (observation_count >= 0),
+  observation_error_count INTEGER NOT NULL CHECK (observation_error_count >= 0),
+  duration_sample_count INTEGER NOT NULL CHECK (duration_sample_count >= 0),
+  duration_p50_ms INTEGER CHECK (duration_p50_ms IS NULL OR duration_p50_ms >= 0),
+  duration_p95_ms INTEGER CHECK (duration_p95_ms IS NULL OR duration_p95_ms >= 0),
+  cert_warning_count INTEGER NOT NULL CHECK (cert_warning_count >= 0),
+  cert_critical_count INTEGER NOT NULL CHECK (cert_critical_count >= 0),
+  fingerprint_sample_count INTEGER NOT NULL CHECK (fingerprint_sample_count >= 0),
+  fingerprint_change_count INTEGER NOT NULL CHECK (fingerprint_change_count >= 0),
+  computed_at TEXT NOT NULL,
+  PRIMARY KEY(node_id, bucket_seconds, bucket_start),
+  CHECK (bucket_end > bucket_start),
+  CHECK (expected_slots = bucket_seconds / 300),
+  CHECK (covered_slots <= expected_slots),
+  CHECK (healthy_count + degraded_count + unreachable_count + stale_count + disabled_count + unknown_count = health_samples),
+  CHECK (observation_error_count <= observation_count),
+  CHECK (
+    (duration_sample_count = 0 AND duration_p50_ms IS NULL AND duration_p95_ms IS NULL)
+    OR
+    (duration_sample_count > 0 AND duration_p50_ms IS NOT NULL AND duration_p95_ms IS NOT NULL)
+  ),
+  CHECK (duration_p50_ms IS NULL OR duration_p50_ms <= duration_p95_ms),
+  CHECK (fingerprint_change_count <= fingerprint_sample_count)
+);
+CREATE INDEX idx_health_rollups_window
+  ON health_rollups(bucket_seconds, bucket_start, node_id);
+CREATE INDEX idx_health_rollups_node_window
+  ON health_rollups(node_id, bucket_seconds, bucket_start);
+
+ALTER TABLE retention_policies RENAME TO retention_policies_legacy_v23;
+CREATE TABLE retention_policies (
+  scope TEXT PRIMARY KEY CHECK (scope IN ('observations', 'observability-runs', 'health-snapshots', 'health-history', 'health-rollups', 'alert-events')),
+  max_age_days INTEGER CHECK (max_age_days IS NULL OR max_age_days >= 1),
+  max_rows INTEGER CHECK (max_rows IS NULL OR max_rows >= 1),
+  updated_at TEXT NOT NULL
+);
+INSERT INTO retention_policies
+  (scope, max_age_days, max_rows, updated_at)
+SELECT scope, max_age_days, max_rows, updated_at
+FROM retention_policies_legacy_v23;
+DROP TABLE retention_policies_legacy_v23;
 "#,
     )?;
     Ok(())

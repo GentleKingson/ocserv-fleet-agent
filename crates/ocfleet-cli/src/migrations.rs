@@ -179,6 +179,12 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         description: "Add reproducible bounded 5-minute, hourly, and daily health rollups.",
         apply: apply_0024_health_rollups,
     },
+    Migration {
+        version: 25,
+        name: "0025_health_rollup_slot_semantics",
+        description: "Rebuild derived health rollups with one status sample per five-minute slot.",
+        apply: apply_0025_health_rollup_slot_semantics,
+    },
 ];
 
 pub(crate) fn migrate_to_current(
@@ -1614,6 +1620,61 @@ INSERT INTO retention_policies
 SELECT scope, max_age_days, max_rows, updated_at
 FROM retention_policies_legacy_v23;
 DROP TABLE retention_policies_legacy_v23;
+"#,
+    )?;
+    Ok(())
+}
+
+fn apply_0025_health_rollup_slot_semantics(tx: &Transaction<'_>) -> Result<(), StoreError> {
+    // Rollups are fully reproducible from append-only history and observations. Dropping
+    // derived rows avoids carrying forward availability biased by repeated evaluations.
+    tx.execute_batch(
+        r#"
+DROP TABLE IF EXISTS health_rollups;
+CREATE TABLE health_rollups (
+  node_id TEXT NOT NULL CHECK (length(node_id) BETWEEN 1 AND 128),
+  bucket_seconds INTEGER NOT NULL CHECK (bucket_seconds IN (300, 3600, 86400)),
+  bucket_start TEXT NOT NULL,
+  bucket_end TEXT NOT NULL,
+  input_watermark TEXT NOT NULL CHECK (length(input_watermark) = 64),
+  health_samples INTEGER NOT NULL CHECK (health_samples >= 0),
+  covered_slots INTEGER NOT NULL CHECK (covered_slots >= 0),
+  expected_slots INTEGER NOT NULL CHECK (expected_slots > 0),
+  healthy_count INTEGER NOT NULL CHECK (healthy_count >= 0),
+  degraded_count INTEGER NOT NULL CHECK (degraded_count >= 0),
+  unreachable_count INTEGER NOT NULL CHECK (unreachable_count >= 0),
+  stale_count INTEGER NOT NULL CHECK (stale_count >= 0),
+  disabled_count INTEGER NOT NULL CHECK (disabled_count >= 0),
+  unknown_count INTEGER NOT NULL CHECK (unknown_count >= 0),
+  observation_count INTEGER NOT NULL CHECK (observation_count >= 0),
+  observation_error_count INTEGER NOT NULL CHECK (observation_error_count >= 0),
+  duration_sample_count INTEGER NOT NULL CHECK (duration_sample_count >= 0),
+  duration_p50_ms INTEGER CHECK (duration_p50_ms IS NULL OR duration_p50_ms >= 0),
+  duration_p95_ms INTEGER CHECK (duration_p95_ms IS NULL OR duration_p95_ms >= 0),
+  cert_warning_count INTEGER NOT NULL CHECK (cert_warning_count >= 0),
+  cert_critical_count INTEGER NOT NULL CHECK (cert_critical_count >= 0),
+  fingerprint_sample_count INTEGER NOT NULL CHECK (fingerprint_sample_count >= 0),
+  fingerprint_change_count INTEGER NOT NULL CHECK (fingerprint_change_count >= 0),
+  computed_at TEXT NOT NULL,
+  PRIMARY KEY(node_id, bucket_seconds, bucket_start),
+  CHECK (bucket_end > bucket_start),
+  CHECK (expected_slots = bucket_seconds / 300),
+  CHECK (health_samples = covered_slots),
+  CHECK (covered_slots <= expected_slots),
+  CHECK (healthy_count + degraded_count + unreachable_count + stale_count + disabled_count + unknown_count = health_samples),
+  CHECK (observation_error_count <= observation_count),
+  CHECK (
+    (duration_sample_count = 0 AND duration_p50_ms IS NULL AND duration_p95_ms IS NULL)
+    OR
+    (duration_sample_count > 0 AND duration_p50_ms IS NOT NULL AND duration_p95_ms IS NOT NULL)
+  ),
+  CHECK (duration_p50_ms IS NULL OR duration_p50_ms <= duration_p95_ms),
+  CHECK (fingerprint_change_count <= fingerprint_sample_count)
+);
+CREATE INDEX idx_health_rollups_window
+  ON health_rollups(bucket_seconds, bucket_start, node_id);
+CREATE INDEX idx_health_rollups_node_window
+  ON health_rollups(node_id, bucket_seconds, bucket_start);
 "#,
     )?;
     Ok(())

@@ -32,7 +32,7 @@ events with no paired business mutation may use `AuditWriter` directly.
 - `scripts/tests/test-controller-mutation-guard.sh` proves every guarded family
   is accepted at its reviewed boundary and rejected from an unsafe production
   module.
-- API routes receive only `ApiReadStore`; all fourteen declared routes are
+- API routes receive only `ApiReadStore`; all sixteen declared routes are
   `GET` and API tests prove forbidden methods do not write.
 
 Legacy raw scheduler/observation/alert helpers remain only as integration-test

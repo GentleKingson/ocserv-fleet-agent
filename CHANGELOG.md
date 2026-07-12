@@ -4,6 +4,14 @@
 
 - Schema 23 adds append-only, replay-safe health history with bounded half-open
   CLI queries and independent retention from the latest health projection.
+- Schemas 24 and 25 add reproducible 5-minute/hourly/daily health rollups and
+  enforce one latest status per five-minute slot; upgrading to schema 25 drops
+  only reproducible schema 24 rollup rows so availability cannot retain
+  repeated-evaluation bias.
+- Fixed 24-hour, 7-day, and 30-day health SLO CLI and read-only API projections
+  expose explicit coverage and missing time, distinct status durations,
+  availability, observation errors, per-bucket latency ranges, certificate
+  risk, and configuration fingerprint changes.
 
 ## 0.3.0 - 2026-07-12
 

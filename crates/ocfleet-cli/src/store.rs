@@ -35,7 +35,7 @@ use crate::storage_payloads::{
     validate_health_payload_relationship, validate_scheduler_payload_relationship,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 24;
+pub const CURRENT_SCHEMA_VERSION: i64 = 25;
 pub const DEFAULT_HEALTH_STALE_WINDOW_SECONDS: u64 = 24 * 60 * 60;
 pub const DEFAULT_HEALTH_UNREACHABLE_FAILURES: u64 = 3;
 pub const DEFAULT_HEALTH_CERT_WARNING_DAYS: u64 = 30;
@@ -2300,6 +2300,32 @@ impl Store {
         )?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(StoreError::from)
+    }
+
+    pub fn health_rollup_stored_node_ids(
+        &self,
+        bucket_seconds: u64,
+        from: &str,
+        to: &str,
+    ) -> Result<Vec<String>, StoreError> {
+        validate_health_rollup_bucket(bucket_seconds)?;
+        let (from, to) = normalize_half_open_window(from, to, "health SLO")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT node_id FROM health_rollups
+             WHERE bucket_seconds = ?1 AND bucket_start >= ?2 AND bucket_start < ?3
+             ORDER BY node_id LIMIT 1001",
+        )?;
+        let rows = stmt
+            .query_map(params![u64_to_i64(bucket_seconds)?, from, to], |row| {
+                row.get(0)
+            })?
+            .collect::<Result<Vec<String>, _>>()?;
+        if rows.len() > 1_000 {
+            return Err(StoreError::InvalidInput(
+                "health SLO window exceeds 1000 nodes".to_string(),
+            ));
+        }
+        Ok(rows)
     }
 
     pub fn get_health_evaluation_run(
@@ -8460,6 +8486,7 @@ fn validate_health_rollup_write(write: &HealthRollupWrite) -> Result<(), StoreEr
             row.duration_p50_ms.is_none() || row.duration_p95_ms.is_none()
         };
         if row.expected_slots != row.bucket_seconds / 300
+            || row.health_samples != row.covered_slots
             || row.covered_slots > row.expected_slots
             || status_total != Some(row.health_samples)
             || row.observation_error_count > row.observation_count

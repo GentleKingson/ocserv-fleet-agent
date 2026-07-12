@@ -171,6 +171,16 @@ pub enum HealthRollupBucket {
     OneDay,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum HealthSloWindow {
+    #[value(name = "24h")]
+    Hours24,
+    #[value(name = "7d")]
+    Days7,
+    #[value(name = "30d")]
+    Days30,
+}
+
 #[derive(Debug, Subcommand)]
 pub enum HealthRollupCommand {
     Recompute {
@@ -686,6 +696,16 @@ pub enum HealthCommand {
     Rollup {
         #[command(subcommand)]
         command: HealthRollupCommand,
+    },
+    Slo {
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        node: Option<String>,
+        #[arg(long, value_enum)]
+        window: HealthSloWindow,
+        #[arg(long)]
+        json: bool,
     },
     Evaluator {
         #[command(subcommand)]

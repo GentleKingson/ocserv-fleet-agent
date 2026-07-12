@@ -12,8 +12,9 @@ use ocfleet_cli::storage_payloads::{
     HealthDegradedMethodsPayloadV1, HealthSummaryPayloadV1, SchedulerSelectorPayloadV1,
 };
 use ocfleet_cli::store::{
-    AlertEventRecord, CURRENT_SCHEMA_VERSION, HealthSnapshotRecord, HealthSnapshotWrite,
-    NodeInsert, ObservabilityJobRecord, ObservabilityRunInsert, ProbeObservationInsert, Store,
+    AlertEventRecord, CURRENT_SCHEMA_VERSION, HealthRollupRecord, HealthRollupWrite,
+    HealthSnapshotRecord, HealthSnapshotWrite, NodeInsert, ObservabilityJobRecord,
+    ObservabilityRunInsert, ProbeObservationInsert, Store,
 };
 use rusqlite::Connection;
 use serde_json::{Value, json};
@@ -58,6 +59,7 @@ fn openapi_contract_is_get_only_and_matches_router_paths() {
         "AlertListResponse",
         "AlertResponse",
         "AuditListResponse",
+        "HealthSloResponse",
         "ErrorResponse",
     ] {
         assert!(
@@ -77,6 +79,7 @@ fn openapi_contract_is_get_only_and_matches_router_paths() {
         "/health/summary",
         "/health/nodes",
         "/health/nodes/{node_id}",
+        "/health/slo",
         "/jobs",
         "/jobs/{job_id}",
         "/runs",
@@ -98,6 +101,7 @@ fn openapi_contract_is_get_only_and_matches_router_paths() {
         "/health/summary",
         "/health/nodes",
         "/health/nodes/{node_id}",
+        "/health/slo",
         "/jobs",
         "/jobs/{job_id}",
         "/runs",
@@ -238,6 +242,81 @@ async fn get_routes_return_fixed_shapes() {
     )
     .await;
     assert_list_shape(&audit, 1);
+}
+
+#[tokio::test]
+async fn health_slo_is_bounded_read_only_and_preserves_missing_coverage() {
+    let fixture = Fixture::new();
+    let store = Store::open(&fixture.database).expect("open store");
+    StoreWriter::write_health_rollups(
+        &store,
+        &HealthRollupWrite {
+            operation_id: "health-rollup-00000000-0000-4000-8000-000000000099".into(),
+            rows: vec![HealthRollupRecord {
+                node_id: "node-a".into(),
+                bucket_seconds: 300,
+                bucket_start: "2026-07-11T00:00:00Z".into(),
+                bucket_end: "2026-07-11T00:05:00Z".into(),
+                input_watermark: "a".repeat(64),
+                health_samples: 1,
+                covered_slots: 1,
+                expected_slots: 1,
+                healthy_count: 1,
+                degraded_count: 0,
+                unreachable_count: 0,
+                stale_count: 0,
+                disabled_count: 0,
+                unknown_count: 0,
+                observation_count: 5,
+                observation_error_count: 1,
+                duration_sample_count: 5,
+                duration_p50_ms: Some(10),
+                duration_p95_ms: Some(50),
+                cert_warning_count: 1,
+                cert_critical_count: 0,
+                fingerprint_sample_count: 2,
+                fingerprint_change_count: 1,
+                computed_at: "2026-07-11T00:05:00Z".into(),
+            }],
+        },
+        "api-test",
+    )
+    .expect("write rollup");
+    drop(store);
+    let before = table_counts(&fixture.database);
+    let (status, body) = json_request(
+        fixture.router(None),
+        Method::GET,
+        "/health/slo?window=24h&to=2026-07-12T00:00:00Z&node_id=node-a",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["schema"], "ocfleet.health_slo.v1");
+    assert_eq!(body["projections"][0]["covered_slots"], 1);
+    assert_eq!(body["projections"][0]["missing_slots"], 287);
+    assert_eq!(
+        body["projections"][0]["service_available_basis_points"],
+        10_000
+    );
+    let spec: Value = serde_json::from_str(OPENAPI).expect("OpenAPI JSON");
+    let required = spec["components"]["schemas"]["HealthSloProjection"]["required"]
+        .as_array()
+        .expect("required projection keys")
+        .iter()
+        .map(|value| value.as_str().expect("required key"))
+        .collect::<BTreeSet<_>>();
+    let actual = body["projections"][0]
+        .as_object()
+        .expect("projection object")
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        actual, required,
+        "runtime projection must match OpenAPI exactly"
+    );
+    assert_eq!(table_counts(&fixture.database), before);
 }
 
 #[tokio::test]
@@ -753,6 +832,10 @@ async fn malformed_and_unknown_query_parameters_return_json_errors() {
         "/observations?unknown=value",
         "/alerts?limit=1&limit=2",
         "/audit/export?from=2026-07-09T00:00:00Z&to=2026-07-10T00:00:00Z&extra=value",
+        "/health/slo?window=24h&to=2026-07-12T00:00:00Z&extra=value",
+        "/health/slo?window=90d&to=2026-07-12T00:00:00Z",
+        "/health/slo?window=24h&to=2026-07-12T00:00:01Z",
+        "/health/slo?window=24h",
     ] {
         let (status, body) = json_request(router.clone(), Method::GET, uri, None).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");

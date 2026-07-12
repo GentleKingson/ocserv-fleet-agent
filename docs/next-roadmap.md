@@ -303,6 +303,7 @@ The agent metrics exporter is published in pull request `#100`.
 The final controller catalog slice adds audited RPC duration sum/count and
 successful retention deleted-row totals without new labels. The A7 acceptance
 inventory remains the final phase gate.
+The controller catalog completion is published in pull request `#101`.
 
 ### Baseline And Production Foundation
 

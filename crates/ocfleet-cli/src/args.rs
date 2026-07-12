@@ -183,6 +183,12 @@ pub enum HealthSloWindow {
 
 #[derive(Debug, Subcommand)]
 pub enum HealthRollupCommand {
+    Refresh {
+        #[arg(long)]
+        at: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
     Recompute {
         #[arg(long)]
         from: String,

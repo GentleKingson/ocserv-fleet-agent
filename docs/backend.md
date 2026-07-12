@@ -118,6 +118,14 @@ bounded expiry, monotonic fences, active-run binding, and atomic abandoned-run
 recovery. Production scheduler paths acquire before starting work and release
 after terminal persistence; stale owners fail closed after takeover.
 
+The B1 health-history slices advance SQLite through schema version 25. Schema
+23 stores append-only evaluation-bound health samples, schema 24 stores
+reproducible 5-minute/hourly/daily projections, and schema 25 rebuilds only the
+derived rollup table with one latest status per covered five-minute slot.
+History and rollup retention are independent. Refresh uses input-watermark-bound
+operation IDs through the actor-bearing SQLite writer; the API receives only
+bounded projections through its read-only adapter.
+
 The first production-hardening slice added node add/enable/disable/remove to this
 contract and removed the CLI's post-commit success audits. Audit-trigger failure
 tests prove both `nodes` and `endpoint_trust` changes roll back. The second slice

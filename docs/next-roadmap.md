@@ -358,6 +358,12 @@ duration, availability eligibility, error, latency-range, certificate, and
 drift fields remain bounded and distinguish missing data. It is published in
 pull request `#111`.
 
+The final B1 slice adds deterministic latest-closed 5-minute, hourly, and daily
+refresh, a hardened network-isolated five-minute systemd timer, and a complete
+requirement-to-test evidence inventory. Persistent restart catches up once and
+never fabricates source data for missed buckets. It is published in pull
+request `#112`.
+
 The A8 completion audit records the successful tag-bound matrix, publication
 of 38 `v0.3.0` assets, and independent checksum, Sigstore, SBOM, and provenance
 verification. It is published in pull request `#108`.
@@ -381,7 +387,7 @@ verification. It is published in pull request `#108`.
 
 | ID | Issue | Status | Depends on | Release target | Acceptance and required evidence |
 | --- | --- | --- | --- | --- | --- |
-| B1 Health history, rollups, and SLOs | `#41` | active implementation | A2, A4 | `v0.3.x` | Schema 23 history, schema 24 reproducible rollups, schema 25 one-status-per-slot semantics, and bounded 24h/7d/30d CLI/API projections are implemented with explicit missing coverage and independent retention. Continuous refresh operations and completion evidence remain. |
+| B1 Health history, rollups, and SLOs | `#41` | operationally mature | A2, A4 | `v0.3.x` | Schema 23 history, schema 24 reproducible rollups, schema 25 one-status-per-slot semantics, bounded 24h/7d/30d CLI/API projections, deterministic closed-bucket refresh, independent retention, and hardened timer operation are complete. `docs/b1-health-history-rollup-slo-inventory.md` records the evidence. |
 | B2 Labels, environment, and maintenance | `#42` | implemented slice | A1, A2, A3 | `v0.4.0` | Bounded audited metadata and selectors have a maximum match count; maintenance affects scheduling/presentation only; tests prove labels cannot create trust, peers, or path authorization. |
 | B3 Versioned API and query contract | `#43` | implemented slice | A2, B1, B2 | `v0.4.0` | `/api/v1` has a compatibility plan, bounded tamper-resistant cursor pagination, time/metadata filters, ETag/conditional GET, stable errors/request IDs, exact OpenAPI/runtime validation, and no RPC-trigger route. Existing API drift listed below is resolved. |
 | B4 Local producer SDK | `#44` | scaffold | A2 | `v0.4.0` | A snapshot-schema crate, validator, Rust SDK, machine schema, version negotiation, compatibility suite, and least-privilege sample producer emit fixed aggregates only and remain unreachable from controller RPC/API/scheduler paths. |

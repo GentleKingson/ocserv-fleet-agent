@@ -376,6 +376,28 @@ snapshot. New evaluator completions atomically update the latest projection,
 append history, finish the evaluation run, and audit. Upgrade failure leaves
 the version-22 database unchanged beside its private backup.
 
+Schema version 24 adds reproducible 5-minute, hourly, and daily health rollups
+with independent retention. Schema version 25 discards only those derived rows
+and recreates the table with one latest health status per covered five-minute
+slot, preventing repeated interactive evaluations from biasing availability.
+Append-only history, observations, retention policy, and audit evidence remain
+unchanged. After upgrade, bootstrap the desired bounded windows with `health
+rollup recompute`; an older binary requires restoring the pre-upgrade backup.
+
+For continuous closed-bucket refresh, install and enable the hardened timer:
+
+```bash
+sudo install -m 0644 deploy/systemd/ocfleet-health-rollup-refresh.service /etc/systemd/system/
+sudo install -m 0644 deploy/systemd/ocfleet-health-rollup-refresh.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now ocfleet-health-rollup-refresh.timer
+```
+
+The oneshot runs as `ocfleet`, writes only the controller SQLite directory,
+has no network namespace or capabilities, and uses deterministic operation IDs.
+The timer processes only the latest closed bucket at each resolution; missed
+source-backed history remains explicit until an operator runs bounded recompute.
+
 Before upgrades, keep an operator-managed backup as well:
 
 ```bash

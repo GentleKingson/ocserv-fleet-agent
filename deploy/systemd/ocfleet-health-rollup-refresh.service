@@ -1,0 +1,36 @@
+[Unit]
+Description=Refresh closed ocfleet health rollup buckets
+Documentation=https://github.com/gentlekingson/ocserv-fleet-agent
+After=local-fs.target
+
+[Service]
+Type=oneshot
+User=ocfleet
+Group=ocfleet
+UMask=0077
+StateDirectory=ocfleet-controller
+StateDirectoryMode=0700
+ExecStart=/usr/local/bin/ocfleet --database /var/lib/ocfleet-controller/controller.sqlite --actor health-rollup-timer health rollup refresh
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+PrivateNetwork=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ReadWritePaths=/var/lib/ocfleet-controller
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_UNIX
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+

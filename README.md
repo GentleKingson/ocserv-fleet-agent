@@ -563,6 +563,10 @@ Networking must allow the controller to reach the agent through iroh using the r
 - `docs/governance.md`: operator identity, RBAC roles, audit model, and trust policy workflow.
 - `docs/next-roadmap.md`: authoritative implementation DAG, milestone issues,
   dependencies, acceptance gates, and completion evidence.
+- `docs/health-history.md`: append-only health history, reproducible rollups,
+  fixed SLO projections, retention, and closed-bucket refresh operations.
+- `docs/b1-health-history-rollup-slo-inventory.md`: B1 requirement, security
+  boundary, implementation, and verification completion inventory.
 - `docs/a1-mutation-inventory.md`: A1 controller writer, failure-injection, and
   static-enforcement completion inventory.
 - `docs/adr/ADR-atomic-audit-writes.md`: fail-closed controller mutation and
@@ -607,6 +611,8 @@ Networking must allow the controller to reach the agent through iroh using the r
   deterministic post-run schedule spreading.
 - `docs/adr/ADR-health-evaluator-runs.md`: schema-v21 durable evaluator run,
   watermark idempotency, lifecycle consistency, and authority boundaries.
+- `docs/adr/ADR-health-history-rollups.md`: schema-v23 through schema-v25
+  history, slot, rollup, missing-data, and SLO denominator decisions.
 - `docs/adr/ADR-alert-delivery-queue.md`: schema-v22 fenced automatic delivery
   queue, idempotency, retry/DLQ lifecycle, and filesystem authority boundary.
 - `docs/a3-scheduler-reliability-inventory.md`: A3 acceptance requirements,

@@ -101,7 +101,25 @@ derived only from present typed observations. Fleet queries are capped at the
 smaller of the configured API maximum and 1,000 nodes. Each node reads at most
 288, 168, or 30 rollup rows for the 24-hour, 7-day, or 30-day window.
 
-## Remaining B1 Work
+## Continuous Refresh
 
-Completion evidence and operational scheduling for continuous rollup refresh
-remain before B1 can be marked operationally mature.
+`ocfleet health rollup refresh` computes only the latest closed 5-minute,
+hourly, and daily buckets. It floors the current UTC time independently for
+each resolution, never writes an open bucket, and uses a deterministic
+resolution/end/input-watermark operation ID. Repeated timer execution or
+restart with the same source is an exact audited replay, while a late source
+row receives a new operation ID and safely replaces the derived row. A bucket with no source
+history or observations is reported as `no_source` and remains absent.
+
+```console
+ocfleet health rollup refresh --json
+ocfleet health rollup refresh --at 2026-07-12T00:01:00Z --json
+```
+
+The optional `--at` is a bounded deterministic test and recovery control; it
+does not select a path, command, service, node, or RPC target. The hardened
+`deploy/systemd/ocfleet-health-rollup-refresh.service` and `.timer` run the
+refresh every five minutes with no network namespace or capabilities. A
+persistent timer catches up only once after downtime. It deliberately does not
+invent missed buckets; use bounded `rollup recompute` windows to backfill source
+data that actually exists.

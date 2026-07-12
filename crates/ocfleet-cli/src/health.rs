@@ -5,6 +5,7 @@ use ocfleet_protocol::method::{
     OCSERV_CERT_EXPIRY, OCSERV_CONFIG_FINGERPRINT, OCSERV_SERVICE_SUMMARY, OCSERV_SESSIONS_SUMMARY,
     OCSERV_VERSION, PROBE_CONTROLLER_PING,
 };
+use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
@@ -586,6 +587,18 @@ fn run_health_history(
 
 fn run_health_rollup(store: &Store, command: HealthRollupCommand) -> anyhow::Result<()> {
     match command {
+        HealthRollupCommand::Refresh { at, json } => {
+            let at = match at {
+                Some(at) => {
+                    if at.len() > 64 {
+                        bail!("--at must not exceed 64 characters");
+                    }
+                    OffsetDateTime::parse(&at, &Rfc3339)?
+                }
+                None => OffsetDateTime::now_utc(),
+            };
+            refresh_closed_health_rollups(store, at, json)
+        }
         HealthRollupCommand::Recompute {
             from,
             to,
@@ -619,6 +632,64 @@ fn run_health_rollup(store: &Store, command: HealthRollupCommand) -> anyhow::Res
             json,
         ),
     }
+}
+
+#[derive(Debug, Serialize)]
+struct HealthRollupRefreshResult {
+    operation_id: String,
+    bucket_seconds: u64,
+    bucket_start: String,
+    bucket_end: String,
+    node_count: usize,
+    row_count: usize,
+    status: &'static str,
+}
+
+fn refresh_closed_health_rollups(
+    store: &Store,
+    at: OffsetDateTime,
+    json_output: bool,
+) -> anyhow::Result<()> {
+    let mut results = Vec::with_capacity(3);
+    for bucket_seconds in [300_u64, 3_600, 86_400] {
+        let bucket_seconds_i64 = i64::try_from(bucket_seconds)?;
+        let bucket_end = OffsetDateTime::from_unix_timestamp(
+            at.unix_timestamp().div_euclid(bucket_seconds_i64) * bucket_seconds_i64,
+        )?;
+        let bucket_start = bucket_end - Duration::seconds(bucket_seconds_i64);
+        results.push(write_health_rollup_window(
+            store,
+            bucket_start,
+            bucket_end,
+            None,
+            bucket_seconds,
+            None,
+        )?);
+    }
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "schema": "ocfleet.health_rollup_refresh.v1",
+                "at": at.format(&Rfc3339)?,
+                "results": results,
+            }))?
+        );
+    } else {
+        for result in results {
+            println!(
+                "operation_id={} bucket_seconds={} bucket_start={} bucket_end={} node_count={} row_count={} status={}",
+                result.operation_id,
+                result.bucket_seconds,
+                result.bucket_start,
+                result.bucket_end,
+                result.node_count,
+                result.row_count,
+                result.status,
+            );
+        }
+    }
+    Ok(())
 }
 
 fn rollup_bucket_seconds(bucket: HealthRollupBucket) -> u64 {
@@ -709,6 +780,46 @@ fn recompute_health_rollups(
     json_output: bool,
 ) -> anyhow::Result<()> {
     let (from, to) = validate_rollup_window(from, to, bucket_seconds)?;
+    let operation_id = operation_id.unwrap_or_else(|| format!("health-rollup-{}", Uuid::new_v4()));
+    let result = write_health_rollup_window(
+        store,
+        from,
+        to,
+        node,
+        bucket_seconds,
+        Some(operation_id.clone()),
+    )?;
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "schema": "ocfleet.health_rollup_recompute.v1",
+                "operation_id": operation_id,
+                "from": result.bucket_start,
+                "to": result.bucket_end,
+                "bucket_seconds": bucket_seconds,
+                "node_count": result.node_count,
+                "row_count": result.row_count,
+                "status": result.status,
+            }))?
+        );
+    } else {
+        println!("operation_id={operation_id}");
+        println!("node_count={}", result.node_count);
+        println!("row_count={}", result.row_count);
+        println!("status={}", result.status);
+    }
+    Ok(())
+}
+
+fn write_health_rollup_window(
+    store: &Store,
+    from: OffsetDateTime,
+    to: OffsetDateTime,
+    node: Option<&str>,
+    bucket_seconds: u64,
+    operation_id: Option<String>,
+) -> anyhow::Result<HealthRollupRefreshResult> {
     let node_ids = if let Some(node_id) = node {
         validate_node_id(node_id)?;
         vec![node_id.to_string()]
@@ -745,34 +856,45 @@ fn recompute_health_rollups(
             )?);
         }
     }
-    let operation_id = operation_id.unwrap_or_else(|| format!("health-rollup-{}", Uuid::new_v4()));
-    StoreWriter::write_health_rollups(
-        store,
-        &HealthRollupWrite {
-            operation_id: operation_id.clone(),
-            rows,
-        },
-        &local_actor(),
-    )?;
-    if json_output {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "schema": "ocfleet.health_rollup_recompute.v1",
-                "operation_id": operation_id,
-                "from": from.format(&Rfc3339)?,
-                "to": to.format(&Rfc3339)?,
-                "bucket_seconds": bucket_seconds,
-                "node_count": node_ids.len(),
-                "row_count": row_count,
-            }))?
-        );
+    let operation_id = operation_id.unwrap_or_else(|| {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"ocfleet-health-rollup-refresh-v1\0");
+        hasher.update(&bucket_seconds.to_be_bytes());
+        hasher.update(&from.unix_timestamp().to_be_bytes());
+        hasher.update(&to.unix_timestamp().to_be_bytes());
+        for row in &rows {
+            hasher.update(row.node_id.as_bytes());
+            hasher.update(b"\0");
+            hasher.update(row.input_watermark.as_bytes());
+        }
+        let mut bytes = [0_u8; 16];
+        bytes.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+        bytes[6] = (bytes[6] & 0x0f) | 0x40;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        format!("health-rollup-{}", Uuid::from_bytes(bytes))
+    });
+    let status = if rows.is_empty() {
+        "no_source"
     } else {
-        println!("operation_id={operation_id}");
-        println!("node_count={}", node_ids.len());
-        println!("row_count={row_count}");
-    }
-    Ok(())
+        StoreWriter::write_health_rollups(
+            store,
+            &HealthRollupWrite {
+                operation_id: operation_id.clone(),
+                rows,
+            },
+            &local_actor(),
+        )?;
+        "written_or_replayed"
+    };
+    Ok(HealthRollupRefreshResult {
+        operation_id,
+        bucket_seconds,
+        bucket_start: from.format(&Rfc3339)?,
+        bucket_end: to.format(&Rfc3339)?,
+        node_count: node_ids.len(),
+        row_count: usize::try_from(row_count)?,
+        status,
+    })
 }
 
 fn validate_rollup_window(

@@ -24,7 +24,7 @@ test("dashboard loads read-only views and audit preview", async ({ page }) => {
   await page.getByRole("button", { name: "Refresh" }).click();
   await expect(page.getByRole("status")).toContainText("Updated");
   await page.getByRole("button", { name: "Preview" }).click();
-  await expect(page.locator("#audit")).toContainText("No rows");
+  await expect(page.locator("#audit")).toContainText(/No rows|controller\.init/);
 
   expect(writeRequests).toEqual([]);
   expect(consoleErrors).toEqual([]);

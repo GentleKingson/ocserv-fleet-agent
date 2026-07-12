@@ -5,6 +5,7 @@ use std::path::Path;
 use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode, header};
+use base64::Engine as _;
 use ocfleet_api::{ApiCli, ApiConfig, AppState, RedactionMode, build_router};
 use ocfleet_cli::audit::AuditEvent;
 use ocfleet_cli::backend::StoreWriter;
@@ -18,6 +19,7 @@ use ocfleet_cli::store::{
 };
 use rusqlite::Connection;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use tower::ServiceExt;
 
@@ -389,15 +391,43 @@ async fn api_v1_nodes_cursor_filters_etag_and_correlation_are_stable() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers()["x-request-id"], "client-request-1");
     let etag = response.headers()[header::ETAG].clone();
-    let value: Value = serde_json::from_slice(
-        &to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("body"),
-    )
-    .expect("json");
+    let first_body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let value: Value = serde_json::from_slice(&first_body).expect("json");
+    assert!(value.get("generated_at").is_none());
+    let digest = Sha256::digest(&first_body);
+    let expected_etag = format!(
+        "\"{}\"",
+        digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
+    assert_eq!(etag, expected_etag);
     assert_eq!(value["data"]["count"], 1);
     assert_eq!(value["data"]["items"][0]["node_id"], "node-a");
     let cursor = value["data"]["next_cursor"].as_str().expect("next cursor");
+
+    let repeated = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/nodes?limit=1")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(repeated.status(), StatusCode::OK);
+    assert_eq!(repeated.headers()[header::ETAG], etag);
+    assert_eq!(
+        to_bytes(repeated.into_body(), usize::MAX)
+            .await
+            .expect("repeated body"),
+        first_body,
+        "the same strong ETag must identify byte-identical response bodies"
+    );
 
     let (status, second) = json_request(
         router.clone(),
@@ -451,6 +481,110 @@ async fn api_v1_nodes_cursor_filters_etag_and_correlation_are_stable() {
             .len(),
         0
     );
+}
+
+#[tokio::test]
+async fn api_v1_cursor_survives_restart_and_current_previous_key_rotation() {
+    let fixture = Fixture::new();
+    Store::open(&fixture.database)
+        .expect("store")
+        .add_node(
+            &NodeInsert {
+                node_id: "node-b".to_string(),
+                endpoint_id: "endpoint-b".to_string(),
+                name: "node-b".to_string(),
+                region: "sg".to_string(),
+                role: "ocserv".to_string(),
+            },
+            "api-test",
+        )
+        .expect("node-b");
+    let first_router = fixture.router(None);
+    let (_, first_page) =
+        json_request(first_router, Method::GET, "/api/v1/nodes?limit=1", None).await;
+    let cursor = first_page["data"]["next_cursor"]
+        .as_str()
+        .expect("next cursor")
+        .to_string();
+
+    let restarted = fixture.router(None);
+    let (status, second_page) = json_request(
+        restarted,
+        Method::GET,
+        &format!("/api/v1/nodes?limit=1&cursor={cursor}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(second_page["data"]["items"][0]["node_id"], "node-b");
+
+    write_cursor_key_file(
+        &fixture.cursor_key_file,
+        "key-2",
+        [2_u8; 32],
+        Some(("key-1", [1_u8; 32])),
+    );
+    let rotated = fixture.router(None);
+    let (status, _) = json_request(
+        rotated,
+        Method::GET,
+        &format!("/api/v1/nodes?limit=1&cursor={cursor}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    write_cursor_key_file(&fixture.cursor_key_file, "key-2", [2_u8; 32], None);
+    let retired = fixture.router(None);
+    let (status, body) = json_request(
+        retired,
+        Method::GET,
+        &format!("/api/v1/nodes?limit=1&cursor={cursor}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error_code"], "INVALID_CURSOR");
+}
+
+#[tokio::test]
+async fn api_v1_node_metadata_fails_closed_on_contaminated_labels() {
+    let fixture = Fixture::new();
+    let store = Store::open(&fixture.database).expect("store");
+    StoreWriter::write_node_metadata(
+        &store,
+        &NodeMetadataRecord {
+            node_id: "node-a".to_string(),
+            environment: "prod".to_string(),
+            site: "hk-1".to_string(),
+            owner_team: "network".to_string(),
+            service_tier: "tier-1".to_string(),
+            labels_json: json!({"color":"blue"}),
+            expected_agent_version: None,
+            updated_at: "2026-07-12T00:00:00Z".to_string(),
+        },
+        "api-test",
+    )
+    .expect("metadata");
+    drop(store);
+    Connection::open(&fixture.database)
+        .expect("sqlite")
+        .execute(
+            "UPDATE node_metadata SET labels_json = ?1 WHERE node_id = 'node-a'",
+            [r#"{"color":{"nested":"must-not-project"}}"#],
+        )
+        .expect("contaminate metadata");
+
+    let (status, body) = json_request(
+        fixture.router(None),
+        Method::GET,
+        "/api/v1/nodes/node-a",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(body["error_code"], "INTERNAL_ERROR");
+    assert!(!body.to_string().contains("must-not-project"));
 }
 
 #[tokio::test]
@@ -799,6 +933,7 @@ fn non_loopback_without_auth_token_file_fails_closed() {
         max_limit: 1_000,
         redact: RedactionMode::Default,
         auth_token_file: None,
+        cursor_key_file: Some(fixture.cursor_key_file.clone()),
     };
     let err = ApiConfig::from_cli(cli).expect_err("must reject non-loopback no-auth");
     assert!(err.to_string().contains("--auth-token-file is required"));
@@ -815,6 +950,7 @@ fn max_limit_is_bounded_at_startup() {
             max_limit,
             redact: RedactionMode::Default,
             auth_token_file: None,
+            cursor_key_file: Some(fixture.cursor_key_file.clone()),
         };
         let err = ApiConfig::from_cli(cli).expect_err("must reject unsafe max limit");
         assert!(err.to_string().contains("between 1 and 10000"));
@@ -984,6 +1120,7 @@ fn bearer_token_file_must_be_private() {
         max_limit: 1_000,
         redact: RedactionMode::Default,
         auth_token_file: Some(token_file),
+        cursor_key_file: Some(fixture.cursor_key_file.clone()),
     };
     let err = ApiConfig::from_cli(cli).expect_err("must reject public token file");
     assert!(err.to_string().contains("failed to load --auth-token-file"));
@@ -999,9 +1136,69 @@ fn read_only_flag_is_required() {
         max_limit: 1_000,
         redact: RedactionMode::Default,
         auth_token_file: None,
+        cursor_key_file: Some(fixture.cursor_key_file.clone()),
     };
     let err = ApiConfig::from_cli(cli).expect_err("must reject missing read-only flag");
     assert!(err.to_string().contains("--read-only is required"));
+}
+
+#[test]
+fn cursor_key_file_is_required() {
+    let fixture = Fixture::new();
+    let cli = ApiCli {
+        database: fixture.database.clone(),
+        read_only: true,
+        listen: "127.0.0.1:8080".parse::<SocketAddr>().expect("addr"),
+        max_limit: 1_000,
+        redact: RedactionMode::Default,
+        auth_token_file: None,
+        cursor_key_file: None,
+    };
+    let err = ApiConfig::from_cli(cli).expect_err("must require persistent cursor keys");
+    assert!(err.to_string().contains("--cursor-key-file is required"));
+}
+
+#[cfg(unix)]
+#[test]
+fn cursor_key_file_must_be_private_and_closed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = Fixture::new();
+    let public = fixture._dir.path().join("public-cursor-keys.json");
+    write_cursor_key_file(&public, "key-1", [1_u8; 32], None);
+    std::fs::set_permissions(&public, std::fs::Permissions::from_mode(0o644))
+        .expect("public permissions");
+    let cli = ApiCli {
+        database: fixture.database.clone(),
+        read_only: true,
+        listen: "127.0.0.1:8080".parse::<SocketAddr>().expect("addr"),
+        max_limit: 1_000,
+        redact: RedactionMode::Default,
+        auth_token_file: None,
+        cursor_key_file: Some(public),
+    };
+    let err = ApiConfig::from_cli(cli).expect_err("must reject public cursor key file");
+    assert!(err.to_string().contains("failed to load --cursor-key-file"));
+
+    let contaminated = fixture._dir.path().join("contaminated-cursor-keys.json");
+    std::fs::write(
+        &contaminated,
+        r#"{"schema":"ocfleet.cursor-keys.v1","current":{"key_id":"key-1","key_base64":"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=","unexpected":true}}"#,
+    )
+    .expect("write contaminated keys");
+    std::fs::set_permissions(&contaminated, std::fs::Permissions::from_mode(0o600))
+        .expect("private permissions");
+    let cli = ApiCli {
+        database: fixture.database.clone(),
+        read_only: true,
+        listen: "127.0.0.1:8080".parse::<SocketAddr>().expect("addr"),
+        max_limit: 1_000,
+        redact: RedactionMode::Default,
+        auth_token_file: None,
+        cursor_key_file: Some(contaminated),
+    };
+    let err = ApiConfig::from_cli(cli).expect_err("must reject unknown key fields");
+    assert!(err.to_string().contains("failed to load --cursor-key-file"));
 }
 
 #[tokio::test]
@@ -1366,16 +1563,20 @@ fn table_counts(path: &Path) -> Vec<i64> {
 struct Fixture {
     _dir: TempDir,
     database: std::path::PathBuf,
+    cursor_key_file: std::path::PathBuf,
 }
 
 impl Fixture {
     fn new() -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let database = dir.path().join("controller.sqlite");
+        let cursor_key_file = dir.path().join("cursor-keys.json");
+        write_cursor_key_file(&cursor_key_file, "key-1", [1_u8; 32], None);
         seed_database(&database);
         Self {
             _dir: dir,
             database,
+            cursor_key_file,
         }
     }
 
@@ -1391,6 +1592,7 @@ impl Fixture {
             max_limit: 1_000,
             redact: RedactionMode::Default,
             auth_token_file,
+            cursor_key_file: Some(self.cursor_key_file.clone()),
         };
         let config = ApiConfig::from_cli(cli).expect("config");
         AppState::from_config(config)
@@ -1410,6 +1612,8 @@ impl Fixture {
 }
 
 fn state_for_database(database: std::path::PathBuf) -> AppState {
+    let cursor_key_file = database.with_extension("cursor-keys.json");
+    write_cursor_key_file(&cursor_key_file, "key-1", [1_u8; 32], None);
     let cli = ApiCli {
         database,
         read_only: true,
@@ -1417,8 +1621,36 @@ fn state_for_database(database: std::path::PathBuf) -> AppState {
         max_limit: 1_000,
         redact: RedactionMode::Default,
         auth_token_file: None,
+        cursor_key_file: Some(cursor_key_file),
     };
     AppState::from_config(ApiConfig::from_cli(cli).expect("config"))
+}
+
+fn write_cursor_key_file(
+    path: &Path,
+    key_id: &str,
+    key: [u8; 32],
+    previous: Option<(&str, [u8; 32])>,
+) {
+    let entry = |key_id: &str, key: [u8; 32]| {
+        json!({
+            "key_id": key_id,
+            "key_base64": base64::engine::general_purpose::STANDARD.encode(key),
+        })
+    };
+    let value = json!({
+        "schema": "ocfleet.cursor-keys.v1",
+        "current": entry(key_id, key),
+        "previous": previous.map(|(id, key)| entry(id, key)),
+    });
+    std::fs::write(path, serde_json::to_vec(&value).expect("cursor key JSON"))
+        .expect("write cursor key file");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .expect("cursor key permissions");
+    }
 }
 
 fn sqlite_sidecar_path(database: &Path, suffix: &str) -> std::path::PathBuf {

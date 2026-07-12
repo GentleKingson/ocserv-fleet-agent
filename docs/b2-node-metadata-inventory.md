@@ -10,7 +10,7 @@ identity and endpoint trust.
 | Bounded labels | At most 32 scalar labels are accepted. Keys and values use closed ASCII character sets and fixed byte limits; duplicate CLI keys are rejected. |
 | Expected agent version | An optional bounded value is stored for later B8 version-readiness analysis. It cannot start an upgrade or agent RPC. |
 | Atomic audit | Metadata replacement and maintenance set/clear use one SQLite transaction with before/after or bounded advisory audit detail. Audit failure rolls back the mutation. |
-| Restricted selectors | Scheduler selectors accept only node ID, role, environment, site, owner team, service tier, or one exact string label. Resolution remains capped at 50 nodes and fails closed when the bounded candidate set overflows. |
+| Restricted selectors | Scheduler selectors accept only node ID, role, environment, site, owner team, service tier, or one exact string label. Role and metadata predicates run in SQLite before `LIMIT 51`, so a large fleet with a small match remains valid while more than 50 matches fail closed. Metadata rows are closed-validated on read and SQLite/contamination errors fail the job instead of silently skipping nodes. |
 | Maintenance | Per-node half-open UTC windows suppress scheduler target resolution only. They do not change health history, trust, enrollment, peer, or path authorization. |
 | Trust isolation | Metadata tables have only a foreign key to `nodes`; their writers never update `endpoint_trust`, enrollment, or controller authorization tables. |
 

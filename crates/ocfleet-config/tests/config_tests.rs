@@ -800,6 +800,28 @@ cert_path = "/etc/ocserv/server-cert.pem"
 }
 
 #[test]
+fn agent_config_omitted_fingerprint_mode_requires_hmac_migration_fields() {
+    let mut config = minimal_agent_config();
+    config.ocserv_readonly.config_fingerprint =
+        Some(ocfleet_config::agent::OcservConfigFingerprintConfig {
+            name: "main".to_string(),
+            config_path: "/etc/ocserv/ocserv.conf".into(),
+            mode: ocfleet_config::agent::ConfigFingerprintMode::default(),
+            key_id: None,
+            key_path: None,
+            previous_key_id: None,
+            previous_key_path: None,
+        });
+
+    let err = validate_agent_config(&config)
+        .expect_err("the HMAC default must fail closed until migration fields are configured");
+    assert!(matches!(
+        err,
+        ConfigError::Invalid(message) if message.contains("HMAC config fingerprint requires key_id")
+    ));
+}
+
+#[test]
 fn agent_config_accepts_ocserv_readonly_collector_snapshot_provider() {
     let config: AgentConfig = toml::from_str(
         r#"

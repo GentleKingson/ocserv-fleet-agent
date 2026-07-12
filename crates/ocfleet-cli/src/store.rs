@@ -1082,6 +1082,80 @@ impl Store {
             .map_err(StoreError::from)
     }
 
+    pub fn list_nodes_by_role_limited(
+        &self,
+        role: &str,
+        limit: u64,
+    ) -> Result<Vec<NodeRecord>, StoreError> {
+        validate_role(role).map_err(|error| StoreError::InvalidInput(error.to_string()))?;
+        let limit = u64_to_i64(limit)?;
+        let mut stmt = self.conn.prepare(
+            "SELECT node_id, endpoint_id, name, region, role, enabled
+             FROM nodes WHERE role = ?1 ORDER BY node_id LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![role, limit], node_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub fn list_nodes_by_metadata_limited(
+        &self,
+        field: &str,
+        expected: &str,
+        limit: u64,
+    ) -> Result<Vec<NodeRecord>, StoreError> {
+        let mut validation = self.conn.prepare(
+            "SELECT node_id, environment, site, owner_team, service_tier, labels_json,
+                    expected_agent_version, updated_at
+             FROM node_metadata ORDER BY node_id",
+        )?;
+        let rows = validation.query_map([], node_metadata_from_row)?;
+        for row in rows {
+            row?;
+        }
+
+        let limit = u64_to_i64(limit)?;
+        let node_columns = "n.node_id, n.endpoint_id, n.name, n.region, n.role, n.enabled";
+        if let Some(key) = field.strip_prefix("label.") {
+            validate_label_json(&json!({key: expected}), "selector label")
+                .map_err(StoreError::InvalidInput)?;
+            let json_path = format!("$.\"{key}\"");
+            let sql = format!(
+                "SELECT {node_columns} FROM nodes n
+                 JOIN node_metadata m ON m.node_id = n.node_id
+                 WHERE json_extract(m.labels_json, ?1) = ?2
+                 ORDER BY n.node_id LIMIT ?3"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(params![json_path, expected, limit], node_from_row)?;
+            return rows
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(StoreError::from);
+        }
+        validate_metadata_value(expected, "selector metadata value")
+            .map_err(StoreError::InvalidInput)?;
+        let column = match field {
+            "environment" => "environment",
+            "site" => "site",
+            "owner_team" => "owner_team",
+            "service_tier" => "service_tier",
+            _ => {
+                return Err(StoreError::InvalidInput(
+                    "unsupported metadata selector field".to_string(),
+                ));
+            }
+        };
+        let sql = format!(
+            "SELECT {node_columns} FROM nodes n
+             JOIN node_metadata m ON m.node_id = n.node_id
+             WHERE m.{column} = ?1 ORDER BY n.node_id LIMIT ?2"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![expected, limit], node_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
     pub fn get_node_metadata(
         &self,
         node_id: &str,
@@ -1223,7 +1297,7 @@ impl Store {
         actor: &str,
     ) -> Result<(), StoreError> {
         validate_actor(actor).map_err(StoreError::InvalidInput)?;
-        validate_node_metadata(metadata)?;
+        validate_node_metadata_record(metadata)?;
         let tx = self.conn.unchecked_transaction()?;
         if get_node_tx(&tx, &metadata.node_id)?.is_none() {
             return Err(StoreError::NodeNotFound(metadata.node_id.clone()));
@@ -1269,7 +1343,7 @@ impl Store {
         actor: &str,
     ) -> Result<(), StoreError> {
         validate_actor(actor).map_err(StoreError::InvalidInput)?;
-        validate_node_maintenance(window)?;
+        validate_node_maintenance_record(window)?;
         let tx = self.conn.unchecked_transaction()?;
         if get_node_tx(&tx, &window.node_id)?.is_none() {
             return Err(StoreError::NodeNotFound(window.node_id.clone()));
@@ -7059,7 +7133,7 @@ fn node_metadata_audit_json(metadata: &NodeMetadataRecord) -> Value {
     })
 }
 
-fn validate_node_metadata(metadata: &NodeMetadataRecord) -> Result<(), StoreError> {
+pub fn validate_node_metadata_record(metadata: &NodeMetadataRecord) -> Result<(), StoreError> {
     validate_node_id(&metadata.node_id).map_err(|e| StoreError::InvalidInput(e.to_string()))?;
     validate_metadata_value(&metadata.environment, "environment")
         .map_err(StoreError::InvalidInput)?;
@@ -7077,7 +7151,7 @@ fn validate_node_metadata(metadata: &NodeMetadataRecord) -> Result<(), StoreErro
     Ok(())
 }
 
-fn validate_node_maintenance(window: &NodeMaintenanceWindow) -> Result<(), StoreError> {
+pub fn validate_node_maintenance_record(window: &NodeMaintenanceWindow) -> Result<(), StoreError> {
     validate_node_id(&window.node_id).map_err(|e| StoreError::InvalidInput(e.to_string()))?;
     let start = validate_bounded_rfc3339(&window.starts_at, "node maintenance starts_at")?;
     let end = validate_bounded_rfc3339(&window.ends_at, "node maintenance ends_at")?;
@@ -7300,7 +7374,7 @@ fn node_metadata_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NodeMetad
         expected_agent_version: row.get(6)?,
         updated_at: row.get(7)?,
     };
-    validate_node_metadata(&metadata).map_err(|error| {
+    validate_node_metadata_record(&metadata).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(5, Type::Text, Box::new(error))
     })?;
     Ok(metadata)
@@ -7314,7 +7388,7 @@ fn node_maintenance_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NodeMa
         reason: row.get(3)?,
         updated_at: row.get(4)?,
     };
-    validate_node_maintenance(&window).map_err(|error| {
+    validate_node_maintenance_record(&window).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(1, Type::Text, Box::new(error))
     })?;
     Ok(window)

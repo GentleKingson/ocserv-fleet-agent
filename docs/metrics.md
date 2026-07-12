@@ -8,7 +8,7 @@ private bearer-token file for every non-loopback listener, and `/metrics` uses
 the same authorization middleware as all other read-only routes.
 
 ```bash
-ocfleet-api --database controller.sqlite --read-only --listen 127.0.0.1:8080
+ocfleet-api --database controller.sqlite --read-only --cursor-key-file ./cursor-keys.json --listen 127.0.0.1:8080
 curl --fail http://127.0.0.1:8080/metrics
 ```
 

@@ -414,6 +414,36 @@ ocfleet --database /var/lib/ocfleet-controller/controller.sqlite --secret-key /v
 
 ## Upgrade Flow
 
+### Configuration fingerprint migration
+
+The configuration-fingerprint default is now `hmac_sha256`. Before restarting
+an upgraded agent, inspect every `[ocserv_readonly.config_fingerprint]` block.
+An existing block containing only `name` and `config_path` no longer starts.
+Choose one explicit migration:
+
+```toml
+# Recommended: provision a private owner-only 32-byte-or-larger key file.
+[ocserv_readonly.config_fingerprint]
+name = "main"
+config_path = "/etc/ocserv/ocserv.conf"
+mode = "hmac_sha256"
+key_id = "fleet-key-2026-07"
+key_path = "/etc/ocfleet-agent/fingerprint.key"
+```
+
+```toml
+# Temporary compatibility mode; retains the prior unkeyed wire shape.
+[ocserv_readonly.config_fingerprint]
+name = "main"
+config_path = "/etc/ocserv/ocserv.conf"
+mode = "legacy_sha256"
+```
+
+The agent fails closed when HMAC is selected without `key_id` and `key_path`.
+Do not silently create a key during service startup. Provision and back it up
+through the existing secret-management workflow, then validate the agent
+configuration before replacing the running binary.
+
 Use this order for routine binary upgrades, with `OS` and `ARCH` set as in the install step above:
 
 ```bash

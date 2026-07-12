@@ -3063,18 +3063,11 @@ fn resolve_node_targets(store: &Store, selector: &str) -> anyhow::Result<Vec<Tar
         if role.is_empty() {
             bail!("selector role must not be empty");
         }
-        let candidates = store.list_nodes_limited((MAX_TARGETS_PER_JOB + 1) as u64)?;
-        if candidates.len() > MAX_TARGETS_PER_JOB {
-            bail!(
-                "role selector candidate set exceeds safe cap: {} > {MAX_TARGETS_PER_JOB}",
-                candidates.len()
-            );
-        }
-        let targets = candidates
+        let targets = store
+            .list_nodes_by_role_limited(role, (MAX_TARGETS_PER_JOB + 1) as u64)?
             .into_iter()
-            .filter(|node| node.role == role)
             .map(|node| TargetNode {
-                node_id: node.node_id.clone(),
+                node_id: node.node_id,
             })
             .collect::<Vec<_>>();
         if targets.len() > MAX_TARGETS_PER_JOB {
@@ -3088,30 +3081,9 @@ fn resolve_node_targets(store: &Store, selector: &str) -> anyhow::Result<Vec<Tar
     let (field, expected) = selector
         .split_once('=')
         .context("selector must use FIELD=VALUE")?;
-    let candidates = store.list_nodes_limited((MAX_TARGETS_PER_JOB + 1) as u64)?;
-    if candidates.len() > MAX_TARGETS_PER_JOB {
-        bail!(
-            "metadata selector candidate set exceeds safe cap: {} > {MAX_TARGETS_PER_JOB}",
-            candidates.len()
-        );
-    }
-    let targets = candidates
+    let targets = store
+        .list_nodes_by_metadata_limited(field, expected, (MAX_TARGETS_PER_JOB + 1) as u64)?
         .into_iter()
-        .filter(|node| {
-            store
-                .get_node_metadata(&node.node_id)
-                .ok()
-                .flatten()
-                .is_some_and(|metadata| match field {
-                    "environment" => metadata.environment == expected,
-                    "site" => metadata.site == expected,
-                    "owner_team" => metadata.owner_team == expected,
-                    "service_tier" => metadata.service_tier == expected,
-                    _ => field.strip_prefix("label.").is_some_and(|key| {
-                        metadata.labels_json.get(key).and_then(Value::as_str) == Some(expected)
-                    }),
-                })
-        })
         .map(|node| TargetNode {
             node_id: node.node_id,
         })
@@ -3827,7 +3799,8 @@ mod tests {
     #[test]
     fn metadata_selectors_are_bounded_and_skip_maintenance() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let store = Store::open(&dir.path().join("controller.sqlite")).expect("store");
+        let database = dir.path().join("controller.sqlite");
+        let store = Store::open(&database).expect("store");
         for node_id in ["node-a", "node-b"] {
             StoreWriter::write_node_add(
                 &store,
@@ -3870,12 +3843,39 @@ mod tests {
         )
         .expect("maintenance");
 
+        for index in 0..51 {
+            StoreWriter::write_node_add(
+                &store,
+                &NodeInsert {
+                    node_id: format!("unmatched-{index:02}"),
+                    endpoint_id: format!("endpoint-unmatched-{index:02}"),
+                    name: format!("unmatched-{index:02}"),
+                    region: "us-west".to_string(),
+                    role: "ocserv".to_string(),
+                },
+                "operator",
+            )
+            .expect("unmatched node");
+        }
+
         let environment = resolve_node_targets(&store, "environment=prod").expect("selector");
         assert_eq!(environment.len(), 1);
         assert_eq!(environment[0].node_id, "node-a");
         assert_eq!(
             resolve_node_targets(&store, "label.color=blue").expect("label")[0].node_id,
             "node-a"
+        );
+
+        rusqlite::Connection::open(&database)
+            .expect("sqlite")
+            .execute(
+                "UPDATE node_metadata SET labels_json = '{\"color\":{\"nested\":true}}' WHERE node_id = 'node-a'",
+                [],
+            )
+            .expect("contaminate labels");
+        assert!(
+            resolve_node_targets(&store, "label.color=blue").is_err(),
+            "SQLite metadata errors must fail the selector instead of silently skipping a node"
         );
     }
 

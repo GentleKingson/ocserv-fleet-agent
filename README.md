@@ -154,11 +154,13 @@ controller database:
 target/debug/ocfleet-api \
   --database controller.sqlite \
   --read-only \
+  --cursor-key-file ./cursor-keys.json \
   --listen 127.0.0.1:8080
 ```
 
 The API opens SQLite in read-only mode and serves only `GET` observation routes.
-Non-loopback listeners require `--auth-token-file`.
+Every listener requires a private persistent cursor keyring; see `docs/api.md`.
+Non-loopback listeners additionally require `--auth-token-file`.
 
 Optionally generate a local ocserv metadata collector config and write a private
 snapshot for the agent `collector_snapshot` provider:

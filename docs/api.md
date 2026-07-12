@@ -60,8 +60,28 @@ install -m 0600 /dev/null ./api.token
 # Internal upstream only; firewall access to the TLS proxy.
 ocfleet-api --database controller.sqlite --read-only \
   --listen 0.0.0.0:8080 \
+  --cursor-key-file ./cursor-keys.json \
   --auth-token-file ./api.token
 ```
+
+All listeners require `--cursor-key-file`. It must be an owner-only regular
+file under a private directory and use this closed format:
+
+```json
+{
+  "schema": "ocfleet.cursor-keys.v1",
+  "current": {
+    "key_id": "cursor-2026-07",
+    "key_base64": "<base64-encoded 32 random bytes>"
+  }
+}
+```
+
+During rotation, move the old entry to optional `previous` and install a new
+`current` entry. Both key IDs must differ. Cursors expire at a deterministic
+UTC-day boundary 24-48 hours after issuance; keep `previous` for 48 hours
+before removing it. Instances behind one load balancer must read the same key
+file. Key material is never returned or logged.
 
 The token file must be private: regular file, owned by the current user, no
 symlink or hardlink, not group/world readable, and under a private parent
@@ -87,7 +107,9 @@ tokens, paths, or other data-derived label values.
 
 ## Response Shape
 
-Every JSON API success or error response includes `generated_at`. Rejected
+Legacy JSON successes and every error response include `generated_at`. Stable
+`/api/v1` success envelopes contain only deterministic `data`; this lets their
+strong ETag identify the complete response bytes. Rejected
 methods, unknown routes, malformed query strings, unsupported query keys, and
 invalid identifiers use the same structured error envelope. All responses send
 `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`.
@@ -148,6 +170,10 @@ Errors:
 | `GET /api/v1/health/history?from=&to=&limit=&cursor=&node_id=&status=` | signed keyset-paginated health history |
 | `GET /api/v1/alerts?from=&to=&limit=&cursor=&state=&severity=&node_id=&reason=` | signed keyset-paginated alert history |
 | `GET /api/v1/alerts/{dedupe_key_or_alert_id}` | conditional single-alert projection |
+
+Every `/api/v1` `200` response uses a strong ETag computed over the complete
+deterministic envelope. Two responses with the same ETag are byte-identical;
+`If-None-Match` returns an empty `304` when that representation is unchanged.
 
 `limit` and `max_rows` default to `50` and may not exceed `--max-limit`.
 `--max-limit` itself must be from `1` through `10000`. Unknown query keys,

@@ -11,14 +11,17 @@ use ocfleet_cli::version_governance::{MAX_VERSION_GOVERNANCE_NODES, build_fleet_
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use time::OffsetDateTime;
 
+use crate::cursor_keys::CursorKeyring;
 use crate::projections::{alert_to_json, health_node_to_json};
 use crate::readonly_store::{AlertPageFilters, HistoryPageFilters, NodeListFilters};
-use crate::responses::{ApiError, ApiResult, now_rfc3339};
+use crate::responses::{ApiError, ApiResult};
 use crate::routes::{AppState, authorize, db};
 
 const DEFAULT_LIMIT: u64 = 50;
 const MAX_CURSOR_BYTES: usize = 2_048;
+const CURSOR_TTL_SECONDS: i64 = 24 * 60 * 60;
 
 pub fn v1_router() -> Router<AppState> {
     Router::new()
@@ -74,6 +77,14 @@ struct AlertsQuery {
 #[serde(deny_unknown_fields)]
 struct CursorPayload {
     version: u8,
+    key_id: String,
+    expires_at: i64,
+    resource: String,
+    after: String,
+    filter_hash: String,
+}
+
+struct CursorPosition {
     resource: String,
     after: String,
     filter_hash: String,
@@ -178,7 +189,7 @@ async fn nodes(
     let after = query
         .cursor
         .as_deref()
-        .map(|cursor| decode_cursor(cursor, &state.cursor_key, "nodes", &filter_hash))
+        .map(|cursor| decode_cursor(cursor, &state.cursor_keys, "nodes", &filter_hash))
         .transpose()?;
     let fetch_limit = limit
         .checked_add(1)
@@ -202,13 +213,12 @@ async fn nodes(
             .last()
             .map(|record| {
                 encode_cursor(
-                    &CursorPayload {
-                        version: 1,
+                    &CursorPosition {
                         resource: "nodes".to_string(),
                         after: record.node.node_id.clone(),
                         filter_hash: filter_hash.clone(),
                     },
-                    &state.cursor_key,
+                    &state.cursor_keys,
                 )
             })
             .transpose()?
@@ -253,7 +263,7 @@ async fn health_history(
     let after = query
         .cursor
         .as_deref()
-        .map(|c| decode_cursor(c, &state.cursor_key, "health-history", &hash))
+        .map(|c| decode_cursor(c, &state.cursor_keys, "health-history", &hash))
         .transpose()?;
     let parts = after.as_deref().map(|v| split_after(v, 3)).transpose()?;
     let mut rows = db(state.store.list_health_history_page(
@@ -272,8 +282,7 @@ async fn health_history(
         rows.last()
             .map(|r| {
                 encode_cursor(
-                    &CursorPayload {
-                        version: 1,
+                    &CursorPosition {
                         resource: "health-history".into(),
                         after: format!(
                             "{}|{}|{}",
@@ -281,7 +290,7 @@ async fn health_history(
                         ),
                         filter_hash: hash.clone(),
                     },
-                    &state.cursor_key,
+                    &state.cursor_keys,
                 )
             })
             .transpose()?
@@ -326,7 +335,7 @@ async fn alerts(
     let after = query
         .cursor
         .as_deref()
-        .map(|c| decode_cursor(c, &state.cursor_key, "alerts", &hash))
+        .map(|c| decode_cursor(c, &state.cursor_keys, "alerts", &hash))
         .transpose()?;
     let parts = after.as_deref().map(|v| split_after(v, 2)).transpose()?;
     let mut rows = db(state.store.list_alert_page(
@@ -347,13 +356,12 @@ async fn alerts(
         rows.last()
             .map(|r| {
                 encode_cursor(
-                    &CursorPayload {
-                        version: 1,
+                    &CursorPosition {
                         resource: "alerts".into(),
                         after: format!("{}|{}", r.last_seen_at, r.alert_id),
                         filter_hash: hash.clone(),
                     },
-                    &state.cursor_key,
+                    &state.cursor_keys,
                 )
             })
             .transpose()?
@@ -455,17 +463,32 @@ fn filter_hash(query: &NodesQuery) -> String {
     ))
 }
 
-fn encode_cursor(payload: &CursorPayload, key: &[u8; 32]) -> ApiResult<String> {
-    let payload = serde_json::to_vec(payload)
+fn encode_cursor(position: &CursorPosition, keyring: &CursorKeyring) -> ApiResult<String> {
+    let key = keyring.current();
+    let payload = CursorPayload {
+        version: 2,
+        key_id: key.key_id().to_string(),
+        expires_at: cursor_expiry(OffsetDateTime::now_utc().unix_timestamp()),
+        resource: position.resource.clone(),
+        after: position.after.clone(),
+        filter_hash: position.filter_hash.clone(),
+    };
+    let payload = serde_json::to_vec(&payload)
         .map_err(|_| ApiError::invalid_cursor("cursor encoding failed"))?;
     let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&payload);
-    let signature = hex(&hmac_sha256(key, encoded.as_bytes()));
+    let signature = hex(&hmac_sha256(key.key(), encoded.as_bytes()));
     Ok(format!("{encoded}.{signature}"))
+}
+
+fn cursor_expiry(now: i64) -> i64 {
+    now.div_euclid(CURSOR_TTL_SECONDS)
+        .saturating_add(2)
+        .saturating_mul(CURSOR_TTL_SECONDS)
 }
 
 fn decode_cursor(
     cursor: &str,
-    key: &[u8; 32],
+    keyring: &CursorKeyring,
     resource: &str,
     filter_hash: &str,
 ) -> ApiResult<String> {
@@ -475,16 +498,20 @@ fn decode_cursor(
     let (encoded, supplied_signature) = cursor
         .split_once('.')
         .ok_or_else(|| ApiError::invalid_cursor("cursor is malformed"))?;
-    let expected_signature = hex(&hmac_sha256(key, encoded.as_bytes()));
-    if !constant_time_eq(supplied_signature.as_bytes(), expected_signature.as_bytes()) {
-        return Err(ApiError::invalid_cursor("cursor signature is invalid"));
-    }
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(encoded)
         .map_err(|_| ApiError::invalid_cursor("cursor payload is invalid"))?;
     let payload: CursorPayload = serde_json::from_slice(&bytes)
         .map_err(|_| ApiError::invalid_cursor("cursor payload is invalid"))?;
-    if payload.version != 1
+    let key = keyring
+        .find(&payload.key_id)
+        .ok_or_else(|| ApiError::invalid_cursor("cursor signature is invalid"))?;
+    let expected_signature = hex(&hmac_sha256(key.key(), encoded.as_bytes()));
+    if !constant_time_eq(supplied_signature.as_bytes(), expected_signature.as_bytes()) {
+        return Err(ApiError::invalid_cursor("cursor signature is invalid"));
+    }
+    if payload.version != 2
+        || payload.expires_at <= OffsetDateTime::now_utc().unix_timestamp()
         || payload.resource != resource
         || payload.filter_hash != filter_hash
         || payload.after.is_empty()
@@ -534,10 +561,11 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn conditional_json(headers: &HeaderMap, data: Value) -> ApiResult<Response> {
+    let body = json!({"data": data});
     let etag = format!(
         "\"{}\"",
         hex(&Sha256::digest(
-            serde_json::to_vec(&data).map_err(|_| ApiError::internal())?
+            serde_json::to_vec(&body).map_err(|_| ApiError::internal())?
         ))
     );
     if headers
@@ -549,10 +577,6 @@ fn conditional_json(headers: &HeaderMap, data: Value) -> ApiResult<Response> {
         set_cache_headers(&mut response, &etag)?;
         return Ok(response);
     }
-    let body = json!({
-        "generated_at": now_rfc3339(),
-        "data": data,
-    });
     let mut response = axum::Json(body).into_response();
     set_cache_headers(&mut response, &etag)?;
     Ok(response)
@@ -576,42 +600,58 @@ mod tests {
 
     #[test]
     fn signed_cursor_rejects_tampering_and_filter_reuse() {
-        let key = [7_u8; 32];
+        let keys = CursorKeyring::for_test("test-key", [7_u8; 32]);
         let cursor = encode_cursor(
-            &CursorPayload {
-                version: 1,
+            &CursorPosition {
                 resource: "nodes".to_string(),
                 after: "node-a".to_string(),
                 filter_hash: "filters-a".to_string(),
             },
-            &key,
+            &keys,
         )
         .expect("cursor");
         assert_eq!(
-            decode_cursor(&cursor, &key, "nodes", "filters-a").expect("decode"),
+            decode_cursor(&cursor, &keys, "nodes", "filters-a").expect("decode"),
             "node-a"
         );
         let mut tampered = cursor.into_bytes();
         tampered[0] ^= 1;
         let tampered = String::from_utf8(tampered).expect("ASCII cursor");
-        assert!(decode_cursor(&tampered, &key, "nodes", "filters-a").is_err());
+        assert!(decode_cursor(&tampered, &keys, "nodes", "filters-a").is_err());
         assert!(
             decode_cursor(
                 &encode_cursor(
-                    &CursorPayload {
-                        version: 1,
+                    &CursorPosition {
                         resource: "nodes".to_string(),
                         after: "node-a".to_string(),
                         filter_hash: "filters-a".to_string(),
                     },
-                    &key
+                    &keys
                 )
                 .expect("cursor"),
-                &key,
+                &keys,
                 "nodes",
                 "filters-b"
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn signed_cursor_rejects_expiration() {
+        let keys = CursorKeyring::for_test("test-key", [7_u8; 32]);
+        let payload = CursorPayload {
+            version: 2,
+            key_id: "test-key".to_string(),
+            expires_at: OffsetDateTime::now_utc().unix_timestamp() - 1,
+            resource: "nodes".to_string(),
+            after: "node-a".to_string(),
+            filter_hash: "filters-a".to_string(),
+        };
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&payload).expect("payload"));
+        let signature = hex(&hmac_sha256(keys.current().key(), encoded.as_bytes()));
+        let cursor = format!("{encoded}.{signature}");
+        assert!(decode_cursor(&cursor, &keys, "nodes", "filters-a").is_err());
     }
 }

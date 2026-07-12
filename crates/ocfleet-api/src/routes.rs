@@ -18,6 +18,7 @@ use uuid::Uuid;
 
 use crate::args::ApiConfig;
 use crate::auth::{AuthToken, Principal};
+use crate::cursor_keys::CursorKeyring;
 use crate::metrics::{CONTENT_TYPE as METRICS_CONTENT_TYPE, render_controller};
 use crate::projections::{
     alert_to_json, audit_to_json, health_node_to_json, health_summary_to_json, job_to_json,
@@ -40,21 +41,17 @@ pub struct AppState {
     pub(crate) max_limit: u64,
     pub(crate) redact: RedactionMode,
     pub(crate) auth_token: Option<AuthToken>,
-    pub(crate) cursor_key: Arc<[u8; 32]>,
+    pub(crate) cursor_keys: Arc<CursorKeyring>,
 }
 
 impl AppState {
     pub fn from_config(config: ApiConfig) -> Self {
-        let mut hasher = Sha256::new();
-        hasher.update(Uuid::new_v4().as_bytes());
-        hasher.update(config.database.as_os_str().as_encoded_bytes());
-        let cursor_key: [u8; 32] = hasher.finalize().into();
         Self {
             store: Arc::new(ReadOnlyStore::new(config.database)),
             max_limit: config.max_limit,
             redact: config.redact,
             auth_token: config.auth_token,
-            cursor_key: Arc::new(cursor_key),
+            cursor_keys: Arc::new(config.cursor_keys),
         }
     }
 

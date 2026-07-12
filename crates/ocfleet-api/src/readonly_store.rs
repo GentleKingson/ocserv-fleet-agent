@@ -11,8 +11,9 @@ use ocfleet_cli::storage_payloads::{
 };
 use ocfleet_cli::store::{
     AlertEventRecord, AuditRecord, CURRENT_SCHEMA_VERSION, HealthHistoryRecord, HealthRollupRecord,
-    HealthSnapshotRecord, NodeRecord, ObservabilityJobRecord, ObservabilityRunRecord,
-    ProbeObservationRecord,
+    HealthSnapshotRecord, NodeMaintenanceWindow, NodeMetadataRecord, NodeRecord,
+    ObservabilityJobRecord, ObservabilityRunRecord, ProbeObservationRecord,
+    validate_node_maintenance_record, validate_node_metadata_record,
 };
 use ocfleet_cli::version_governance::{
     CapabilityNegotiationStatus, CapabilitySnapshot, VersionGovernanceInput,
@@ -1177,13 +1178,51 @@ fn attach_node_advisory(conn: &Connection, record: &mut NodeHealthRecord) -> rus
         |row| {
             let labels: String = row.get(4)?;
             let labels: Value = serde_json::from_str(&labels).map_err(|error| rusqlite::Error::FromSqlConversionFailure(4, Type::Text, Box::new(error)))?;
-            Ok(serde_json::json!({"environment":row.get::<_,String>(0)?,"site":row.get::<_,String>(1)?,"owner_team":row.get::<_,String>(2)?,"service_tier":row.get::<_,String>(3)?,"labels":labels,"expected_agent_version":row.get::<_,Option<String>>(5)?,"updated_at":row.get::<_,String>(6)?}))
+            let metadata = NodeMetadataRecord {
+                node_id: record.node.node_id.clone(),
+                environment: row.get(0)?,
+                site: row.get(1)?,
+                owner_team: row.get(2)?,
+                service_tier: row.get(3)?,
+                labels_json: labels,
+                expected_agent_version: row.get(5)?,
+                updated_at: row.get(6)?,
+            };
+            validate_node_metadata_record(&metadata).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(4, Type::Text, Box::new(error))
+            })?;
+            Ok(serde_json::json!({
+                "environment": metadata.environment,
+                "site": metadata.site,
+                "owner_team": metadata.owner_team,
+                "service_tier": metadata.service_tier,
+                "labels": metadata.labels_json,
+                "expected_agent_version": metadata.expected_agent_version,
+                "updated_at": metadata.updated_at,
+            }))
         },
     ).optional()?;
     record.maintenance = conn.query_row(
         "SELECT starts_at, ends_at, reason, updated_at FROM node_maintenance_windows WHERE node_id=?1",
         [&record.node.node_id],
-        |row| Ok(serde_json::json!({"from":row.get::<_,String>(0)?,"to":row.get::<_,String>(1)?,"reason":row.get::<_,String>(2)?,"updated_at":row.get::<_,String>(3)?})),
+        |row| {
+            let window = NodeMaintenanceWindow {
+                node_id: record.node.node_id.clone(),
+                starts_at: row.get(0)?,
+                ends_at: row.get(1)?,
+                reason: row.get(2)?,
+                updated_at: row.get(3)?,
+            };
+            validate_node_maintenance_record(&window).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(error))
+            })?;
+            Ok(serde_json::json!({
+                "from": window.starts_at,
+                "to": window.ends_at,
+                "reason": window.reason,
+                "updated_at": window.updated_at,
+            }))
+        },
     ).optional()?;
     Ok(())
 }

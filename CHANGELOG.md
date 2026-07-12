@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- API v1 now requires a private, persistent `--cursor-key-file`; signed cursors
+  carry a key ID and bounded expiry and remain valid across restarts and during
+  one-key rotation. Strong ETags cover the complete deterministic v1 response
+  body, and contaminated node metadata fails closed on read.
+- Configuration fingerprinting now defaults to `hmac_sha256`. Existing agent
+  configurations that only set `name` and `config_path` must provision
+  `key_id` plus a private `key_path`, or explicitly set
+  `mode = "legacy_sha256"` before upgrading. Otherwise agent startup fails
+  closed.
 - B-READY completes the Stage B source gate: all B1-B8 items are operationally
   mature, default/all-feature milestone regression and isolated non-root Linux
   checks pass, bounded mixed-version behavior is verified, and the default

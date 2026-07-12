@@ -2,11 +2,11 @@
   "baseline_commit": "b3c906a94823b4620dc1a2077a44e7160c0848b2",
   "current_phase": "A6",
   "completed_phases": ["A1", "A2", "A3", "A4", "A5"],
-  "active_branch": "codex/a6-restore-workflow",
+  "active_branch": "codex/a6-completion-inventory",
   "active_issue": 38,
-  "active_pr": 97,
+  "active_pr": 98,
   "last_test_result": "passed",
   "last_updated_at": "2026-07-12T00:30:00Z",
   "blockers": [],
-  "next_action": "Publish restore plan/apply and the automated disaster-recovery drill, then run the A6 completion audit."
+  "next_action": "Publish and merge the A6 completion inventory, close issue 38, then start A7 low-cardinality metrics."
 }

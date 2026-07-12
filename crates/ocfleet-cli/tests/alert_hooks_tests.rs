@@ -1463,6 +1463,111 @@ fn alert_worker_rejects_non_private_or_symlink_secret_directory() {
 }
 
 #[test]
+fn alert_hook_enable_state_is_idempotent_atomic_and_visible_in_delivery_health() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let database = dir.path().join("controller.sqlite");
+    let store = Store::open(&database).expect("open store");
+    seed_alert(&store, "node:hk-ocserv-01:node_stale");
+    let hook = seed_webhook_hook(
+        &store,
+        "webhook-hook-state",
+        "https://93.184.216.34/alerts",
+        b"0123456789abcdef0123456789abcdef",
+    );
+
+    assert!(
+        StoreWriter::write_alert_webhook_hook_enabled(
+            &store,
+            &hook.hook_id,
+            false,
+            "2026-07-12T01:00:00Z",
+            "test-actor",
+        )
+        .expect("disable hook")
+    );
+    assert!(
+        !StoreWriter::write_alert_webhook_hook_enabled(
+            &store,
+            &hook.hook_id,
+            false,
+            "2026-07-12T01:00:01Z",
+            "test-actor",
+        )
+        .expect("idempotent disable")
+    );
+    assert!(
+        !store
+            .get_alert_webhook_hook(&hook.hook_id)
+            .expect("load hook")
+            .expect("hook exists")
+            .enabled
+    );
+
+    let conn = Connection::open(&database).expect("open database");
+    conn.execute_batch(
+        "CREATE TRIGGER fail_hook_enable_audit BEFORE INSERT ON controller_audit_log
+         WHEN NEW.event = 'alert.hook.enable'
+         BEGIN SELECT RAISE(ABORT, 'injected hook enable audit failure'); END;",
+    )
+    .expect("install audit failure trigger");
+    let error = StoreWriter::write_alert_webhook_hook_enabled(
+        &store,
+        &hook.hook_id,
+        true,
+        "2026-07-12T01:00:02Z",
+        "test-actor",
+    )
+    .expect_err("audit failure rejects enable");
+    assert!(
+        error
+            .to_string()
+            .contains("injected hook enable audit failure")
+    );
+    assert!(
+        !store
+            .get_alert_webhook_hook(&hook.hook_id)
+            .expect("load hook after rollback")
+            .expect("hook exists")
+            .enabled
+    );
+    conn.execute_batch("DROP TRIGGER fail_hook_enable_audit;")
+        .expect("remove audit failure trigger");
+
+    StoreWriter::write_alert_webhook_hook_enabled(
+        &store,
+        &hook.hook_id,
+        true,
+        "2026-07-12T01:00:03Z",
+        "test-actor",
+    )
+    .expect("enable hook");
+    StoreWriter::write_alert_delivery_queue_enqueue(
+        &store,
+        &ocfleet_cli::store::AlertDeliveryQueueEnqueue {
+            queue_id: "delivery-queue-health-status".to_string(),
+            alert_id: "alert-seeded".to_string(),
+            hook_id: hook.hook_id,
+            idempotency_key: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .to_string(),
+            group_key: "warning:node_stale".to_string(),
+            enqueued_at: "2026-07-12T01:00:04Z".to_string(),
+        },
+        "test-actor",
+    )
+    .expect("enqueue health row");
+    let health = store
+        .alert_delivery_queue_health("2026-07-12T01:00:05Z")
+        .expect("delivery health");
+    assert_eq!(health.pending, 1);
+    assert_eq!(health.due, 1);
+    assert_eq!(
+        health.oldest_due_at.as_deref(),
+        Some("2026-07-12T01:00:04Z")
+    );
+    assert_eq!(health.dead_letter, 0);
+}
+
+#[test]
 #[cfg(unix)]
 fn alert_worker_enqueues_signs_delivers_and_rate_limits_replay() {
     let dir = tempfile::tempdir().expect("temp dir");

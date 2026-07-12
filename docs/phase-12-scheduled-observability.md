@@ -514,6 +514,10 @@ ocfleet alert deliver --hook webhook:<hook-id> --limit 100 --dry-run
 ocfleet alert deliver --hook webhook:<hook-id> --limit 100 --hmac-secret-file ./webhook.secret
 ocfleet alert worker run --hmac-secret-dir ./webhook-secrets --json
 ocfleet alert worker daemon --hmac-secret-dir ./webhook-secrets --interval-seconds 60
+ocfleet alert delivery-daemon --hmac-secret-dir ./webhook-secrets --interval-seconds 60
+ocfleet alert worker status --json
+ocfleet alert hook disable <hook-id>
+ocfleet alert hook enable <hook-id>
 ocfleet alert silence <dedupe-key> --for-duration 24h --reason "maintenance"
 ocfleet alert resolve <dedupe-key> --reason "certificate renewed"
 ```
@@ -540,6 +544,11 @@ tick, defers excess work without consuming an attempt, and suppresses repeated
 successful notifications for five minutes. Retry backoff is durable and bounded;
 SIGINT/SIGTERM drains the current synchronous attempt before exit. JSONL paths
 remain manual and are never selected by the worker.
+
+`alert delivery-daemon` is the compatibility spelling of `alert worker daemon`.
+`alert worker status` is read-only and reports aggregate queue state, due and
+expired work, oldest due time, and latest attempt time. Hook enable/disable is
+an idempotent actor-bound transaction; audit failure rolls back the state change.
 
 ### Audit Export
 

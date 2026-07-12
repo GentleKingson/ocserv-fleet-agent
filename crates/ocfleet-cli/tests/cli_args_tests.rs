@@ -223,6 +223,28 @@ fn parses_alert_worker_commands() {
             }
         }
     ));
+    let cli = Cli::parse_from(["ocfleet", "alert", "worker", "status", "--json"]);
+    assert!(matches!(
+        cli.command,
+        Command::Alert {
+            command: AlertCommand::Worker {
+                command: AlertWorkerCommand::Status { json: true }
+            }
+        }
+    ));
+    let cli = Cli::parse_from([
+        "ocfleet",
+        "alert",
+        "delivery-daemon",
+        "--hmac-secret-dir",
+        "/run/ocfleet-alert-secrets",
+    ]);
+    assert!(matches!(
+        cli.command,
+        Command::Alert {
+            command: AlertCommand::DeliveryDaemon { .. }
+        }
+    ));
     let cli = Cli::parse_from([
         "ocfleet",
         "alert",
@@ -332,6 +354,26 @@ fn parses_alert_webhook_hook_commands() {
         hmac_secret_file,
         Some(PathBuf::from("state/webhook.secret"))
     );
+
+    for (action, expected) in [("enable", true), ("disable", false)] {
+        let cli = Cli::parse_from(["ocfleet", "alert", "hook", action, "webhook-1"]);
+        let matches = match cli.command {
+            Command::Alert {
+                command:
+                    AlertCommand::Hook {
+                        command: AlertHookCommand::Enable { hook_id },
+                    },
+            } => expected && hook_id == "webhook-1",
+            Command::Alert {
+                command:
+                    AlertCommand::Hook {
+                        command: AlertHookCommand::Disable { hook_id },
+                    },
+            } => !expected && hook_id == "webhook-1",
+            _ => false,
+        };
+        assert!(matches, "failed to parse alert hook {action}");
+    }
 }
 
 #[test]

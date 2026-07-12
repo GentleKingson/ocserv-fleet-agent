@@ -506,6 +506,19 @@ pub struct AlertDeliveryQueueOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlertDeliveryQueueHealth {
+    pub pending: u64,
+    pub claimed: u64,
+    pub retry: u64,
+    pub dead_letter: u64,
+    pub succeeded: u64,
+    pub due: u64,
+    pub expired_claims: u64,
+    pub oldest_due_at: Option<String>,
+    pub last_attempt_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetentionPolicyRecord {
     pub scope: String,
     pub max_age_days: Option<u64>,
@@ -2501,6 +2514,105 @@ impl Store {
                 alert_webhook_hook_from_row,
             )
             .optional()
+            .map_err(StoreError::from)
+    }
+
+    pub fn write_alert_webhook_hook_enabled(
+        &self,
+        hook_id: &str,
+        enabled: bool,
+        updated_at: &str,
+        actor: &str,
+    ) -> Result<bool, StoreError> {
+        validate_actor(actor).map_err(StoreError::InvalidInput)?;
+        validate_safe_id("hook_id", hook_id, 128)?;
+        validate_rfc3339(updated_at, "alert hook updated_at")?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let current = tx
+            .query_row(
+                "SELECT enabled FROM alert_hooks WHERE hook_id = ?1 AND hook_type = 'webhook'",
+                [hook_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()?;
+        let Some(current) = current else {
+            return Err(StoreError::InvalidInput(
+                "alert webhook hook does not exist".to_string(),
+            ));
+        };
+        if current == enabled {
+            tx.commit()?;
+            return Ok(false);
+        }
+        let changed = tx.execute(
+            "UPDATE alert_hooks SET enabled = ?2, updated_at = ?3
+             WHERE hook_id = ?1 AND hook_type = 'webhook' AND enabled = ?4",
+            params![hook_id, enabled, updated_at, current],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::AlertMutationConflict {
+                operation_id: hook_id.to_string(),
+                detail: "alert webhook hook changed before enable state update",
+            });
+        }
+        let event_name = if enabled {
+            "alert.hook.enable"
+        } else {
+            "alert.hook.disable"
+        };
+        let mut event = AuditEvent::new(actor, event_name);
+        event.ok = Some(true);
+        event.request_id = Some(format!("{event_name}:{hook_id}:{updated_at}"));
+        event.params_hash = Some(
+            blake3::hash(format!("{hook_id}:{enabled}:{updated_at}").as_bytes())
+                .to_hex()
+                .to_string(),
+        );
+        event.detail_json = json!({
+            "actor_type": "user",
+            "target_type": "alert_webhook_hook",
+            "target_id": hook_id,
+            "enabled": enabled,
+            "reason": Value::Null,
+        });
+        insert_audit_tx(&tx, &event)?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    pub fn alert_delivery_queue_health(
+        &self,
+        now: &str,
+    ) -> Result<AlertDeliveryQueueHealth, StoreError> {
+        validate_rfc3339(now, "delivery health timestamp")?;
+        self.conn
+            .query_row(
+                "SELECT
+                   COALESCE(SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END), 0),
+                   COALESCE(SUM(CASE WHEN status = 'claimed' THEN 1 ELSE 0 END), 0),
+                   COALESCE(SUM(CASE WHEN status = 'retry' THEN 1 ELSE 0 END), 0),
+                   COALESCE(SUM(CASE WHEN status = 'dead_letter' THEN 1 ELSE 0 END), 0),
+                   COALESCE(SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END), 0),
+                   COALESCE(SUM(CASE WHEN status IN ('pending', 'retry') AND next_attempt_at <= ?1 THEN 1 ELSE 0 END), 0),
+                   COALESCE(SUM(CASE WHEN status = 'claimed' AND lease_expires_at <= ?1 THEN 1 ELSE 0 END), 0),
+                   MIN(CASE WHEN status IN ('pending', 'retry') THEN next_attempt_at END),
+                   (SELECT MAX(attempted_at) FROM alert_delivery_attempts)
+                 FROM alert_delivery_queue",
+                [now],
+                |row| {
+                    Ok(AlertDeliveryQueueHealth {
+                        pending: i64_to_u64(row.get::<_, i64>(0)?)?,
+                        claimed: i64_to_u64(row.get::<_, i64>(1)?)?,
+                        retry: i64_to_u64(row.get::<_, i64>(2)?)?,
+                        dead_letter: i64_to_u64(row.get::<_, i64>(3)?)?,
+                        succeeded: i64_to_u64(row.get::<_, i64>(4)?)?,
+                        due: i64_to_u64(row.get::<_, i64>(5)?)?,
+                        expired_claims: i64_to_u64(row.get::<_, i64>(6)?)?,
+                        oldest_due_at: row.get(7)?,
+                        last_attempt_at: row.get(8)?,
+                    })
+                },
+            )
             .map_err(StoreError::from)
     }
 

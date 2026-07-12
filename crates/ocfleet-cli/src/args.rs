@@ -657,6 +657,15 @@ pub enum AlertCommand {
         #[command(subcommand)]
         command: AlertWorkerCommand,
     },
+    #[command(name = "delivery-daemon")]
+    DeliveryDaemon {
+        #[arg(long, value_name = "DIR")]
+        hmac_secret_dir: PathBuf,
+        #[arg(long, default_value_t = 60)]
+        interval_seconds: u64,
+        #[arg(long, default_value_t = 10)]
+        max_deliveries: usize,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -676,6 +685,10 @@ pub enum AlertWorkerCommand {
         interval_seconds: u64,
         #[arg(long, default_value_t = 10)]
         max_deliveries: usize,
+    },
+    Status {
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -705,6 +718,12 @@ pub enum AlertHookCommand {
         dry_run: bool,
         #[arg(long, value_name = "PATH")]
         hmac_secret_file: Option<PathBuf>,
+    },
+    Enable {
+        hook_id: String,
+    },
+    Disable {
+        hook_id: String,
     },
 }
 

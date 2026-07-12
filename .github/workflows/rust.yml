@@ -132,6 +132,9 @@ jobs:
       - name: Check release version validation
         run: ./scripts/test-release-version-validation.sh
 
+      - name: Check release policy contract
+        run: ./scripts/check-release-policy.sh
+
       - name: Install Rust toolchain
         run: rustup toolchain install 1.96.1 --profile minimal
 

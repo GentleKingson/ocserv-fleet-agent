@@ -22,6 +22,8 @@ jobs:
     timeout-minutes: 90
     permissions:
       contents: read
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -69,6 +71,33 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         run: ./scripts/build-release.sh "$VERSION"
 
+      - name: Install pinned SBOM generator
+        run: cargo install cargo-cyclonedx --version 0.5.9 --locked
+
+      - name: Generate CycloneDX SBOMs
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          ARTIFACT_ARCH: ${{ matrix.artifact_arch }}
+          SOURCE_DATE_EPOCH: 0
+        run: ./scripts/generate-sbom.sh "$VERSION" "dist/$VERSION" && for sbom in dist/$VERSION/*.cdx.json; do mv "$sbom" "${sbom%.cdx.json}-$ARTIFACT_ARCH.cdx.json"; done
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@faadad0cce49287aee09b3a48701e75088a2c6ad # v4.0.0
+
+      - name: Keyless-sign release artifacts and SBOMs
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          for artifact in dist/$VERSION/ocfleet-*; do
+            cosign sign-blob --yes --bundle "$artifact.sigstore.json" "$artifact"
+          done
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: dist/${{ steps.version.outputs.version }}/ocfleet-*
+
       - name: Verify release checksums
         env:
           VERSION: ${{ steps.version.outputs.version }}
@@ -86,6 +115,8 @@ jobs:
           test -x "dist/$VERSION/ocfleet-api-$VERSION-$ARTIFACT_ARCH"
           test -x "dist/$VERSION/ocfleet-ocserv-collector-$VERSION-$ARTIFACT_ARCH"
           test -f "dist/$VERSION/SHA256SUMS"
+          test "$(find "dist/$VERSION" -name '*.cdx.json' | wc -l)" -eq 5
+          test "$(find "dist/$VERSION" -name '*.sigstore.json' | wc -l)" -eq 9
 
       - name: Upload draft artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -98,6 +129,8 @@ jobs:
             dist/${{ steps.version.outputs.version }}/ocfleet-agent-${{ steps.version.outputs.version }}-${{ matrix.artifact_arch }}
             dist/${{ steps.version.outputs.version }}/ocfleet-api-${{ steps.version.outputs.version }}-${{ matrix.artifact_arch }}
             dist/${{ steps.version.outputs.version }}/ocfleet-ocserv-collector-${{ steps.version.outputs.version }}-${{ matrix.artifact_arch }}
+            dist/${{ steps.version.outputs.version }}/*.cdx.json
+            dist/${{ steps.version.outputs.version }}/*.sigstore.json
             dist/${{ steps.version.outputs.version }}/SHA256SUMS
 
   draft-release:
@@ -107,6 +140,8 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: write
+      id-token: write
+      attestations: read
     steps:
       - name: Checkout tagged source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
@@ -119,11 +154,15 @@ jobs:
         with:
           path: release-artifacts
 
+      - name: Install cosign
+        uses: sigstore/cosign-installer@faadad0cce49287aee09b3a48701e75088a2c6ad # v4.0.0
+
       - name: Assemble and verify release files
         id: version
         shell: bash
         env:
           INPUT_VERSION: ${{ inputs.version }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           version="$INPUT_VERSION"
@@ -151,6 +190,22 @@ jobs:
                 exit 1
               fi
               install -m 0755 "${matches[0]}" "release-files/$artifact"
+              install -m 0644 "${matches[0]}.sigstore.json" \
+                "release-files/$artifact.sigstore.json"
+            done
+            for crate in ocfleet-protocol ocfleet-config ocfleet-agent ocfleet-cli ocfleet-api; do
+              artifact="$crate-$version-$artifact_arch.cdx.json"
+              mapfile -d '' -t matches < <(
+                find release-artifacts -type f -name "$artifact" -print0
+              )
+              if [[ "${#matches[@]}" -ne 1 ]]; then
+                printf 'expected exactly one SBOM named %s, found %s\n' \
+                  "$artifact" "${#matches[@]}" >&2
+                exit 1
+              fi
+              install -m 0644 "${matches[0]}" "release-files/$artifact"
+              install -m 0644 "${matches[0]}.sigstore.json" \
+                "release-files/$artifact.sigstore.json"
             done
           done
           (
@@ -159,10 +214,18 @@ jobs:
             sha256sum ocfleet-* > SHA256SUMS
             sha256sum -c SHA256SUMS
           )
+          ./scripts/verify-release-supply-chain.sh release-files "$version"
+          for artifact in release-files/ocfleet-*; do
+            case "$artifact" in *.sigstore.json) continue ;; esac
+            gh attestation verify "$artifact" --repo "$GITHUB_REPOSITORY"
+          done
           notes="docs/release-notes/$version.md"
           test -f "$notes"
           printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
           printf 'notes=%s\n' "$notes" >> "$GITHUB_OUTPUT"
+
+      - name: Sign combined checksum manifest
+        run: cosign sign-blob --yes --bundle release-files/SHA256SUMS.sigstore.json release-files/SHA256SUMS
 
       - name: Create tag-bound draft release
         shell: bash

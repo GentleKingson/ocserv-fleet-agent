@@ -322,6 +322,12 @@ isolated controller database. It covers desktop and narrow viewports, CSP,
 refresh and audit preview, console errors, and rejects every non-GET browser
 request. This slice is published in pull request `#104`.
 
+The third A8 slice emits CycloneDX component SBOMs, keyless Sigstore bundles,
+and GitHub build-provenance attestations for both release architectures. Draft
+assembly independently verifies checksums, SBOM structure, workflow identity,
+OIDC issuer, signatures, and repository provenance before signing the combined
+manifest. This slice is published in pull request `#105`.
+
 ### Baseline And Production Foundation
 
 | ID | Issue | Status | Depends on | Release target | Acceptance and required evidence |

@@ -2,7 +2,7 @@ use axum::extract::rejection::QueryRejection;
 use axum::extract::{Path as AxumPath, Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, header};
 use axum::middleware::{self, Next};
-use axum::response::{Html, Response};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use base64::Engine as _;
@@ -15,6 +15,7 @@ use std::sync::{Arc, OnceLock};
 
 use crate::args::ApiConfig;
 use crate::auth::{AuthToken, Principal};
+use crate::metrics::{CONTENT_TYPE as METRICS_CONTENT_TYPE, render_controller};
 use crate::projections::{
     alert_to_json, audit_to_json, health_node_to_json, health_summary_to_json, job_to_json,
     observation_record_to_json, run_to_json,
@@ -60,6 +61,7 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/", get(dashboard))
         .route("/healthz", get(healthz))
+        .route("/metrics", get(metrics))
         .route("/health/summary", get(health_summary))
         .route("/health/nodes", get(health_nodes))
         .route("/health/nodes/{node_id}", get(health_node))
@@ -126,6 +128,18 @@ async fn healthz(
         "read_only": true,
         "auth_enabled": state.auth_token.is_some(),
     })))
+}
+
+async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Response> {
+    authorize(&state, &headers)?;
+    let generated_at = now_rfc3339();
+    let snapshot = db(state.store.controller_metrics(&generated_at))?;
+    let mut response = render_controller(&snapshot).into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(METRICS_CONTENT_TYPE),
+    );
+    Ok(response)
 }
 
 async fn health_summary(

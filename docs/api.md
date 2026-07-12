@@ -76,6 +76,11 @@ auth is configured. Every JSON data request made by that page still requires
 the configured token. Tokens stay in page memory and are not persisted by the
 dashboard.
 
+`GET /metrics` serves Prometheus text and follows the same authorization rule
+as JSON data routes. Its fixed low-cardinality catalog is documented in
+`docs/metrics.md`; it never includes identifiers, addresses, requests, sessions,
+tokens, paths, or other data-derived label values.
+
 ## Response Shape
 
 Every JSON API success or error response includes `generated_at`. Rejected

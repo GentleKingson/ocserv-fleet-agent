@@ -361,7 +361,8 @@ pull request `#111`.
 The final B1 slice adds deterministic latest-closed 5-minute, hourly, and daily
 refresh, a hardened network-isolated five-minute systemd timer, and a complete
 requirement-to-test evidence inventory. Persistent restart catches up once and
-never fabricates source data for missed buckets.
+never fabricates source data for missed buckets. It is published in pull
+request `#112`.
 
 The A8 completion audit records the successful tag-bound matrix, publication
 of 38 `v0.3.0` assets, and independent checksum, Sigstore, SBOM, and provenance

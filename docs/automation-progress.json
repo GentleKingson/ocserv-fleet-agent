@@ -4,9 +4,9 @@
   "completed_phases": ["A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8", "A-READY"],
   "active_branch": "codex/b1-rollup-refresh",
   "active_issue": 41,
-  "active_pr": null,
+  "active_pr": 112,
   "last_test_result": "passed",
   "last_updated_at": "2026-07-12T12:30:00Z",
   "blockers": [],
-  "next_action": "Publish deterministic closed-bucket refresh and B1 completion evidence, close issue 41, then audit B2 completion gaps."
+  "next_action": "Merge PR 112, close issue 41, then audit B2 completion gaps."
 }

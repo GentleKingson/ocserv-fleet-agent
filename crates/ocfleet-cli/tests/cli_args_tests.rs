@@ -3,10 +3,11 @@ use ocfleet_cli::args::{
     AlertCommand, AlertHookCommand, AlertSeverity, AlertState, AlertWorkerCommand, AuditCommand,
     AuditExportFormat, BackupCommand, Cli, Command, EndpointCommand, EnrollCommand,
     EnrollRequestCommand, EnrollTokenCommand, HealthCommand, HealthEvaluatorCommand,
-    HealthPolicyCommand, HealthSnapshotCommand, NodeCommand, ObservationCommand, OcservCommand,
-    OcservSessionsCommand, ProbeCommand, RedactionMode, RestoreCommand, RetentionCommand,
-    RetentionScope, ScheduleCommand, ScheduleJobCommand, ScheduleJobKind, ScheduleRunCommand,
-    TrustCommand, TrustDiffFormat, TrustPolicyDiffFormat,
+    HealthPolicyCommand, HealthRollupBucket, HealthRollupCommand, HealthSnapshotCommand,
+    NodeCommand, ObservationCommand, OcservCommand, OcservSessionsCommand, ProbeCommand,
+    RedactionMode, RestoreCommand, RetentionCommand, RetentionScope, ScheduleCommand,
+    ScheduleJobCommand, ScheduleJobKind, ScheduleRunCommand, TrustCommand, TrustDiffFormat,
+    TrustPolicyDiffFormat,
 };
 use std::path::PathBuf;
 
@@ -1679,4 +1680,61 @@ fn ocserv_commands_reject_dangerous_selector_flags() {
         let err = Cli::try_parse_from(args).expect_err("dangerous ocserv selector rejected");
         assert!(err.to_string().contains("unexpected argument"));
     }
+}
+
+#[test]
+fn parses_bounded_health_rollup_commands() {
+    let recompute = Cli::parse_from([
+        "ocfleet",
+        "health",
+        "rollup",
+        "recompute",
+        "--from",
+        "2026-07-11T00:00:00Z",
+        "--to",
+        "2026-07-12T00:00:00Z",
+        "--bucket",
+        "1h",
+        "--node",
+        "node-a",
+        "--operation-id",
+        "health-rollup-00000000-0000-4000-8000-000000000001",
+        "--json",
+    ]);
+    let Command::Health {
+        command:
+            HealthCommand::Rollup {
+                command:
+                    HealthRollupCommand::Recompute {
+                        bucket,
+                        node,
+                        operation_id,
+                        json,
+                        ..
+                    },
+            },
+    } = recompute.command
+    else {
+        panic!("expected health rollup recompute");
+    };
+    assert_eq!(bucket, HealthRollupBucket::OneHour);
+    assert_eq!(node.as_deref(), Some("node-a"));
+    assert!(operation_id.is_some());
+    assert!(json);
+
+    assert!(
+        Cli::try_parse_from([
+            "ocfleet",
+            "health",
+            "rollup",
+            "list",
+            "--from",
+            "2026-07-11T00:00:00Z",
+            "--to",
+            "2026-07-12T00:00:00Z",
+            "--bucket",
+            "2h",
+        ])
+        .is_err()
+    );
 }

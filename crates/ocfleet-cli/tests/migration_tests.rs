@@ -1042,6 +1042,43 @@ fn migration_tests_health_rollups_upgrade_schema_23() {
     assert_sqlite_checks_pass(&conn);
 }
 
+#[test]
+fn migration_tests_health_rollup_slot_semantics_upgrade_schema_24() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("controller.sqlite");
+    create_legacy_fixture(&db, 24, 0);
+
+    let store = Store::open(&db).expect("migrate v24 health rollup slots");
+    assert_eq!(
+        store.current_schema_version().expect("schema version"),
+        CURRENT_SCHEMA_VERSION
+    );
+    drop(store);
+
+    let conn = Connection::open(&db).expect("open migrated db");
+    assert_schema_object_exists(&conn, "table", "health_rollups");
+    assert!(
+        conn.execute(
+            "INSERT INTO health_rollups
+             (node_id, bucket_seconds, bucket_start, bucket_end, input_watermark,
+              health_samples, covered_slots, expected_slots, healthy_count,
+              degraded_count, unreachable_count, stale_count, disabled_count,
+              unknown_count, observation_count, observation_error_count,
+              duration_sample_count, duration_p50_ms, duration_p95_ms,
+              cert_warning_count, cert_critical_count, fingerprint_sample_count,
+              fingerprint_change_count, computed_at)
+             VALUES ('node-a', 300, '2026-07-11T00:00:00Z',
+                     '2026-07-11T00:05:00Z', ?1, 2, 1, 1, 1, 1, 0, 0, 0, 0,
+                     0, 0, 0, NULL, NULL, 0, 0, 0, 0,
+                     '2026-07-11T00:05:00Z')",
+            ["a".repeat(64)],
+        )
+        .is_err(),
+        "multiple health samples in one five-minute slot must be rejected"
+    );
+    assert_sqlite_checks_pass(&conn);
+}
+
 fn insert_legacy_delivery_attempt(conn: &Connection, bytes_sent: i64) {
     conn.execute(
         "INSERT INTO alert_delivery_attempts

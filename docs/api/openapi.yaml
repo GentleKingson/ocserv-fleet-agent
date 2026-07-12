@@ -130,6 +130,22 @@
         }
       }
     },
+    "/health/slo": {
+      "get": {
+        "operationId": "getHealthSlo",
+        "summary": "Bounded health SLO projection from stored rollups",
+        "parameters": [
+          { "name": "window", "in": "query", "required": true, "schema": { "type": "string", "enum": ["24h", "7d", "30d"] } },
+          { "$ref": "#/components/parameters/To" },
+          { "name": "node_id", "in": "query", "required": false, "schema": { "type": "string", "maxLength": 128 } }
+        ],
+        "responses": {
+          "200": { "description": "Low-sensitive SLO projections with explicit missing coverage", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/HealthSloResponse" } } } },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
     "/jobs": {
       "get": {
         "operationId": "listJobs",
@@ -809,6 +825,67 @@
           "summary": {
             "$ref": "#/components/schemas/LowSensitiveObject"
           }
+        },
+        "additionalProperties": false
+      },
+      "HealthSloProjection": {
+        "type": "object",
+        "required": ["node_id", "window", "from", "to", "bucket_seconds", "expected_buckets", "present_buckets", "expected_slots", "covered_slots", "missing_slots", "covered_duration_seconds", "missing_duration_seconds", "coverage_basis_points", "health_samples", "healthy_samples", "degraded_samples", "unreachable_samples", "stale_samples", "disabled_samples", "unknown_samples", "healthy_duration_seconds", "degraded_duration_seconds", "unreachable_duration_seconds", "stale_duration_seconds", "disabled_duration_seconds", "unknown_duration_seconds", "availability_eligible_samples", "service_available_basis_points", "strictly_healthy_basis_points", "observation_count", "observation_error_count", "observation_error_basis_points", "duration_sample_count", "latency_p50_ms_min", "latency_p50_ms_max", "latency_p95_ms_max", "cert_warning_count", "cert_critical_count", "fingerprint_sample_count", "fingerprint_change_count"],
+        "properties": {
+          "node_id": { "type": "string", "maxLength": 128 },
+          "window": { "type": "string", "enum": ["24h", "7d", "30d"] },
+          "from": { "type": "string", "format": "date-time" },
+          "to": { "type": "string", "format": "date-time" },
+          "bucket_seconds": { "type": "integer", "enum": [300, 3600, 86400] },
+          "expected_buckets": { "type": "integer", "minimum": 1, "maximum": 288 },
+          "present_buckets": { "type": "integer", "minimum": 0, "maximum": 288 },
+          "expected_slots": { "type": "integer", "minimum": 288, "maximum": 8640 },
+          "covered_slots": { "type": "integer", "minimum": 0, "maximum": 8640 },
+          "missing_slots": { "type": "integer", "minimum": 0, "maximum": 8640 },
+          "covered_duration_seconds": { "type": "integer", "minimum": 0, "maximum": 2592000 },
+          "missing_duration_seconds": { "type": "integer", "minimum": 0, "maximum": 2592000 },
+          "coverage_basis_points": { "type": ["integer", "null"], "minimum": 0, "maximum": 10000 },
+          "health_samples": { "type": "integer", "minimum": 0 },
+          "healthy_samples": { "type": "integer", "minimum": 0 },
+          "degraded_samples": { "type": "integer", "minimum": 0 },
+          "unreachable_samples": { "type": "integer", "minimum": 0 },
+          "stale_samples": { "type": "integer", "minimum": 0 },
+          "disabled_samples": { "type": "integer", "minimum": 0 },
+          "unknown_samples": { "type": "integer", "minimum": 0 },
+          "healthy_duration_seconds": { "type": "integer", "minimum": 0, "maximum": 2592000 },
+          "degraded_duration_seconds": { "type": "integer", "minimum": 0, "maximum": 2592000 },
+          "unreachable_duration_seconds": { "type": "integer", "minimum": 0, "maximum": 2592000 },
+          "stale_duration_seconds": { "type": "integer", "minimum": 0, "maximum": 2592000 },
+          "disabled_duration_seconds": { "type": "integer", "minimum": 0, "maximum": 2592000 },
+          "unknown_duration_seconds": { "type": "integer", "minimum": 0, "maximum": 2592000 },
+          "availability_eligible_samples": { "type": "integer", "minimum": 0 },
+          "service_available_basis_points": { "type": ["integer", "null"], "minimum": 0, "maximum": 10000 },
+          "strictly_healthy_basis_points": { "type": ["integer", "null"], "minimum": 0, "maximum": 10000 },
+          "observation_count": { "type": "integer", "minimum": 0 },
+          "observation_error_count": { "type": "integer", "minimum": 0 },
+          "observation_error_basis_points": { "type": ["integer", "null"], "minimum": 0, "maximum": 10000 },
+          "duration_sample_count": { "type": "integer", "minimum": 0 },
+          "latency_p50_ms_min": { "type": ["integer", "null"], "minimum": 0 },
+          "latency_p50_ms_max": { "type": ["integer", "null"], "minimum": 0 },
+          "latency_p95_ms_max": { "type": ["integer", "null"], "minimum": 0 },
+          "cert_warning_count": { "type": "integer", "minimum": 0 },
+          "cert_critical_count": { "type": "integer", "minimum": 0 },
+          "fingerprint_sample_count": { "type": "integer", "minimum": 0 },
+          "fingerprint_change_count": { "type": "integer", "minimum": 0 }
+        },
+        "additionalProperties": false
+      },
+      "HealthSloResponse": {
+        "type": "object",
+        "required": ["schema", "generated_at", "window", "from", "to", "node_count", "projections"],
+        "properties": {
+          "schema": { "type": "string", "const": "ocfleet.health_slo.v1" },
+          "generated_at": { "$ref": "#/components/schemas/GeneratedAt" },
+          "window": { "type": "string", "enum": ["24h", "7d", "30d"] },
+          "from": { "type": "string", "format": "date-time" },
+          "to": { "type": "string", "format": "date-time" },
+          "node_count": { "type": "integer", "minimum": 0, "maximum": 1000 },
+          "projections": { "type": "array", "maxItems": 1000, "items": { "$ref": "#/components/schemas/HealthSloProjection" } }
         },
         "additionalProperties": false
       },

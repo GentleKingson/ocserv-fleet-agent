@@ -6,17 +6,18 @@ use ocfleet_protocol::method::{
     OCSERV_VERSION, PROBE_CONTROLLER_PING,
 };
 use serde_json::{Value, json};
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::args::{
     HealthCommand, HealthEvaluatorCommand, HealthPolicyCommand, HealthRollupBucket,
-    HealthRollupCommand, HealthSnapshotCommand,
+    HealthRollupCommand, HealthSloWindow, HealthSnapshotCommand,
 };
 use crate::backend::StoreWriter;
 use crate::duration_args::parse_duration_seconds;
 use crate::input_validation::local_actor;
 use crate::observation::safe_observation_summary;
+use crate::slo::{SloWindow, project_health_slo};
 use crate::storage_payloads::{HealthDegradedMethodsPayloadV1, HealthSummaryPayloadV1};
 use crate::store::{
     HealthEvaluationFailure, HealthEvaluationFinish, HealthEvaluationStart, HealthPolicyRecord,
@@ -42,6 +43,12 @@ pub async fn run_health_command(store: &Store, command: HealthCommand) -> anyhow
             json,
         } => run_health_history(store, &from, &to, node.as_deref(), limit, json),
         HealthCommand::Rollup { command } => run_health_rollup(store, command),
+        HealthCommand::Slo {
+            to,
+            node,
+            window,
+            json,
+        } => run_health_slo(store, &to, node.as_deref(), slo_window(window), json),
         HealthCommand::Evaluator { command } => run_health_evaluator_command(store, command).await,
     }
 }
@@ -622,6 +629,75 @@ fn rollup_bucket_seconds(bucket: HealthRollupBucket) -> u64 {
     }
 }
 
+fn slo_window(window: HealthSloWindow) -> SloWindow {
+    match window {
+        HealthSloWindow::Hours24 => SloWindow::Hours24,
+        HealthSloWindow::Days7 => SloWindow::Days7,
+        HealthSloWindow::Days30 => SloWindow::Days30,
+    }
+}
+
+fn run_health_slo(
+    store: &Store,
+    to: &str,
+    node: Option<&str>,
+    window: SloWindow,
+    json_output: bool,
+) -> anyhow::Result<()> {
+    if to.len() > 64 {
+        bail!("--to must not exceed 64 characters");
+    }
+    if let Some(node_id) = node {
+        validate_node_id(node_id)?;
+    }
+    let to_time = OffsetDateTime::parse(to, &Rfc3339)?;
+    if to_time.unix_timestamp() % i64::try_from(window.bucket_seconds())? != 0 {
+        bail!("--to must align to the selected SLO rollup bucket");
+    }
+    let from_time = to_time - Duration::seconds(i64::try_from(window.seconds())?);
+    let from = from_time.format(&Rfc3339)?;
+    let to = to_time.format(&Rfc3339)?;
+    let node_ids = match node {
+        Some(node_id) => vec![node_id.to_string()],
+        None => store.health_rollup_stored_node_ids(window.bucket_seconds(), &from, &to)?,
+    };
+    let mut projections = Vec::with_capacity(node_ids.len());
+    for node_id in node_ids {
+        let rows = store.list_health_rollups(
+            Some(&node_id),
+            window.bucket_seconds(),
+            &from,
+            &to,
+            window.seconds() / window.bucket_seconds(),
+        )?;
+        let projection = project_health_slo(&node_id, window, &from, &to, &rows)
+            .context("health SLO counters overflow")?;
+        projections.push(projection);
+    }
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "schema": "ocfleet.health_slo.v1",
+                "window": window.as_str(),
+                "from": from,
+                "to": to,
+                "node_count": projections.len(),
+                "projections": projections,
+            }))?
+        );
+    } else {
+        println!("window={}", window.as_str());
+        println!("from={from}");
+        println!("to={to}");
+        println!("node_count={}", projections.len());
+        for projection in projections {
+            println!("{}", serde_json::to_string(&projection)?);
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn recompute_health_rollups(
     store: &Store,
@@ -728,8 +804,7 @@ fn build_health_rollup(
     bucket_end: &str,
     source: HealthRollupSource,
 ) -> anyhow::Result<HealthRollupRecord> {
-    let mut status_counts = [0_u64; 6];
-    let mut covered_slots = BTreeSet::new();
+    let mut status_by_slot = BTreeMap::new();
     for record in &source.history {
         let index = match record.snapshot.status.as_str() {
             "healthy" => 0,
@@ -740,9 +815,14 @@ fn build_health_rollup(
             "unknown" => 5,
             _ => bail!("stored health history status is invalid"),
         };
-        status_counts[index] += 1;
         let timestamp = OffsetDateTime::parse(&record.snapshot.computed_at, &Rfc3339)?;
-        covered_slots.insert(timestamp.unix_timestamp().div_euclid(300));
+        // Source rows are ordered, so the last evaluation in a five-minute slot wins.
+        // This prevents interactive re-evaluations from biasing availability.
+        status_by_slot.insert(timestamp.unix_timestamp().div_euclid(300), index);
+    }
+    let mut status_counts = [0_u64; 6];
+    for index in status_by_slot.values() {
+        status_counts[*index] += 1;
     }
 
     let classified = source
@@ -818,8 +898,8 @@ fn build_health_rollup(
         bucket_start: bucket_start.to_string(),
         bucket_end: bucket_end.to_string(),
         input_watermark: watermark,
-        health_samples: u64::try_from(source.history.len())?,
-        covered_slots: u64::try_from(covered_slots.len())?,
+        health_samples: u64::try_from(status_by_slot.len())?,
+        covered_slots: u64::try_from(status_by_slot.len())?,
         expected_slots: bucket_seconds / 300,
         healthy_count: status_counts[0],
         degraded_count: status_counts[1],
@@ -1418,8 +1498,8 @@ mod tests {
         )
         .expect("repeat rollup");
         assert_eq!(first, second);
-        assert_eq!(first.health_samples, 2);
-        assert_eq!(first.healthy_count, 1);
+        assert_eq!(first.health_samples, 1);
+        assert_eq!(first.healthy_count, 0);
         assert_eq!(first.unreachable_count, 1);
         assert_eq!(first.unknown_count, 0, "missing is not an unknown sample");
         assert_eq!(first.covered_slots, 1);

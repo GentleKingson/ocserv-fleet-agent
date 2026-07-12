@@ -23,6 +23,7 @@ pub mod private_file;
 pub mod retention;
 pub mod rpc_client;
 pub mod scheduler;
+pub mod slo;
 pub mod storage_payloads;
 pub mod store;
 pub mod trust_policy;

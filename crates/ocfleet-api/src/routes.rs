@@ -8,10 +8,12 @@ use axum::{Json, Router};
 use base64::Engine as _;
 use ocfleet_cli::args::RedactionMode;
 use ocfleet_cli::audit_export::validate_window;
+use ocfleet_cli::slo::{SloWindow, project_health_slo};
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::sync::{Arc, OnceLock};
+use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::args::ApiConfig;
 use crate::auth::{AuthToken, Principal};
@@ -65,6 +67,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/health/summary", get(health_summary))
         .route("/health/nodes", get(health_nodes))
         .route("/health/nodes/{node_id}", get(health_node))
+        .route("/health/slo", get(health_slo))
         .route("/jobs", get(jobs))
         .route("/jobs/{job_id}", get(job))
         .route("/runs", get(runs))
@@ -171,6 +174,83 @@ async fn health_node(
     let record = db(state.store.get_node_health(&node_id))?
         .ok_or_else(|| ApiError::not_found(format!("node not found: {node_id}")))?;
     Ok(single_response(health_node_to_json(&record)))
+}
+
+async fn health_slo(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    query: Result<Query<HealthSloQuery>, QueryRejection>,
+) -> ApiResult<Json<serde_json::Value>> {
+    authorize(&state, &headers)?;
+    let query = parse_query(query)?;
+    let to = query
+        .to
+        .as_deref()
+        .ok_or_else(|| ApiError::bad_request("to is required"))?;
+    if to.len() > 64 {
+        return Err(ApiError::bad_request("to must not exceed 64 characters"));
+    }
+    let window = match query.window.as_deref() {
+        Some("24h") => SloWindow::Hours24,
+        Some("7d") => SloWindow::Days7,
+        Some("30d") => SloWindow::Days30,
+        _ => return Err(ApiError::bad_request("window must be one of 24h, 7d, 30d")),
+    };
+    if let Some(node_id) = &query.node_id {
+        validate_identifier("node_id", node_id)?;
+    }
+    let to_time = OffsetDateTime::parse(to, &Rfc3339)
+        .map_err(|_| ApiError::bad_request("to must be RFC3339"))?;
+    let bucket_seconds =
+        i64::try_from(window.bucket_seconds()).map_err(|_| ApiError::internal())?;
+    if to_time.unix_timestamp() % bucket_seconds != 0 {
+        return Err(ApiError::bad_request(
+            "to must align to the selected SLO rollup bucket",
+        ));
+    }
+    let window_seconds = i64::try_from(window.seconds()).map_err(|_| ApiError::internal())?;
+    let from_time = to_time - Duration::seconds(window_seconds);
+    let from = from_time
+        .format(&Rfc3339)
+        .map_err(|_| ApiError::internal())?;
+    let to = to_time.format(&Rfc3339).map_err(|_| ApiError::internal())?;
+    let node_ids = match query.node_id {
+        Some(node_id) => vec![node_id],
+        None => {
+            let nodes = db(state
+                .store
+                .health_slo_node_ids(window.bucket_seconds(), &from, &to))?;
+            if nodes.len() > 1_000 || nodes.len() > state.max_limit as usize {
+                return Err(ApiError::bad_request(
+                    "health SLO node count exceeds the bounded fleet maximum",
+                ));
+            }
+            nodes
+        }
+    };
+    let mut projections = Vec::with_capacity(node_ids.len());
+    for node_id in node_ids {
+        validate_identifier("stored node_id", &node_id).map_err(|_| ApiError::internal())?;
+        let rows = db(state.store.list_health_rollups(
+            &node_id,
+            window.bucket_seconds(),
+            &from,
+            &to,
+            window.seconds() / window.bucket_seconds(),
+        ))?;
+        let projection = project_health_slo(&node_id, window, &from, &to, &rows)
+            .ok_or_else(ApiError::internal)?;
+        projections.push(projection);
+    }
+    Ok(Json(json!({
+        "schema": "ocfleet.health_slo.v1",
+        "generated_at": now_rfc3339(),
+        "window": window.as_str(),
+        "from": from,
+        "to": to,
+        "node_count": projections.len(),
+        "projections": projections,
+    })))
 }
 
 async fn jobs(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Json<ListResponse>> {
@@ -448,6 +528,14 @@ struct RunsQuery {
     limit: Option<u64>,
     job_id: Option<String>,
     status: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HealthSloQuery {
+    window: Option<String>,
+    to: Option<String>,
+    node_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

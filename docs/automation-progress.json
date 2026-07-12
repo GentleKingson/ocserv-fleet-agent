@@ -2,11 +2,11 @@
   "baseline_commit": "b3c906a94823b4620dc1a2077a44e7160c0848b2",
   "current_phase": "B1",
   "completed_phases": ["A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8", "A-READY"],
-  "active_branch": "codex/b1-health-rollups",
+  "active_branch": "codex/b1-health-slo",
   "active_issue": 41,
-  "active_pr": 110,
+  "active_pr": 111,
   "last_test_result": "passed",
-  "last_updated_at": "2026-07-12T10:00:00Z",
+  "last_updated_at": "2026-07-12T11:30:00Z",
   "blockers": [],
-  "next_action": "Merge schema 24 reproducible health rollups, then implement bounded 24h/7d/30d SLO CLI and read-only API projections."
+  "next_action": "Merge schema 25 bounded SLO projections, then add continuous rollup refresh operations and complete B1 evidence."
 }

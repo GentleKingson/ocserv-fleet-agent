@@ -18,12 +18,12 @@ automatic trust, automatic peer mesh, or automatic path-probe authorization.
 | Workspace | Version `0.3.0`, Rust edition `2024`, Rust toolchain `1.96.1` |
 | Workspace crates | Five: `ocfleet-protocol`, `ocfleet-config`, `ocfleet-agent`, `ocfleet-cli`, and `ocfleet-api` |
 | Release binaries | Four: `ocfleet`, `ocfleet-agent`, `ocfleet-api`, and `ocfleet-ocserv-collector` |
-| Controller schema | SQLite schema version `23`; migrations `0001` through `0023` |
+| Controller schema | SQLite schema version `25`; migrations `0001` through `0025` |
 | RPC protocol | Protocol version `1`; ALPN `/com.github.gentlekingson.ocfleet.mgmt/1` |
 | Other schemas | Config version `1`; trust-policy version `1`; collector snapshot `ocfleet.ocserv.snapshot.v2`; OpenAPI `3.1.1` |
 | Features | Every crate has an empty default feature set. `controlled-writes` exists in protocol/config/agent and is propagated by the agent. `postgres-backend` exists in the CLI. Both tracks are default-off. |
 | Runtime backends | SQLite only. The Postgres feature is a non-connecting scaffold. |
-| HTTP API | Read-only version `0.3.0`; fourteen declared `GET` paths including the dashboard root; API data access is SQLite read-only. |
+| HTTP API | Read-only version `0.3.0`; sixteen declared `GET` paths including the dashboard root and metrics; API data access is SQLite read-only. |
 
 The baseline audit found no failing required check. These commands passed at the
 baseline commit:
@@ -352,6 +352,12 @@ records input watermarks, supports exact audited replay, and has independent
 long-term retention. It is published in pull request `#110`. Bounded 24-hour,
 7-day, and 30-day SLO projections remain the next B1 slice.
 
+The third B1 slice adds schema 25 unbiased five-minute slot semantics and
+fixed 24-hour, 7-day, and 30-day CLI/API SLO projections. Coverage, status
+duration, availability eligibility, error, latency-range, certificate, and
+drift fields remain bounded and distinguish missing data. It is published in
+pull request `#111`.
+
 The A8 completion audit records the successful tag-bound matrix, publication
 of 38 `v0.3.0` assets, and independent checksum, Sigstore, SBOM, and provenance
 verification. It is published in pull request `#108`.
@@ -375,7 +381,7 @@ verification. It is published in pull request `#108`.
 
 | ID | Issue | Status | Depends on | Release target | Acceptance and required evidence |
 | --- | --- | --- | --- | --- | --- |
-| B1 Health history, rollups, and SLOs | `#41` | active implementation | A2, A4 | `v0.3.x` | Schema 23 append-only history and schema 24 reproducible 5m/1h/1d rollups are implemented with bounded CLI queries, atomic audited replay, explicit missing coverage, and independent retention. Bounded 24h/7d/30d availability, duration, latency, error, coverage, certificate, and drift projections remain. |
+| B1 Health history, rollups, and SLOs | `#41` | active implementation | A2, A4 | `v0.3.x` | Schema 23 history, schema 24 reproducible rollups, schema 25 one-status-per-slot semantics, and bounded 24h/7d/30d CLI/API projections are implemented with explicit missing coverage and independent retention. Continuous refresh operations and completion evidence remain. |
 | B2 Labels, environment, and maintenance | `#42` | implemented slice | A1, A2, A3 | `v0.4.0` | Bounded audited metadata and selectors have a maximum match count; maintenance affects scheduling/presentation only; tests prove labels cannot create trust, peers, or path authorization. |
 | B3 Versioned API and query contract | `#43` | implemented slice | A2, B1, B2 | `v0.4.0` | `/api/v1` has a compatibility plan, bounded tamper-resistant cursor pagination, time/metadata filters, ETag/conditional GET, stable errors/request IDs, exact OpenAPI/runtime validation, and no RPC-trigger route. Existing API drift listed below is resolved. |
 | B4 Local producer SDK | `#44` | scaffold | A2 | `v0.4.0` | A snapshot-schema crate, validator, Rust SDK, machine schema, version negotiation, compatibility suite, and least-privilege sample producer emit fixed aggregates only and remain unreachable from controller RPC/API/scheduler paths. |

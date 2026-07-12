@@ -66,8 +66,42 @@ a deterministic input watermark and use the bucket end as `computed_at`, so
 the same stored inputs produce the same row. Rollups have independent
 `health-rollups` retention, defaulting to 1,095 days and 5,000,000 rows.
 
+Schema 25 tightens availability semantics to exactly one status per
+five-minute slot: the last evaluation in a slot wins. Because schema 24 rows
+cannot be converted without bias, the migration drops only the derived rollup
+table contents; append-only source history, observations, audit evidence, and
+retention policy remain intact. Operators must recompute the desired windows
+after upgrade.
+
+## Bounded SLO Projections
+
+The CLI and read-only API project fixed 24-hour, 7-day, and 30-day windows from
+stored 5-minute, hourly, and daily rollups respectively. The window end is
+required and bucket-aligned, which makes the same request reproducible.
+
+```console
+ocfleet health slo --window 24h --to 2026-07-12T00:00:00Z --node node-a --json
+curl 'http://127.0.0.1:8080/health/slo?window=7d&to=2026-07-12T00:00:00Z&node_id=node-a'
+```
+
+Coverage uses five-minute slots. Missing slots and missing duration are
+reported separately and are never changed into unknown, stale, or unreachable
+samples. `service_available_basis_points` treats healthy and degraded samples
+as service-available; `strictly_healthy_basis_points` counts only healthy
+samples. Both use healthy, degraded, unreachable, and stale slots as the
+availability-eligible denominator; disabled and unknown durations remain
+visible but are not silently classified as downtime. Coverage has its own
+full-window denominator. Observation error ratios likewise use
+only observations with a stored boolean outcome.
+
+Latency fields are deliberately named as ranges or maxima of the stored
+per-bucket quantiles; they are not presented as mathematically merged window
+percentiles. Certificate warning/critical and fingerprint change counters are
+derived only from present typed observations. Fleet queries are capped at the
+smaller of the configured API maximum and 1,000 nodes. Each node reads at most
+288, 168, or 30 rollup rows for the 24-hour, 7-day, or 30-day window.
+
 ## Remaining B1 Work
 
-Bounded 24-hour, 7-day, and 30-day SLO CLI/API projections remain. They must distinguish unknown,
-stale, unreachable, and missing duration and derive latency, error, certificate
-risk, and drift only from present typed observations.
+Completion evidence and operational scheduling for continuous rollup refresh
+remain before B1 can be marked operationally mature.

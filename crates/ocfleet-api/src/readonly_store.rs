@@ -10,8 +10,9 @@ use ocfleet_cli::storage_payloads::{
     validate_scheduler_payload_relationship,
 };
 use ocfleet_cli::store::{
-    AlertEventRecord, AuditRecord, CURRENT_SCHEMA_VERSION, HealthSnapshotRecord, NodeRecord,
-    ObservabilityJobRecord, ObservabilityRunRecord, ProbeObservationRecord,
+    AlertEventRecord, AuditRecord, CURRENT_SCHEMA_VERSION, HealthRollupRecord,
+    HealthSnapshotRecord, NodeRecord, ObservabilityJobRecord, ObservabilityRunRecord,
+    ProbeObservationRecord,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, params, types::Type};
 use serde_json::Value;
@@ -99,6 +100,26 @@ pub trait ApiReadStore: Send + Sync {
         limit: u64,
     ) -> rusqlite::Result<Vec<AuditRecord>>;
     fn controller_metrics(&self, now: &str) -> rusqlite::Result<ControllerMetricsSnapshot>;
+    fn health_slo_node_ids(
+        &self,
+        bucket_seconds: u64,
+        from: &str,
+        to: &str,
+    ) -> rusqlite::Result<Vec<String>> {
+        let _ = (bucket_seconds, from, to);
+        Err(rusqlite::Error::InvalidQuery)
+    }
+    fn list_health_rollups(
+        &self,
+        node_id: &str,
+        bucket_seconds: u64,
+        from: &str,
+        to: &str,
+        limit: u64,
+    ) -> rusqlite::Result<Vec<HealthRollupRecord>> {
+        let _ = (node_id, bucket_seconds, from, to, limit);
+        Err(rusqlite::Error::InvalidQuery)
+    }
 }
 
 impl ReadOnlyStore {
@@ -172,6 +193,65 @@ impl ReadOnlyStore {
             node_health_from_row,
         )
         .optional()
+    }
+
+    pub fn health_slo_node_ids(
+        &self,
+        bucket_seconds: u64,
+        from: &str,
+        to: &str,
+    ) -> rusqlite::Result<Vec<String>> {
+        let conn = self.open_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT node_id FROM health_rollups
+             WHERE bucket_seconds = ?1 AND bucket_start >= ?2 AND bucket_start < ?3
+             ORDER BY node_id LIMIT 1001",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![u64_to_i64(bucket_seconds, "bucket_seconds")?, from, to],
+                |row| row.get(0),
+            )?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        if rows.len() > 1_000 {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        Ok(rows)
+    }
+
+    pub fn list_health_rollups(
+        &self,
+        node_id: &str,
+        bucket_seconds: u64,
+        from: &str,
+        to: &str,
+        limit: u64,
+    ) -> rusqlite::Result<Vec<HealthRollupRecord>> {
+        let conn = self.open_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT node_id, bucket_seconds, bucket_start, bucket_end, input_watermark,
+                    health_samples, covered_slots, expected_slots, healthy_count,
+                    degraded_count, unreachable_count, stale_count, disabled_count,
+                    unknown_count, observation_count, observation_error_count,
+                    duration_sample_count, duration_p50_ms, duration_p95_ms,
+                    cert_warning_count, cert_critical_count, fingerprint_sample_count,
+                    fingerprint_change_count, computed_at
+             FROM health_rollups
+             WHERE node_id = ?1 AND bucket_seconds = ?2
+               AND bucket_start >= ?3 AND bucket_start < ?4
+             ORDER BY bucket_start LIMIT ?5",
+        )?;
+        stmt.query_map(
+            params![
+                node_id,
+                u64_to_i64(bucket_seconds, "bucket_seconds")?,
+                from,
+                to,
+                u64_to_i64(limit, "limit")?
+            ],
+            health_rollup_from_row,
+        )?
+        .collect()
     }
 
     pub fn controller_metrics(&self, now: &str) -> rusqlite::Result<ControllerMetricsSnapshot> {
@@ -527,6 +607,26 @@ impl ApiReadStore for ReadOnlyStore {
     fn controller_metrics(&self, now: &str) -> rusqlite::Result<ControllerMetricsSnapshot> {
         Self::controller_metrics(self, now)
     }
+
+    fn health_slo_node_ids(
+        &self,
+        bucket_seconds: u64,
+        from: &str,
+        to: &str,
+    ) -> rusqlite::Result<Vec<String>> {
+        Self::health_slo_node_ids(self, bucket_seconds, from, to)
+    }
+
+    fn list_health_rollups(
+        &self,
+        node_id: &str,
+        bucket_seconds: u64,
+        from: &str,
+        to: &str,
+        limit: u64,
+    ) -> rusqlite::Result<Vec<HealthRollupRecord>> {
+        Self::list_health_rollups(self, node_id, bucket_seconds, from, to, limit)
+    }
 }
 
 fn count_where(conn: &Connection, sql: &str, value: &str) -> rusqlite::Result<u64> {
@@ -594,10 +694,11 @@ fn open_read_only_connection(path: &Path) -> rusqlite::Result<Connection> {
     Ok(conn)
 }
 
-const REQUIRED_API_TABLES: [&str; 13] = [
+const REQUIRED_API_TABLES: [&str; 14] = [
     "schema_migrations",
     "nodes",
     "health_snapshots",
+    "health_rollups",
     "observability_jobs",
     "observability_runs",
     "scheduler_job_claims",
@@ -658,6 +759,41 @@ fn sqlite_sidecar_paths(path: &Path) -> [PathBuf; 2] {
     let mut shm = path.as_os_str().to_os_string();
     shm.push("-shm");
     [PathBuf::from(wal), PathBuf::from(shm)]
+}
+
+fn health_rollup_from_row(row: &Row<'_>) -> rusqlite::Result<HealthRollupRecord> {
+    let value = |index| i64_to_u64(row.get(index)?, index);
+    let optional = |index| {
+        row.get::<_, Option<i64>>(index)?
+            .map(|value| i64_to_u64(value, index))
+            .transpose()
+    };
+    Ok(HealthRollupRecord {
+        node_id: row.get(0)?,
+        bucket_seconds: value(1)?,
+        bucket_start: row.get(2)?,
+        bucket_end: row.get(3)?,
+        input_watermark: row.get(4)?,
+        health_samples: value(5)?,
+        covered_slots: value(6)?,
+        expected_slots: value(7)?,
+        healthy_count: value(8)?,
+        degraded_count: value(9)?,
+        unreachable_count: value(10)?,
+        stale_count: value(11)?,
+        disabled_count: value(12)?,
+        unknown_count: value(13)?,
+        observation_count: value(14)?,
+        observation_error_count: value(15)?,
+        duration_sample_count: value(16)?,
+        duration_p50_ms: optional(17)?,
+        duration_p95_ms: optional(18)?,
+        cert_warning_count: value(19)?,
+        cert_critical_count: value(20)?,
+        fingerprint_sample_count: value(21)?,
+        fingerprint_change_count: value(22)?,
+        computed_at: row.get(23)?,
+    })
 }
 
 fn node_health_from_row(row: &Row<'_>) -> rusqlite::Result<NodeHealthRecord> {

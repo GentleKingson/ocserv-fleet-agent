@@ -3,9 +3,9 @@ use ocfleet_cli::args::{
     AlertCommand, AlertHookCommand, AlertSeverity, AlertState, AlertWorkerCommand, AuditCommand,
     AuditExportFormat, BackupCommand, Cli, Command, EndpointCommand, EnrollCommand,
     EnrollRequestCommand, EnrollTokenCommand, HealthCommand, HealthEvaluatorCommand,
-    HealthPolicyCommand, HealthRollupBucket, HealthRollupCommand, HealthSnapshotCommand,
-    NodeCommand, ObservationCommand, OcservCommand, OcservSessionsCommand, ProbeCommand,
-    RedactionMode, RestoreCommand, RetentionCommand, RetentionScope, ScheduleCommand,
+    HealthPolicyCommand, HealthRollupBucket, HealthRollupCommand, HealthSloWindow,
+    HealthSnapshotCommand, NodeCommand, ObservationCommand, OcservCommand, OcservSessionsCommand,
+    ProbeCommand, RedactionMode, RestoreCommand, RetentionCommand, RetentionScope, ScheduleCommand,
     ScheduleJobCommand, ScheduleJobKind, ScheduleRunCommand, TrustCommand, TrustDiffFormat,
     TrustPolicyDiffFormat,
 };
@@ -1734,6 +1734,45 @@ fn parses_bounded_health_rollup_commands() {
             "2026-07-12T00:00:00Z",
             "--bucket",
             "2h",
+        ])
+        .is_err()
+    );
+}
+
+#[test]
+fn parses_fixed_health_slo_windows() {
+    let cli = Cli::parse_from([
+        "ocfleet",
+        "health",
+        "slo",
+        "--window",
+        "30d",
+        "--to",
+        "2026-07-12T00:00:00Z",
+        "--node",
+        "node-a",
+        "--json",
+    ]);
+    let Command::Health {
+        command: HealthCommand::Slo {
+            window, node, json, ..
+        },
+    } = cli.command
+    else {
+        panic!("expected health SLO")
+    };
+    assert_eq!(window, HealthSloWindow::Days30);
+    assert_eq!(node.as_deref(), Some("node-a"));
+    assert!(json);
+    assert!(
+        Cli::try_parse_from([
+            "ocfleet",
+            "health",
+            "slo",
+            "--window",
+            "90d",
+            "--to",
+            "2026-07-12T00:00:00Z",
         ])
         .is_err()
     );

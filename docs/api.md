@@ -191,3 +191,7 @@ array. It never reflects the polluted value into the API or dashboard.
 The API must not return raw RPC response bodies, raw stdout/stderr, raw audit
 secret-like fields, username, client IP, session ID, certificate subject/SAN,
 issuer, serial, private keys, raw config content, or raw logs.
+`GET /health/slo` accepts a required fixed `window` (`24h`, `7d`, or `30d`),
+an aligned RFC3339 `to`, and an optional `node_id`. It returns bounded,
+low-sensitive projections from stored rollups only and never triggers probes or
+agent RPC. Missing coverage is explicit and excluded from health-sample ratios.

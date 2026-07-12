@@ -10,6 +10,8 @@
   headers, read-only requests, refresh and audit-preview behavior in Chromium.
 - Release candidates now include CycloneDX SBOMs, keyless Sigstore bundles,
   GitHub build provenance, and fail-closed independent assembly verification.
+- Release support, upgrade, rollback, migration-corpus, and failure-injection
+  contracts are documented and enforced by CI policy checks.
 - A protected read-only Prometheus controller endpoint exports a closed,
   low-cardinality scheduler, health, alert, delivery, RPC, observation, SQLite,
   and audit-export catalog.

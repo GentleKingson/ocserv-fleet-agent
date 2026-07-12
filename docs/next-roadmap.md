@@ -328,6 +328,12 @@ assembly independently verifies checksums, SBOM structure, workflow identity,
 OIDC issuer, signatures, and repository provenance before signing the combined
 manifest. This slice is published in pull request `#105`.
 
+The fourth A8 slice defines supported versions and platforms, the explicit
+`v0.1.x`/`v0.2.x` to `v0.3.x` upgrade matrix, release gates, rollback triggers
+and procedures, and requirement-level migration/failure-injection evidence.
+CI enforces the critical policy clauses. This slice is published in pull
+request `#106`.
+
 ### Baseline And Production Foundation
 
 | ID | Issue | Status | Depends on | Release target | Acceptance and required evidence |

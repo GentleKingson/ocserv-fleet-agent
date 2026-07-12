@@ -16,6 +16,9 @@ For backup and hardening details, keep these guides next to this install runbook
 - [Backup And Restore](backup-restore.md)
 - [Security Hardening](security-hardening.md)
 - [Troubleshooting](troubleshooting.md)
+- [Release And Support Policy](release-policy.md)
+- [Release Upgrade And Rollback](release-rollback-runbook.md)
+- [Release Supply-Chain Verification](release-security.md)
 
 ## Local CLI/State Smoke
 

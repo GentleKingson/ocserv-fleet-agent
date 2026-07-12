@@ -19,7 +19,10 @@ pub struct OcservStatusView {
     pub sessions_total: Option<u32>,
     pub sessions_status: OcservFieldStatus,
     pub config_algorithm: Option<String>,
+    pub config_key_id: Option<String>,
     pub config_hash: Option<String>,
+    pub config_previous_key_id: Option<String>,
+    pub config_previous_hash: Option<String>,
     pub config_status: OcservFieldStatus,
     pub live: Option<OcservLiveReadonlyMetadata>,
     pub degraded_methods: Vec<&'static str>,
@@ -55,7 +58,18 @@ pub fn format_status_human(
         sessions_total: sessions.sessions.total,
         sessions_status: sessions.sessions.status,
         config_algorithm: Some(fingerprint.fingerprint.algorithm.clone()),
+        config_key_id: fingerprint.fingerprint.key_id.clone(),
         config_hash: fingerprint.fingerprint.hash.clone(),
+        config_previous_key_id: fingerprint
+            .fingerprint
+            .previous
+            .as_ref()
+            .map(|v| v.key_id.clone()),
+        config_previous_hash: fingerprint
+            .fingerprint
+            .previous
+            .as_ref()
+            .map(|v| v.hash.clone()),
         config_status: fingerprint.fingerprint.status,
         live: service.live.clone(),
         degraded_methods: Vec::new(),
@@ -79,8 +93,22 @@ pub fn format_status_view_human(view: &OcservStatusView) -> Result<String> {
     } else {
         format!("degraded_methods={}\n", view.degraded_methods.join(","))
     };
+    let algorithm = view.config_algorithm.as_deref().unwrap_or("sha256");
+    let fingerprint_label = algorithm.replace('-', "_");
+    let key_lines = match (
+        view.config_key_id.as_deref(),
+        view.config_previous_key_id.as_deref(),
+        view.config_previous_hash.as_deref(),
+    ) {
+        (Some(key), Some(previous), hash) => format!(
+            "config_fingerprint_key_id={key}\nconfig_fingerprint_previous_key_id={previous}\nconfig_fingerprint_previous={}\n",
+            short_fingerprint(hash, view.config_status)?
+        ),
+        (Some(key), None, _) => format!("config_fingerprint_key_id={key}\n"),
+        _ => String::new(),
+    };
     let output = format!(
-        "node_id={}\nstatus={}\nservice_state={}\nservice_enabled={}\nversion={}\nsessions_total={}\nconfig_fingerprint_sha256={}\n{}",
+        "node_id={}\nstatus={}\nservice_state={}\nservice_enabled={}\nversion={}\nsessions_total={}\nconfig_fingerprint_{}={}\n{}{}",
         view.node_id,
         view.status(),
         service_state,
@@ -89,7 +117,9 @@ pub fn format_status_view_human(view: &OcservStatusView) -> Result<String> {
         view.sessions_total
             .map(|value| value.to_string())
             .unwrap_or_else(|| "<unavailable>".to_string()),
+        fingerprint_label,
         short_fingerprint(view.config_hash.as_deref(), view.config_status)?,
+        key_lines,
         degraded_methods,
     );
     assert_low_sensitive_ocserv_output(&output)?;
@@ -122,7 +152,10 @@ pub fn format_status_json(view: &OcservStatusView) -> Result<String> {
         },
         "config_fingerprint": {
             "algorithm": view.config_algorithm.as_deref().unwrap_or("sha256"),
+            "key_id": view.config_key_id,
             "prefix": fingerprint_prefix(view.config_hash.as_deref(), view.config_status)?,
+            "previous_key_id": view.config_previous_key_id,
+            "previous_prefix": fingerprint_prefix(view.config_previous_hash.as_deref(), view.config_status)?,
             "status": view.config_status,
         },
         "config_fingerprint_prefix": fingerprint_prefix(view.config_hash.as_deref(), view.config_status)?,

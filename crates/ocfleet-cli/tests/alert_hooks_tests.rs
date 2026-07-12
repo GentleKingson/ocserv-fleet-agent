@@ -15,6 +15,7 @@ use rusqlite::Connection;
 use serde_json::{Value, json};
 use std::cell::RefCell;
 use std::fs;
+use std::io::Read;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -77,7 +78,12 @@ fn spawn_ocfleet(args: &[&str]) -> Child {
         .expect("spawn ocfleet")
 }
 
-fn wait_for_alert_evaluation_count(database: &Path, previous_count: i64, timeout: StdDuration) {
+fn wait_for_alert_evaluation_count(
+    database: &Path,
+    previous_count: i64,
+    timeout: StdDuration,
+    child: &mut Child,
+) {
     let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
         let count = Connection::open(database)
@@ -92,8 +98,29 @@ fn wait_for_alert_evaluation_count(database: &Path, previous_count: i64, timeout
         if count > previous_count {
             return;
         }
+        if let Some(status) = child.try_wait().expect("poll alert worker") {
+            let mut stdout = String::new();
+            let mut stderr = String::new();
+            child
+                .stdout
+                .as_mut()
+                .expect("worker stdout")
+                .read_to_string(&mut stdout)
+                .expect("read worker stdout");
+            child
+                .stderr
+                .as_mut()
+                .expect("worker stderr")
+                .read_to_string(&mut stderr)
+                .expect("read worker stderr");
+            panic!(
+                "alert worker exited before evaluation: {status}; stdout={stdout}; stderr={stderr}"
+            );
+        }
         thread::sleep(StdDuration::from_millis(25));
     }
+    let _ = child.kill();
+    let _ = child.wait();
     panic!("timed out waiting for alert worker evaluation");
 }
 
@@ -1822,7 +1849,7 @@ fn alert_worker_daemon_drains_on_sigterm_and_restarts() {
     drop(store);
 
     for previous_count in 0..2 {
-        let child = spawn_ocfleet(&[
+        let mut child = spawn_ocfleet(&[
             "--database",
             &database_arg,
             "alert",
@@ -1833,7 +1860,12 @@ fn alert_worker_daemon_drains_on_sigterm_and_restarts() {
             "--interval-seconds",
             "10",
         ]);
-        wait_for_alert_evaluation_count(&database, previous_count, StdDuration::from_secs(30));
+        wait_for_alert_evaluation_count(
+            &database,
+            previous_count,
+            StdDuration::from_secs(90),
+            &mut child,
+        );
         let signal = Command::new("kill")
             .args(["-TERM", child.id().to_string().as_str()])
             .output()

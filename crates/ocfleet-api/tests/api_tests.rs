@@ -13,8 +13,8 @@ use ocfleet_cli::storage_payloads::{
 };
 use ocfleet_cli::store::{
     AlertEventRecord, CURRENT_SCHEMA_VERSION, HealthRollupRecord, HealthRollupWrite,
-    HealthSnapshotRecord, HealthSnapshotWrite, NodeInsert, ObservabilityJobRecord,
-    ObservabilityRunInsert, ProbeObservationInsert, Store,
+    HealthSnapshotRecord, HealthSnapshotWrite, NodeInsert, NodeMetadataRecord,
+    ObservabilityJobRecord, ObservabilityRunInsert, ProbeObservationInsert, Store,
 };
 use rusqlite::Connection;
 use serde_json::{Value, json};
@@ -24,6 +24,7 @@ use tower::ServiceExt;
 const TOKEN: &str = "abcdefghijklmnopqrstuvwxyz123456";
 const OPENAPI: &str = include_str!("../../../docs/api/openapi.yaml");
 const ROUTES_SOURCE: &str = include_str!("../src/routes.rs");
+const V1_ROUTES_SOURCE: &str = include_str!("../src/v1.rs");
 
 #[test]
 fn openapi_contract_is_get_only_and_matches_router_paths() {
@@ -61,6 +62,7 @@ fn openapi_contract_is_get_only_and_matches_router_paths() {
         "AuditListResponse",
         "HealthSloResponse",
         "ErrorResponse",
+        "V1VersionReadinessEnvelope",
     ] {
         assert!(
             spec["components"]["schemas"].get(schema).is_some(),
@@ -74,6 +76,13 @@ fn openapi_contract_is_get_only_and_matches_router_paths() {
     let declared = paths.keys().map(String::as_str).collect::<BTreeSet<_>>();
     let expected = [
         "/",
+        "/api/v1/fleet/summary",
+        "/api/v1/version/readiness",
+        "/api/v1/health/history",
+        "/api/v1/alerts",
+        "/api/v1/nodes",
+        "/api/v1/nodes/{node_id}",
+        "/api/v1/alerts/{dedupe_key_or_alert_id}",
         "/healthz",
         "/metrics",
         "/health/summary",
@@ -117,6 +126,20 @@ fn openapi_contract_is_get_only_and_matches_router_paths() {
         assert!(
             ROUTES_SOURCE.contains(&format!(".route(\"{path}\", get(")),
             "router route missing from contract audit: {path}"
+        );
+    }
+    for path in [
+        "/fleet/summary",
+        "/version/readiness",
+        "/nodes",
+        "/nodes/{node_id}",
+        "/health/history",
+        "/alerts",
+        "/alerts/{lookup}",
+    ] {
+        assert!(
+            V1_ROUTES_SOURCE.contains(&format!(".route(\"{path}\", get(")),
+            "v1 router route missing from contract audit: {path}"
         );
     }
 
@@ -317,6 +340,253 @@ async fn health_slo_is_bounded_read_only_and_preserves_missing_coverage() {
         "runtime projection must match OpenAPI exactly"
     );
     assert_eq!(table_counts(&fixture.database), before);
+}
+
+#[tokio::test]
+async fn api_v1_nodes_cursor_filters_etag_and_correlation_are_stable() {
+    let fixture = Fixture::new();
+    let store = Store::open(&fixture.database).expect("store");
+    store
+        .add_node(
+            &NodeInsert {
+                node_id: "node-b".to_string(),
+                endpoint_id: "endpoint-b".to_string(),
+                name: "node-b".to_string(),
+                region: "sg".to_string(),
+                role: "ocserv".to_string(),
+            },
+            "api-test",
+        )
+        .expect("node-b");
+    for (node_id, environment, color) in
+        [("node-a", "prod", "blue"), ("node-b", "staging", "green")]
+    {
+        StoreWriter::write_node_metadata(
+            &store,
+            &NodeMetadataRecord {
+                node_id: node_id.to_string(),
+                environment: environment.to_string(),
+                site: "site-1".to_string(),
+                owner_team: "network".to_string(),
+                service_tier: "tier-1".to_string(),
+                labels_json: json!({"color":color}),
+                expected_agent_version: Some("0.4.0".to_string()),
+                updated_at: "2026-07-12T00:00:00Z".to_string(),
+            },
+            "api-test",
+        )
+        .expect("metadata");
+    }
+    drop(store);
+    let router = fixture.router(None);
+
+    let request = Request::builder()
+        .uri("/api/v1/nodes?limit=1")
+        .header("x-request-id", "client-request-1")
+        .body(Body::empty())
+        .expect("request");
+    let response = router.clone().oneshot(request).await.expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["x-request-id"], "client-request-1");
+    let etag = response.headers()[header::ETAG].clone();
+    let value: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body"),
+    )
+    .expect("json");
+    assert_eq!(value["data"]["count"], 1);
+    assert_eq!(value["data"]["items"][0]["node_id"], "node-a");
+    let cursor = value["data"]["next_cursor"].as_str().expect("next cursor");
+
+    let (status, second) = json_request(
+        router.clone(),
+        Method::GET,
+        &format!("/api/v1/nodes?limit=1&cursor={cursor}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(second["data"]["items"][0]["node_id"], "node-b");
+    assert!(second["data"]["next_cursor"].is_null());
+
+    let mut tampered = cursor.as_bytes().to_vec();
+    tampered[0] ^= 1;
+    let tampered = String::from_utf8(tampered).expect("cursor ASCII");
+    let (status, error) = json_request(
+        router.clone(),
+        Method::GET,
+        &format!("/api/v1/nodes?limit=1&cursor={tampered}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(error["error_code"], "INVALID_CURSOR");
+
+    let (_, filtered) = json_request(
+        router.clone(),
+        Method::GET,
+        "/api/v1/nodes?environment=prod&label=color%3Dblue&status=unreachable",
+        None,
+    )
+    .await;
+    assert_eq!(filtered["data"]["count"], 1);
+    assert_eq!(filtered["data"]["items"][0]["node_id"], "node-a");
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/nodes?limit=1")
+                .header(header::IF_NONE_MATCH, etag)
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body")
+            .len(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn api_v1_version_readiness_projects_distribution_alerts_and_no_actions() {
+    let fixture = Fixture::new();
+    let store = Store::open(&fixture.database).expect("store");
+    StoreWriter::write_node_metadata(
+        &store,
+        &NodeMetadataRecord {
+            node_id: "node-a".to_string(),
+            environment: "prod".to_string(),
+            site: "hk-1".to_string(),
+            owner_team: "network".to_string(),
+            service_tier: "tier-1".to_string(),
+            labels_json: json!({}),
+            expected_agent_version: Some("0.4.0".to_string()),
+            updated_at: "2026-07-12T00:00:00Z".to_string(),
+        },
+        "api-test",
+    )
+    .expect("metadata");
+    drop(store);
+    Connection::open(&fixture.database)
+        .expect("sqlite")
+        .execute(
+            "INSERT INTO node_capability_snapshots
+             (node_id,endpoint_id,observed_at,status,agent_version,protocol_min,protocol_max,
+              ocserv_snapshot_min,ocserv_snapshot_max,controlled_writes_compiled,
+              controlled_writes_locally_enabled)
+             VALUES ('node-a','endpoint-a','2026-07-12T00:01:00Z','compatible','0.3.0',1,1,2,2,0,0)",
+            [],
+        )
+        .expect("capability snapshot");
+    let before = table_counts(&fixture.database);
+    let router = fixture.router(None);
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/version/readiness")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let etag = response.headers()[header::ETAG].clone();
+    let value: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body"),
+    )
+    .expect("json");
+    assert_eq!(value["data"]["outdated_count"], 1);
+    assert_eq!(value["data"]["blocked_count"], 1);
+    assert_eq!(value["data"]["distribution"][0]["version"], "0.3.0");
+    assert_eq!(
+        value["data"]["alerts"][0]["reason_code"],
+        "AGENT_VERSION_OUTDATED"
+    );
+    assert_eq!(value["data"]["actions_enabled"], false);
+    let encoded = value.to_string();
+    for forbidden in ["/etc/", "systemctl", "local_policy", "package_manager"] {
+        assert!(!encoded.contains(forbidden));
+    }
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/version/readiness")
+                .header(header::IF_NONE_MATCH, etag)
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(table_counts(&fixture.database), before);
+}
+
+#[tokio::test]
+async fn api_v1_history_and_alerts_enforce_windows_and_reason_filters() {
+    let fixture = Fixture::new();
+    let router = fixture.router(None);
+    let (status,history)=json_request(router.clone(),Method::GET,"/api/v1/health/history?from=2026-07-09T00:00:00Z&to=2026-07-10T00:00:00Z&node_id=node-a&status=unreachable&limit=1",None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(history["data"]["count"], 1);
+    assert_eq!(history["data"]["items"][0]["status"], "unreachable");
+    let (status,alerts)=json_request(router.clone(),Method::GET,"/api/v1/alerts?from=2026-07-09T00:00:00Z&to=2026-07-10T00:00:00Z&reason=NODE_UNREACHABLE&state=open",None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(alerts["data"]["count"], 1);
+    assert_eq!(
+        alerts["data"]["items"][0]["reason_code"],
+        "NODE_UNREACHABLE"
+    );
+    for uri in [
+        "/api/v1/health/history?from=2026-07-10T00:00:00Z&to=2026-07-09T00:00:00Z",
+        "/api/v1/alerts?from=2026-07-09T00:00:00Z&to=2026-07-10T00:00:00Z&unknown=x",
+        "/api/v1/alerts?from=2026-07-09T00:00:00Z&to=2026-07-10T00:00:00Z&reason=a&reason=b",
+    ] {
+        let (status, error) = json_request(router.clone(), Method::GET, uri, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+        assert!(error["error_code"].is_string());
+    }
+}
+
+#[tokio::test]
+async fn api_v1_single_records_reject_queries_and_correlate_errors() {
+    let fixture = Fixture::new();
+    let router = fixture.router(None);
+    let (_, node) = json_request(router.clone(), Method::GET, "/api/v1/nodes/node-a", None).await;
+    assert_eq!(node["data"]["item"]["node_id"], "node-a");
+    let (_, alert) = json_request(
+        router.clone(),
+        Method::GET,
+        "/api/v1/alerts/node:node-a:node_unreachable",
+        None,
+    )
+    .await;
+    assert_eq!(alert["data"]["item"]["reason_code"], "NODE_UNREACHABLE");
+
+    let request = Request::builder()
+        .uri("/api/v1/fleet/summary?unknown=x")
+        .header("x-request-id", "client-error-42")
+        .body(Body::empty())
+        .expect("request");
+    let response = router.oneshot(request).await.expect("response");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.headers()["x-request-id"], "client-error-42");
+    let body: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body"),
+    )
+    .expect("json");
+    assert_eq!(body["request_id"], "client-error-42");
 }
 
 #[tokio::test]
@@ -836,6 +1106,7 @@ async fn malformed_and_unknown_query_parameters_return_json_errors() {
         "/health/slo?window=90d&to=2026-07-12T00:00:00Z",
         "/health/slo?window=24h&to=2026-07-12T00:00:01Z",
         "/health/slo?window=24h",
+        "/api/v1/version/readiness?unknown=value",
     ] {
         let (status, body) = json_request(router.clone(), Method::GET, uri, None).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
@@ -935,6 +1206,9 @@ async fn dashboard_contains_no_mutating_route_wiring() {
 
     for required in [
         "id=\"summary\"",
+        "id=\"version-summary\"",
+        "id=\"versions\"",
+        "loadJson(\"/api/v1/version/readiness\")",
         "id=\"nodes\"",
         "id=\"jobs\"",
         "id=\"runs\"",
@@ -962,6 +1236,9 @@ async fn dashboard_contains_no_mutating_route_wiring() {
         "apply config",
         "rollback config",
         "disconnect session",
+        "install package",
+        "package manager",
+        "upgrade agent",
         "/rpc",
         "/jobs/{id}/run",
         "/alerts/{id}/resolve",
@@ -1074,6 +1351,7 @@ fn table_counts(path: &Path) -> Vec<i64> {
         "health_snapshots",
         "alert_events",
         "controller_audit_log",
+        "node_capability_snapshots",
     ]
     .iter()
     .map(|table| {

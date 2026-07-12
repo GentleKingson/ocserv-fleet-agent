@@ -17,8 +17,10 @@ blake3.workspace = true
 clap.workspace = true
 iroh.workspace = true
 libc.workspace = true
+ring.workspace = true
 ocfleet-config = { path = "../ocfleet-config" }
 ocfleet-protocol = { path = "../ocfleet-protocol" }
+ocfleet-snapshot-schema = { path = "../ocfleet-snapshot-schema" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

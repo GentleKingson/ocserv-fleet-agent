@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ocfleet.dev/schema/ocfleet.ocserv.snapshot.v2.schema.json",
+  "title": "OCFleet local ocserv aggregate snapshot v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "collected_at", "collector_status", "service_state", "enabled_state"],
+  "properties": {
+    "schema_version": { "const": "ocfleet.ocserv.snapshot.v2" },
+    "collected_at": { "type": "string", "format": "date-time", "maxLength": 64 },
+    "collector_status": { "type": "string", "enum": ["ok", "partial", "stale", "unavailable", "unknown"] },
+    "service_state": { "type": "string", "enum": ["running", "stopped", "failed", "starting", "stopping", "unknown", "unavailable"] },
+    "enabled_state": { "type": "string", "enum": ["enabled", "disabled", "static", "unknown", "unavailable"] },
+    "version": { "type": "string", "maxLength": 128 },
+    "session_total": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+    "auth_failure_count_rolling": { "type": "integer", "minimum": 0, "maximum": 1000000 },
+    "connection_failure_count_rolling": { "type": "integer", "minimum": 0, "maximum": 1000000 },
+    "cert_min_days_remaining": { "type": "integer", "minimum": -3650, "maximum": 36500 },
+    "config_fingerprint_short": { "type": "string", "pattern": "^[0-9a-f]{6,16}$" }
+  }
+}

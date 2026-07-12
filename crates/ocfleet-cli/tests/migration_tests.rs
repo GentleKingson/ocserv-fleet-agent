@@ -39,6 +39,9 @@ fn migration_tests_new_database_creates_all_current_tables_and_indexes() {
         "alert_delivery_queue",
         "health_history",
         "health_rollups",
+        "node_metadata",
+        "node_maintenance_windows",
+        "node_capability_snapshots",
     ] {
         assert_schema_object_exists(&conn, "table", table);
     }
@@ -53,12 +56,15 @@ fn migration_tests_new_database_creates_all_current_tables_and_indexes() {
         "idx_health_evaluation_runs_input",
         "idx_health_evaluation_runs_status_started",
         "idx_alert_delivery_queue_alert_hook_key",
+        "idx_node_metadata_environment",
+        "idx_node_maintenance_active",
         "idx_alert_delivery_queue_due",
         "idx_alert_delivery_queue_lease",
         "idx_health_history_node_computed",
         "idx_health_history_computed",
         "idx_health_rollups_window",
         "idx_health_rollups_node_window",
+        "idx_node_capability_snapshots_observed",
     ] {
         assert_schema_object_exists(&conn, "index", index);
     }

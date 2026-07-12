@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+- B-READY completes the Stage B source gate: all B1-B8 items are operationally
+  mature, default/all-feature milestone regression and isolated non-root Linux
+  checks pass, bounded mixed-version behavior is verified, and the default
+  agent-control boundary remains read-only. This prepares, but does not publish,
+  `v0.4.0`.
+- B8 adds schema 27 latest capability observations, bounded SemVer fleet
+  distribution, expected-version and pre-release policy, protocol/provider
+  compatibility alerts, upgrade-readiness CLI/API/dashboard projections, and
+  explicit unknown states. Every action remains disabled; there is no install,
+  package-manager, restart, or automatic upgrade path.
+- B7 adds the fixed `node.capabilities` RPC with closed bounded protocol,
+  method, provider-schema, feature, and controlled-write state. Controllers
+  fail closed on incompatible or malformed responses, reduce audit detail, and
+  treat legacy `METHOD_NOT_FOUND` deterministically without enabling features.
+- B6 adds detached Ed25519 trust-policy revisions, deterministic bounded CI
+  plans and Markdown reports, closed drift-alert projections, signed approval
+  records, bounded append-only history, and a read-only/no-create SQLite review
+  path. No policy apply or agent RPC path exists.
+- B5 adds agent-local HMAC-SHA-256 configuration fingerprints with key IDs,
+  one-key dual-report rotation, legacy SHA-256 compatibility, prefix-only
+  controller/CLI projections, and private key-file enforcement.
+- B4 adds the independent `ocfleet-snapshot-schema` crate, closed validator,
+  embedded machine schema, private atomic Rust producer SDK, least-privilege
+  example, agent compatibility, and non-root Linux permission verification.
+- The first B3 compatibility slice adds stable `/api/v1` exact fleet summary
+  and signed keyset-paginated node projections with bounded metadata filters,
+  ETags, conditional GET, request correlation IDs, and synchronized OpenAPI.
+- Schema 26 adds bounded advisory node metadata, labels, expected agent
+  versions, and per-node maintenance windows with atomic audit, restricted
+  capped scheduler selectors, advisory trust-policy diffs, and read-only API
+  projection.
 - Schema 23 adds append-only, replay-safe health history with bounded half-open
   CLI queries and independent retention from the latest health projection.
 - Schemas 24 and 25 add reproducible 5-minute/hourly/daily health rollups and

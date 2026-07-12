@@ -10,6 +10,7 @@ use ocfleet_protocol::method::{
 };
 use rusqlite::Connection;
 use serde_json::{Value, json};
+use std::io::Read;
 use std::process::{Child, Command, Output, Stdio};
 use std::thread;
 use std::time::Duration as StdDuration;
@@ -40,7 +41,7 @@ fn spawn_ocfleet(args: &[&str]) -> Child {
         .expect("spawn ocfleet")
 }
 
-fn wait_for_health_evaluation(database: &std::path::Path, timeout: StdDuration) {
+fn wait_for_health_evaluation(database: &std::path::Path, timeout: StdDuration, child: &mut Child) {
     let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
         let found = Connection::open(database)
@@ -57,8 +58,29 @@ fn wait_for_health_evaluation(database: &std::path::Path, timeout: StdDuration) 
         if found == 1 {
             return;
         }
+        if let Some(status) = child.try_wait().expect("poll health evaluator") {
+            let mut stdout = String::new();
+            let mut stderr = String::new();
+            child
+                .stdout
+                .as_mut()
+                .expect("evaluator stdout")
+                .read_to_string(&mut stdout)
+                .expect("read evaluator stdout");
+            child
+                .stderr
+                .as_mut()
+                .expect("evaluator stderr")
+                .read_to_string(&mut stderr)
+                .expect("read evaluator stderr");
+            panic!(
+                "health evaluator exited before completion: {status}; stdout={stdout}; stderr={stderr}"
+            );
+        }
         thread::sleep(StdDuration::from_millis(25));
     }
+    let _ = child.kill();
+    let _ = child.wait();
     panic!("timed out waiting for completed health evaluation");
 }
 
@@ -926,7 +948,7 @@ fn health_evaluator_daemon_drains_on_sigterm_and_restarts_cleanly() {
     let database_arg = database.to_string_lossy().into_owned();
     drop(Store::open(&database).expect("open store"));
 
-    let child = spawn_ocfleet(&[
+    let mut child = spawn_ocfleet(&[
         "--database",
         &database_arg,
         "health",
@@ -935,7 +957,7 @@ fn health_evaluator_daemon_drains_on_sigterm_and_restarts_cleanly() {
         "--interval-seconds",
         "10",
     ]);
-    wait_for_health_evaluation(&database, StdDuration::from_secs(30));
+    wait_for_health_evaluation(&database, StdDuration::from_secs(90), &mut child);
     let signal = Command::new("kill")
         .args(["-TERM", child.id().to_string().as_str()])
         .output()

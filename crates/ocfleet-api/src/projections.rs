@@ -63,6 +63,8 @@ pub fn health_node_to_json(record: &NodeHealthRecord) -> Value {
         "region": record.node.region,
         "role": record.node.role,
         "enabled": record.node.enabled,
+        "metadata": record.metadata,
+        "maintenance": record.maintenance,
         "status": status,
         "computed_at": record.snapshot.as_ref().map(|snapshot| snapshot.computed_at.as_str()),
         "freshness_seconds": record.snapshot.as_ref().and_then(|snapshot| snapshot.freshness_seconds),

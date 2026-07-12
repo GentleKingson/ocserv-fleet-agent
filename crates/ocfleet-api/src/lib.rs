@@ -5,6 +5,7 @@ pub mod projections;
 pub mod readonly_store;
 pub mod responses;
 pub mod routes;
+pub mod v1;
 pub mod web;
 
 pub use args::{ApiCli, ApiConfig};

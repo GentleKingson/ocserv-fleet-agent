@@ -4,9 +4,9 @@ use anyhow::{Context, Result};
 use iroh::EndpointId;
 use ocfleet_config::agent::SecurityConfig;
 use ocfleet_protocol::method::{
-    NODE_INFO, NODE_PING, OCSERV_CERT_EXPIRY, OCSERV_CONFIG_FINGERPRINT, OCSERV_SERVICE_SUMMARY,
-    OCSERV_SESSIONS_SUMMARY, OCSERV_VERSION, PROBE_CONTROLLER_PING, PROBE_PATH_ECHO,
-    PROBE_PEER_ECHO,
+    NODE_CAPABILITIES, NODE_INFO, NODE_PING, OCSERV_CERT_EXPIRY, OCSERV_CONFIG_FINGERPRINT,
+    OCSERV_SERVICE_SUMMARY, OCSERV_SESSIONS_SUMMARY, OCSERV_VERSION, PROBE_CONTROLLER_PING,
+    PROBE_PATH_ECHO, PROBE_PEER_ECHO,
 };
 
 use crate::server::parse_endpoint_id;
@@ -125,6 +125,7 @@ impl AgentAuthorization {
                     method,
                     NODE_PING
                         | NODE_INFO
+                        | NODE_CAPABILITIES
                         | PROBE_CONTROLLER_PING
                         | PROBE_PATH_ECHO
                         | OCSERV_SERVICE_SUMMARY

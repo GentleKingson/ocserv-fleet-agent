@@ -13,6 +13,7 @@ const MAX_SELECTOR_LEN: usize = 128;
 const MAX_LABEL_ENTRIES: usize = 32;
 const MAX_LABEL_KEY_LEN: usize = 64;
 const MAX_LABEL_VALUE_LEN: usize = 128;
+const MAX_METADATA_VALUE_LEN: usize = 64;
 
 static PROCESS_ACTOR: OnceLock<RwLock<Option<String>>> = OnceLock::new();
 
@@ -151,6 +152,19 @@ pub fn validate_label_json(value: &Value, field: &'static str) -> Result<(), Str
                 return Err(format!("{field} values must be scalar"));
             }
         }
+    }
+    Ok(())
+}
+
+pub fn validate_metadata_value(value: &str, field: &'static str) -> Result<(), String> {
+    validate_printable_text(value, field, MAX_METADATA_VALUE_LEN)?;
+    if !value
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'@'))
+    {
+        return Err(format!(
+            "{field} may contain only ASCII letters, digits, '.', '_', '-', and '@'"
+        ));
     }
     Ok(())
 }

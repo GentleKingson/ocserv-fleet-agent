@@ -3,8 +3,13 @@ use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 use serde_json::Value;
+use std::future::Future;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
+
+tokio::task_local! {
+    static REQUEST_ID: String;
+}
 
 pub type ApiResult<T> = Result<T, ApiError>;
 
@@ -27,6 +32,10 @@ struct ApiErrorBody {
 impl ApiError {
     pub fn bad_request(message: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, "BAD_REQUEST", message)
+    }
+
+    pub fn invalid_cursor(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, "INVALID_CURSOR", message)
     }
 
     pub fn unauthorized() -> Self {
@@ -62,9 +71,15 @@ impl ApiError {
             status,
             error_code,
             message: message.into(),
-            request_id: Uuid::new_v4().to_string(),
+            request_id: REQUEST_ID
+                .try_with(Clone::clone)
+                .unwrap_or_else(|_| Uuid::new_v4().to_string()),
         }
     }
+}
+
+pub async fn with_request_id<F: Future>(request_id: String, future: F) -> F::Output {
+    REQUEST_ID.scope(request_id, future).await
 }
 
 impl IntoResponse for ApiError {

@@ -1,12 +1,12 @@
 {
   "baseline_commit": "b3c906a94823b4620dc1a2077a44e7160c0848b2",
-  "current_phase": "B1",
-  "completed_phases": ["A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8", "A-READY"],
-  "active_branch": "codex/b1-rollup-refresh",
-  "active_issue": 41,
-  "active_pr": 112,
+  "current_phase": "B-READY",
+  "completed_phases": ["A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8", "A-READY", "B1", "B2", "B3", "B4", "B5", "B6", "B7", "B8", "B-READY"],
+  "active_branch": "main",
+  "active_issue": null,
+  "active_pr": null,
   "last_test_result": "passed",
-  "last_updated_at": "2026-07-12T12:30:00Z",
+  "last_updated_at": "2026-07-12T13:31:23Z",
   "blockers": [],
-  "next_action": "Merge PR 112, close issue 41, then audit B2 completion gaps."
+  "next_action": "Prepare the v0.4.0 release candidate without changing the default read-only boundary."
 }

@@ -34,6 +34,10 @@ pub enum Command {
         #[command(subcommand)]
         command: NodeCommand,
     },
+    Version {
+        #[command(subcommand)]
+        command: VersionCommand,
+    },
     Enroll {
         #[command(subcommand)]
         command: EnrollCommand,
@@ -81,6 +85,18 @@ pub enum Command {
     Restore {
         #[command(subcommand)]
         command: RestoreCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum VersionCommand {
+    Distribution {
+        #[arg(long)]
+        json: bool,
+    },
+    Readiness {
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -224,6 +240,11 @@ pub enum NodeCommand {
     Info {
         node_id: String,
     },
+    Capabilities {
+        node_id: String,
+        #[arg(long)]
+        json: bool,
+    },
     Add {
         node_id: String,
         #[arg(long)]
@@ -234,6 +255,14 @@ pub enum NodeCommand {
         role: String,
     },
     List,
+    Metadata {
+        #[command(subcommand)]
+        command: NodeMetadataCommand,
+    },
+    Maintenance {
+        #[command(subcommand)]
+        command: NodeMaintenanceCommand,
+    },
     Disable {
         node_id: String,
     },
@@ -244,6 +273,51 @@ pub enum NodeCommand {
         node_id: String,
         #[arg(long)]
         yes: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum NodeMetadataCommand {
+    Set {
+        node_id: String,
+        #[arg(long)]
+        environment: String,
+        #[arg(long)]
+        site: String,
+        #[arg(long)]
+        owner_team: String,
+        #[arg(long)]
+        service_tier: String,
+        #[arg(long = "label", value_name = "KEY=VALUE")]
+        labels: Vec<String>,
+        #[arg(long)]
+        expected_agent_version: Option<String>,
+    },
+    Show {
+        node_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum NodeMaintenanceCommand {
+    Set {
+        node_id: String,
+        #[arg(long)]
+        from: String,
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        reason: String,
+    },
+    Clear {
+        node_id: String,
+    },
+    Show {
+        node_id: String,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -389,6 +463,10 @@ pub enum TrustPolicyCommand {
         file: PathBuf,
         #[arg(long)]
         json: bool,
+        #[arg(long, requires = "public_key")]
+        signature: Option<PathBuf>,
+        #[arg(long, requires = "signature")]
+        public_key: Option<PathBuf>,
     },
     Diff {
         file: PathBuf,
@@ -398,6 +476,65 @@ pub enum TrustPolicyCommand {
         format: TrustPolicyDiffFormat,
         #[arg(long)]
         output: Option<PathBuf>,
+    },
+    Sign {
+        file: PathBuf,
+        #[arg(long)]
+        key_file: PathBuf,
+        #[arg(long)]
+        key_id: String,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long)]
+        public_key_output: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    Plan {
+        file: PathBuf,
+        #[arg(long)]
+        signature: PathBuf,
+        #[arg(long)]
+        public_key: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long)]
+        markdown_output: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    Approve {
+        plan: PathBuf,
+        #[arg(long)]
+        key_file: PathBuf,
+        #[arg(long)]
+        key_id: String,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    History {
+        #[command(subcommand)]
+        command: TrustPolicyHistoryCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TrustPolicyHistoryCommand {
+    Record {
+        plan: PathBuf,
+        #[arg(long)]
+        approval: Option<PathBuf>,
+        #[arg(long)]
+        history: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    List {
+        history: PathBuf,
+        #[arg(long)]
+        json: bool,
     },
 }
 

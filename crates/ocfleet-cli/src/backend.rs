@@ -6,11 +6,12 @@ use crate::store::{
     EnrollmentTokenInsert, EnrollmentTokenRecord, HealthEvaluationFailure, HealthEvaluationFinish,
     HealthEvaluationStart, HealthPolicyRecord, HealthRollupWrite, HealthSnapshotRecord,
     HealthSnapshotWrite, JoinRequestInsert, JoinRequestRecord, LegacyEnrollmentClaimInput,
-    NodeInsert, NodeRecord, ObservabilityJobRecord, ObservabilityRunRecord, ProbeObservationRecord,
-    RetentionApplyInput, RetentionApplyResult, RetentionPolicyRecord, SchedulerJobClaim,
-    SchedulerMaintenanceWindow, SchedulerOutcomeWrite, SchedulerRunFinish, SchedulerRunStart,
-    Store, StoreError,
+    NodeInsert, NodeMaintenanceWindow, NodeMetadataRecord, NodeRecord, ObservabilityJobRecord,
+    ObservabilityRunRecord, ProbeObservationRecord, RetentionApplyInput, RetentionApplyResult,
+    RetentionPolicyRecord, SchedulerJobClaim, SchedulerMaintenanceWindow, SchedulerOutcomeWrite,
+    SchedulerRunFinish, SchedulerRunStart, Store, StoreError,
 };
+use crate::version_governance::CapabilitySnapshot;
 
 pub const MAX_STORE_READER_ROWS: u64 = 1_000;
 
@@ -55,6 +56,23 @@ pub trait StoreWriter {
     fn write_node_enable(&self, node_id: &str, actor: &str) -> Result<(), Self::Error>;
     fn write_node_disable(&self, node_id: &str, actor: &str) -> Result<(), Self::Error>;
     fn write_node_remove(&self, node_id: &str, actor: &str) -> Result<(), Self::Error>;
+    fn write_node_metadata(
+        &self,
+        metadata: &NodeMetadataRecord,
+        actor: &str,
+    ) -> Result<(), Self::Error>;
+    fn write_node_maintenance_set(
+        &self,
+        window: &NodeMaintenanceWindow,
+        actor: &str,
+    ) -> Result<(), Self::Error>;
+    fn write_node_maintenance_clear(&self, node_id: &str, actor: &str)
+    -> Result<bool, Self::Error>;
+    fn write_node_capability_snapshot(
+        &self,
+        snapshot: &CapabilitySnapshot,
+        audit: &AuditEvent,
+    ) -> Result<(), Self::Error>;
     fn write_scheduler_job_add(
         &self,
         job: &ObservabilityJobRecord,
@@ -411,6 +429,36 @@ impl StoreWriter for Store {
 
     fn write_node_remove(&self, node_id: &str, actor: &str) -> Result<(), Self::Error> {
         Store::remove_node(self, node_id, actor)
+    }
+
+    fn write_node_metadata(
+        &self,
+        metadata: &NodeMetadataRecord,
+        actor: &str,
+    ) -> Result<(), Self::Error> {
+        Store::set_node_metadata(self, metadata, actor)
+    }
+
+    fn write_node_capability_snapshot(
+        &self,
+        snapshot: &CapabilitySnapshot,
+        audit: &AuditEvent,
+    ) -> Result<(), Self::Error> {
+        self.upsert_node_capability_snapshot_with_audit(snapshot, audit)
+    }
+    fn write_node_maintenance_set(
+        &self,
+        window: &NodeMaintenanceWindow,
+        actor: &str,
+    ) -> Result<(), Self::Error> {
+        Store::set_node_maintenance(self, window, actor)
+    }
+    fn write_node_maintenance_clear(
+        &self,
+        node_id: &str,
+        actor: &str,
+    ) -> Result<bool, Self::Error> {
+        Store::clear_node_maintenance(self, node_id, actor)
     }
 
     fn write_scheduler_job_add(
@@ -835,6 +883,90 @@ mod tests {
         assert_eq!(
             MigrationManager::migration_backend(&store),
             BackendKind::Sqlite
+        );
+    }
+
+    #[test]
+    fn node_metadata_and_maintenance_are_atomic_audited_writes() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = Store::open(&dir.path().join("controller.sqlite")).expect("open store");
+        StoreWriter::write_node_add(
+            &store,
+            &NodeInsert {
+                node_id: "node-a".to_string(),
+                endpoint_id: "endpoint-a".to_string(),
+                name: "node-a".to_string(),
+                region: "us-east".to_string(),
+                role: "ocserv".to_string(),
+            },
+            "operator",
+        )
+        .expect("add node");
+        let metadata = NodeMetadataRecord {
+            node_id: "node-a".to_string(),
+            environment: "prod".to_string(),
+            site: "iad-1".to_string(),
+            owner_team: "network@ops".to_string(),
+            service_tier: "tier-1".to_string(),
+            labels_json: json!({"color":"blue"}),
+            expected_agent_version: Some("0.4.0".to_string()),
+            updated_at: "2026-07-12T00:00:00Z".to_string(),
+        };
+        StoreWriter::write_node_metadata(&store, &metadata, "operator").expect("metadata");
+        assert_eq!(
+            store.get_node_metadata("node-a").expect("read"),
+            Some(metadata)
+        );
+
+        StoreWriter::write_node_maintenance_set(
+            &store,
+            &NodeMaintenanceWindow {
+                node_id: "node-a".to_string(),
+                starts_at: "2026-07-12T01:00:00Z".to_string(),
+                ends_at: "2026-07-12T02:00:00Z".to_string(),
+                reason: "planned".to_string(),
+                updated_at: "2026-07-12T00:00:00Z".to_string(),
+            },
+            "operator",
+        )
+        .expect("maintenance");
+        assert!(
+            !store
+                .node_maintenance_active_at("node-a", "2026-07-12T00:59:59Z")
+                .expect("before")
+        );
+        assert!(
+            store
+                .node_maintenance_active_at("node-a", "2026-07-12T01:00:00Z")
+                .expect("start")
+        );
+        assert!(
+            !store
+                .node_maintenance_active_at("node-a", "2026-07-12T02:00:00Z")
+                .expect("end")
+        );
+        assert!(
+            StoreWriter::write_node_maintenance_clear(&store, "node-a", "operator").expect("clear")
+        );
+
+        let audit = StoreReader::read_audit_window(
+            &store,
+            "2000-01-01T00:00:00Z",
+            "2100-01-01T00:00:00Z",
+            100,
+        )
+        .expect("audit");
+        assert_eq!(
+            audit
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event.event.as_str(),
+                        "node.metadata.set" | "node.maintenance.set" | "node.maintenance.clear"
+                    )
+                })
+                .count(),
+            3
         );
     }
 

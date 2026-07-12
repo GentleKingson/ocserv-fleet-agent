@@ -75,13 +75,17 @@ snapshot_path = "/var/lib/ocfleet-agent/ocserv-live-snapshot.json"
 [ocserv_readonly.config_fingerprint]
 name = "main"
 config_path = "/etc/ocserv/ocserv.conf"
+mode = "hmac_sha256"
+key_id = "fleet-key-2026-07"
+key_path = "/etc/ocfleet-agent/fingerprint.key"
 
 [[ocserv_readonly.certificates]]
 name = "server"
 cert_path = "/etc/ocserv/server-cert.pem"
 ```
 
-The controller cannot override `snapshot_path`, `config_path`, certificate paths,
+The controller cannot override `snapshot_path`, `config_path`, fingerprint key
+paths, certificate paths,
 or provider kind. `snapshot_path` must be absolute, and on Unix the snapshot file
 must be a regular single-link private file owned by root or the agent user.
 

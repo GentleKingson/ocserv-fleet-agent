@@ -88,6 +88,7 @@ production-complete.
 - Supports fixed RPC methods:
   - `node.ping`
   - `node.info`
+  - `node.capabilities`
   - `probe.controller.ping`
   - `probe.peer.echo`
   - `probe.path.echo`
@@ -290,6 +291,9 @@ Call the Phase 1 RPCs:
 ```bash
 target/debug/ocfleet ping hk-ocserv-01
 target/debug/ocfleet node info hk-ocserv-01
+target/debug/ocfleet node capabilities hk-ocserv-01 --json
+target/debug/ocfleet version distribution --json
+target/debug/ocfleet version readiness --json
 target/debug/ocfleet probe ping hk-ocserv-01
 ```
 
@@ -354,6 +358,9 @@ snapshot_path = "/var/lib/ocfleet-agent/ocserv-readonly.json"
 [ocserv_readonly.config_fingerprint]
 name = "main"
 config_path = "/etc/ocserv/ocserv.conf"
+mode = "hmac_sha256"
+key_id = "fleet-key-2026-07"
+key_path = "/etc/ocfleet-agent/fingerprint.key"
 
 [[ocserv_readonly.certificates]]
 name = "server"
@@ -509,6 +516,18 @@ target/debug/ocfleet trust policy diff ./trust-policy.toml --json
 install -d -m 0700 ./trust-policy-review
 target/debug/ocfleet trust policy diff ./trust-policy.toml \
   --format markdown --output ./trust-policy-review/trust-policy-diff.md
+target/debug/ocfleet trust policy sign ./trust-policy.toml \
+  --key-file /run/secrets/policy-signing.pk8 --key-id policy-ci-2026 \
+  --output ./trust-policy-review/policy.signature.json \
+  --public-key-output ./trust-policy-review/policy.public-key.json
+target/debug/ocfleet --database ./controller.sqlite trust policy plan ./trust-policy.toml \
+  --signature ./trust-policy-review/policy.signature.json \
+  --public-key ./trust-policy-review/policy.public-key.json \
+  --output ./trust-policy-review/plan.json \
+  --markdown-output ./trust-policy-review/review.md
+target/debug/ocfleet --actor security-reviewer trust policy approve \
+  ./trust-policy-review/plan.json --key-file /run/secrets/review.pk8 \
+  --key-id security-review-2026 --output ./trust-policy-review/approval.json
 ```
 
 These commands operate inside the controller boundary. Scheduler jobs use only
@@ -566,7 +585,33 @@ Networking must allow the controller to reach the agent through iroh using the r
 - `docs/health-history.md`: append-only health history, reproducible rollups,
   fixed SLO projections, retention, and closed-bucket refresh operations.
 - `docs/b1-health-history-rollup-slo-inventory.md`: B1 requirement, security
-  boundary, implementation, and verification completion inventory.
+  boundary, and direct-test completion evidence.
+- `docs/b2-node-metadata-inventory.md`: bounded advisory node metadata,
+  selectors, maintenance, audit, and trust-isolation evidence.
+- `docs/b3-api-v1-inventory.md`: stable read-only API v1 compatibility,
+  pagination, caching, and remaining B3 completion evidence.
+- `docs/b4-snapshot-producer-inventory.md`: closed local producer schema, SDK,
+  validator, compatibility, permission, and forbidden-data evidence.
+- `docs/snapshot-producer-author-guide.md`: least-privilege third-party local
+  producer integration guide.
+- `docs/b5-hmac-config-fingerprint-inventory.md`: local HMAC key, rotation,
+  compatibility, redaction, and Linux file-safety evidence.
+- `docs/hmac-config-fingerprint.md`: recommended agent-local key and rotation
+  configuration.
+- `docs/b6-trust-policy-gitops-inventory.md`: signed revisions, deterministic
+  plans, approval/history chain, drift projection, and zero-mutation evidence.
+- `docs/trust-policy-gitops.md`: review-only signing, CI artifact, approval,
+  and history workflow.
+- `docs/b7-protocol-capabilities-inventory.md`: closed capability DTO,
+  cross-version behavior, authorization, redaction, and verification evidence.
+- `docs/node-capabilities.md`: fixed read-only negotiation contract and
+  deterministic legacy-agent behavior.
+- `docs/b8-agent-version-governance-inventory.md`: SemVer policy,
+  distribution, compatibility alerts, readiness, API/dashboard, and tests.
+- `docs/agent-version-governance.md`: operator workflow and explicit
+  no-install/no-restart boundary.
+- `docs/b-ready-readonly-product-gate.md`: Stage B completion, full regression,
+  Linux isolation, read-only boundary, and remaining `v0.4.0` release limits.
 - `docs/a1-mutation-inventory.md`: A1 controller writer, failure-injection, and
   static-enforcement completion inventory.
 - `docs/adr/ADR-atomic-audit-writes.md`: fail-closed controller mutation and

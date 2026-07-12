@@ -7,7 +7,7 @@ use ocfleet_cli::args::{
     HealthSnapshotCommand, NodeCommand, ObservationCommand, OcservCommand, OcservSessionsCommand,
     ProbeCommand, RedactionMode, RestoreCommand, RetentionCommand, RetentionScope, ScheduleCommand,
     ScheduleJobCommand, ScheduleJobKind, ScheduleRunCommand, TrustCommand, TrustDiffFormat,
-    TrustPolicyDiffFormat,
+    TrustPolicyDiffFormat, VersionCommand,
 };
 use std::path::PathBuf;
 
@@ -1536,7 +1536,7 @@ fn parses_trust_policy_commands() {
     };
 
     match command {
-        ocfleet_cli::args::TrustPolicyCommand::Validate { file, json } => {
+        ocfleet_cli::args::TrustPolicyCommand::Validate { file, json, .. } => {
             assert_eq!(file, PathBuf::from("policy.toml"));
             assert!(json);
         }
@@ -1579,6 +1579,49 @@ fn parses_trust_policy_commands() {
 }
 
 #[test]
+fn parses_trust_policy_gitops_commands() {
+    let cli = Cli::parse_from([
+        "ocfleet",
+        "trust",
+        "policy",
+        "plan",
+        "policy.toml",
+        "--signature",
+        "policy.sig.json",
+        "--public-key",
+        "policy.pub.json",
+        "--output",
+        "plan.json",
+        "--markdown-output",
+        "review.md",
+        "--json",
+    ]);
+    let Command::Trust {
+        command:
+            TrustCommand::Policy {
+                command:
+                    ocfleet_cli::args::TrustPolicyCommand::Plan {
+                        file,
+                        signature,
+                        public_key,
+                        output,
+                        markdown_output,
+                        json,
+                    },
+            },
+    } = cli.command
+    else {
+        panic!("expected trust policy plan command");
+    };
+    assert_eq!(file, PathBuf::from("policy.toml"));
+    assert_eq!(signature, PathBuf::from("policy.sig.json"));
+    assert_eq!(public_key, PathBuf::from("policy.pub.json"));
+    assert_eq!(output, PathBuf::from("plan.json"));
+    assert_eq!(markdown_output, Some(PathBuf::from("review.md")));
+    assert!(json);
+}
+
+#[test]
 fn parses_node_info_command() {
     let cli = Cli::parse_from(["ocfleet", "node", "info", "hk-ocserv-01"]);
 
@@ -1590,6 +1633,42 @@ fn parses_node_info_command() {
     };
 
     assert_eq!(node_id, "hk-ocserv-01");
+}
+
+#[test]
+fn parses_node_capabilities_command() {
+    let cli = Cli::parse_from(["ocfleet", "node", "capabilities", "hk-ocserv-01", "--json"]);
+
+    let Command::Node {
+        command: NodeCommand::Capabilities { node_id, json },
+    } = cli.command
+    else {
+        panic!("expected node capabilities command");
+    };
+
+    assert_eq!(node_id, "hk-ocserv-01");
+    assert!(json);
+}
+
+#[test]
+fn parses_version_governance_commands() {
+    let readiness = Cli::parse_from(["ocfleet", "version", "readiness", "--json"]);
+    let Command::Version {
+        command: VersionCommand::Readiness { json },
+    } = readiness.command
+    else {
+        panic!("expected version readiness command");
+    };
+    assert!(json);
+
+    let distribution = Cli::parse_from(["ocfleet", "version", "distribution"]);
+    let Command::Version {
+        command: VersionCommand::Distribution { json },
+    } = distribution.command
+    else {
+        panic!("expected version distribution command");
+    };
+    assert!(!json);
 }
 
 #[test]

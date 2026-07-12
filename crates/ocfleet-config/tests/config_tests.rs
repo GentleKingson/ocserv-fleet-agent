@@ -780,6 +780,7 @@ snapshot_path = "/var/lib/ocfleet-agent/ocserv-readonly.json"
 [ocserv_readonly.config_fingerprint]
 name = "main"
 config_path = "/etc/ocserv/ocserv.conf"
+mode = "legacy_sha256"
 
 [[ocserv_readonly.certificates]]
 name = "server"
@@ -1014,6 +1015,11 @@ fn agent_config_rejects_config_fingerprint_bad_name() {
         Some(ocfleet_config::agent::OcservConfigFingerprintConfig {
             name: "../main".to_string(),
             config_path: "/etc/ocserv/ocserv.conf".into(),
+            mode: ocfleet_config::agent::ConfigFingerprintMode::LegacySha256,
+            key_id: None,
+            key_path: None,
+            previous_key_id: None,
+            previous_key_path: None,
         });
 
     let err = validate_agent_config(&config).expect_err("bad fingerprint name rejected");

@@ -10,9 +10,12 @@ use ocfleet_cli::storage_payloads::{
     validate_scheduler_payload_relationship,
 };
 use ocfleet_cli::store::{
-    AlertEventRecord, AuditRecord, CURRENT_SCHEMA_VERSION, HealthRollupRecord,
+    AlertEventRecord, AuditRecord, CURRENT_SCHEMA_VERSION, HealthHistoryRecord, HealthRollupRecord,
     HealthSnapshotRecord, NodeRecord, ObservabilityJobRecord, ObservabilityRunRecord,
     ProbeObservationRecord,
+};
+use ocfleet_cli::version_governance::{
+    CapabilityNegotiationStatus, CapabilitySnapshot, VersionGovernanceInput,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, params, types::Type};
 use serde_json::Value;
@@ -26,6 +29,37 @@ pub struct ReadOnlyStore {
 pub struct NodeHealthRecord {
     pub node: NodeRecord,
     pub snapshot: Option<HealthSnapshotRecord>,
+    pub metadata: Option<Value>,
+    pub maintenance: Option<Value>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct NodeListFilters<'a> {
+    pub after_node_id: Option<&'a str>,
+    pub region: Option<&'a str>,
+    pub role: Option<&'a str>,
+    pub environment: Option<&'a str>,
+    pub label_key: Option<&'a str>,
+    pub label_value: Option<&'a str>,
+    pub status: Option<&'a str>,
+}
+
+pub struct HistoryPageFilters<'a> {
+    pub after: Option<(&'a str, &'a str, &'a str)>,
+    pub node_id: Option<&'a str>,
+    pub status: Option<&'a str>,
+    pub from: &'a str,
+    pub to: &'a str,
+}
+
+pub struct AlertPageFilters<'a> {
+    pub after: Option<(&'a str, &'a str)>,
+    pub state: Option<&'a str>,
+    pub severity: Option<&'a str>,
+    pub node_id: Option<&'a str>,
+    pub reason: Option<&'a str>,
+    pub from: &'a str,
+    pub to: &'a str,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,6 +100,40 @@ pub trait ApiReadStore: Send + Sync {
     fn check_readable(&self) -> rusqlite::Result<()>;
     fn list_node_health(&self, limit: u64) -> rusqlite::Result<Vec<NodeHealthRecord>>;
     fn get_node_health(&self, node_id: &str) -> rusqlite::Result<Option<NodeHealthRecord>>;
+    fn list_node_health_page(
+        &self,
+        limit: u64,
+        filters: &NodeListFilters<'_>,
+    ) -> rusqlite::Result<Vec<NodeHealthRecord>> {
+        let _ = (limit, filters);
+        Err(rusqlite::Error::InvalidQuery)
+    }
+    fn fleet_health_summary(&self) -> rusqlite::Result<[u64; 6]> {
+        Err(rusqlite::Error::InvalidQuery)
+    }
+    fn version_governance_inputs(
+        &self,
+        limit: u64,
+    ) -> rusqlite::Result<Vec<VersionGovernanceInput>> {
+        let _ = limit;
+        Err(rusqlite::Error::InvalidQuery)
+    }
+    fn list_health_history_page(
+        &self,
+        limit: u64,
+        filters: &HistoryPageFilters<'_>,
+    ) -> rusqlite::Result<Vec<HealthHistoryRecord>> {
+        let _ = (limit, filters);
+        Err(rusqlite::Error::InvalidQuery)
+    }
+    fn list_alert_page(
+        &self,
+        limit: u64,
+        filters: &AlertPageFilters<'_>,
+    ) -> rusqlite::Result<Vec<AlertEventRecord>> {
+        let _ = (limit, filters);
+        Err(rusqlite::Error::InvalidQuery)
+    }
     fn list_jobs(&self, limit: u64) -> rusqlite::Result<Vec<ObservabilityJobRecord>>;
     fn get_job(&self, job_id: &str) -> rusqlite::Result<Option<ObservabilityJobRecord>>;
     fn list_runs(
@@ -176,23 +244,186 @@ impl ReadOnlyStore {
              LIMIT ?1",
         )?;
         let rows = stmt.query_map([limit], node_health_from_row)?;
-        rows.collect()
+        let mut records = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        for record in &mut records {
+            attach_node_advisory(&conn, record)?;
+        }
+        Ok(records)
     }
 
     pub fn get_node_health(&self, node_id: &str) -> rusqlite::Result<Option<NodeHealthRecord>> {
         let conn = self.open_conn()?;
-        conn.query_row(
-            "SELECT n.node_id, n.endpoint_id, n.name, n.region, n.role, n.enabled,
+        let mut record = conn
+            .query_row(
+                "SELECT n.node_id, n.endpoint_id, n.name, n.region, n.role, n.enabled,
                     h.node_id, h.endpoint_id, h.computed_at, h.status, h.freshness_seconds,
                     h.last_success_at, h.last_failure_at, h.last_error_code,
                     h.degraded_methods_json, h.summary_json
              FROM nodes n
              LEFT JOIN health_snapshots h ON h.node_id = n.node_id
              WHERE n.node_id = ?1",
-            [node_id],
+                [node_id],
+                node_health_from_row,
+            )
+            .optional()?;
+        if let Some(record) = &mut record {
+            attach_node_advisory(&conn, record)?;
+        }
+        Ok(record)
+    }
+
+    pub fn list_node_health_page(
+        &self,
+        limit: u64,
+        filters: &NodeListFilters<'_>,
+    ) -> rusqlite::Result<Vec<NodeHealthRecord>> {
+        let limit = u64_to_i64(limit, "limit")?;
+        let conn = self.open_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT n.node_id, n.endpoint_id, n.name, n.region, n.role, n.enabled,
+                    h.node_id, h.endpoint_id, h.computed_at, h.status, h.freshness_seconds,
+                    h.last_success_at, h.last_failure_at, h.last_error_code,
+                    h.degraded_methods_json, h.summary_json
+             FROM nodes n
+             LEFT JOIN health_snapshots h ON h.node_id = n.node_id
+             LEFT JOIN node_metadata m ON m.node_id = n.node_id
+             WHERE (?1 IS NULL OR n.node_id > ?1)
+               AND (?2 IS NULL OR n.region = ?2)
+               AND (?3 IS NULL OR n.role = ?3)
+               AND (?4 IS NULL OR m.environment = ?4)
+               AND (?5 IS NULL OR EXISTS (
+                    SELECT 1 FROM json_each(m.labels_json) labels
+                    WHERE labels.key = ?5 AND labels.type = 'text' AND labels.value = ?6
+               ))
+               AND (?7 IS NULL OR CASE
+                    WHEN n.enabled = 0 THEN 'disabled'
+                    ELSE COALESCE(h.status, 'unknown')
+               END = ?7)
+             ORDER BY n.node_id ASC
+             LIMIT ?8",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                filters.after_node_id,
+                filters.region,
+                filters.role,
+                filters.environment,
+                filters.label_key,
+                filters.label_value,
+                filters.status,
+                limit,
+            ],
             node_health_from_row,
-        )
-        .optional()
+        )?;
+        let mut records = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        for record in &mut records {
+            attach_node_advisory(&conn, record)?;
+        }
+        Ok(records)
+    }
+
+    pub fn fleet_health_summary(&self) -> rusqlite::Result<[u64; 6]> {
+        let conn = self.open_conn()?;
+        let mut counts = [0_u64; 6];
+        let mut stmt = conn.prepare(
+            "SELECT CASE WHEN n.enabled = 0 THEN 'disabled' ELSE COALESCE(h.status, 'unknown') END AS effective_status,
+                    COUNT(*)
+             FROM nodes n LEFT JOIN health_snapshots h ON h.node_id = n.node_id
+             GROUP BY effective_status",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        for row in rows {
+            let (status, count) = row?;
+            let index = match status.as_str() {
+                "healthy" => 0,
+                "degraded" => 1,
+                "unreachable" => 2,
+                "stale" => 3,
+                "disabled" => 4,
+                _ => 5,
+            };
+            counts[index] = i64_to_u64(count, 1)?;
+        }
+        Ok(counts)
+    }
+
+    pub fn version_governance_inputs(
+        &self,
+        limit: u64,
+    ) -> rusqlite::Result<Vec<VersionGovernanceInput>> {
+        let limit = u64_to_i64(limit, "limit")?;
+        let conn = self.open_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT n.node_id, n.enabled, m.expected_agent_version,
+                    c.node_id, c.endpoint_id, c.observed_at, c.status, c.agent_version,
+                    c.protocol_min, c.protocol_max, c.ocserv_snapshot_min,
+                    c.ocserv_snapshot_max, c.controlled_writes_compiled,
+                    c.controlled_writes_locally_enabled
+             FROM nodes n
+             LEFT JOIN node_metadata m ON m.node_id = n.node_id
+             LEFT JOIN node_capability_snapshots c ON c.node_id = n.node_id
+             ORDER BY n.node_id
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit], version_governance_input_from_row)?;
+        rows.collect()
+    }
+
+    pub fn list_health_history_page(
+        &self,
+        limit: u64,
+        filters: &HistoryPageFilters<'_>,
+    ) -> rusqlite::Result<Vec<HealthHistoryRecord>> {
+        let limit = u64_to_i64(limit, "limit")?;
+        let conn = self.open_conn()?;
+        let (after_ts, after_node, after_eval) = filters
+            .after
+            .map_or((None, None, None), |(a, b, c)| (Some(a), Some(b), Some(c)));
+        let mut stmt=conn.prepare("SELECT evaluation_id,node_id,endpoint_id,computed_at,status,freshness_seconds,last_success_at,last_failure_at,last_error_code,degraded_methods_json,summary_json FROM health_history WHERE computed_at>=?1 AND computed_at<?2 AND (?3 IS NULL OR node_id=?3) AND (?4 IS NULL OR status=?4) AND (?5 IS NULL OR (computed_at,node_id,evaluation_id) < (?5,?6,?7)) ORDER BY computed_at DESC,node_id DESC,evaluation_id DESC LIMIT ?8")?;
+        stmt.query_map(
+            params![
+                filters.from,
+                filters.to,
+                filters.node_id,
+                filters.status,
+                after_ts,
+                after_node,
+                after_eval,
+                limit
+            ],
+            health_history_from_row_api,
+        )?
+        .collect()
+    }
+
+    pub fn list_alert_page(
+        &self,
+        limit: u64,
+        filters: &AlertPageFilters<'_>,
+    ) -> rusqlite::Result<Vec<AlertEventRecord>> {
+        let limit = u64_to_i64(limit, "limit")?;
+        let conn = self.open_conn()?;
+        let (after_ts, after_id) = filters
+            .after
+            .map_or((None, None), |(a, b)| (Some(a), Some(b)));
+        let mut stmt=conn.prepare("SELECT alert_id,dedupe_key,node_id,severity,state,reason_code,first_seen_at,last_seen_at,last_sent_at,resolved_at,detail_json FROM alert_events WHERE last_seen_at>=?1 AND last_seen_at<?2 AND (?3 IS NULL OR state=?3) AND (?4 IS NULL OR severity=?4) AND (?5 IS NULL OR node_id=?5) AND (?6 IS NULL OR reason_code=?6) AND (?7 IS NULL OR (last_seen_at,alert_id) < (?7,?8)) ORDER BY last_seen_at DESC,alert_id DESC LIMIT ?9")?;
+        stmt.query_map(
+            params![
+                filters.from,
+                filters.to,
+                filters.state,
+                filters.severity,
+                filters.node_id,
+                filters.reason,
+                after_ts,
+                after_id,
+                limit
+            ],
+            alert_event_from_row,
+        )?
+        .collect()
     }
 
     pub fn health_slo_node_ids(
@@ -544,6 +775,38 @@ impl ApiReadStore for ReadOnlyStore {
         Self::get_node_health(self, node_id)
     }
 
+    fn list_node_health_page(
+        &self,
+        limit: u64,
+        filters: &NodeListFilters<'_>,
+    ) -> rusqlite::Result<Vec<NodeHealthRecord>> {
+        Self::list_node_health_page(self, limit, filters)
+    }
+
+    fn fleet_health_summary(&self) -> rusqlite::Result<[u64; 6]> {
+        Self::fleet_health_summary(self)
+    }
+    fn version_governance_inputs(
+        &self,
+        limit: u64,
+    ) -> rusqlite::Result<Vec<VersionGovernanceInput>> {
+        Self::version_governance_inputs(self, limit)
+    }
+    fn list_health_history_page(
+        &self,
+        limit: u64,
+        filters: &HistoryPageFilters<'_>,
+    ) -> rusqlite::Result<Vec<HealthHistoryRecord>> {
+        Self::list_health_history_page(self, limit, filters)
+    }
+    fn list_alert_page(
+        &self,
+        limit: u64,
+        filters: &AlertPageFilters<'_>,
+    ) -> rusqlite::Result<Vec<AlertEventRecord>> {
+        Self::list_alert_page(self, limit, filters)
+    }
+
     fn list_jobs(&self, limit: u64) -> rusqlite::Result<Vec<ObservabilityJobRecord>> {
         Self::list_jobs(self, limit)
     }
@@ -694,7 +957,7 @@ fn open_read_only_connection(path: &Path) -> rusqlite::Result<Connection> {
     Ok(conn)
 }
 
-const REQUIRED_API_TABLES: [&str; 14] = [
+const REQUIRED_API_TABLES: [&str; 17] = [
     "schema_migrations",
     "nodes",
     "health_snapshots",
@@ -709,6 +972,9 @@ const REQUIRED_API_TABLES: [&str; 14] = [
     "probe_observations",
     "alert_events",
     "controller_audit_log",
+    "node_metadata",
+    "node_maintenance_windows",
+    "node_capability_snapshots",
 ];
 
 fn table_exists(conn: &Connection, table: &str) -> rusqlite::Result<bool> {
@@ -851,7 +1117,75 @@ fn node_health_from_row(row: &Row<'_>) -> rusqlite::Result<NodeHealthRecord> {
             })
         })
         .transpose()?;
-    Ok(NodeHealthRecord { node, snapshot })
+    Ok(NodeHealthRecord {
+        node,
+        snapshot,
+        metadata: None,
+        maintenance: None,
+    })
+}
+
+fn health_history_from_row_api(row: &Row<'_>) -> rusqlite::Result<HealthHistoryRecord> {
+    let freshness: Option<i64> = row.get(5)?;
+    let degraded_text: String = row.get(9)?;
+    let summary_text: String = row.get(10)?;
+    let degraded = parse_json_column(&degraded_text, 9)?;
+    HealthDegradedMethodsPayloadV1::from_value(&degraded).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(
+            9,
+            Type::Text,
+            Box::new(io::Error::new(io::ErrorKind::InvalidData, e)),
+        )
+    })?;
+    let summary = parse_json_column(&summary_text, 10)?;
+    let typed = HealthSummaryPayloadV1::from_value(&summary).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(
+            10,
+            Type::Text,
+            Box::new(io::Error::new(io::ErrorKind::InvalidData, e)),
+        )
+    })?;
+    let status: String = row.get(4)?;
+    validate_health_payload_relationship(&status, &typed).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(
+            10,
+            Type::Text,
+            Box::new(io::Error::new(io::ErrorKind::InvalidData, e)),
+        )
+    })?;
+    Ok(HealthHistoryRecord {
+        evaluation_id: row.get(0)?,
+        snapshot: HealthSnapshotRecord {
+            node_id: row.get(1)?,
+            endpoint_id: row.get(2)?,
+            computed_at: row.get(3)?,
+            status,
+            freshness_seconds: freshness.map(|v| i64_to_u64(v, 5)).transpose()?,
+            last_success_at: row.get(6)?,
+            last_failure_at: row.get(7)?,
+            last_error_code: row.get(8)?,
+            degraded_methods_json: degraded,
+            summary_json: summary,
+        },
+    })
+}
+
+fn attach_node_advisory(conn: &Connection, record: &mut NodeHealthRecord) -> rusqlite::Result<()> {
+    record.metadata = conn.query_row(
+        "SELECT environment, site, owner_team, service_tier, labels_json, expected_agent_version, updated_at FROM node_metadata WHERE node_id=?1",
+        [&record.node.node_id],
+        |row| {
+            let labels: String = row.get(4)?;
+            let labels: Value = serde_json::from_str(&labels).map_err(|error| rusqlite::Error::FromSqlConversionFailure(4, Type::Text, Box::new(error)))?;
+            Ok(serde_json::json!({"environment":row.get::<_,String>(0)?,"site":row.get::<_,String>(1)?,"owner_team":row.get::<_,String>(2)?,"service_tier":row.get::<_,String>(3)?,"labels":labels,"expected_agent_version":row.get::<_,Option<String>>(5)?,"updated_at":row.get::<_,String>(6)?}))
+        },
+    ).optional()?;
+    record.maintenance = conn.query_row(
+        "SELECT starts_at, ends_at, reason, updated_at FROM node_maintenance_windows WHERE node_id=?1",
+        [&record.node.node_id],
+        |row| Ok(serde_json::json!({"from":row.get::<_,String>(0)?,"to":row.get::<_,String>(1)?,"reason":row.get::<_,String>(2)?,"updated_at":row.get::<_,String>(3)?})),
+    ).optional()?;
+    Ok(())
 }
 
 fn observability_job_from_row(row: &Row<'_>) -> rusqlite::Result<ObservabilityJobRecord> {
@@ -1071,6 +1405,72 @@ fn audit_record_from_row(row: &Row<'_>) -> rusqlite::Result<AuditRecord> {
         duration_ms,
         detail_json: payload.public_detail(),
     })
+}
+
+fn version_governance_input_from_row(row: &Row<'_>) -> rusqlite::Result<VersionGovernanceInput> {
+    let capability = if row.get::<_, Option<String>>(3)?.is_some() {
+        let status: String = row.get(6)?;
+        let status = match status.as_str() {
+            "compatible" => CapabilityNegotiationStatus::Compatible,
+            "incompatible_protocol" => CapabilityNegotiationStatus::IncompatibleProtocol,
+            "unsupported_capability" => CapabilityNegotiationStatus::UnsupportedCapability,
+            "legacy_unsupported" => CapabilityNegotiationStatus::LegacyUnsupported,
+            "invalid_response" => CapabilityNegotiationStatus::InvalidResponse,
+            _ => return Err(invalid_data(6, "invalid capability negotiation status")),
+        };
+        let capability = CapabilitySnapshot {
+            node_id: row.get(3)?,
+            endpoint_id: row.get(4)?,
+            observed_at: row.get(5)?,
+            status,
+            agent_version: row.get(7)?,
+            protocol_min: optional_u32(row, 8)?,
+            protocol_max: optional_u32(row, 9)?,
+            ocserv_snapshot_min: optional_u32(row, 10)?,
+            ocserv_snapshot_max: optional_u32(row, 11)?,
+            controlled_writes_compiled: optional_bool(row, 12)?,
+            controlled_writes_locally_enabled: optional_bool(row, 13)?,
+        };
+        capability
+            .validate()
+            .map_err(|error| invalid_data(3, &error))?;
+        Some(capability)
+    } else {
+        None
+    };
+    Ok(VersionGovernanceInput {
+        node_id: row.get(0)?,
+        enabled: i64_to_bool(row.get(1)?, 1)?,
+        expected_agent_version: row.get(2)?,
+        capability,
+    })
+}
+
+fn optional_u32(row: &Row<'_>, column: usize) -> rusqlite::Result<Option<u32>> {
+    row.get::<_, Option<i64>>(column)?
+        .map(|value| {
+            u32::try_from(value).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(column, Type::Integer, Box::new(error))
+            })
+        })
+        .transpose()
+}
+
+fn optional_bool(row: &Row<'_>, column: usize) -> rusqlite::Result<Option<bool>> {
+    row.get::<_, Option<i64>>(column)?
+        .map(|value| i64_to_bool(value, column))
+        .transpose()
+}
+
+fn invalid_data(column: usize, message: &str) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        column,
+        Type::Text,
+        Box::new(io::Error::new(
+            io::ErrorKind::InvalidData,
+            message.to_string(),
+        )),
+    )
 }
 
 fn parse_json_column(value: &str, column: usize) -> rusqlite::Result<Value> {

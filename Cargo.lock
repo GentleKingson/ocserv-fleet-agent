@@ -2380,6 +2380,8 @@ dependencies = [
  "ocfleet-cli",
  "ocfleet-config",
  "ocfleet-protocol",
+ "ocfleet-snapshot-schema",
+ "ring",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -2434,6 +2436,7 @@ dependencies = [
  "reqwest 0.12.28",
  "ring",
  "rusqlite",
+ "semver",
  "serde",
  "serde_json",
  "serde_yaml_ng",
@@ -2468,6 +2471,21 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "thiserror 2.0.18",
+ "time",
+ "uuid",
+]
+
+[[package]]
+name = "ocfleet-snapshot-schema"
+version = "0.3.0"
+dependencies = [
+ "clap",
+ "libc",
+ "ocfleet-protocol",
+ "serde",
+ "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "time",
  "uuid",

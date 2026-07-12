@@ -185,6 +185,18 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         description: "Rebuild derived health rollups with one status sample per five-minute slot.",
         apply: apply_0025_health_rollup_slot_semantics,
     },
+    Migration {
+        version: 26,
+        name: "0026_node_metadata",
+        description: "Add bounded node metadata, labels, and per-node maintenance windows.",
+        apply: apply_0026_node_metadata,
+    },
+    Migration {
+        version: 27,
+        name: "0027_node_capability_snapshots",
+        description: "Add bounded latest capability observations for read-only version governance.",
+        apply: apply_0027_node_capability_snapshots,
+    },
 ];
 
 pub(crate) fn migrate_to_current(
@@ -1675,6 +1687,64 @@ CREATE INDEX idx_health_rollups_window
   ON health_rollups(bucket_seconds, bucket_start, node_id);
 CREATE INDEX idx_health_rollups_node_window
   ON health_rollups(node_id, bucket_seconds, bucket_start);
+"#,
+    )?;
+    Ok(())
+}
+
+fn apply_0026_node_metadata(tx: &Transaction<'_>) -> Result<(), StoreError> {
+    tx.execute_batch(
+        r#"
+CREATE TABLE node_metadata (
+  node_id TEXT PRIMARY KEY REFERENCES nodes(node_id) ON DELETE CASCADE,
+  environment TEXT NOT NULL CHECK (length(environment) BETWEEN 1 AND 64),
+  site TEXT NOT NULL CHECK (length(site) BETWEEN 1 AND 64),
+  owner_team TEXT NOT NULL CHECK (length(owner_team) BETWEEN 1 AND 64),
+  service_tier TEXT NOT NULL CHECK (length(service_tier) BETWEEN 1 AND 64),
+  expected_agent_version TEXT CHECK (expected_agent_version IS NULL OR length(expected_agent_version) BETWEEN 1 AND 64),
+  labels_json TEXT NOT NULL CHECK (json_valid(labels_json) AND json_type(labels_json) = 'object' AND length(labels_json) <= 8192),
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX idx_node_metadata_environment ON node_metadata(environment, node_id);
+CREATE INDEX idx_node_metadata_site ON node_metadata(site, node_id);
+CREATE INDEX idx_node_metadata_owner ON node_metadata(owner_team, node_id);
+CREATE INDEX idx_node_metadata_tier ON node_metadata(service_tier, node_id);
+
+CREATE TABLE node_maintenance_windows (
+  node_id TEXT PRIMARY KEY REFERENCES nodes(node_id) ON DELETE CASCADE,
+  starts_at TEXT NOT NULL,
+  ends_at TEXT NOT NULL,
+  reason TEXT NOT NULL CHECK (length(reason) BETWEEN 1 AND 256),
+  updated_at TEXT NOT NULL,
+  CHECK (ends_at > starts_at)
+);
+CREATE INDEX idx_node_maintenance_active ON node_maintenance_windows(starts_at, ends_at, node_id);
+"#,
+    )?;
+    Ok(())
+}
+
+fn apply_0027_node_capability_snapshots(tx: &Transaction<'_>) -> Result<(), StoreError> {
+    tx.execute_batch(
+        r#"
+CREATE TABLE node_capability_snapshots (
+  node_id TEXT PRIMARY KEY REFERENCES nodes(node_id) ON DELETE CASCADE,
+  endpoint_id TEXT NOT NULL CHECK (length(endpoint_id) BETWEEN 1 AND 128),
+  observed_at TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('compatible', 'incompatible_protocol', 'unsupported_capability', 'legacy_unsupported', 'invalid_response')),
+  agent_version TEXT CHECK (agent_version IS NULL OR length(agent_version) BETWEEN 1 AND 64),
+  protocol_min INTEGER CHECK (protocol_min IS NULL OR protocol_min BETWEEN 1 AND 65535),
+  protocol_max INTEGER CHECK (protocol_max IS NULL OR protocol_max BETWEEN 1 AND 65535),
+  ocserv_snapshot_min INTEGER CHECK (ocserv_snapshot_min IS NULL OR ocserv_snapshot_min BETWEEN 1 AND 65535),
+  ocserv_snapshot_max INTEGER CHECK (ocserv_snapshot_max IS NULL OR ocserv_snapshot_max BETWEEN 1 AND 65535),
+  controlled_writes_compiled INTEGER CHECK (controlled_writes_compiled IS NULL OR controlled_writes_compiled IN (0, 1)),
+  controlled_writes_locally_enabled INTEGER CHECK (controlled_writes_locally_enabled IS NULL OR controlled_writes_locally_enabled IN (0, 1)),
+  CHECK (protocol_min IS NULL OR protocol_max IS NULL OR protocol_min <= protocol_max),
+  CHECK (ocserv_snapshot_min IS NULL OR ocserv_snapshot_max IS NULL OR ocserv_snapshot_min <= ocserv_snapshot_max),
+  CHECK (controlled_writes_locally_enabled IS NULL OR controlled_writes_locally_enabled = 0 OR controlled_writes_compiled = 1)
+);
+CREATE INDEX idx_node_capability_snapshots_observed
+  ON node_capability_snapshots(observed_at, node_id);
 "#,
     )?;
     Ok(())

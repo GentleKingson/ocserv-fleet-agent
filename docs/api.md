@@ -9,6 +9,10 @@ The machine-readable contract lives at `docs/api/openapi.yaml`. It uses OpenAPI
 3.1.1, declares only `GET` operations, and defines the bounded projection for
 each stored record type.
 
+`/api/v1` is the stable read-only compatibility namespace introduced in B3.
+The unversioned Phase 12 routes remain available through the v0.4 compatibility
+window and are not aliases for write or RPC-trigger behavior.
+
 ## Start
 
 ```bash
@@ -137,6 +141,13 @@ Errors:
 | `GET /alerts?state=&severity=&node_id=&limit=` | bounded alert rows |
 | `GET /alerts/{dedupe_key_or_alert_id}` | one alert row |
 | `GET /audit/export?from=&to=&redact=&max_rows=` | bounded audit window |
+| `GET /api/v1/fleet/summary` | exact fleet status distribution with ETag |
+| `GET /api/v1/version/readiness` | bounded version distribution, compatibility, readiness, and derived read-only alerts with ETag |
+| `GET /api/v1/nodes?limit=&cursor=&region=&role=&environment=&label=&status=` | signed keyset-paginated node health and metadata |
+| `GET /api/v1/nodes/{node_id}` | conditional single-node health and metadata |
+| `GET /api/v1/health/history?from=&to=&limit=&cursor=&node_id=&status=` | signed keyset-paginated health history |
+| `GET /api/v1/alerts?from=&to=&limit=&cursor=&state=&severity=&node_id=&reason=` | signed keyset-paginated alert history |
+| `GET /api/v1/alerts/{dedupe_key_or_alert_id}` | conditional single-alert projection |
 
 `limit` and `max_rows` default to `50` and may not exceed `--max-limit`.
 `--max-limit` itself must be from `1` through `10000`. Unknown query keys,

@@ -983,17 +983,24 @@ fn build_health_rollup(
                 cert_warning_count += 1;
             }
         }
-        if observation.method == OCSERV_CONFIG_FINGERPRINT
-            && let Some(fingerprint) = summary
-                .get("config_fingerprint_prefix")
-                .and_then(Value::as_str)
-        {
-            fingerprints.push(fingerprint.to_string());
+        if observation.method == OCSERV_CONFIG_FINGERPRINT {
+            let aliases = [
+                summary.get("config_fingerprint_prefix"),
+                summary.get("config_fingerprint_previous_prefix"),
+            ]
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+            if !aliases.is_empty() {
+                fingerprints.push(aliases);
+            }
         }
     }
     let fingerprint_change_count = fingerprints
         .windows(2)
-        .filter(|pair| pair[0] != pair[1])
+        .filter(|pair| !pair[0].iter().any(|value| pair[1].contains(value)))
         .count();
     let watermark = blake3::hash(&serde_json::to_vec(&json!({
         "history": source.history.iter().map(|record| json!({
@@ -1599,7 +1606,7 @@ mod tests {
                     Some(true),
                     None,
                     "2026-07-11T01:04:20Z",
-                    json!({"config_fingerprint_prefix": "bbbbbbbbbbbb"}),
+                    json!({"config_fingerprint_prefix": "bbbbbbbbbbbb", "config_fingerprint_previous_prefix": "aaaaaaaaaaaa"}),
                 ),
             ],
         };
@@ -1632,7 +1639,10 @@ mod tests {
         assert_eq!(first.duration_p95_ms, Some(100));
         assert_eq!(first.cert_critical_count, 1);
         assert_eq!(first.fingerprint_sample_count, 2);
-        assert_eq!(first.fingerprint_change_count, 1);
+        assert_eq!(
+            first.fingerprint_change_count, 0,
+            "dual-report rotation preserves continuity"
+        );
     }
 
     #[test]

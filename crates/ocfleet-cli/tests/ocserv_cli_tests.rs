@@ -48,7 +48,9 @@ fn formats_ocserv_status_human_output_as_low_sensitive_summary() {
         &OcservConfigFingerprintResponse {
             fingerprint: OcservConfigFingerprint {
                 algorithm: "sha256".to_string(),
+                key_id: None,
                 hash: Some("a".repeat(64)),
+                previous: None,
                 status: OcservFieldStatus::Available,
             },
             meta: meta(),
@@ -95,7 +97,9 @@ fn formats_unavailable_ocserv_status_fields_without_paths_or_raw_output() {
         &OcservConfigFingerprintResponse {
             fingerprint: OcservConfigFingerprint {
                 algorithm: "sha256".to_string(),
+                key_id: None,
                 hash: None,
+                previous: None,
                 status: OcservFieldStatus::Unavailable,
             },
             meta: meta(),
@@ -137,7 +141,9 @@ fn human_status_output_shortens_config_fingerprint() {
         &OcservConfigFingerprintResponse {
             fingerprint: OcservConfigFingerprint {
                 algorithm: "sha256".to_string(),
+                key_id: None,
                 hash: Some("c".repeat(64)),
+                previous: None,
                 status: OcservFieldStatus::Available,
             },
             meta: meta(),
@@ -164,7 +170,10 @@ fn json_status_output_shortens_config_fingerprint() {
         sessions_total: Some(12),
         sessions_status: OcservFieldStatus::Available,
         config_algorithm: Some("sha256".to_string()),
+        config_key_id: None,
         config_hash: Some(hash.clone()),
+        config_previous_key_id: None,
+        config_previous_hash: None,
         config_status: OcservFieldStatus::Available,
         live: None,
         degraded_methods: Vec::new(),
@@ -174,6 +183,42 @@ fn json_status_output_shortens_config_fingerprint() {
     assert!(output.contains("\"config_fingerprint_prefix\": \"dddddddddddd\""));
     assert!(!output.contains(&hash));
     assert_low_sensitive_ocserv_output(&output).expect("json status is low-sensitive");
+}
+
+#[test]
+fn hmac_status_output_exposes_only_key_ids_and_short_rotation_digests() {
+    let current_hash = "a".repeat(64);
+    let previous_hash = "b".repeat(64);
+    let view = OcservStatusView {
+        node_id: "hk-ocserv-01".to_string(),
+        service: None,
+        version: None,
+        version_status: OcservFieldStatus::Unavailable,
+        sessions_total: None,
+        sessions_status: OcservFieldStatus::Unavailable,
+        config_algorithm: Some("hmac-sha256".to_string()),
+        config_key_id: Some("key-2026-07".to_string()),
+        config_hash: Some(current_hash.clone()),
+        config_previous_key_id: Some("key-2026-06".to_string()),
+        config_previous_hash: Some(previous_hash.clone()),
+        config_status: OcservFieldStatus::Available,
+        live: None,
+        degraded_methods: Vec::new(),
+    };
+
+    let human = format_status_view_human(&view).expect("format HMAC human status");
+    let json = format_status_json(&view).expect("format HMAC JSON status");
+
+    for output in [&human, &json] {
+        assert!(output.contains("key-2026-07"));
+        assert!(output.contains("key-2026-06"));
+        assert!(output.contains("aaaaaaaaaaaa"));
+        assert!(output.contains("bbbbbbbbbbbb"));
+        assert!(!output.contains(&current_hash));
+        assert!(!output.contains(&previous_hash));
+        assert_low_sensitive_ocserv_output(output).expect("HMAC output is low-sensitive");
+    }
+    assert!(human.contains("config_fingerprint_hmac_sha256=aaaaaaaaaaaa..."));
 }
 
 #[test]
@@ -190,7 +235,10 @@ fn json_status_output_includes_live_readonly_metadata() {
         sessions_total: Some(12),
         sessions_status: OcservFieldStatus::Available,
         config_algorithm: Some("sha256".to_string()),
+        config_key_id: None,
         config_hash: None,
+        config_previous_key_id: None,
+        config_previous_hash: None,
         config_status: OcservFieldStatus::Unavailable,
         live: Some(OcservLiveReadonlyMetadata {
             collector_status: OcservCollectorStatus::Ok,
@@ -226,7 +274,10 @@ fn formats_status_degraded_without_raw_errors() {
         sessions_total: Some(12),
         sessions_status: OcservFieldStatus::Available,
         config_algorithm: Some("sha256".to_string()),
+        config_key_id: None,
         config_hash: None,
+        config_previous_key_id: None,
+        config_previous_hash: None,
         config_status: OcservFieldStatus::Unavailable,
         live: None,
         degraded_methods: vec!["ocserv.version", "ocserv.config.fingerprint"],

@@ -344,6 +344,7 @@ Evaluator and interactive health writers atomically commit latest projection,
 history, durable evaluation state where applicable, and audit; exact replay
 does not duplicate history. Bounded half-open CLI queries and independent
 history retention are the foundation for subsequent rollups and API views.
+The B1 history foundation is published in pull request `#109`.
 
 The A8 completion audit records the successful tag-bound matrix, publication
 of 38 `v0.3.0` assets, and independent checksum, Sigstore, SBOM, and provenance

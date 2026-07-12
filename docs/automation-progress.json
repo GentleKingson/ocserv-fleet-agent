@@ -4,7 +4,7 @@
   "completed_phases": ["A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8", "A-READY"],
   "active_branch": "codex/b1-health-history-foundation",
   "active_issue": 41,
-  "active_pr": null,
+  "active_pr": 109,
   "last_test_result": "passed",
   "last_updated_at": "2026-07-12T09:00:00Z",
   "blockers": [],

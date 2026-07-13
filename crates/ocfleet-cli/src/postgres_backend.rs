@@ -17,7 +17,7 @@ use r2d2::{Pool, PooledConnection};
 use r2d2_postgres::PostgresConnectionManager;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use tempfile::NamedTempFile;
+use tempfile::{NamedTempFile, TempDir};
 
 use crate::audit::AuditEvent;
 use crate::backend::{
@@ -676,9 +676,8 @@ fn sha256(bytes: &[u8]) -> String {
 }
 
 fn empty_sqlite_image() -> Result<Vec<u8>, PostgresError> {
-    let temp = NamedTempFile::new()?;
-    let path = temp.path().to_path_buf();
-    drop(temp);
+    let directory = private_tempdir()?;
+    let path = directory.path().join("state.sqlite3");
     let store = Store::open(&path)?;
     drop(store);
     Ok(std::fs::read(path)?)
@@ -725,8 +724,50 @@ fn check_state_size(conn: &mut postgres::Client) -> Result<u64, PostgresError> {
     Ok(size as u64)
 }
 
-fn materialize(image: &[u8]) -> Result<(NamedTempFile, Store), PostgresError> {
-    let mut temp = NamedTempFile::new()?;
+struct PrivateTempFile {
+    _directory: TempDir,
+    file: NamedTempFile,
+}
+
+impl PrivateTempFile {
+    fn new() -> Result<Self, std::io::Error> {
+        let directory = private_tempdir()?;
+        let file = NamedTempFile::new_in(directory.path())?;
+        Ok(Self {
+            _directory: directory,
+            file,
+        })
+    }
+
+    fn path(&self) -> &Path {
+        self.file.path()
+    }
+}
+
+impl Write for PrivateTempFile {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.file.write(buffer)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
+fn private_tempdir() -> Result<TempDir, std::io::Error> {
+    let directory = tempfile::Builder::new()
+        .prefix("ocfleet-postgres-state-")
+        .tempdir()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(directory)
+}
+
+fn materialize(image: &[u8]) -> Result<(PrivateTempFile, Store), PostgresError> {
+    let mut temp = PrivateTempFile::new()?;
     temp.write_all(image)?;
     temp.flush()?;
     let store = Store::open(temp.path())?;

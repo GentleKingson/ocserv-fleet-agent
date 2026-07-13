@@ -179,10 +179,12 @@ Responses must not contain raw stdout/stderr, raw occtl/systemctl/journalctl
 output, raw config, raw certificate material, username, client IP, session ID, or
 secret values.
 
-## SQLite Schema Draft
+## SQLite State Schema
 
-No migration is implemented in this phase. A future migration should be additive
-or a safe rebuild with the existing backup and integrity-check rules.
+Schema migration `0026_controlled_write_state` implements the additive D0
+tables. The default build cannot access the state-machine module and the agent
+still has no write dispatch. The abbreviated schema below documents the core
+relationships; the migration is authoritative for constraints and indexes.
 
 ```sql
 CREATE TABLE change_requests (

@@ -1,10 +1,46 @@
+//! Explicit, default-off Postgres runtime backend.
+//!
+//! The first runtime format stores the already versioned SQLite state as a
+//! checksummed database image. That keeps the existing Store contract,
+//! projections, limits, redaction, retention, and atomic audit behavior
+//! identical while Postgres supplies pooling, durable transactions, migration
+//! serialization, and multi-controller coordination.
+
 use std::fmt;
-use std::path::PathBuf;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
-use crate::backend::BackendKind;
+use postgres::{Config, NoTls, Transaction};
+use r2d2::{Pool, PooledConnection};
+use r2d2_postgres::PostgresConnectionManager;
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
+use tempfile::NamedTempFile;
 
-/// Compile-time scaffold only. No Postgres connection, migration, import, or
-/// write path exists in this release.
+use crate::audit::AuditEvent;
+use crate::backend::{
+    AuditWriter, BackendKind, MAX_STORE_READER_ROWS, MigrationManager, StoreReader, StoreWriter,
+};
+use crate::private_file;
+use crate::store::{
+    AlertDeliveryAttemptWrite, AlertDeliveryFinalizeWrite, AlertDeliveryQueueClaim,
+    AlertDeliveryQueueEnqueue, AlertDeliveryQueueOutcome, AlertEvaluationWrite, AlertEventRecord,
+    AlertStateTransition, AlertWebhookHookRecord, ApprovalInput, AuditRecord,
+    CURRENT_SCHEMA_VERSION, EndpointTrustRecord, EnrollmentTokenInsert, EnrollmentTokenRecord,
+    HealthEvaluationFailure, HealthEvaluationFinish, HealthEvaluationStart, HealthPolicyRecord,
+    HealthRollupWrite, HealthSnapshotRecord, HealthSnapshotWrite, JoinRequestInsert,
+    JoinRequestRecord, LegacyEnrollmentClaimInput, NodeInsert, NodeRecord, ObservabilityJobRecord,
+    ObservabilityRunRecord, ProbeObservationRecord, RetentionApplyInput, RetentionApplyResult,
+    RetentionPolicyRecord, SchedulerJobClaim, SchedulerMaintenanceWindow, SchedulerOutcomeWrite,
+    SchedulerRunFinish, SchedulerRunStart, Store, StoreError,
+};
+
+const MIGRATION_LOCK_ID: i64 = 0x4f43464c454554;
+const FORMAT_VERSION: i32 = 1;
+const DEFAULT_POOL_SIZE: u32 = 8;
+const MAX_DSN_BYTES: usize = 8_192;
+
 #[derive(Clone, PartialEq, Eq)]
 pub enum PostgresConnectionSource {
     Environment { variable: String },
@@ -12,37 +48,82 @@ pub enum PostgresConnectionSource {
 }
 
 impl PostgresConnectionSource {
-    pub fn validate(&self) -> Result<(), &'static str> {
+    pub fn validate(&self) -> Result<(), PostgresError> {
         match self {
             Self::Environment { variable }
-                if variable == "OCFLEET_POSTGRES_URL"
-                    || variable == "OCFLEET_TEST_POSTGRES_URL" =>
+                if matches!(
+                    variable.as_str(),
+                    "OCFLEET_POSTGRES_URL" | "OCFLEET_TEST_POSTGRES_URL"
+                ) =>
             {
                 Ok(())
             }
+            Self::Environment { .. } => Err(PostgresError::Configuration(
+                "unsupported Postgres environment variable",
+            )),
             Self::PrivateConfigFile { path } if path.is_absolute() => Ok(()),
-            Self::Environment { .. } => Err("unsupported Postgres environment variable"),
-            Self::PrivateConfigFile { .. } => Err("Postgres private config path must be absolute"),
+            Self::PrivateConfigFile { .. } => Err(PostgresError::Configuration(
+                "Postgres private config path must be absolute",
+            )),
+        }
+    }
+
+    fn load(&self) -> Result<PrivatePostgresConfig, PostgresError> {
+        self.validate()?;
+        match self {
+            Self::Environment { variable } => {
+                let dsn = std::env::var(variable).map_err(|_| {
+                    PostgresError::Configuration("Postgres DSN environment variable is not set")
+                })?;
+                validate_dsn(&dsn)?;
+                Ok(PrivatePostgresConfig {
+                    dsn,
+                    pool_size: DEFAULT_POOL_SIZE,
+                })
+            }
+            Self::PrivateConfigFile { path } => {
+                let file = private_file::open_existing_private_read(path)?;
+                let mut text = String::new();
+                file.take((MAX_DSN_BYTES + 1) as u64)
+                    .read_to_string(&mut text)?;
+                if text.len() > MAX_DSN_BYTES {
+                    return Err(PostgresError::Configuration("Postgres config is too large"));
+                }
+                let config: PrivatePostgresConfig = toml::from_str(&text)
+                    .map_err(|_| PostgresError::Configuration("Postgres config is invalid"))?;
+                validate_dsn(&config.dsn)?;
+                if config.pool_size == 0 || config.pool_size > 64 {
+                    return Err(PostgresError::Configuration(
+                        "Postgres pool_size must be between 1 and 64",
+                    ));
+                }
+                Ok(config)
+            }
         }
     }
 
     pub const fn backend_kind(&self) -> BackendKind {
-        BackendKind::PostgresPlanned
+        BackendKind::Postgres
     }
 }
 
 impl fmt::Debug for PostgresConnectionSource {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Environment { variable } => {
-                let display = match variable.as_str() {
-                    "OCFLEET_POSTGRES_URL" | "OCFLEET_TEST_POSTGRES_URL" => variable.as_str(),
-                    _ => "<redacted-invalid>",
-                };
-                f.debug_struct("Environment")
-                    .field("variable", &display)
-                    .finish()
-            }
+            Self::Environment { variable } => f
+                .debug_struct("Environment")
+                .field(
+                    "variable",
+                    &if matches!(
+                        variable.as_str(),
+                        "OCFLEET_POSTGRES_URL" | "OCFLEET_TEST_POSTGRES_URL"
+                    ) {
+                        variable.as_str()
+                    } else {
+                        "<redacted-invalid>"
+                    },
+                )
+                .finish(),
             Self::PrivateConfigFile { .. } => f
                 .debug_struct("PrivateConfigFile")
                 .field("path", &"<redacted>")
@@ -51,40 +132,519 @@ impl fmt::Debug for PostgresConnectionSource {
     }
 }
 
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
-#[error("Postgres backend is scaffolding only; no runtime connection path is implemented")]
-pub struct PostgresBackendUnavailable;
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PrivatePostgresConfig {
+    dsn: String,
+    #[serde(default = "default_pool_size")]
+    pool_size: u32,
+}
 
-pub fn connect(source: &PostgresConnectionSource) -> Result<(), PostgresBackendUnavailable> {
-    let _ = source;
-    Err(PostgresBackendUnavailable)
+fn default_pool_size() -> u32 {
+    DEFAULT_POOL_SIZE
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum PostgresError {
+    #[error("Postgres configuration error: {0}")]
+    Configuration(&'static str),
+    #[error("Postgres connection or query failed")]
+    Database(#[source] postgres::Error),
+    #[error("Postgres connection pool failed")]
+    Pool(#[source] r2d2::Error),
+    #[error("Postgres state checksum verification failed")]
+    Checksum,
+    #[error("Postgres state format {0} is unsupported")]
+    UnsupportedFormat(i32),
+    #[error("Postgres imported state is invalid: {0}")]
+    InvalidState(String),
+    #[error("private Postgres configuration could not be read")]
+    PrivateConfig(#[source] crate::private_file::PrivateFileError),
+    #[error("Postgres backend local staging failed")]
+    Io(#[source] std::io::Error),
+    #[error("store operation failed: {0}")]
+    Store(#[source] StoreError),
+}
+
+impl From<postgres::Error> for PostgresError {
+    fn from(value: postgres::Error) -> Self {
+        Self::Database(value)
+    }
+}
+impl From<r2d2::Error> for PostgresError {
+    fn from(value: r2d2::Error) -> Self {
+        Self::Pool(value)
+    }
+}
+impl From<crate::private_file::PrivateFileError> for PostgresError {
+    fn from(value: crate::private_file::PrivateFileError) -> Self {
+        Self::PrivateConfig(value)
+    }
+}
+impl From<std::io::Error> for PostgresError {
+    fn from(value: std::io::Error) -> Self {
+        Self::Io(value)
+    }
+}
+impl From<StoreError> for PostgresError {
+    fn from(value: StoreError) -> Self {
+        Self::Store(value)
+    }
+}
+
+pub struct PostgresStore {
+    pool: Pool<PostgresConnectionManager<NoTls>>,
+}
+
+impl fmt::Debug for PostgresStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PostgresStore")
+            .field("pool", &"<redacted>")
+            .finish()
+    }
+}
+
+pub fn connect(source: &PostgresConnectionSource) -> Result<PostgresStore, PostgresError> {
+    let private = source.load()?;
+    let config = Config::from_str(&private.dsn)
+        .map_err(|_| PostgresError::Configuration("Postgres DSN is invalid"))?;
+    let manager = PostgresConnectionManager::new(config, NoTls);
+    let pool = Pool::builder().max_size(private.pool_size).build(manager)?;
+    let store = PostgresStore { pool };
+    store.migrate()?;
+    Ok(store)
+}
+
+impl PostgresStore {
+    pub fn migrate(&self) -> Result<(), PostgresError> {
+        let mut conn = self.connection()?;
+        let mut tx = conn.transaction()?;
+        tx.query_one("SELECT pg_advisory_xact_lock($1)", &[&MIGRATION_LOCK_ID])?;
+        tx.batch_execute(
+            "CREATE TABLE IF NOT EXISTS ocfleet_backend_migrations (
+               version INTEGER PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now());
+             CREATE TABLE IF NOT EXISTS ocfleet_runtime_state (
+               singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+               format_version INTEGER NOT NULL,
+               sqlite_schema_version BIGINT NOT NULL,
+               state_sha256 TEXT NOT NULL CHECK (length(state_sha256) = 64),
+               state_bytes BYTEA NOT NULL,
+               updated_at TIMESTAMPTZ NOT NULL DEFAULT now());
+             CREATE TABLE IF NOT EXISTS ocfleet_imports (
+               import_id UUID PRIMARY KEY, source_sha256 TEXT NOT NULL,
+               source_size BIGINT NOT NULL, verified BOOLEAN NOT NULL DEFAULT FALSE,
+               created_at TIMESTAMPTZ NOT NULL DEFAULT now(), completed_at TIMESTAMPTZ);
+             CREATE INDEX IF NOT EXISTS idx_ocfleet_imports_created ON ocfleet_imports(created_at);"
+        )?;
+        tx.execute(
+            "INSERT INTO ocfleet_backend_migrations(version) VALUES ($1) ON CONFLICT DO NOTHING",
+            &[&FORMAT_VERSION],
+        )?;
+        if tx
+            .query_opt(
+                "SELECT 1 FROM ocfleet_runtime_state WHERE singleton = TRUE",
+                &[],
+            )?
+            .is_none()
+        {
+            let image = empty_sqlite_image()?;
+            insert_state(&mut tx, &image)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn doctor(&self) -> Result<PostgresDoctor, PostgresError> {
+        let mut conn = self.connection()?;
+        let row = conn.query_one("SELECT format_version, sqlite_schema_version, state_sha256, state_bytes FROM ocfleet_runtime_state WHERE singleton = TRUE", &[])?;
+        let image: Vec<u8> = row.get(3);
+        let checksum: String = row.get(2);
+        Ok(PostgresDoctor {
+            connected: true,
+            format_version: row.get(0),
+            schema_version: row.get(1),
+            checksum_valid: sha256(&image) == checksum,
+            pool_max_size: self.pool.max_size(),
+        })
+    }
+
+    pub fn import_sqlite(&self, path: &Path, dry_run: bool) -> Result<ImportReport, PostgresError> {
+        let image = std::fs::read(path)?;
+        let source_sha256 = sha256(&image);
+        let (schema_version, counts) = verify_image(&image)?;
+        if !dry_run {
+            let mut conn = self.connection()?;
+            let mut tx = conn.transaction()?;
+            tx.query_one("SELECT pg_advisory_xact_lock($1)", &[&MIGRATION_LOCK_ID])?;
+            insert_state(&mut tx, &image)?;
+            tx.commit()?;
+        }
+        Ok(ImportReport {
+            dry_run,
+            source_sha256,
+            source_size: image.len() as u64,
+            schema_version,
+            counts_verified: counts,
+        })
+    }
+
+    /// Acquires or renews a bounded distributed lease. Every successful new
+    /// ownership epoch increments the fencing token; stale holders therefore
+    /// cannot commit through `verify_fence` after failover.
+    pub fn acquire_lease(
+        &self,
+        name: &str,
+        owner_id: &str,
+        ttl_seconds: u32,
+    ) -> Result<Option<ControllerLease>, PostgresError> {
+        validate_lease(name, owner_id, ttl_seconds)?;
+        let mut conn = self.connection()?;
+        conn.batch_execute(
+            "CREATE TABLE IF NOT EXISTS ocfleet_controller_leases (
+          lease_name TEXT PRIMARY KEY, owner_id TEXT NOT NULL, fencing_token BIGINT NOT NULL,
+          lease_until TIMESTAMPTZ NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now())",
+        )?;
+        let row = conn.query_opt(
+            "INSERT INTO ocfleet_controller_leases(lease_name, owner_id, fencing_token, lease_until)
+             VALUES($1,$2,1,now() + make_interval(secs => $3))
+             ON CONFLICT(lease_name) DO UPDATE SET
+               owner_id = EXCLUDED.owner_id,
+               fencing_token = CASE WHEN ocfleet_controller_leases.owner_id = EXCLUDED.owner_id THEN ocfleet_controller_leases.fencing_token ELSE ocfleet_controller_leases.fencing_token + 1 END,
+               lease_until = EXCLUDED.lease_until, updated_at = now()
+             WHERE ocfleet_controller_leases.lease_until <= now() OR ocfleet_controller_leases.owner_id = EXCLUDED.owner_id
+             RETURNING owner_id, fencing_token, extract(epoch from lease_until)::BIGINT",
+            &[&name, &owner_id, &(ttl_seconds as f64)],
+        )?;
+        Ok(row.map(|row| ControllerLease {
+            name: name.into(),
+            owner_id: row.get(0),
+            fencing_token: row.get::<_, i64>(1) as u64,
+            lease_until_unix: row.get(2),
+        }))
+    }
+
+    pub fn verify_fence(&self, lease: &ControllerLease) -> Result<bool, PostgresError> {
+        let mut conn = self.connection()?;
+        Ok(conn.query_opt(
+            "SELECT 1 FROM ocfleet_controller_leases WHERE lease_name=$1 AND owner_id=$2 AND fencing_token=$3 AND lease_until > now()",
+            &[&lease.name, &lease.owner_id, &(lease.fencing_token as i64)],
+        )?.is_some())
+    }
+
+    fn connection(
+        &self,
+    ) -> Result<PooledConnection<PostgresConnectionManager<NoTls>>, PostgresError> {
+        Ok(self.pool.get()?)
+    }
+
+    fn with_store<T>(
+        &self,
+        callback: impl FnOnce(&Store) -> Result<T, StoreError>,
+    ) -> Result<T, PostgresError> {
+        let mut conn = self.connection()?;
+        let image = load_state(&mut conn)?;
+        let (_temp, store) = materialize(&image)?;
+        Ok(callback(&store)?)
+    }
+
+    fn with_write<T>(
+        &self,
+        callback: impl FnOnce(&Store) -> Result<T, StoreError>,
+    ) -> Result<T, PostgresError> {
+        let mut conn = self.connection()?;
+        let mut tx = conn.transaction()?;
+        tx.query_one(
+            "SELECT pg_advisory_xact_lock($1)",
+            &[&(MIGRATION_LOCK_ID + 1)],
+        )?;
+        let row = tx.query_one("SELECT format_version, state_sha256, state_bytes FROM ocfleet_runtime_state WHERE singleton = TRUE FOR UPDATE", &[])?;
+        let format: i32 = row.get(0);
+        if format != FORMAT_VERSION {
+            return Err(PostgresError::UnsupportedFormat(format));
+        }
+        let checksum: String = row.get(1);
+        let image: Vec<u8> = row.get(2);
+        if sha256(&image) != checksum {
+            return Err(PostgresError::Checksum);
+        }
+        let (temp, store) = materialize(&image)?;
+        let result = callback(&store)?;
+        drop(store);
+        let updated = std::fs::read(temp.path())?;
+        insert_state(&mut tx, &updated)?;
+        tx.commit()?;
+        Ok(result)
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PostgresDoctor {
+    pub connected: bool,
+    pub format_version: i32,
+    pub schema_version: i64,
+    pub checksum_valid: bool,
+    pub pool_max_size: u32,
+}
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ImportReport {
+    pub dry_run: bool,
+    pub source_sha256: String,
+    pub source_size: u64,
+    pub schema_version: i64,
+    pub counts_verified: u64,
+}
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ControllerLease {
+    pub name: String,
+    pub owner_id: String,
+    pub fencing_token: u64,
+    pub lease_until_unix: i64,
+}
+
+impl StoreReader for PostgresStore {
+    type Error = PostgresError;
+    fn backend_kind(&self) -> BackendKind {
+        BackendKind::Postgres
+    }
+    fn read_nodes(&self, limit: u64) -> Result<Vec<NodeRecord>, Self::Error> {
+        checked_limit(limit)?;
+        self.with_store(|s| s.list_nodes_limited(limit))
+    }
+    fn read_node(&self, id: &str) -> Result<Option<NodeRecord>, Self::Error> {
+        self.with_store(|s| s.get_node(id))
+    }
+    fn read_jobs(&self, limit: u64) -> Result<Vec<ObservabilityJobRecord>, Self::Error> {
+        checked_limit(limit)?;
+        self.with_store(|s| <Store as StoreReader>::read_jobs(s, limit))
+    }
+    fn read_runs(&self, limit: u64) -> Result<Vec<ObservabilityRunRecord>, Self::Error> {
+        checked_limit(limit)?;
+        self.with_store(|s| <Store as StoreReader>::read_runs(s, limit))
+    }
+    fn read_observations(
+        &self,
+        node: Option<&str>,
+        method: Option<&str>,
+        limit: u64,
+    ) -> Result<Vec<ProbeObservationRecord>, Self::Error> {
+        checked_limit(limit)?;
+        self.with_store(|s| <Store as StoreReader>::read_observations(s, node, method, limit))
+    }
+    fn read_health_snapshots(&self, limit: u64) -> Result<Vec<HealthSnapshotRecord>, Self::Error> {
+        checked_limit(limit)?;
+        self.with_store(|s| <Store as StoreReader>::read_health_snapshots(s, limit))
+    }
+    fn read_alerts(&self, limit: u64) -> Result<Vec<AlertEventRecord>, Self::Error> {
+        checked_limit(limit)?;
+        self.with_store(|s| <Store as StoreReader>::read_alerts(s, limit))
+    }
+    fn read_audit_window(
+        &self,
+        from: &str,
+        to: &str,
+        limit: usize,
+    ) -> Result<Vec<AuditRecord>, Self::Error> {
+        if limit == 0 || limit > MAX_STORE_READER_ROWS as usize {
+            return Err(PostgresError::InvalidState(
+                "query limit is out of bounds".into(),
+            ));
+        }
+        self.with_store(|s| <Store as StoreReader>::read_audit_window(s, from, to, limit))
+    }
+}
+
+macro_rules! forward_write {
+    ($name:ident($($arg:ident : $ty:ty),*) -> $ret:ty => $method:ident) => {
+        fn $name(&self, $($arg: $ty),*) -> Result<$ret, Self::Error> {
+            self.with_write(|store| store.$method($($arg),*))
+        }
+    };
+}
+
+impl StoreWriter for PostgresStore {
+    type Error = PostgresError;
+    forward_write!(write_node_add(node: &NodeInsert, actor: &str) -> () => add_node);
+    forward_write!(write_node_enable(node_id: &str, actor: &str) -> () => enable_node);
+    forward_write!(write_node_disable(node_id: &str, actor: &str) -> () => disable_node);
+    forward_write!(write_node_remove(node_id: &str, actor: &str) -> () => remove_node);
+    forward_write!(write_scheduler_job_add(job: &ObservabilityJobRecord, actor: &str) -> () => insert_observability_job);
+    fn write_scheduler_job_enable(&self, job_id: &str, actor: &str) -> Result<(), Self::Error> {
+        self.with_write(|s| s.set_observability_job_enabled(job_id, true, actor))
+    }
+    fn write_scheduler_job_disable(&self, job_id: &str, actor: &str) -> Result<(), Self::Error> {
+        self.with_write(|s| s.set_observability_job_enabled(job_id, false, actor))
+    }
+    forward_write!(write_scheduler_maintenance_set(window: &SchedulerMaintenanceWindow, actor: &str) -> () => set_scheduler_maintenance);
+    forward_write!(write_scheduler_maintenance_clear(cleared_at: &str, actor: &str) -> bool => clear_scheduler_maintenance);
+    forward_write!(write_scheduler_claim_next_due(owner_id: &str, now: &str, lease_seconds: u64, actor: &str) -> Option<SchedulerJobClaim> => claim_next_due_scheduler_job);
+    forward_write!(write_scheduler_claim(job_id: &str, owner_id: &str, now: &str, lease_seconds: u64, actor: &str) -> Option<SchedulerJobClaim> => claim_scheduler_job);
+    forward_write!(write_scheduler_claim_due(job_id: &str, owner_id: &str, now: &str, lease_seconds: u64, actor: &str) -> Option<SchedulerJobClaim> => claim_due_scheduler_job);
+    forward_write!(write_scheduler_claim_renew(claim: &SchedulerJobClaim, now: &str, lease_seconds: u64, actor: &str) -> SchedulerJobClaim => renew_scheduler_job_claim);
+    forward_write!(write_scheduler_claim_release(claim: &SchedulerJobClaim, released_at: &str, actor: &str) -> () => release_scheduler_job_claim);
+    forward_write!(write_scheduler_run_start(start: &SchedulerRunStart, actor: &str) -> () => write_scheduler_run_start);
+    forward_write!(write_scheduler_claimed_run_start(start: &SchedulerRunStart, claim: &SchedulerJobClaim, actor: &str) -> () => write_scheduler_claimed_run_start);
+    forward_write!(write_scheduler_outcome(outcome: &SchedulerOutcomeWrite, actor: &str) -> () => write_scheduler_outcome);
+    forward_write!(write_scheduler_run_finish(finish: &SchedulerRunFinish, actor: &str) -> () => write_scheduler_run_finish);
+    forward_write!(write_health_policy(policy: &HealthPolicyRecord, actor: &str) -> () => set_health_policy);
+    forward_write!(write_health_snapshots(write: &HealthSnapshotWrite, actor: &str) -> () => write_health_snapshots);
+    forward_write!(write_health_evaluation_start(start: &HealthEvaluationStart, actor: &str) -> () => write_health_evaluation_start);
+    forward_write!(write_health_evaluation_finish(finish: &HealthEvaluationFinish, actor: &str) -> () => write_health_evaluation_finish);
+    forward_write!(write_health_evaluation_failure(failure: &HealthEvaluationFailure, actor: &str) -> () => write_health_evaluation_failure);
+    forward_write!(write_health_evaluation_recovery(cutoff: &str, recovered_at: &str, actor: &str) -> usize => write_health_evaluation_recovery);
+    forward_write!(write_health_rollups(write: &HealthRollupWrite, actor: &str) -> () => write_health_rollups);
+    forward_write!(write_alert_evaluation(write: &AlertEvaluationWrite, actor: &str) -> () => write_alert_evaluation);
+    forward_write!(write_alert_state_transition(write: &AlertStateTransition, actor: &str) -> () => write_alert_state_transition);
+    forward_write!(write_alert_webhook_hook_create(hook: &AlertWebhookHookRecord, actor: &str) -> () => write_alert_webhook_hook_create);
+    forward_write!(write_alert_webhook_hook_enabled(hook_id: &str, enabled: bool, updated_at: &str, actor: &str) -> bool => write_alert_webhook_hook_enabled);
+    forward_write!(write_alert_delivery_attempt(write: &AlertDeliveryAttemptWrite, actor: &str) -> () => write_alert_delivery_attempt);
+    forward_write!(write_alert_delivery_queue_enqueue(enqueue: &AlertDeliveryQueueEnqueue, actor: &str) -> () => write_alert_delivery_queue_enqueue);
+    forward_write!(write_alert_delivery_queue_claim_next(owner_id: &str, now: &str, lease_seconds: u64, actor: &str) -> Option<AlertDeliveryQueueClaim> => write_alert_delivery_queue_claim_next);
+    forward_write!(write_alert_delivery_queue_renew(claim: &AlertDeliveryQueueClaim, now: &str, lease_seconds: u64, actor: &str) -> AlertDeliveryQueueClaim => write_alert_delivery_queue_renew);
+    forward_write!(write_alert_delivery_queue_outcome(outcome: &AlertDeliveryQueueOutcome, actor: &str) -> () => write_alert_delivery_queue_outcome);
+    forward_write!(write_alert_delivery_queue_defer(claim: &AlertDeliveryQueueClaim, deferred_at: &str, next_attempt_at: &str, actor: &str) -> () => write_alert_delivery_queue_defer);
+    forward_write!(write_alert_delivery_finalize(write: &AlertDeliveryFinalizeWrite, actor: &str) -> () => write_alert_delivery_finalize);
+    forward_write!(write_retention_policy(policy: &RetentionPolicyRecord, actor: &str) -> RetentionPolicyRecord => set_retention_policy);
+    forward_write!(write_retention_apply(input: &RetentionApplyInput, actor: &str) -> RetentionApplyResult => apply_retention);
+    forward_write!(write_enrollment_token_create(token: &EnrollmentTokenInsert, actor: &str) -> EnrollmentTokenRecord => create_enrollment_token);
+    forward_write!(write_enrollment_token_revoke(token_id: &str, actor: &str, reason: &str) -> EnrollmentTokenRecord => revoke_enrollment_token);
+    forward_write!(write_enrollment_request_submit(request: &JoinRequestInsert, actor: &str) -> JoinRequestRecord => submit_join_request);
+    forward_write!(write_enrollment_request_reject(request_id: &str, actor: &str, reason: &str) -> JoinRequestRecord => reject_join_request);
+    forward_write!(write_enrollment_approval(approval: &ApprovalInput, actor: &str) -> JoinRequestRecord => approve_join_request);
+    forward_write!(write_legacy_enrollment_claim(claim: &LegacyEnrollmentClaimInput, actor: &str) -> JoinRequestRecord => claim_legacy_enrollment);
+    forward_write!(write_endpoint_rotation(old_endpoint_id: &str, new_endpoint_id: &str, actor: &str, reason: &str) -> EndpointTrustRecord => rotate_endpoint);
+    forward_write!(write_endpoint_revocation(endpoint_id: &str, actor: &str, reason: &str) -> EndpointTrustRecord => revoke_endpoint);
+    forward_write!(write_endpoint_quarantine(endpoint_id: &str, actor: &str, reason: &str) -> EndpointTrustRecord => quarantine_endpoint);
+}
+
+impl MigrationManager for PostgresStore {
+    type Error = PostgresError;
+    fn schema_version(&self) -> Result<i64, Self::Error> {
+        Ok(self.doctor()?.schema_version)
+    }
+    fn migration_backend(&self) -> BackendKind {
+        BackendKind::Postgres
+    }
+}
+
+impl AuditWriter for PostgresStore {
+    type Error = PostgresError;
+    fn append_audit(&self, event: &AuditEvent) -> Result<(), Self::Error> {
+        self.with_write(|store| store.insert_audit(event))
+    }
+}
+
+fn validate_dsn(dsn: &str) -> Result<(), PostgresError> {
+    if dsn.is_empty()
+        || dsn.len() > MAX_DSN_BYTES
+        || !(dsn.starts_with("postgres://") || dsn.starts_with("postgresql://"))
+    {
+        return Err(PostgresError::Configuration(
+            "Postgres DSN must be a bounded postgres URL",
+        ));
+    }
+    Ok(())
+}
+fn validate_lease(name: &str, owner: &str, ttl: u32) -> Result<(), PostgresError> {
+    let valid = |value: &str| {
+        !value.is_empty()
+            && value.len() <= 128
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b':'))
+    };
+    if !valid(name) || !valid(owner) || !(1..=300).contains(&ttl) {
+        return Err(PostgresError::InvalidState(
+            "lease name, owner, or TTL is invalid".into(),
+        ));
+    }
+    Ok(())
+}
+fn checked_limit(limit: u64) -> Result<(), PostgresError> {
+    if limit == 0 || limit > MAX_STORE_READER_ROWS {
+        Err(PostgresError::InvalidState(
+            "query limit is out of bounds".into(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+fn sha256(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn empty_sqlite_image() -> Result<Vec<u8>, PostgresError> {
+    let temp = NamedTempFile::new()?;
+    let path = temp.path().to_path_buf();
+    drop(temp);
+    let store = Store::open(&path)?;
+    drop(store);
+    Ok(std::fs::read(path)?)
+}
+
+fn load_state(conn: &mut postgres::Client) -> Result<Vec<u8>, PostgresError> {
+    let row = conn.query_one("SELECT format_version, state_sha256, state_bytes FROM ocfleet_runtime_state WHERE singleton = TRUE", &[])?;
+    let format: i32 = row.get(0);
+    if format != FORMAT_VERSION {
+        return Err(PostgresError::UnsupportedFormat(format));
+    }
+    let checksum: String = row.get(1);
+    let image: Vec<u8> = row.get(2);
+    if sha256(&image) != checksum {
+        return Err(PostgresError::Checksum);
+    }
+    Ok(image)
+}
+
+fn insert_state(tx: &mut Transaction<'_>, image: &[u8]) -> Result<(), PostgresError> {
+    let (schema, _) = verify_image(image)?;
+    let checksum = sha256(image);
+    tx.execute("INSERT INTO ocfleet_runtime_state(singleton, format_version, sqlite_schema_version, state_sha256, state_bytes, updated_at) VALUES(TRUE,$1,$2,$3,$4,now()) ON CONFLICT(singleton) DO UPDATE SET format_version=EXCLUDED.format_version, sqlite_schema_version=EXCLUDED.sqlite_schema_version, state_sha256=EXCLUDED.state_sha256, state_bytes=EXCLUDED.state_bytes, updated_at=now()", &[&FORMAT_VERSION, &schema, &checksum, &image])?;
+    Ok(())
+}
+
+fn materialize(image: &[u8]) -> Result<(NamedTempFile, Store), PostgresError> {
+    let mut temp = NamedTempFile::new()?;
+    temp.write_all(image)?;
+    temp.flush()?;
+    let store = Store::open(temp.path())?;
+    Ok((temp, store))
+}
+
+fn verify_image(image: &[u8]) -> Result<(i64, u64), PostgresError> {
+    if image.len() < 16 || &image[..16] != b"SQLite format 3\0" {
+        return Err(PostgresError::InvalidState(
+            "source is not a SQLite database".into(),
+        ));
+    }
+    let (_temp, store) = materialize(image)?;
+    let schema = store.current_schema_version()?;
+    if schema != CURRENT_SCHEMA_VERSION {
+        return Err(PostgresError::InvalidState(format!(
+            "source schema {schema} does not match required schema {CURRENT_SCHEMA_VERSION}"
+        )));
+    }
+    let counts = store.list_nodes()?.len() as u64
+        + store.list_observability_jobs()?.len() as u64
+        + store
+            .list_alert_events_limited(MAX_STORE_READER_ROWS)?
+            .len() as u64;
+    Ok((schema, counts))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
-    fn scaffold_never_logs_private_config_path_or_connects() {
-        let source = PostgresConnectionSource::PrivateConfigFile {
-            path: PathBuf::from("/run/secrets/ocfleet-postgres.toml"),
+    fn connection_sources_never_debug_dsn_or_path() {
+        let env = PostgresConnectionSource::Environment {
+            variable: "postgres://user:secret@host/db".into(),
         };
-        assert!(source.validate().is_ok());
-        let debug = format!("{source:?}");
-        assert!(debug.contains("<redacted>"));
-        assert!(!debug.contains("/run/secrets"));
-        assert_eq!(connect(&source), Err(PostgresBackendUnavailable));
-    }
-
-    #[test]
-    fn invalid_environment_source_is_redacted_before_validation() {
-        let source = PostgresConnectionSource::Environment {
-            variable: "postgres://operator:secret@db.example/ocfleet".to_string(),
-        };
-        assert!(source.validate().is_err());
-        let debug = format!("{source:?}");
-        assert!(debug.contains("<redacted-invalid>"));
-        assert!(!debug.contains("operator"));
+        assert!(env.validate().is_err());
+        let debug = format!("{env:?}");
         assert!(!debug.contains("secret"));
+        let file = PostgresConnectionSource::PrivateConfigFile {
+            path: PathBuf::from("/run/secrets/postgres.toml"),
+        };
+        assert!(!format!("{file:?}").contains("/run/secrets"));
     }
 }

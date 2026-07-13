@@ -39,7 +39,7 @@ use crate::version_governance::{
     VersionGovernanceInput,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 27;
+pub const CURRENT_SCHEMA_VERSION: i64 = 28;
 pub const DEFAULT_HEALTH_STALE_WINDOW_SECONDS: u64 = 24 * 60 * 60;
 pub const DEFAULT_HEALTH_UNREACHABLE_FAILURES: u64 = 3;
 pub const DEFAULT_HEALTH_CERT_WARNING_DAYS: u64 = 30;
@@ -879,7 +879,7 @@ pub struct TrustSnapshot {
 }
 
 pub struct Store {
-    conn: Connection,
+    pub(crate) conn: Connection,
     database_path: PathBuf,
 }
 

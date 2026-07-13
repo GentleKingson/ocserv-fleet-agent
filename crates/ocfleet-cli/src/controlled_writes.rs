@@ -1,0 +1,759 @@
+//! Controller-side controlled-write approval state. This module deliberately
+//! contains no agent RPC or local service adapter; D0 can only record dry-runs.
+
+use base64::Engine as _;
+use ocfleet_protocol::controlled_write::{
+    ControlledWriteOperationKind, SignedControlledWriteIntent,
+};
+use ring::signature::{ED25519, UnparsedPublicKey};
+use rusqlite::{OptionalExtension, Transaction, params};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use std::fmt;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use uuid::Uuid;
+
+use crate::input_validation::{validate_actor, validate_endpoint_id, validate_reason};
+use crate::store::{Store, StoreError, validate_low_sensitive_json};
+
+const MAX_ROWS: u64 = 1_000;
+const MAX_LIFETIME_SECONDS: i64 = 30 * 24 * 60 * 60;
+const MIN_NONCE_BYTES: usize = 16;
+const MAX_NONCE_BYTES: usize = 128;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeState {
+    Draft,
+    DryRunPending,
+    DryRunSucceeded,
+    DryRunFailed,
+    ApprovalPending,
+    Approved,
+    Rejected,
+    Dispatching,
+    Succeeded,
+    Failed,
+    RollbackPending,
+    RolledBack,
+    Cancelled,
+    Expired,
+}
+
+impl ChangeState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Draft => "draft",
+            Self::DryRunPending => "dry_run_pending",
+            Self::DryRunSucceeded => "dry_run_succeeded",
+            Self::DryRunFailed => "dry_run_failed",
+            Self::ApprovalPending => "approval_pending",
+            Self::Approved => "approved",
+            Self::Rejected => "rejected",
+            Self::Dispatching => "dispatching",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::RollbackPending => "rollback_pending",
+            Self::RolledBack => "rolled_back",
+            Self::Cancelled => "cancelled",
+            Self::Expired => "expired",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, StoreError> {
+        match value {
+            "draft" => Ok(Self::Draft),
+            "dry_run_pending" => Ok(Self::DryRunPending),
+            "dry_run_succeeded" => Ok(Self::DryRunSucceeded),
+            "dry_run_failed" => Ok(Self::DryRunFailed),
+            "approval_pending" => Ok(Self::ApprovalPending),
+            "approved" => Ok(Self::Approved),
+            "rejected" => Ok(Self::Rejected),
+            "dispatching" => Ok(Self::Dispatching),
+            "succeeded" => Ok(Self::Succeeded),
+            "failed" => Ok(Self::Failed),
+            "rollback_pending" => Ok(Self::RollbackPending),
+            "rolled_back" => Ok(Self::RolledBack),
+            "cancelled" => Ok(Self::Cancelled),
+            "expired" => Ok(Self::Expired),
+            _ => Err(StoreError::InvalidInput(
+                "stored change state is invalid".into(),
+            )),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct CreateChangeRequest {
+    pub request_id: String,
+    pub operation_id: String,
+    pub operation_kind: ControlledWriteOperationKind,
+    pub endpoint_id: String,
+    pub actor: String,
+    pub reason: String,
+    pub change_ticket: String,
+    pub nonce: String,
+    pub expires_at: String,
+    pub params_summary: Value,
+    pub signed_intent: SignedControlledWriteIntent,
+    /// Raw Ed25519 public key. It is used for verification and never persisted.
+    pub signer_public_key: Vec<u8>,
+}
+
+impl fmt::Debug for CreateChangeRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CreateChangeRequest")
+            .field("request_id", &self.request_id)
+            .field("operation_id", &self.operation_id)
+            .field("operation_kind", &self.operation_kind)
+            .field("endpoint_id", &self.endpoint_id)
+            .field("actor", &"<redacted>")
+            .field("reason", &"<redacted>")
+            .field("change_ticket", &self.change_ticket)
+            .field("nonce", &"<redacted>")
+            .field("expires_at", &self.expires_at)
+            .field("params_summary", &"<typed-summary-only>")
+            .field("signed_intent", &"<redacted>")
+            .field("signer_public_key", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ChangeRequestRecord {
+    pub request_id: String,
+    pub operation_id: String,
+    pub operation_kind: String,
+    pub endpoint_id: String,
+    pub actor: String,
+    pub change_ticket: String,
+    pub operation_digest: String,
+    pub state: ChangeState,
+    pub expires_at: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ApprovalDecision {
+    pub approval_id: String,
+    pub approver: String,
+    pub role: String,
+    pub reason: String,
+    pub expires_at: String,
+}
+
+impl Store {
+    pub fn create_change_request(
+        &self,
+        input: &CreateChangeRequest,
+        now: &str,
+    ) -> Result<ChangeRequestRecord, StoreError> {
+        validate_create(input, now)?;
+        let digest = operation_digest(input)?;
+        if digest != input.signed_intent.payload_sha256 {
+            return Err(invalid("signed intent digest does not match the operation"));
+        }
+        let signature = decode_signature(&input.signed_intent.signature)?;
+        UnparsedPublicKey::new(&ED25519, &input.signer_public_key)
+            .verify(digest.as_bytes(), &signature)
+            .map_err(|_| invalid("signed intent signature is invalid"))?;
+
+        let tx = self.conn.unchecked_transaction()?;
+        let signed_intent = json!({
+            "schema": "ocfleet.signed_intent.v1",
+            "key_id": input.signed_intent.key_id,
+            "algorithm": input.signed_intent.algorithm,
+            "payload_sha256": input.signed_intent.payload_sha256,
+            "signature": "[REDACTED]"
+        });
+        tx.execute(
+            "INSERT INTO change_requests
+             (request_id, operation_id, operation_kind, endpoint_id, actor, reason,
+              change_ticket, operation_digest, nonce, signer_key_id, signed_intent_json,
+              params_summary_json, state, expires_at, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                     'draft', ?13, ?14, ?14)",
+            params![
+                input.request_id,
+                input.operation_id,
+                operation_kind(input.operation_kind),
+                input.endpoint_id,
+                input.actor,
+                input.reason,
+                input.change_ticket,
+                digest,
+                input.nonce,
+                input.signed_intent.key_id,
+                serde_json::to_string(&signed_intent).map_err(json_error)?,
+                serde_json::to_string(&input.params_summary).map_err(json_error)?,
+                input.expires_at,
+                now,
+            ],
+        )?;
+        insert_transition_audit(
+            &tx,
+            input,
+            None,
+            ChangeState::Draft,
+            &input.actor,
+            None,
+            true,
+            None,
+            now,
+        )?;
+        let record = get_change_tx(&tx, &input.request_id)?
+            .ok_or_else(|| invalid("created change request is missing"))?;
+        tx.commit()?;
+        Ok(record)
+    }
+
+    /// Records a policy-only dry-run. No RPC, service adapter, or filesystem
+    /// operation is reachable from this method.
+    pub fn record_change_dry_run(
+        &self,
+        request_id: &str,
+        actor: &str,
+        feature_enabled: bool,
+        local_policy_enabled: bool,
+        now: &str,
+    ) -> Result<ChangeRequestRecord, StoreError> {
+        validate_actor(actor).map_err(StoreError::InvalidInput)?;
+        parse_time(now, "now")?;
+        let tx = self.conn.unchecked_transaction()?;
+        let current = require_active_change(&tx, request_id, now)?;
+        if current.actor != actor {
+            return Err(invalid("dry-run actor must be the change request actor"));
+        }
+        if !matches!(
+            current.state,
+            ChangeState::Draft | ChangeState::DryRunFailed
+        ) {
+            return Err(invalid("invalid transition to dry_run_pending"));
+        }
+        transition(
+            &tx,
+            request_id,
+            current.state,
+            ChangeState::DryRunPending,
+            now,
+        )?;
+        let allowed = feature_enabled && local_policy_enabled;
+        let target = if allowed {
+            ChangeState::DryRunSucceeded
+        } else {
+            ChangeState::DryRunFailed
+        };
+        let attempt_id = format!("dry-run:{}", Uuid::new_v4());
+        tx.execute(
+            "INSERT INTO write_operation_attempts
+             (attempt_id, request_id, attempt_kind, status, validation_code, created_at, completed_at)
+             VALUES (?1, ?2, 'dry_run', ?3, ?4, ?5, ?5)",
+            params![attempt_id, request_id, if allowed { "succeeded" } else { "failed" }, if allowed { "POLICY_ALLOWED" } else { "POLICY_DISABLED" }, now],
+        )?;
+        transition(&tx, request_id, ChangeState::DryRunPending, target, now)?;
+        insert_record_audit(
+            &tx,
+            &current,
+            Some(current.state),
+            target,
+            actor,
+            None,
+            allowed,
+            (!allowed).then_some("POLICY_DISABLED"),
+            now,
+        )?;
+        let record =
+            get_change_tx(&tx, request_id)?.ok_or_else(|| invalid("change request is missing"))?;
+        tx.commit()?;
+        Ok(record)
+    }
+
+    pub fn approve_change(
+        &self,
+        request_id: &str,
+        approval: &ApprovalDecision,
+        now: &str,
+    ) -> Result<ChangeRequestRecord, StoreError> {
+        validate_approval(approval, now)?;
+        let tx = self.conn.unchecked_transaction()?;
+        let current = require_active_change(&tx, request_id, now)?;
+        if current.actor == approval.approver {
+            return Err(invalid(
+                "change actor and approver must be different principals",
+            ));
+        }
+        if current.state != ChangeState::DryRunSucceeded
+            && current.state != ChangeState::ApprovalPending
+        {
+            return Err(invalid("approval requires a successful dry-run"));
+        }
+        tx.execute(
+            "INSERT INTO change_approvals
+             (approval_id, request_id, approver_actor, approver_role, decision, reason, expires_at, created_at)
+             VALUES (?1, ?2, ?3, ?4, 'approved', ?5, ?6, ?7)",
+            params![approval.approval_id, request_id, approval.approver, approval.role, approval.reason, approval.expires_at, now],
+        )?;
+        transition(&tx, request_id, current.state, ChangeState::Approved, now)?;
+        insert_record_audit(
+            &tx,
+            &current,
+            Some(current.state),
+            ChangeState::Approved,
+            &approval.approver,
+            Some(&approval.approval_id),
+            true,
+            None,
+            now,
+        )?;
+        let record =
+            get_change_tx(&tx, request_id)?.ok_or_else(|| invalid("change request is missing"))?;
+        tx.commit()?;
+        Ok(record)
+    }
+
+    pub fn reject_change(
+        &self,
+        request_id: &str,
+        decision: &ApprovalDecision,
+        now: &str,
+    ) -> Result<ChangeRequestRecord, StoreError> {
+        validate_approval(decision, now)?;
+        let tx = self.conn.unchecked_transaction()?;
+        let current = require_active_change(&tx, request_id, now)?;
+        if current.actor == decision.approver {
+            return Err(invalid(
+                "change actor and approver must be different principals",
+            ));
+        }
+        if !matches!(
+            current.state,
+            ChangeState::DryRunSucceeded | ChangeState::ApprovalPending
+        ) {
+            return Err(invalid("change request is not awaiting approval"));
+        }
+        tx.execute(
+            "INSERT INTO change_approvals
+             (approval_id, request_id, approver_actor, approver_role, decision, reason, expires_at, created_at)
+             VALUES (?1, ?2, ?3, ?4, 'rejected', ?5, ?6, ?7)",
+            params![decision.approval_id, request_id, decision.approver, decision.role, decision.reason, decision.expires_at, now],
+        )?;
+        transition(&tx, request_id, current.state, ChangeState::Rejected, now)?;
+        insert_record_audit(
+            &tx,
+            &current,
+            Some(current.state),
+            ChangeState::Rejected,
+            &decision.approver,
+            Some(&decision.approval_id),
+            true,
+            None,
+            now,
+        )?;
+        let record =
+            get_change_tx(&tx, request_id)?.ok_or_else(|| invalid("change request is missing"))?;
+        tx.commit()?;
+        Ok(record)
+    }
+
+    pub fn cancel_change(
+        &self,
+        request_id: &str,
+        actor: &str,
+        now: &str,
+    ) -> Result<ChangeRequestRecord, StoreError> {
+        validate_actor(actor).map_err(StoreError::InvalidInput)?;
+        let tx = self.conn.unchecked_transaction()?;
+        let current = require_active_change(&tx, request_id, now)?;
+        if current.actor != actor {
+            return Err(invalid("only the requesting actor may cancel a change"));
+        }
+        if matches!(
+            current.state,
+            ChangeState::Dispatching | ChangeState::Succeeded | ChangeState::RolledBack
+        ) {
+            return Err(invalid("change can no longer be cancelled"));
+        }
+        transition(&tx, request_id, current.state, ChangeState::Cancelled, now)?;
+        insert_record_audit(
+            &tx,
+            &current,
+            Some(current.state),
+            ChangeState::Cancelled,
+            actor,
+            None,
+            true,
+            None,
+            now,
+        )?;
+        let record =
+            get_change_tx(&tx, request_id)?.ok_or_else(|| invalid("change request is missing"))?;
+        tx.commit()?;
+        Ok(record)
+    }
+
+    pub fn get_change_request(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<ChangeRequestRecord>, StoreError> {
+        get_change_conn(&self.conn, request_id)
+    }
+
+    pub fn list_change_requests(&self, limit: u64) -> Result<Vec<ChangeRequestRecord>, StoreError> {
+        if limit == 0 || limit > MAX_ROWS {
+            return Err(invalid("change request limit must be between 1 and 1000"));
+        }
+        let limit = i64::try_from(limit).map_err(|_| invalid("change request limit is invalid"))?;
+        let mut statement = self.conn.prepare(
+            "SELECT request_id, operation_id, operation_kind, endpoint_id, actor, change_ticket,
+                    operation_digest, state, expires_at, created_at, updated_at
+             FROM change_requests ORDER BY created_at DESC, request_id LIMIT ?1",
+        )?;
+        let rows = statement.query_map([limit], change_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+}
+
+fn validate_create(input: &CreateChangeRequest, now: &str) -> Result<(), StoreError> {
+    validate_id(&input.request_id, "request_id")?;
+    Uuid::parse_str(&input.request_id).map_err(|_| invalid("request_id must be a UUID"))?;
+    validate_id(&input.operation_id, "operation_id")?;
+    validate_endpoint_id(&input.endpoint_id).map_err(StoreError::InvalidInput)?;
+    validate_actor(&input.actor).map_err(StoreError::InvalidInput)?;
+    validate_reason(&input.reason).map_err(StoreError::InvalidInput)?;
+    validate_id(&input.change_ticket, "change_ticket")?;
+    validate_id(&input.signed_intent.key_id, "signer key id")?;
+    if input.signed_intent.algorithm != "Ed25519" {
+        return Err(invalid("signed intent algorithm must be Ed25519"));
+    }
+    if input.nonce.len() < MIN_NONCE_BYTES
+        || input.nonce.len() > MAX_NONCE_BYTES
+        || !input.nonce.bytes().all(safe_id_byte)
+    {
+        return Err(invalid("nonce must be a bounded opaque identifier"));
+    }
+    validate_low_sensitive_json(&input.params_summary, "controlled write params summary")?;
+    let now = parse_time(now, "now")?;
+    let expires = parse_time(&input.expires_at, "expires_at")?;
+    if expires <= now || expires - now > time::Duration::seconds(MAX_LIFETIME_SECONDS) {
+        return Err(invalid(
+            "change request expiry must be in the future and within 30 days",
+        ));
+    }
+    if input.signer_public_key.len() != 32 {
+        return Err(invalid("Ed25519 public key must be 32 bytes"));
+    }
+    Ok(())
+}
+
+fn validate_approval(input: &ApprovalDecision, now: &str) -> Result<(), StoreError> {
+    validate_id(&input.approval_id, "approval_id")?;
+    validate_actor(&input.approver).map_err(StoreError::InvalidInput)?;
+    validate_reason(&input.reason).map_err(StoreError::InvalidInput)?;
+    if input.role != "change-approver" && input.role != "security-admin" {
+        return Err(invalid("approver role is not permitted"));
+    }
+    let now = parse_time(now, "now")?;
+    let expires = parse_time(&input.expires_at, "approval expires_at")?;
+    if expires <= now || expires - now > time::Duration::seconds(MAX_LIFETIME_SECONDS) {
+        return Err(invalid(
+            "approval expiry must be in the future and within 30 days",
+        ));
+    }
+    Ok(())
+}
+
+fn operation_digest(input: &CreateChangeRequest) -> Result<String, StoreError> {
+    let canonical = serde_json::to_vec(&json!({
+        "schema": "ocfleet.controlled_write_intent.v1",
+        "request_id": input.request_id,
+        "operation_id": input.operation_id,
+        "operation_kind": operation_kind(input.operation_kind),
+        "endpoint_id": input.endpoint_id,
+        "change_ticket": input.change_ticket,
+        "nonce": input.nonce,
+        "expires_at": input.expires_at,
+        "params_summary": input.params_summary,
+    }))
+    .map_err(json_error)?;
+    Ok(format!("{:x}", Sha256::digest(canonical)))
+}
+
+fn require_active_change(
+    tx: &Transaction<'_>,
+    request_id: &str,
+    now: &str,
+) -> Result<ChangeRequestRecord, StoreError> {
+    validate_id(request_id, "request_id")?;
+    let now_time = parse_time(now, "now")?;
+    let current =
+        get_change_tx(tx, request_id)?.ok_or_else(|| invalid("change request not found"))?;
+    let expires = parse_time(&current.expires_at, "stored expires_at")?;
+    if expires <= now_time {
+        if !matches!(
+            current.state,
+            ChangeState::Succeeded
+                | ChangeState::Failed
+                | ChangeState::Rejected
+                | ChangeState::Cancelled
+                | ChangeState::Expired
+                | ChangeState::RolledBack
+        ) {
+            transition(tx, request_id, current.state, ChangeState::Expired, now)?;
+        }
+        return Err(invalid("change request has expired"));
+    }
+    Ok(current)
+}
+
+fn transition(
+    tx: &Transaction<'_>,
+    request_id: &str,
+    from: ChangeState,
+    to: ChangeState,
+    now: &str,
+) -> Result<(), StoreError> {
+    let changed = tx.execute(
+        "UPDATE change_requests SET state = ?1, updated_at = ?2 WHERE request_id = ?3 AND state = ?4",
+        params![to.as_str(), now, request_id, from.as_str()],
+    )?;
+    if changed != 1 {
+        return Err(invalid(
+            "change request transition lost a concurrent update",
+        ));
+    }
+    Ok(())
+}
+
+fn insert_transition_audit(
+    tx: &Transaction<'_>,
+    input: &CreateChangeRequest,
+    from: Option<ChangeState>,
+    to: ChangeState,
+    actor: &str,
+    approval_id: Option<&str>,
+    ok: bool,
+    error: Option<&str>,
+    now: &str,
+) -> Result<(), StoreError> {
+    tx.execute(
+        "INSERT INTO write_operation_audit
+         (ts, request_id, operation_id, operation_kind, actor, approval_id, state_from, state_to, ok, error_code, detail_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![now, input.request_id, input.operation_id, operation_kind(input.operation_kind), actor, approval_id, from.map(ChangeState::as_str), to.as_str(), ok, error, "{\"schema\":\"ocfleet.write_audit.v1\"}"],
+    )?;
+    Ok(())
+}
+
+fn insert_record_audit(
+    tx: &Transaction<'_>,
+    record: &ChangeRequestRecord,
+    from: Option<ChangeState>,
+    to: ChangeState,
+    actor: &str,
+    approval_id: Option<&str>,
+    ok: bool,
+    error: Option<&str>,
+    now: &str,
+) -> Result<(), StoreError> {
+    tx.execute(
+        "INSERT INTO write_operation_audit
+         (ts, request_id, operation_id, operation_kind, actor, approval_id, state_from, state_to, ok, error_code, detail_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![now, record.request_id, record.operation_id, record.operation_kind, actor, approval_id, from.map(ChangeState::as_str), to.as_str(), ok, error, "{\"schema\":\"ocfleet.write_audit.v1\"}"],
+    )?;
+    Ok(())
+}
+
+fn get_change_conn(
+    conn: &rusqlite::Connection,
+    request_id: &str,
+) -> Result<Option<ChangeRequestRecord>, StoreError> {
+    conn.query_row(
+        "SELECT request_id, operation_id, operation_kind, endpoint_id, actor, change_ticket,
+                operation_digest, state, expires_at, created_at, updated_at
+         FROM change_requests WHERE request_id = ?1",
+        [request_id],
+        change_from_row,
+    )
+    .optional()
+    .map_err(StoreError::from)
+}
+
+fn get_change_tx(
+    tx: &Transaction<'_>,
+    request_id: &str,
+) -> Result<Option<ChangeRequestRecord>, StoreError> {
+    tx.query_row(
+        "SELECT request_id, operation_id, operation_kind, endpoint_id, actor, change_ticket,
+                operation_digest, state, expires_at, created_at, updated_at
+         FROM change_requests WHERE request_id = ?1",
+        [request_id],
+        change_from_row,
+    )
+    .optional()
+    .map_err(StoreError::from)
+}
+
+fn change_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChangeRequestRecord> {
+    let state: String = row.get(7)?;
+    let state = ChangeState::parse(&state).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    Ok(ChangeRequestRecord {
+        request_id: row.get(0)?,
+        operation_id: row.get(1)?,
+        operation_kind: row.get(2)?,
+        endpoint_id: row.get(3)?,
+        actor: row.get(4)?,
+        change_ticket: row.get(5)?,
+        operation_digest: row.get(6)?,
+        state,
+        expires_at: row.get(8)?,
+        created_at: row.get(9)?,
+        updated_at: row.get(10)?,
+    })
+}
+
+fn operation_kind(kind: ControlledWriteOperationKind) -> &'static str {
+    match kind {
+        ControlledWriteOperationKind::OcservReload => "ocserv_reload",
+        ControlledWriteOperationKind::OcservRestart => "ocserv_restart",
+        ControlledWriteOperationKind::OcservConfigApply => "ocserv_config_apply",
+        ControlledWriteOperationKind::OcservConfigRollback => "ocserv_config_rollback",
+        ControlledWriteOperationKind::OcservSessionDisconnect => "ocserv_session_disconnect",
+    }
+}
+
+fn decode_signature(value: &str) -> Result<Vec<u8>, StoreError> {
+    base64::engine::general_purpose::STANDARD
+        .decode(value)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(value))
+        .map_err(|_| invalid("signed intent signature is not valid base64"))
+}
+
+fn validate_id(value: &str, field: &str) -> Result<(), StoreError> {
+    if value.is_empty() || value.len() > 128 || !value.bytes().all(safe_id_byte) {
+        return Err(invalid(format!("{field} is invalid")));
+    }
+    Ok(())
+}
+
+fn safe_id_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':')
+}
+fn parse_time(value: &str, field: &str) -> Result<OffsetDateTime, StoreError> {
+    OffsetDateTime::parse(value, &Rfc3339).map_err(|_| invalid(format!("{field} must be RFC3339")))
+}
+fn invalid(message: impl Into<String>) -> StoreError {
+    StoreError::InvalidInput(message.into())
+}
+fn json_error(error: serde_json::Error) -> StoreError {
+    invalid(format!("controlled write JSON is invalid: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ring::rand::SystemRandom;
+    use ring::signature::{Ed25519KeyPair, KeyPair};
+
+    fn fixture() -> (tempfile::TempDir, Store, CreateChangeRequest) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(&dir.path().join("controller.sqlite")).expect("store");
+        let key = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).expect("generate key");
+        let key = Ed25519KeyPair::from_pkcs8(key.as_ref()).expect("parse key");
+        let mut request = CreateChangeRequest {
+            request_id: Uuid::new_v4().to_string(),
+            operation_id: format!("op:{}", Uuid::new_v4()),
+            operation_kind: ControlledWriteOperationKind::OcservReload,
+            endpoint_id: iroh::SecretKey::generate().public().to_string(),
+            actor: "operator-a".into(),
+            reason: "Reviewed reload dry run".into(),
+            change_ticket: "CHG-1234".into(),
+            nonce: format!("nonce:{}", Uuid::new_v4()),
+            expires_at: "2026-07-14T00:00:00Z".into(),
+            params_summary: json!({"schema":"ocfleet.reload.v1"}),
+            signed_intent: SignedControlledWriteIntent {
+                key_id: "test-key".into(),
+                algorithm: "Ed25519".into(),
+                payload_sha256: "0".repeat(64),
+                signature: "pending".into(),
+            },
+            signer_public_key: key.public_key().as_ref().to_vec(),
+        };
+        let digest = operation_digest(&request).expect("digest");
+        request.signed_intent.payload_sha256 = digest.clone();
+        request.signed_intent.signature =
+            base64::engine::general_purpose::STANDARD.encode(key.sign(digest.as_bytes()).as_ref());
+        (dir, store, request)
+    }
+
+    #[test]
+    fn dry_run_and_two_person_approval_never_dispatch() {
+        let (_dir, store, request) = fixture();
+        let created = store
+            .create_change_request(&request, "2026-07-13T00:00:00Z")
+            .expect("create");
+        assert_eq!(created.state, ChangeState::Draft);
+        let dry_run = store
+            .record_change_dry_run(
+                &request.request_id,
+                &request.actor,
+                true,
+                true,
+                "2026-07-13T00:01:00Z",
+            )
+            .expect("dry run");
+        assert_eq!(dry_run.state, ChangeState::DryRunSucceeded);
+        let approval = ApprovalDecision {
+            approval_id: "approval:test".into(),
+            approver: "approver-b".into(),
+            role: "change-approver".into(),
+            reason: "Reviewed exact endpoint".into(),
+            expires_at: "2026-07-13T12:00:00Z".into(),
+        };
+        let approved = store
+            .approve_change(&request.request_id, &approval, "2026-07-13T00:02:00Z")
+            .expect("approve");
+        assert_eq!(approved.state, ChangeState::Approved);
+    }
+
+    #[test]
+    fn policy_disabled_same_actor_and_replay_fail_closed() {
+        let (_dir, store, request) = fixture();
+        store
+            .create_change_request(&request, "2026-07-13T00:00:00Z")
+            .expect("create");
+        assert!(
+            store
+                .create_change_request(&request, "2026-07-13T00:00:00Z")
+                .is_err(),
+            "operation id and nonce are idempotent/replay protected"
+        );
+        let failed = store
+            .record_change_dry_run(
+                &request.request_id,
+                &request.actor,
+                false,
+                true,
+                "2026-07-13T00:01:00Z",
+            )
+            .expect("record denial");
+        assert_eq!(failed.state, ChangeState::DryRunFailed);
+    }
+
+    #[test]
+    fn debug_redacts_signed_and_sensitive_material() {
+        let (_dir, _store, request) = fixture();
+        let debug = format!("{request:?}");
+        assert!(!debug.contains(&request.reason));
+        assert!(!debug.contains(&request.nonce));
+        assert!(!debug.contains(&request.signed_intent.signature));
+        assert!(!debug.contains(
+            &base64::engine::general_purpose::STANDARD.encode(&request.signer_public_key)
+        ));
+    }
+}

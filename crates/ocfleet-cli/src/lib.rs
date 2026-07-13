@@ -7,6 +7,8 @@ pub mod audit;
 pub mod audit_export;
 pub mod backend;
 pub mod backup;
+#[cfg(feature = "controlled-writes")]
+pub mod controlled_writes;
 pub mod controller_rpc;
 pub mod doctor;
 pub mod duration_args;

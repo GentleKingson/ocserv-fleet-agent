@@ -1,10 +1,9 @@
-# Backend Plan
+# Controller Backends
 
-`ocfleet` currently implements one controller backend: local SQLite. Postgres is
-planned as an optional backend for larger fleets, longer history windows, and
-centralized audit queries, but it is not required. The optional feature in this
-slice is intentionally a compile-only scaffold whose `connect` function always
-returns unavailable.
+SQLite remains the default controller backend. A Postgres runtime backend is
+available only when the binary is built with `postgres-backend` and the caller
+explicitly supplies an approved connection source. No command silently selects
+Postgres and no Postgres dependency is present in the default feature set.
 
 ## Current SQLite Contract
 
@@ -154,7 +153,8 @@ The API retains a narrower `ApiReadStore` adapter for API projections;
 `ReadOnlyStore` opens SQLite with read-only/query-only flags, validates private
 database/sidecar files, checks schema version/tables/integrity, and never exposes
 a writer to routes. Consolidating this adapter with the neutral reader remains
-future work; SQLite is the only runtime backend.
+future work; the API still uses SQLite even when the optional controller
+Postgres backend is compiled.
 
 The controller `Store` also retains the absolute path it actually opened. A
 crate-private scheduler dispatch gate uses that bound path to open a short-lived
@@ -187,12 +187,33 @@ file checks or redaction. The scheduler writer expansions change no schema,
 protocol, agent capability, or API route; neither does the binding/lifecycle
 hardening. The API remains read-only.
 
-## Postgres Scaffold
+## Postgres Runtime
 
-The `postgres-backend` feature is default-off. It defines only redacted
-connection-source configuration and an always-unavailable connection stub. It
-does not add a client dependency, SQL schema, migration, import, secret logging,
-or runtime selection. SQLite remains required for all current commands.
+The `postgres-backend` feature is default-off. `PostgresConnectionSource`
+accepts only `OCFLEET_POSTGRES_URL`, `OCFLEET_TEST_POSTGRES_URL`, or an absolute
+private TOML file containing `dsn` and an optional bounded `pool_size`. Debug and
+error output never includes the DSN, password, or private path.
+
+The runtime uses an r2d2 pool and a Postgres migration transaction protected by
+`pg_advisory_xact_lock`. Its versioned, checksummed state image preserves the
+same SQLite `StoreReader`/`StoreWriter` contract and therefore the same bounded
+queries, typed projections, retention behavior, and actor-bound atomic audit.
+Each write locks the singleton state row and commits the updated checksum and
+database image in the same Postgres transaction. Controller leases use bounded
+TTLs and monotonically increasing fencing tokens.
+
+`import_sqlite(path, true)` validates the SQLite header, current schema, and
+bounded table counts without changing Postgres. A non-dry-run import holds the
+migration advisory lock and replaces the state only after full checksum/schema
+verification. Interrupted imports leave the previous singleton state valid.
+`doctor()` reports connection, format/schema, pool size, and checksum status
+without connection details.
+
+Back up Postgres with the deployment's normal encrypted `pg_dump` workflow and
+restore into a separate database before validation. Do not copy the private DSN
+file into a backup or place `pg_dump` command lines containing passwords in
+shell history; use a private password file or secret injection supported by the
+deployment platform.
 
 ## SQLite-only Assumptions To Isolate
 

@@ -11,6 +11,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+use postgres::config::Host;
 use postgres::{Config, NoTls, Transaction};
 use r2d2::{Pool, PooledConnection};
 use r2d2_postgres::PostgresConnectionManager;
@@ -30,16 +31,19 @@ use crate::store::{
     CURRENT_SCHEMA_VERSION, EndpointTrustRecord, EnrollmentTokenInsert, EnrollmentTokenRecord,
     HealthEvaluationFailure, HealthEvaluationFinish, HealthEvaluationStart, HealthPolicyRecord,
     HealthRollupWrite, HealthSnapshotRecord, HealthSnapshotWrite, JoinRequestInsert,
-    JoinRequestRecord, LegacyEnrollmentClaimInput, NodeInsert, NodeRecord, ObservabilityJobRecord,
-    ObservabilityRunRecord, ProbeObservationRecord, RetentionApplyInput, RetentionApplyResult,
-    RetentionPolicyRecord, SchedulerJobClaim, SchedulerMaintenanceWindow, SchedulerOutcomeWrite,
-    SchedulerRunFinish, SchedulerRunStart, Store, StoreError,
+    JoinRequestRecord, LegacyEnrollmentClaimInput, NodeInsert, NodeMaintenanceWindow,
+    NodeMetadataRecord, NodeRecord, ObservabilityJobRecord, ObservabilityRunRecord,
+    ProbeObservationRecord, RetentionApplyInput, RetentionApplyResult, RetentionPolicyRecord,
+    SchedulerJobClaim, SchedulerMaintenanceWindow, SchedulerOutcomeWrite, SchedulerRunFinish,
+    SchedulerRunStart, Store, StoreError,
 };
+use crate::version_governance::CapabilitySnapshot;
 
 const MIGRATION_LOCK_ID: i64 = 0x4f43464c454554;
 const FORMAT_VERSION: i32 = 1;
 const DEFAULT_POOL_SIZE: u32 = 8;
 const MAX_DSN_BYTES: usize = 8_192;
+const MAX_STATE_IMAGE_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Clone, PartialEq, Eq)]
 pub enum PostgresConnectionSource {
@@ -158,6 +162,10 @@ pub enum PostgresError {
     UnsupportedFormat(i32),
     #[error("Postgres imported state is invalid: {0}")]
     InvalidState(String),
+    #[error("Postgres StoreWriter requires a current controller lease")]
+    FenceRequired,
+    #[error("Postgres controller lease is stale")]
+    StaleFence,
     #[error("private Postgres configuration could not be read")]
     PrivateConfig(#[source] crate::private_file::PrivateFileError),
     #[error("Postgres backend local staging failed")]
@@ -194,12 +202,14 @@ impl From<StoreError> for PostgresError {
 
 pub struct PostgresStore {
     pool: Pool<PostgresConnectionManager<NoTls>>,
+    write_fence: Option<ControllerLease>,
 }
 
 impl fmt::Debug for PostgresStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PostgresStore")
             .field("pool", &"<redacted>")
+            .field("write_fence", &self.write_fence)
             .finish()
     }
 }
@@ -208,9 +218,13 @@ pub fn connect(source: &PostgresConnectionSource) -> Result<PostgresStore, Postg
     let private = source.load()?;
     let config = Config::from_str(&private.dsn)
         .map_err(|_| PostgresError::Configuration("Postgres DSN is invalid"))?;
+    validate_transport(&config)?;
     let manager = PostgresConnectionManager::new(config, NoTls);
     let pool = Pool::builder().max_size(private.pool_size).build(manager)?;
-    let store = PostgresStore { pool };
+    let store = PostgresStore {
+        pool,
+        write_fence: None,
+    };
     store.migrate()?;
     Ok(store)
 }
@@ -234,6 +248,11 @@ impl PostgresStore {
                import_id UUID PRIMARY KEY, source_sha256 TEXT NOT NULL,
                source_size BIGINT NOT NULL, verified BOOLEAN NOT NULL DEFAULT FALSE,
                created_at TIMESTAMPTZ NOT NULL DEFAULT now(), completed_at TIMESTAMPTZ);
+             CREATE TABLE IF NOT EXISTS ocfleet_controller_leases (
+               lease_name TEXT PRIMARY KEY, owner_id TEXT NOT NULL,
+               fencing_token BIGINT NOT NULL CHECK (fencing_token > 0),
+               lease_until TIMESTAMPTZ NOT NULL,
+               updated_at TIMESTAMPTZ NOT NULL DEFAULT now());
              CREATE INDEX IF NOT EXISTS idx_ocfleet_imports_created ON ocfleet_imports(created_at);"
         )?;
         tx.execute(
@@ -256,6 +275,7 @@ impl PostgresStore {
 
     pub fn doctor(&self) -> Result<PostgresDoctor, PostgresError> {
         let mut conn = self.connection()?;
+        check_state_size(&mut conn)?;
         let row = conn.query_one("SELECT format_version, sqlite_schema_version, state_sha256, state_bytes FROM ocfleet_runtime_state WHERE singleton = TRUE", &[])?;
         let image: Vec<u8> = row.get(3);
         let checksum: String = row.get(2);
@@ -269,13 +289,28 @@ impl PostgresStore {
     }
 
     pub fn import_sqlite(&self, path: &Path, dry_run: bool) -> Result<ImportReport, PostgresError> {
-        let image = std::fs::read(path)?;
+        let metadata = std::fs::metadata(path)?;
+        if metadata.len() > MAX_STATE_IMAGE_BYTES {
+            return Err(PostgresError::InvalidState(
+                "SQLite import exceeds the state image limit".into(),
+            ));
+        }
+        let file = std::fs::File::open(path)?;
+        let mut image = Vec::with_capacity(metadata.len() as usize);
+        file.take(MAX_STATE_IMAGE_BYTES + 1)
+            .read_to_end(&mut image)?;
+        if image.len() as u64 > MAX_STATE_IMAGE_BYTES {
+            return Err(PostgresError::InvalidState(
+                "SQLite import exceeds the state image limit".into(),
+            ));
+        }
         let source_sha256 = sha256(&image);
         let (schema_version, counts) = verify_image(&image)?;
         if !dry_run {
             let mut conn = self.connection()?;
             let mut tx = conn.transaction()?;
             tx.query_one("SELECT pg_advisory_xact_lock($1)", &[&MIGRATION_LOCK_ID])?;
+            self.lock_write_fence(&mut tx)?;
             insert_state(&mut tx, &image)?;
             tx.commit()?;
         }
@@ -290,7 +325,7 @@ impl PostgresStore {
 
     /// Acquires or renews a bounded distributed lease. Every successful new
     /// ownership epoch increments the fencing token; stale holders therefore
-    /// cannot commit through `verify_fence` after failover.
+    /// cannot commit through a fenced writer after failover.
     pub fn acquire_lease(
         &self,
         name: &str,
@@ -299,17 +334,12 @@ impl PostgresStore {
     ) -> Result<Option<ControllerLease>, PostgresError> {
         validate_lease(name, owner_id, ttl_seconds)?;
         let mut conn = self.connection()?;
-        conn.batch_execute(
-            "CREATE TABLE IF NOT EXISTS ocfleet_controller_leases (
-          lease_name TEXT PRIMARY KEY, owner_id TEXT NOT NULL, fencing_token BIGINT NOT NULL,
-          lease_until TIMESTAMPTZ NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now())",
-        )?;
         let row = conn.query_opt(
             "INSERT INTO ocfleet_controller_leases(lease_name, owner_id, fencing_token, lease_until)
              VALUES($1,$2,1,now() + make_interval(secs => $3))
              ON CONFLICT(lease_name) DO UPDATE SET
                owner_id = EXCLUDED.owner_id,
-               fencing_token = CASE WHEN ocfleet_controller_leases.owner_id = EXCLUDED.owner_id THEN ocfleet_controller_leases.fencing_token ELSE ocfleet_controller_leases.fencing_token + 1 END,
+               fencing_token = CASE WHEN ocfleet_controller_leases.owner_id = EXCLUDED.owner_id AND ocfleet_controller_leases.lease_until > now() THEN ocfleet_controller_leases.fencing_token ELSE ocfleet_controller_leases.fencing_token + 1 END,
                lease_until = EXCLUDED.lease_until, updated_at = now()
              WHERE ocfleet_controller_leases.lease_until <= now() OR ocfleet_controller_leases.owner_id = EXCLUDED.owner_id
              RETURNING owner_id, fencing_token, extract(epoch from lease_until)::BIGINT",
@@ -329,6 +359,19 @@ impl PostgresStore {
             "SELECT 1 FROM ocfleet_controller_leases WHERE lease_name=$1 AND owner_id=$2 AND fencing_token=$3 AND lease_until > now()",
             &[&lease.name, &lease.owner_id, &(lease.fencing_token as i64)],
         )?.is_some())
+    }
+
+    /// Returns a writer view whose lease is revalidated while holding the same
+    /// Postgres transaction that replaces controller state.
+    pub fn fenced(&self, lease: ControllerLease) -> Result<Self, PostgresError> {
+        validate_lease(&lease.name, &lease.owner_id, 1)?;
+        if lease.fencing_token == 0 {
+            return Err(PostgresError::StaleFence);
+        }
+        Ok(Self {
+            pool: self.pool.clone(),
+            write_fence: Some(lease),
+        })
     }
 
     fn connection(
@@ -357,6 +400,18 @@ impl PostgresStore {
             "SELECT pg_advisory_xact_lock($1)",
             &[&(MIGRATION_LOCK_ID + 1)],
         )?;
+        self.lock_write_fence(&mut tx)?;
+        let state_size = tx
+            .query_one(
+                "SELECT octet_length(state_bytes)::BIGINT FROM ocfleet_runtime_state WHERE singleton = TRUE",
+                &[],
+            )?
+            .get::<_, i64>(0);
+        if state_size < 0 || state_size as u64 > MAX_STATE_IMAGE_BYTES {
+            return Err(PostgresError::InvalidState(
+                "stored state image exceeds the configured limit".into(),
+            ));
+        }
         let row = tx.query_one("SELECT format_version, state_sha256, state_bytes FROM ocfleet_runtime_state WHERE singleton = TRUE FOR UPDATE", &[])?;
         let format: i32 = row.get(0);
         if format != FORMAT_VERSION {
@@ -370,10 +425,34 @@ impl PostgresStore {
         let (temp, store) = materialize(&image)?;
         let result = callback(&store)?;
         drop(store);
+        if std::fs::metadata(temp.path())?.len() > MAX_STATE_IMAGE_BYTES {
+            return Err(PostgresError::InvalidState(
+                "updated state image exceeds the configured limit".into(),
+            ));
+        }
         let updated = std::fs::read(temp.path())?;
         insert_state(&mut tx, &updated)?;
         tx.commit()?;
         Ok(result)
+    }
+
+    fn lock_write_fence(&self, tx: &mut Transaction<'_>) -> Result<(), PostgresError> {
+        let fence = self
+            .write_fence
+            .as_ref()
+            .ok_or(PostgresError::FenceRequired)?;
+        let fence_valid = tx
+            .query_opt(
+                "SELECT 1 FROM ocfleet_controller_leases
+                 WHERE lease_name=$1 AND owner_id=$2 AND fencing_token=$3 AND lease_until > now()
+                 FOR SHARE",
+                &[&fence.name, &fence.owner_id, &(fence.fencing_token as i64)],
+            )?
+            .is_some();
+        if !fence_valid {
+            return Err(PostgresError::StaleFence);
+        }
+        Ok(())
     }
 }
 
@@ -467,6 +546,16 @@ impl StoreWriter for PostgresStore {
     forward_write!(write_node_enable(node_id: &str, actor: &str) -> () => enable_node);
     forward_write!(write_node_disable(node_id: &str, actor: &str) -> () => disable_node);
     forward_write!(write_node_remove(node_id: &str, actor: &str) -> () => remove_node);
+    forward_write!(write_node_metadata(metadata: &NodeMetadataRecord, actor: &str) -> () => set_node_metadata);
+    forward_write!(write_node_maintenance_set(window: &NodeMaintenanceWindow, actor: &str) -> () => set_node_maintenance);
+    forward_write!(write_node_maintenance_clear(node_id: &str, actor: &str) -> bool => clear_node_maintenance);
+    fn write_node_capability_snapshot(
+        &self,
+        snapshot: &CapabilitySnapshot,
+        audit: &AuditEvent,
+    ) -> Result<(), Self::Error> {
+        self.with_write(|store| store.upsert_node_capability_snapshot_with_audit(snapshot, audit))
+    }
     forward_write!(write_scheduler_job_add(job: &ObservabilityJobRecord, actor: &str) -> () => insert_observability_job);
     fn write_scheduler_job_enable(&self, job_id: &str, actor: &str) -> Result<(), Self::Error> {
         self.with_write(|s| s.set_observability_job_enabled(job_id, true, actor))
@@ -544,6 +633,20 @@ fn validate_dsn(dsn: &str) -> Result<(), PostgresError> {
     }
     Ok(())
 }
+
+fn validate_transport(config: &Config) -> Result<(), PostgresError> {
+    let local_only = config.get_hosts().iter().all(|host| match host {
+        Host::Tcp(host) => matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1"),
+        #[cfg(unix)]
+        Host::Unix(_) => true,
+    });
+    if !local_only {
+        return Err(PostgresError::Configuration(
+            "NoTls Postgres connections are restricted to Unix sockets or loopback",
+        ));
+    }
+    Ok(())
+}
 fn validate_lease(name: &str, owner: &str, ttl: u32) -> Result<(), PostgresError> {
     let valid = |value: &str| {
         !value.is_empty()
@@ -582,6 +685,7 @@ fn empty_sqlite_image() -> Result<Vec<u8>, PostgresError> {
 }
 
 fn load_state(conn: &mut postgres::Client) -> Result<Vec<u8>, PostgresError> {
+    check_state_size(conn)?;
     let row = conn.query_one("SELECT format_version, state_sha256, state_bytes FROM ocfleet_runtime_state WHERE singleton = TRUE", &[])?;
     let format: i32 = row.get(0);
     if format != FORMAT_VERSION {
@@ -596,10 +700,29 @@ fn load_state(conn: &mut postgres::Client) -> Result<Vec<u8>, PostgresError> {
 }
 
 fn insert_state(tx: &mut Transaction<'_>, image: &[u8]) -> Result<(), PostgresError> {
+    if image.len() as u64 > MAX_STATE_IMAGE_BYTES {
+        return Err(PostgresError::InvalidState(
+            "state image exceeds the configured limit".into(),
+        ));
+    }
     let (schema, _) = verify_image(image)?;
     let checksum = sha256(image);
     tx.execute("INSERT INTO ocfleet_runtime_state(singleton, format_version, sqlite_schema_version, state_sha256, state_bytes, updated_at) VALUES(TRUE,$1,$2,$3,$4,now()) ON CONFLICT(singleton) DO UPDATE SET format_version=EXCLUDED.format_version, sqlite_schema_version=EXCLUDED.sqlite_schema_version, state_sha256=EXCLUDED.state_sha256, state_bytes=EXCLUDED.state_bytes, updated_at=now()", &[&FORMAT_VERSION, &schema, &checksum, &image])?;
     Ok(())
+}
+
+fn check_state_size(conn: &mut postgres::Client) -> Result<u64, PostgresError> {
+    let row = conn.query_one(
+        "SELECT octet_length(state_bytes)::BIGINT FROM ocfleet_runtime_state WHERE singleton = TRUE",
+        &[],
+    )?;
+    let size = row.get::<_, i64>(0);
+    if size < 0 || size as u64 > MAX_STATE_IMAGE_BYTES {
+        return Err(PostgresError::InvalidState(
+            "stored state image exceeds the configured limit".into(),
+        ));
+    }
+    Ok(size as u64)
 }
 
 fn materialize(image: &[u8]) -> Result<(NamedTempFile, Store), PostgresError> {
@@ -646,5 +769,13 @@ mod tests {
             path: PathBuf::from("/run/secrets/postgres.toml"),
         };
         assert!(!format!("{file:?}").contains("/run/secrets"));
+    }
+
+    #[test]
+    fn no_tls_transport_rejects_remote_hosts() {
+        let remote = Config::from_str("postgresql://db.example.test/ocfleet").expect("config");
+        assert!(validate_transport(&remote).is_err());
+        let loopback = Config::from_str("postgresql://127.0.0.1/ocfleet").expect("config");
+        assert!(validate_transport(&loopback).is_ok());
     }
 }

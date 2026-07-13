@@ -10,7 +10,10 @@ use rusqlite::{OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::io::Read;
+use std::path::Path;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
@@ -21,6 +24,108 @@ const MAX_ROWS: u64 = 1_000;
 const MAX_LIFETIME_SECONDS: i64 = 30 * 24 * 60 * 60;
 const MIN_NONCE_BYTES: usize = 16;
 const MAX_NONCE_BYTES: usize = 128;
+const MAX_KEYRING_BYTES: usize = 64 * 1024;
+const MAX_TRUSTED_KEYS: usize = 64;
+
+#[derive(Clone)]
+pub struct TrustedIntentKeyring {
+    keys: BTreeMap<String, TrustedIntentKey>,
+}
+
+#[derive(Clone)]
+struct TrustedIntentKey {
+    public_key: [u8; 32],
+    public_key_fingerprint: String,
+    allowed_actors: BTreeSet<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KeyringFile {
+    keys: Vec<KeyringEntry>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KeyringEntry {
+    key_id: String,
+    public_key_base64: String,
+    allowed_actors: Vec<String>,
+}
+
+impl fmt::Debug for TrustedIntentKeyring {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TrustedIntentKeyring")
+            .field("key_count", &self.keys.len())
+            .field("key_material", &"<redacted>")
+            .finish()
+    }
+}
+
+impl TrustedIntentKeyring {
+    pub fn from_private_file(path: &Path) -> Result<Self, StoreError> {
+        let file = crate::private_file::open_existing_private_read(path)
+            .map_err(|_| invalid("trusted intent keyring could not be read"))?;
+        let mut text = String::new();
+        file.take((MAX_KEYRING_BYTES + 1) as u64)
+            .read_to_string(&mut text)
+            .map_err(|_| invalid("trusted intent keyring could not be read"))?;
+        if text.len() > MAX_KEYRING_BYTES {
+            return Err(invalid("trusted intent keyring is too large"));
+        }
+        let parsed: KeyringFile =
+            toml::from_str(&text).map_err(|_| invalid("trusted intent keyring is invalid"))?;
+        Self::from_entries(parsed.keys)
+    }
+
+    fn from_entries(entries: Vec<KeyringEntry>) -> Result<Self, StoreError> {
+        if entries.is_empty() || entries.len() > MAX_TRUSTED_KEYS {
+            return Err(invalid("trusted intent keyring must contain 1-64 keys"));
+        }
+        let mut keys = BTreeMap::new();
+        for entry in entries {
+            validate_id(&entry.key_id, "trusted key_id")?;
+            if entry.allowed_actors.is_empty() || entry.allowed_actors.len() > 64 {
+                return Err(invalid("trusted intent key must bind at least one actor"));
+            }
+            let mut allowed_actors = BTreeSet::new();
+            for actor in entry.allowed_actors {
+                validate_actor(&actor).map_err(StoreError::InvalidInput)?;
+                if !allowed_actors.insert(actor) {
+                    return Err(invalid("trusted intent key contains a duplicate actor"));
+                }
+            }
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(&entry.public_key_base64)
+                .map_err(|_| invalid("trusted Ed25519 public key is invalid"))?;
+            let public_key: [u8; 32] = decoded
+                .try_into()
+                .map_err(|_| invalid("trusted Ed25519 public key must be 32 bytes"))?;
+            let fingerprint = format!("{:x}", Sha256::digest(public_key));
+            let trusted = TrustedIntentKey {
+                public_key,
+                public_key_fingerprint: fingerprint,
+                allowed_actors,
+            };
+            if keys.insert(entry.key_id, trusted).is_some() {
+                return Err(invalid("trusted intent key_id is duplicated"));
+            }
+        }
+        Ok(Self { keys })
+    }
+
+    fn resolve(&self, key_id: &str, actor: &str) -> Result<&TrustedIntentKey, StoreError> {
+        let key = self
+            .keys
+            .get(key_id)
+            .ok_or_else(|| invalid("signed intent key_id is not trusted"))?;
+        if !key.allowed_actors.contains(actor) {
+            return Err(invalid("signed intent key is not authorized for actor"));
+        }
+        Ok(key)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -97,8 +202,6 @@ pub struct CreateChangeRequest {
     pub expires_at: String,
     pub params_summary: Value,
     pub signed_intent: SignedControlledWriteIntent,
-    /// Raw Ed25519 public key. It is used for verification and never persisted.
-    pub signer_public_key: Vec<u8>,
 }
 
 impl fmt::Debug for CreateChangeRequest {
@@ -115,7 +218,6 @@ impl fmt::Debug for CreateChangeRequest {
             .field("expires_at", &self.expires_at)
             .field("params_summary", &"<typed-summary-only>")
             .field("signed_intent", &"<redacted>")
-            .field("signer_public_key", &"<redacted>")
             .finish()
     }
 }
@@ -148,6 +250,7 @@ impl Store {
     pub fn create_change_request(
         &self,
         input: &CreateChangeRequest,
+        keyring: &TrustedIntentKeyring,
         now: &str,
     ) -> Result<ChangeRequestRecord, StoreError> {
         validate_create(input, now)?;
@@ -156,7 +259,8 @@ impl Store {
             return Err(invalid("signed intent digest does not match the operation"));
         }
         let signature = decode_signature(&input.signed_intent.signature)?;
-        UnparsedPublicKey::new(&ED25519, &input.signer_public_key)
+        let trusted_key = keyring.resolve(&input.signed_intent.key_id, &input.actor)?;
+        UnparsedPublicKey::new(&ED25519, trusted_key.public_key)
             .verify(digest.as_bytes(), &signature)
             .map_err(|_| invalid("signed intent signature is invalid"))?;
 
@@ -166,7 +270,8 @@ impl Store {
             "key_id": input.signed_intent.key_id,
             "algorithm": input.signed_intent.algorithm,
             "payload_sha256": input.signed_intent.payload_sha256,
-            "signature": "[REDACTED]"
+            "signature": input.signed_intent.signature,
+            "public_key_fingerprint": trusted_key.public_key_fingerprint,
         });
         tx.execute(
             "INSERT INTO change_requests
@@ -195,13 +300,15 @@ impl Store {
         insert_transition_audit(
             &tx,
             input,
-            None,
-            ChangeState::Draft,
-            &input.actor,
-            None,
-            true,
-            None,
-            now,
+            TransitionAudit {
+                from: None,
+                to: ChangeState::Draft,
+                actor: &input.actor,
+                approval_id: None,
+                ok: true,
+                error: None,
+                now,
+            },
         )?;
         let record = get_change_tx(&tx, &input.request_id)?
             .ok_or_else(|| invalid("created change request is missing"))?;
@@ -221,6 +328,7 @@ impl Store {
     ) -> Result<ChangeRequestRecord, StoreError> {
         validate_actor(actor).map_err(StoreError::InvalidInput)?;
         parse_time(now, "now")?;
+        self.persist_expiry_if_needed(request_id, now)?;
         let tx = self.conn.unchecked_transaction()?;
         let current = require_active_change(&tx, request_id, now)?;
         if current.actor != actor {
@@ -256,13 +364,15 @@ impl Store {
         insert_record_audit(
             &tx,
             &current,
-            Some(current.state),
-            target,
-            actor,
-            None,
-            allowed,
-            (!allowed).then_some("POLICY_DISABLED"),
-            now,
+            TransitionAudit {
+                from: Some(current.state),
+                to: target,
+                actor,
+                approval_id: None,
+                ok: allowed,
+                error: (!allowed).then_some("POLICY_DISABLED"),
+                now,
+            },
         )?;
         let record =
             get_change_tx(&tx, request_id)?.ok_or_else(|| invalid("change request is missing"))?;
@@ -277,6 +387,7 @@ impl Store {
         now: &str,
     ) -> Result<ChangeRequestRecord, StoreError> {
         validate_approval(approval, now)?;
+        self.persist_expiry_if_needed(request_id, now)?;
         let tx = self.conn.unchecked_transaction()?;
         let current = require_active_change(&tx, request_id, now)?;
         if current.actor == approval.approver {
@@ -299,13 +410,15 @@ impl Store {
         insert_record_audit(
             &tx,
             &current,
-            Some(current.state),
-            ChangeState::Approved,
-            &approval.approver,
-            Some(&approval.approval_id),
-            true,
-            None,
-            now,
+            TransitionAudit {
+                from: Some(current.state),
+                to: ChangeState::Approved,
+                actor: &approval.approver,
+                approval_id: Some(&approval.approval_id),
+                ok: true,
+                error: None,
+                now,
+            },
         )?;
         let record =
             get_change_tx(&tx, request_id)?.ok_or_else(|| invalid("change request is missing"))?;
@@ -320,6 +433,7 @@ impl Store {
         now: &str,
     ) -> Result<ChangeRequestRecord, StoreError> {
         validate_approval(decision, now)?;
+        self.persist_expiry_if_needed(request_id, now)?;
         let tx = self.conn.unchecked_transaction()?;
         let current = require_active_change(&tx, request_id, now)?;
         if current.actor == decision.approver {
@@ -343,13 +457,15 @@ impl Store {
         insert_record_audit(
             &tx,
             &current,
-            Some(current.state),
-            ChangeState::Rejected,
-            &decision.approver,
-            Some(&decision.approval_id),
-            true,
-            None,
-            now,
+            TransitionAudit {
+                from: Some(current.state),
+                to: ChangeState::Rejected,
+                actor: &decision.approver,
+                approval_id: Some(&decision.approval_id),
+                ok: true,
+                error: None,
+                now,
+            },
         )?;
         let record =
             get_change_tx(&tx, request_id)?.ok_or_else(|| invalid("change request is missing"))?;
@@ -364,14 +480,20 @@ impl Store {
         now: &str,
     ) -> Result<ChangeRequestRecord, StoreError> {
         validate_actor(actor).map_err(StoreError::InvalidInput)?;
+        self.persist_expiry_if_needed(request_id, now)?;
         let tx = self.conn.unchecked_transaction()?;
         let current = require_active_change(&tx, request_id, now)?;
         if current.actor != actor {
             return Err(invalid("only the requesting actor may cancel a change"));
         }
-        if matches!(
+        if !matches!(
             current.state,
-            ChangeState::Dispatching | ChangeState::Succeeded | ChangeState::RolledBack
+            ChangeState::Draft
+                | ChangeState::DryRunPending
+                | ChangeState::DryRunSucceeded
+                | ChangeState::DryRunFailed
+                | ChangeState::ApprovalPending
+                | ChangeState::Approved
         ) {
             return Err(invalid("change can no longer be cancelled"));
         }
@@ -379,13 +501,15 @@ impl Store {
         insert_record_audit(
             &tx,
             &current,
-            Some(current.state),
-            ChangeState::Cancelled,
-            actor,
-            None,
-            true,
-            None,
-            now,
+            TransitionAudit {
+                from: Some(current.state),
+                to: ChangeState::Cancelled,
+                actor,
+                approval_id: None,
+                ok: true,
+                error: None,
+                now,
+            },
         )?;
         let record =
             get_change_tx(&tx, request_id)?.ok_or_else(|| invalid("change request is missing"))?;
@@ -413,6 +537,47 @@ impl Store {
         let rows = statement.query_map([limit], change_from_row)?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(StoreError::from)
+    }
+
+    fn persist_expiry_if_needed(&self, request_id: &str, now: &str) -> Result<(), StoreError> {
+        validate_id(request_id, "request_id")?;
+        let now_time = parse_time(now, "now")?;
+        let tx = self.conn.unchecked_transaction()?;
+        let current =
+            get_change_tx(&tx, request_id)?.ok_or_else(|| invalid("change request not found"))?;
+        let expires = parse_time(&current.expires_at, "stored expires_at")?;
+        if expires > now_time {
+            tx.commit()?;
+            return Ok(());
+        }
+        if matches!(
+            current.state,
+            ChangeState::Succeeded
+                | ChangeState::Failed
+                | ChangeState::Rejected
+                | ChangeState::Cancelled
+                | ChangeState::Expired
+                | ChangeState::RolledBack
+        ) {
+            tx.commit()?;
+            return Err(invalid("change request has expired"));
+        }
+        transition(&tx, request_id, current.state, ChangeState::Expired, now)?;
+        insert_record_audit(
+            &tx,
+            &current,
+            TransitionAudit {
+                from: Some(current.state),
+                to: ChangeState::Expired,
+                actor: "system:expiry",
+                approval_id: None,
+                ok: true,
+                error: None,
+                now,
+            },
+        )?;
+        tx.commit()?;
+        Err(invalid("change request has expired"))
     }
 }
 
@@ -442,8 +607,8 @@ fn validate_create(input: &CreateChangeRequest, now: &str) -> Result<(), StoreEr
             "change request expiry must be in the future and within 30 days",
         ));
     }
-    if input.signer_public_key.len() != 32 {
-        return Err(invalid("Ed25519 public key must be 32 bytes"));
+    if input.operation_kind == ControlledWriteOperationKind::OcservSessionDisconnect {
+        return Err(invalid("session disconnect is not supported by D0"));
     }
     Ok(())
 }
@@ -472,6 +637,8 @@ fn operation_digest(input: &CreateChangeRequest) -> Result<String, StoreError> {
         "operation_id": input.operation_id,
         "operation_kind": operation_kind(input.operation_kind),
         "endpoint_id": input.endpoint_id,
+        "actor": input.actor,
+        "reason": input.reason,
         "change_ticket": input.change_ticket,
         "nonce": input.nonce,
         "expires_at": input.expires_at,
@@ -492,17 +659,6 @@ fn require_active_change(
         get_change_tx(tx, request_id)?.ok_or_else(|| invalid("change request not found"))?;
     let expires = parse_time(&current.expires_at, "stored expires_at")?;
     if expires <= now_time {
-        if !matches!(
-            current.state,
-            ChangeState::Succeeded
-                | ChangeState::Failed
-                | ChangeState::Rejected
-                | ChangeState::Cancelled
-                | ChangeState::Expired
-                | ChangeState::RolledBack
-        ) {
-            transition(tx, request_id, current.state, ChangeState::Expired, now)?;
-        }
         return Err(invalid("change request has expired"));
     }
     Ok(current)
@@ -527,22 +683,26 @@ fn transition(
     Ok(())
 }
 
+struct TransitionAudit<'a> {
+    from: Option<ChangeState>,
+    to: ChangeState,
+    actor: &'a str,
+    approval_id: Option<&'a str>,
+    ok: bool,
+    error: Option<&'a str>,
+    now: &'a str,
+}
+
 fn insert_transition_audit(
     tx: &Transaction<'_>,
     input: &CreateChangeRequest,
-    from: Option<ChangeState>,
-    to: ChangeState,
-    actor: &str,
-    approval_id: Option<&str>,
-    ok: bool,
-    error: Option<&str>,
-    now: &str,
+    audit: TransitionAudit<'_>,
 ) -> Result<(), StoreError> {
     tx.execute(
         "INSERT INTO write_operation_audit
          (ts, request_id, operation_id, operation_kind, actor, approval_id, state_from, state_to, ok, error_code, detail_json)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-        params![now, input.request_id, input.operation_id, operation_kind(input.operation_kind), actor, approval_id, from.map(ChangeState::as_str), to.as_str(), ok, error, "{\"schema\":\"ocfleet.write_audit.v1\"}"],
+        params![audit.now, input.request_id, input.operation_id, operation_kind(input.operation_kind), audit.actor, audit.approval_id, audit.from.map(ChangeState::as_str), audit.to.as_str(), audit.ok, audit.error, "{\"schema\":\"ocfleet.write_audit.v1\"}"],
     )?;
     Ok(())
 }
@@ -550,19 +710,13 @@ fn insert_transition_audit(
 fn insert_record_audit(
     tx: &Transaction<'_>,
     record: &ChangeRequestRecord,
-    from: Option<ChangeState>,
-    to: ChangeState,
-    actor: &str,
-    approval_id: Option<&str>,
-    ok: bool,
-    error: Option<&str>,
-    now: &str,
+    audit: TransitionAudit<'_>,
 ) -> Result<(), StoreError> {
     tx.execute(
         "INSERT INTO write_operation_audit
          (ts, request_id, operation_id, operation_kind, actor, approval_id, state_from, state_to, ok, error_code, detail_json)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-        params![now, record.request_id, record.operation_id, record.operation_kind, actor, approval_id, from.map(ChangeState::as_str), to.as_str(), ok, error, "{\"schema\":\"ocfleet.write_audit.v1\"}"],
+        params![audit.now, record.request_id, record.operation_id, record.operation_kind, audit.actor, audit.approval_id, audit.from.map(ChangeState::as_str), audit.to.as_str(), audit.ok, audit.error, "{\"schema\":\"ocfleet.write_audit.v1\"}"],
     )?;
     Ok(())
 }
@@ -660,7 +814,12 @@ mod tests {
     use ring::rand::SystemRandom;
     use ring::signature::{Ed25519KeyPair, KeyPair};
 
-    fn fixture() -> (tempfile::TempDir, Store, CreateChangeRequest) {
+    fn fixture() -> (
+        tempfile::TempDir,
+        Store,
+        CreateChangeRequest,
+        TrustedIntentKeyring,
+    ) {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(&dir.path().join("controller.sqlite")).expect("store");
         let key = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).expect("generate key");
@@ -682,20 +841,26 @@ mod tests {
                 payload_sha256: "0".repeat(64),
                 signature: "pending".into(),
             },
-            signer_public_key: key.public_key().as_ref().to_vec(),
         };
         let digest = operation_digest(&request).expect("digest");
         request.signed_intent.payload_sha256 = digest.clone();
         request.signed_intent.signature =
             base64::engine::general_purpose::STANDARD.encode(key.sign(digest.as_bytes()).as_ref());
-        (dir, store, request)
+        let keyring = TrustedIntentKeyring::from_entries(vec![KeyringEntry {
+            key_id: "test-key".into(),
+            public_key_base64: base64::engine::general_purpose::STANDARD
+                .encode(key.public_key().as_ref()),
+            allowed_actors: vec!["operator-a".into()],
+        }])
+        .expect("keyring");
+        (dir, store, request, keyring)
     }
 
     #[test]
     fn dry_run_and_two_person_approval_never_dispatch() {
-        let (_dir, store, request) = fixture();
+        let (_dir, store, request, keyring) = fixture();
         let created = store
-            .create_change_request(&request, "2026-07-13T00:00:00Z")
+            .create_change_request(&request, &keyring, "2026-07-13T00:00:00Z")
             .expect("create");
         assert_eq!(created.state, ChangeState::Draft);
         let dry_run = store
@@ -723,13 +888,13 @@ mod tests {
 
     #[test]
     fn policy_disabled_same_actor_and_replay_fail_closed() {
-        let (_dir, store, request) = fixture();
+        let (_dir, store, request, keyring) = fixture();
         store
-            .create_change_request(&request, "2026-07-13T00:00:00Z")
+            .create_change_request(&request, &keyring, "2026-07-13T00:00:00Z")
             .expect("create");
         assert!(
             store
-                .create_change_request(&request, "2026-07-13T00:00:00Z")
+                .create_change_request(&request, &keyring, "2026-07-13T00:00:00Z")
                 .is_err(),
             "operation id and nonce are idempotent/replay protected"
         );
@@ -747,13 +912,112 @@ mod tests {
 
     #[test]
     fn debug_redacts_signed_and_sensitive_material() {
-        let (_dir, _store, request) = fixture();
+        let (_dir, _store, request, keyring) = fixture();
         let debug = format!("{request:?}");
         assert!(!debug.contains(&request.reason));
         assert!(!debug.contains(&request.nonce));
         assert!(!debug.contains(&request.signed_intent.signature));
-        assert!(!debug.contains(
-            &base64::engine::general_purpose::STANDARD.encode(&request.signer_public_key)
-        ));
+        assert!(format!("{keyring:?}").contains("<redacted>"));
+    }
+
+    #[test]
+    fn trusted_key_binding_and_signed_actor_reason_fail_closed() {
+        let (_dir, store, request, keyring) = fixture();
+        let mut actor_tamper = request.clone();
+        actor_tamper.actor = "operator-b".into();
+        assert!(
+            store
+                .create_change_request(&actor_tamper, &keyring, "2026-07-13T00:00:00Z")
+                .is_err()
+        );
+        let mut reason_tamper = request.clone();
+        reason_tamper.reason = "Different reviewed reason".into();
+        assert!(
+            store
+                .create_change_request(&reason_tamper, &keyring, "2026-07-13T00:00:00Z")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn expiry_transition_is_committed_and_terminal_cancel_is_rejected() {
+        let (_dir, store, request, keyring) = fixture();
+        store
+            .create_change_request(&request, &keyring, "2026-07-13T00:00:00Z")
+            .expect("create");
+        assert!(
+            store
+                .record_change_dry_run(
+                    &request.request_id,
+                    &request.actor,
+                    true,
+                    true,
+                    "2026-07-14T00:00:00Z",
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .get_change_request(&request.request_id)
+                .expect("read")
+                .expect("request")
+                .state,
+            ChangeState::Expired
+        );
+        assert!(
+            store
+                .cancel_change(&request.request_id, &request.actor, "2026-07-14T00:01:00Z")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn unsupported_operation_is_rejected_before_sql() {
+        let (_dir, store, mut request, keyring) = fixture();
+        request.operation_kind = ControlledWriteOperationKind::OcservSessionDisconnect;
+        assert!(
+            store
+                .create_change_request(&request, &keyring, "2026-07-13T00:00:00Z")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn rust_operation_catalog_matches_schema_allowlist() {
+        let (_dir, store, _request, _keyring) = fixture();
+        for (index, kind) in [
+            ControlledWriteOperationKind::OcservReload,
+            ControlledWriteOperationKind::OcservRestart,
+            ControlledWriteOperationKind::OcservConfigApply,
+            ControlledWriteOperationKind::OcservConfigRollback,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO change_requests
+                     (request_id, operation_id, operation_kind, endpoint_id, actor, reason,
+                      change_ticket, operation_digest, nonce, signer_key_id, signed_intent_json,
+                      params_summary_json, state, expires_at, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, 'endpoint', 'actor', 'reason', 'CHG-1', ?4, ?5,
+                             'key', '{}', '{}', 'draft', ?6, ?7, ?7)",
+                    params![
+                        format!("request-{index}"),
+                        format!("operation-{index}"),
+                        operation_kind(kind),
+                        "0".repeat(64),
+                        format!("nonce-{index:016}"),
+                        "2026-07-14T00:00:00Z",
+                        "2026-07-13T00:00:00Z",
+                    ],
+                )
+                .expect("supported Rust kind must satisfy schema");
+        }
+        assert_eq!(
+            operation_kind(ControlledWriteOperationKind::OcservSessionDisconnect),
+            "ocserv_session_disconnect"
+        );
     }
 }

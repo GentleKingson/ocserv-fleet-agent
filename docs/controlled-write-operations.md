@@ -181,10 +181,17 @@ secret values.
 
 ## SQLite State Schema
 
-Schema migration `0026_controlled_write_state` implements the additive D0
+Schema migration `0028_controlled_write_state` implements the additive D0
 tables. The default build cannot access the state-machine module and the agent
 still has no write dispatch. The abbreviated schema below documents the core
 relationships; the migration is authoritative for constraints and indexes.
+
+Intent verification never accepts a caller-supplied public key. The controller
+loads a private TOML keyring whose entries bind a `key_id` and Ed25519 public
+key to an explicit set of actors. The canonical signed payload includes actor,
+reason, exact EndpointID, operation, ticket, nonce, expiry, and typed parameter
+summary. Storage retains the signature, payload digest, key ID, and public-key
+fingerprint so the decision can be reverified without trusting request input.
 
 ```sql
 CREATE TABLE change_requests (

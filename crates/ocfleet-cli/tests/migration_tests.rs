@@ -42,6 +42,11 @@ fn migration_tests_new_database_creates_all_current_tables_and_indexes() {
         "node_metadata",
         "node_maintenance_windows",
         "node_capability_snapshots",
+        "change_requests",
+        "change_approvals",
+        "write_operation_attempts",
+        "write_operation_audit",
+        "signed_bundles",
     ] {
         assert_schema_object_exists(&conn, "table", table);
     }
@@ -70,6 +75,45 @@ fn migration_tests_new_database_creates_all_current_tables_and_indexes() {
     }
     assert_eq!(table_count(&conn, "health_policy"), 1);
     assert_sqlite_checks_pass(&conn);
+}
+
+#[test]
+fn migration_tests_controlled_write_state_upgrades_schema_27() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("controller.sqlite");
+    drop(Store::open(&db).expect("create current store"));
+
+    let conn = Connection::open(&db).expect("open current db");
+    conn.execute_batch(
+        "DROP TABLE signed_bundles;
+         DROP TABLE write_operation_audit;
+         DROP TABLE write_operation_attempts;
+         DROP TABLE change_approvals;
+         DROP TABLE change_requests;
+         DELETE FROM schema_migrations WHERE version = 28;",
+    )
+    .expect("downgrade fixture to schema 27");
+    drop(conn);
+
+    let store = Store::open(&db).expect("upgrade schema 27 to 28");
+    assert_eq!(
+        store.current_schema_version().expect("schema version"),
+        CURRENT_SCHEMA_VERSION
+    );
+    drop(store);
+
+    let conn = Connection::open(&db).expect("open migrated db");
+    for table in [
+        "change_requests",
+        "change_approvals",
+        "write_operation_attempts",
+        "write_operation_audit",
+        "signed_bundles",
+    ] {
+        assert_schema_object_exists(&conn, "table", table);
+    }
+    assert_sqlite_checks_pass(&conn);
+    assert_eq!(backup_files(dir.path()).len(), 1);
 }
 
 #[test]

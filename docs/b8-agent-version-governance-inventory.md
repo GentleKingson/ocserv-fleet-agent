@@ -41,7 +41,7 @@ capability observation; it adds no remote write or upgrade RPC.
   redaction, readiness, and snapshot/audit rollback.
 - `controller_rpc_tests.rs`: compatible/incompatible/unsupported decode,
   bounded audit summary, snapshot projection, and deterministic legacy state.
-- `migration_tests.rs`: every historical schema upgrades through schema 27 and
+- `migration_tests.rs`: every historical schema upgrades through current schema 28 and
   new/reopened databases remain complete and idempotent.
 - `cli_args_tests.rs`: closed distribution/readiness command surface.
 - `api_tests.rs`: exact OpenAPI/router path, bounded readiness projection,

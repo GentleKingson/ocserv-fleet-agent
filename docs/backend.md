@@ -198,9 +198,17 @@ The runtime uses an r2d2 pool and a Postgres migration transaction protected by
 `pg_advisory_xact_lock`. Its versioned, checksummed state image preserves the
 same SQLite `StoreReader`/`StoreWriter` contract and therefore the same bounded
 queries, typed projections, retention behavior, and actor-bound atomic audit.
-Each write locks the singleton state row and commits the updated checksum and
-database image in the same Postgres transaction. Controller leases use bounded
-TTLs and monotonically increasing fencing tokens.
+Each write requires a bound controller lease, locks that lease row, verifies its
+owner and fencing token, locks the singleton state row, and commits the updated
+checksum and database image in the same Postgres transaction. Controller leases
+use bounded TTLs; every ownership epoch, including same-owner reacquisition
+after expiry, receives a monotonically increasing fencing token.
+
+The current client uses `NoTls` only for Unix sockets and loopback addresses.
+Remote hosts fail closed and must be reached through a certificate-verifying TLS
+implementation in a later reviewed change, not by weakening this restriction.
+State images are capped at 512 MiB before import, database retrieval, checksum,
+or replacement.
 
 `import_sqlite(path, true)` validates the SQLite header, current schema, and
 bounded table counts without changing Postgres. A non-dry-run import holds the

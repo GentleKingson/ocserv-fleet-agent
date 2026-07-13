@@ -54,8 +54,10 @@ scan_roots = [Path(value).resolve() for value in sys.argv[2:]]
 # Keep this list deliberately small. A new backend must first establish a
 # reviewed transactional writer boundary before its path is added here.
 ALLOWED_FILES = {
-    ("crates", "ocfleet-cli", "src", "store.rs"),
+    ("crates", "ocfleet-cli", "src", "controlled_writes.rs"),
     ("crates", "ocfleet-cli", "src", "migrations.rs"),
+    ("crates", "ocfleet-cli", "src", "postgres_backend.rs"),
+    ("crates", "ocfleet-cli", "src", "store.rs"),
 }
 ALLOWED_DIRECTORIES = {
     ("crates", "ocfleet-cli", "migrations"),
@@ -126,6 +128,7 @@ LEGACY_SCHEDULER_WRITER_ALLOWED_FILES = {
 DIRECT_SCHEDULER_CONFIG_MUTATOR_ALLOWED_FILES = {
     ("crates", "ocfleet-cli", "src", "store.rs"),
     ("crates", "ocfleet-cli", "src", "backend.rs"),
+    ("crates", "ocfleet-cli", "src", "postgres_backend.rs"),
 }
 DIRECT_NODE_ENDPOINT_MUTATOR_ALLOWED_FILES = {
     ("crates", "ocfleet-cli", "src", "store.rs"),

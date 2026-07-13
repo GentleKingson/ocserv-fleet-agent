@@ -1,0 +1,23 @@
+[package]
+name = "ocfleet-snapshot-schema"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "ocfleet-snapshot-validator"
+path = "src/bin/validator.rs"
+
+[dependencies]
+clap.workspace = true
+libc.workspace = true
+ocfleet-protocol = { path = "../ocfleet-protocol" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+time.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -27,5 +27,6 @@ pub mod slo;
 pub mod storage_payloads;
 pub mod store;
 pub mod trust_policy;
+pub mod version_governance;
 
 pub const CLI_VERSION: &str = env!("CARGO_PKG_VERSION");

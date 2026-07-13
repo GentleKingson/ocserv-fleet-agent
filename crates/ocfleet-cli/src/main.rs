@@ -3,19 +3,21 @@ use clap::Parser;
 use ocfleet_cli::alerts::run_alert_command;
 use ocfleet_cli::args::{
     Cli, Command, EndpointCommand, EnrollCommand, EnrollRequestCommand, EnrollTokenCommand,
-    NodeCommand, OcservCommand, OcservSessionsCommand, ProbeCommand, TrustCommand, TrustDiffFormat,
-    TrustPolicyCommand,
+    NodeCommand, NodeMaintenanceCommand, NodeMetadataCommand, OcservCommand, OcservSessionsCommand,
+    ProbeCommand, TrustCommand, TrustDiffFormat, TrustPolicyCommand, TrustPolicyHistoryCommand,
+    VersionCommand,
 };
 use ocfleet_cli::audit::AuditEvent;
 use ocfleet_cli::audit_export::run_audit_command;
 use ocfleet_cli::backend::StoreWriter;
 use ocfleet_cli::backup::{run_backup_command, run_restore_command};
 use ocfleet_cli::controller_rpc::{
-    FixedControllerRpc, OcservCommandAudit, RpcAuditRecord, RpcCommandFailure, elapsed_ms,
+    FixedControllerRpc, OcservCommandAudit, RpcAuditRecord, RpcCommandFailure,
+    capability_snapshot_from_failure, capability_snapshot_from_success, elapsed_ms,
     endpoint_trust_rejection, error_code_from_name, execute_fixed_node_rpc, execute_ocserv_rpc,
-    execute_optional_ocserv_rpc, hash_json_value, known_endpoint_id, load_ocserv_rpc_node,
-    low_sensitive_detail, low_sensitive_fixed_rpc_summary, ocserv_failure_detail,
-    write_ocserv_command_audit, write_rpc_audit,
+    execute_optional_ocserv_rpc, hash_json_value, known_endpoint_id, legacy_capabilities_fallback,
+    load_ocserv_rpc_node, low_sensitive_detail, low_sensitive_fixed_rpc_summary,
+    ocserv_failure_detail, write_capability_rpc_audit, write_ocserv_command_audit, write_rpc_audit,
 };
 use ocfleet_cli::doctor::{DoctorOptions, format_human, run_doctor};
 use ocfleet_cli::duration_args::parse_duration_seconds;
@@ -34,18 +36,24 @@ use ocfleet_cli::retention::run_retention_command;
 use ocfleet_cli::scheduler::run_schedule_command;
 use ocfleet_cli::store::{
     ApprovalInput, EndpointTrustRecord, EnrollmentTokenInsert, JoinRequestInsert,
-    LegacyEnrollmentClaimInput, NodeInsert, NodeRecord, ProbeHistoryRecord, ProbeObservationRecord,
-    Store,
+    LegacyEnrollmentClaimInput, NodeInsert, NodeMaintenanceWindow, NodeMetadataRecord, NodeRecord,
+    ProbeHistoryRecord, ProbeObservationRecord, Store,
 };
-use ocfleet_cli::trust_policy::{run_trust_policy_diff, run_trust_policy_validate};
+use ocfleet_cli::trust_policy::{
+    run_trust_policy_approve, run_trust_policy_diff, run_trust_policy_history_list,
+    run_trust_policy_history_record, run_trust_policy_plan, run_trust_policy_sign,
+    run_trust_policy_validate,
+};
+use ocfleet_cli::version_governance::{MAX_VERSION_GOVERNANCE_NODES, build_fleet_version_report};
 use ocfleet_config::validation::{
     canonicalize_node_endpoint_id, validate_node_id, validate_region, validate_role,
 };
 use ocfleet_protocol::enrollment::{EndpointStatus, TrustBundle};
 use ocfleet_protocol::error::ErrorCode;
 use ocfleet_protocol::method::{
-    NODE_INFO, NODE_PING, OCSERV_CERT_EXPIRY, OCSERV_CONFIG_FINGERPRINT, OCSERV_SERVICE_SUMMARY,
-    OCSERV_SESSIONS_SUMMARY, OCSERV_VERSION, PROBE_CONTROLLER_PING, PROBE_PATH_ECHO,
+    NODE_CAPABILITIES, NODE_INFO, NODE_PING, OCSERV_CERT_EXPIRY, OCSERV_CONFIG_FINGERPRINT,
+    OCSERV_SERVICE_SUMMARY, OCSERV_SESSIONS_SUMMARY, OCSERV_VERSION, PROBE_CONTROLLER_PING,
+    PROBE_PATH_ECHO,
 };
 use ocfleet_protocol::ocserv::{
     OcservCertExpiryResponse, OcservConfigFingerprintResponse, OcservServiceSummaryResponse,
@@ -104,14 +112,20 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Ping { node_id } => {
             let store = Store::open(&cli.database).context("failed to open controller database")?;
-            run_node_rpc_command(&store, &cli.secret_key, &node_id, NODE_PING).await?;
+            run_node_rpc_command(&store, &cli.secret_key, &node_id, NODE_PING, false).await?;
         }
         Command::Probe { command } => {
             let store = Store::open(&cli.database).context("failed to open controller database")?;
             match command {
                 ProbeCommand::Ping { node_id } => {
-                    run_node_rpc_command(&store, &cli.secret_key, &node_id, PROBE_CONTROLLER_PING)
-                        .await?;
+                    run_node_rpc_command(
+                        &store,
+                        &cli.secret_key,
+                        &node_id,
+                        PROBE_CONTROLLER_PING,
+                        false,
+                    )
+                    .await?;
                 }
                 ProbeCommand::Path {
                     source_node_id,
@@ -152,7 +166,18 @@ async fn main() -> anyhow::Result<()> {
             let store = Store::open(&cli.database).context("failed to open controller database")?;
             match command {
                 NodeCommand::Info { node_id } => {
-                    run_node_rpc_command(&store, &cli.secret_key, &node_id, NODE_INFO).await?;
+                    run_node_rpc_command(&store, &cli.secret_key, &node_id, NODE_INFO, false)
+                        .await?;
+                }
+                NodeCommand::Capabilities { node_id, json } => {
+                    run_node_rpc_command(
+                        &store,
+                        &cli.secret_key,
+                        &node_id,
+                        NODE_CAPABILITIES,
+                        json,
+                    )
+                    .await?;
                 }
                 NodeCommand::Add {
                     node_id,
@@ -188,6 +213,102 @@ async fn main() -> anyhow::Result<()> {
                         );
                     }
                 }
+                NodeCommand::Metadata { command } => match command {
+                    NodeMetadataCommand::Set {
+                        node_id,
+                        environment,
+                        site,
+                        owner_team,
+                        service_tier,
+                        labels,
+                        expected_agent_version,
+                    } => {
+                        let labels_json = parse_node_labels(labels)?;
+                        StoreWriter::write_node_metadata(
+                            &store,
+                            &NodeMetadataRecord {
+                                node_id,
+                                environment,
+                                site,
+                                owner_team,
+                                service_tier,
+                                labels_json,
+                                expected_agent_version,
+                                updated_at: now_rfc3339()?,
+                            },
+                            &local_actor(),
+                        )?;
+                    }
+                    NodeMetadataCommand::Show {
+                        node_id,
+                        json: json_output,
+                    } => {
+                        let metadata = store
+                            .get_node_metadata(&node_id)?
+                            .context("node metadata is not configured")?;
+                        let output = json!({"node_id":metadata.node_id,"environment":metadata.environment,"site":metadata.site,"owner_team":metadata.owner_team,"service_tier":metadata.service_tier,"labels":metadata.labels_json,"expected_agent_version":metadata.expected_agent_version,"updated_at":metadata.updated_at});
+                        if json_output {
+                            println!("{}", serde_json::to_string_pretty(&output)?);
+                        } else {
+                            println!(
+                                "node_id={} environment={} site={} owner_team={} service_tier={} labels={} expected_agent_version={}",
+                                output["node_id"].as_str().unwrap_or(""),
+                                output["environment"].as_str().unwrap_or(""),
+                                output["site"].as_str().unwrap_or(""),
+                                output["owner_team"].as_str().unwrap_or(""),
+                                output["service_tier"].as_str().unwrap_or(""),
+                                output["labels"],
+                                output["expected_agent_version"].as_str().unwrap_or("-")
+                            );
+                        }
+                    }
+                },
+                NodeCommand::Maintenance { command } => match command {
+                    NodeMaintenanceCommand::Set {
+                        node_id,
+                        from,
+                        to,
+                        reason,
+                    } => StoreWriter::write_node_maintenance_set(
+                        &store,
+                        &NodeMaintenanceWindow {
+                            node_id,
+                            starts_at: from,
+                            ends_at: to,
+                            reason,
+                            updated_at: now_rfc3339()?,
+                        },
+                        &local_actor(),
+                    )?,
+                    NodeMaintenanceCommand::Clear { node_id } => {
+                        let removed = StoreWriter::write_node_maintenance_clear(
+                            &store,
+                            &node_id,
+                            &local_actor(),
+                        )?;
+                        println!(
+                            "status={}",
+                            if removed { "cleared" } else { "already-clear" }
+                        );
+                    }
+                    NodeMaintenanceCommand::Show {
+                        node_id,
+                        json: json_output,
+                    } => {
+                        let window = store.get_node_maintenance(&node_id)?;
+                        let active = store.node_maintenance_active_at(&node_id, &now_rfc3339()?)?;
+                        if json_output {
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(
+                                    &json!({"window":window.as_ref().map(|w|json!({"node_id":w.node_id,"from":w.starts_at,"to":w.ends_at,"reason":w.reason,"updated_at":w.updated_at})),"active":active})
+                                )?
+                            );
+                        } else {
+                            println!("active={active}");
+                        }
+                    }
+                },
                 NodeCommand::Disable { node_id } => {
                     validate_node_id(&node_id)?;
                     StoreWriter::write_node_disable(&store, &node_id, &local_actor())?;
@@ -204,6 +325,10 @@ async fn main() -> anyhow::Result<()> {
                     StoreWriter::write_node_remove(&store, &node_id, &local_actor())?;
                 }
             }
+        }
+        Command::Version { command } => {
+            let store = Store::open(&cli.database).context("failed to open controller database")?;
+            run_version_command(&store, command)?;
         }
         Command::Enroll { command } => {
             let store = Store::open(&cli.database).context("failed to open controller database")?;
@@ -346,8 +471,18 @@ async fn main() -> anyhow::Result<()> {
                 run_trust_diff_command(&store, endpoint.as_deref(), format, strict)?;
             }
             TrustCommand::Policy { command } => match command {
-                TrustPolicyCommand::Validate { file, json } => {
-                    run_trust_policy_validate(&file, json)?;
+                TrustPolicyCommand::Validate {
+                    file,
+                    json,
+                    signature,
+                    public_key,
+                } => {
+                    run_trust_policy_validate(
+                        &file,
+                        json,
+                        signature.as_deref(),
+                        public_key.as_deref(),
+                    )?;
                 }
                 TrustPolicyCommand::Diff {
                     file,
@@ -355,10 +490,79 @@ async fn main() -> anyhow::Result<()> {
                     format,
                     output,
                 } => {
-                    let store =
-                        Store::open(&cli.database).context("failed to open controller database")?;
+                    let store = Store::open_read_only_policy_snapshot(&cli.database)
+                        .context("failed to open read-only controller policy snapshot")?;
                     run_trust_policy_diff(&store, &file, json, format, output.as_deref())?;
                 }
+                TrustPolicyCommand::Sign {
+                    file,
+                    key_file,
+                    key_id,
+                    output,
+                    public_key_output,
+                    json,
+                } => run_trust_policy_sign(
+                    &file,
+                    &key_file,
+                    &key_id,
+                    &output,
+                    &public_key_output,
+                    json,
+                )?,
+                TrustPolicyCommand::Plan {
+                    file,
+                    signature,
+                    public_key,
+                    output,
+                    markdown_output,
+                    json,
+                } => {
+                    let store = Store::open_read_only_policy_snapshot(&cli.database)
+                        .context("failed to open read-only controller policy snapshot")?;
+                    run_trust_policy_plan(
+                        &store,
+                        &file,
+                        &signature,
+                        &public_key,
+                        &output,
+                        markdown_output.as_deref(),
+                        json,
+                    )?;
+                }
+                TrustPolicyCommand::Approve {
+                    plan,
+                    key_file,
+                    key_id,
+                    reviewer_keyring,
+                    output,
+                    json,
+                } => run_trust_policy_approve(
+                    &plan,
+                    &key_file,
+                    &key_id,
+                    &actor,
+                    &reviewer_keyring,
+                    &output,
+                    json,
+                )?,
+                TrustPolicyCommand::History { command } => match command {
+                    TrustPolicyHistoryCommand::Record {
+                        plan,
+                        approval,
+                        reviewer_keyring,
+                        history,
+                        json,
+                    } => run_trust_policy_history_record(
+                        &plan,
+                        approval.as_deref(),
+                        reviewer_keyring.as_deref(),
+                        &history,
+                        json,
+                    )?,
+                    TrustPolicyHistoryCommand::List { history, json } => {
+                        run_trust_policy_history_list(&history, json)?
+                    }
+                },
             },
         },
         Command::Ocserv { command } => {
@@ -405,6 +609,106 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn parse_node_labels(labels: Vec<String>) -> anyhow::Result<Value> {
+    let mut values = serde_json::Map::new();
+    for label in labels {
+        let (key, value) = label
+            .split_once('=')
+            .context("--label must use KEY=VALUE")?;
+        if values
+            .insert(key.to_string(), Value::String(value.to_string()))
+            .is_some()
+        {
+            bail!("duplicate label key: {key}");
+        }
+    }
+    let labels = Value::Object(values);
+    ocfleet_cli::input_validation::validate_label_json(&labels, "labels")
+        .map_err(anyhow::Error::msg)?;
+    Ok(labels)
+}
+
+fn run_version_command(store: &Store, command: VersionCommand) -> anyhow::Result<()> {
+    let report = build_fleet_version_report(
+        store.list_version_governance_inputs(MAX_VERSION_GOVERNANCE_NODES)?,
+    )
+    .map_err(anyhow::Error::msg)?;
+    match command {
+        VersionCommand::Distribution { json: json_output } => {
+            let observed_node_count = report
+                .distribution
+                .iter()
+                .map(|entry| entry.node_count)
+                .sum::<usize>();
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "schema": "ocfleet.version-distribution.v1",
+                        "node_count": report.node_count,
+                        "observed_node_count": observed_node_count,
+                        "unknown_node_count": report.node_count.saturating_sub(observed_node_count),
+                        "distribution": report.distribution,
+                        "actions_enabled": false,
+                    }))?
+                );
+            } else {
+                println!("node_count={}", report.node_count);
+                println!("observed_node_count={observed_node_count}");
+                println!(
+                    "unknown_node_count={}",
+                    report.node_count.saturating_sub(observed_node_count)
+                );
+                for entry in report.distribution {
+                    println!("version={} node_count={}", entry.version, entry.node_count);
+                }
+                println!("actions_enabled=false");
+            }
+        }
+        VersionCommand::Readiness { json: json_output } => {
+            if json_output {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("node_count={}", report.node_count);
+                println!("ready_count={}", report.ready_count);
+                println!("blocked_count={}", report.blocked_count);
+                println!("unknown_count={}", report.unknown_count);
+                println!("disabled_count={}", report.disabled_count);
+                println!("outdated_count={}", report.outdated_count);
+                println!(
+                    "protocol_incompatible_count={}",
+                    report.protocol_incompatible_count
+                );
+                println!(
+                    "provider_incompatible_count={}",
+                    report.provider_incompatible_count
+                );
+                println!("alert_count={}", report.alert_count);
+                for node in report.nodes {
+                    println!(
+                        "node_id={} observed={} expected={} version_status={:?} protocol_status={:?} provider_schema_status={:?} readiness={:?}",
+                        node.node_id,
+                        node.observed_agent_version.as_deref().unwrap_or("unknown"),
+                        node.expected_agent_version.as_deref().unwrap_or("unset"),
+                        node.version_status,
+                        node.protocol_status,
+                        node.provider_schema_status,
+                        node.readiness,
+                    );
+                }
+                println!("actions_enabled=false");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn now_rfc3339() -> anyhow::Result<String> {
+    OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .map_err(anyhow::Error::from)
 }
 
 fn run_enroll_token_create(
@@ -1571,6 +1875,7 @@ async fn run_node_rpc_command(
     secret_key_path: &Path,
     node_id: &str,
     method: &str,
+    json_output: bool,
 ) -> anyhow::Result<()> {
     validate_node_id(node_id)?;
     let actor = local_actor();
@@ -1650,40 +1955,99 @@ async fn run_node_rpc_command(
     match execute_fixed_node_rpc(store, secret_key_path, &node, rpc).await {
         Ok(success) => {
             let summary = low_sensitive_fixed_rpc_summary(method, &success.result)?;
-            write_rpc_audit(
-                store,
-                RpcAuditRecord {
-                    actor,
-                    node_id: node.node_id.clone(),
-                    endpoint_id: Some(node.endpoint_id.clone()),
-                    method: method.to_string(),
-                    request_id: Some(success.request_id.clone()),
-                    params_hash,
-                    ok: true,
-                    error_code: None,
-                    duration_ms: elapsed_ms(started),
-                    detail_json: summary,
-                },
-            )?;
-            print_rpc_result(method, &success.result);
+            let audit = RpcAuditRecord {
+                actor,
+                node_id: node.node_id.clone(),
+                endpoint_id: Some(node.endpoint_id.clone()),
+                method: method.to_string(),
+                request_id: Some(success.request_id.clone()),
+                params_hash,
+                ok: true,
+                error_code: None,
+                duration_ms: elapsed_ms(started),
+                detail_json: summary,
+            };
+            if method == NODE_CAPABILITIES {
+                let snapshot = capability_snapshot_from_success(
+                    &node.node_id,
+                    &node.endpoint_id,
+                    &now_rfc3339()?,
+                    &success.result,
+                )
+                .map_err(anyhow::Error::new)?;
+                write_capability_rpc_audit(store, audit, &snapshot)?;
+            } else {
+                write_rpc_audit(store, audit)?;
+            }
+            if json_output && method == NODE_CAPABILITIES {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "status": "compatible",
+                        "actions_enabled": false,
+                        "capabilities": success.result,
+                    }))?
+                );
+            } else {
+                print_rpc_result(method, &success.result);
+            }
             Ok(())
         }
         Err(failure) => {
-            write_rpc_audit(
-                store,
-                RpcAuditRecord {
-                    actor,
-                    node_id: node.node_id.clone(),
-                    endpoint_id: Some(node.endpoint_id.clone()),
-                    method: method.to_string(),
-                    request_id: failure.request_id.clone(),
-                    params_hash,
-                    ok: false,
-                    error_code: Some(failure.code),
-                    duration_ms: elapsed_ms(started),
-                    detail_json: failure.detail_json.clone(),
-                },
-            )?;
+            let legacy_fallback = (method == NODE_CAPABILITIES)
+                .then(|| legacy_capabilities_fallback(&failure.code))
+                .flatten();
+            let detail_json = legacy_fallback
+                .clone()
+                .unwrap_or_else(|| failure.detail_json.clone());
+            let snapshot = if method == NODE_CAPABILITIES {
+                capability_snapshot_from_failure(
+                    &node.node_id,
+                    &node.endpoint_id,
+                    &now_rfc3339()?,
+                    &failure.code,
+                    &detail_json,
+                )
+                .transpose()?
+            } else {
+                None
+            };
+            let audit = RpcAuditRecord {
+                actor,
+                node_id: node.node_id.clone(),
+                endpoint_id: Some(node.endpoint_id.clone()),
+                method: method.to_string(),
+                request_id: failure.request_id.clone(),
+                params_hash,
+                ok: false,
+                error_code: Some(failure.code),
+                duration_ms: elapsed_ms(started),
+                detail_json,
+            };
+            if let Some(snapshot) = snapshot {
+                write_capability_rpc_audit(store, audit, &snapshot)?;
+            } else {
+                write_rpc_audit(store, audit)?;
+            }
+            if legacy_fallback.is_some() {
+                if json_output {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&json!({
+                            "status": "legacy_unsupported",
+                            "compatibility": "unknown",
+                            "reason": "node_capabilities_method_not_found",
+                            "actions_enabled": false,
+                        }))?
+                    );
+                } else {
+                    println!("status=legacy_unsupported");
+                    println!("compatibility=unknown");
+                    println!("reason=node_capabilities_method_not_found");
+                    println!("actions_enabled=false");
+                }
+                return Ok(());
+            }
             bail!(failure.message);
         }
     }
@@ -1824,9 +2188,26 @@ async fn run_ocserv_status_command(
         config_algorithm: fingerprint
             .as_available()
             .map(|response| response.fingerprint.algorithm.clone()),
+        config_key_id: fingerprint
+            .as_available()
+            .and_then(|response| response.fingerprint.key_id.clone()),
         config_hash: fingerprint
             .as_available()
             .and_then(|response| response.fingerprint.hash.clone()),
+        config_previous_key_id: fingerprint.as_available().and_then(|response| {
+            response
+                .fingerprint
+                .previous
+                .as_ref()
+                .map(|value| value.key_id.clone())
+        }),
+        config_previous_hash: fingerprint.as_available().and_then(|response| {
+            response
+                .fingerprint
+                .previous
+                .as_ref()
+                .map(|value| value.hash.clone())
+        }),
         config_status: fingerprint
             .as_available()
             .map(|response| response.fingerprint.status)
@@ -2137,6 +2518,23 @@ fn print_rpc_result(method: &str, result: &Value) {
                 if let Some(value) = result.get(field) {
                     println!("{field}={value}");
                 }
+            }
+        }
+        NODE_CAPABILITIES => {
+            println!("status=compatible");
+            println!("actions_enabled=false");
+            for field in ["protocol_min", "protocol_max", "agent_version"] {
+                if let Some(value) = result.get(field) {
+                    println!("{field}={value}");
+                }
+            }
+            for field in ["supported_methods", "provider_schemas", "feature_flags"] {
+                if let Some(value) = result.get(field) {
+                    println!("{field}={value}");
+                }
+            }
+            if let Some(controlled) = result.get("controlled_writes") {
+                println!("controlled_writes={controlled}");
             }
         }
         _ => {}

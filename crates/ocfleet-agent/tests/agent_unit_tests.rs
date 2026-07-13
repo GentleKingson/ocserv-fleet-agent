@@ -4,6 +4,7 @@ use ocfleet_agent::{
     audit::{AgentAuditEvent, JsonlAuditWriter},
     audit_limiter::{AuditLimitDecision, RejectedAuditLimiter},
     authz::{AgentAuthorization, CallerClass, PathProbeDecision},
+    capabilities::collect_node_capabilities,
     enrollment::{AgentEnrollment, AgentEnrollmentStateExt},
     node_info::collect_node_info,
     nonce::{NonceCache, NonceDecision, NonceLimitScope},
@@ -20,14 +21,15 @@ use ocfleet_config::agent::{
 use ocfleet_config::agent::{
     ControlledWriteOperationPolicy, ControlledWritesConfig, validate_agent_config,
 };
+use ocfleet_protocol::capabilities::{FixedRpcMethod, NodeCapabilitiesResponse};
 use ocfleet_protocol::constants::PROTOCOL_VERSION;
 use ocfleet_protocol::enrollment::{EndpointStatus, TrustBundle};
 use ocfleet_protocol::error::ErrorCode;
 use ocfleet_protocol::method::{
-    NODE_INFO, NODE_PING, OCSERV_CERT_EXPIRY, OCSERV_CONFIG_APPLY, OCSERV_CONFIG_FINGERPRINT,
-    OCSERV_CONFIG_ROLLBACK, OCSERV_RELOAD, OCSERV_RESTART, OCSERV_SERVICE_SUMMARY,
-    OCSERV_SESSION_DISCONNECT, OCSERV_SESSIONS_SUMMARY, OCSERV_VERSION, PROBE_CONTROLLER_PING,
-    PROBE_PATH_ECHO, PROBE_PEER_ECHO,
+    NODE_CAPABILITIES, NODE_INFO, NODE_PING, OCSERV_CERT_EXPIRY, OCSERV_CONFIG_APPLY,
+    OCSERV_CONFIG_FINGERPRINT, OCSERV_CONFIG_ROLLBACK, OCSERV_RELOAD, OCSERV_RESTART,
+    OCSERV_SERVICE_SUMMARY, OCSERV_SESSION_DISCONNECT, OCSERV_SESSIONS_SUMMARY, OCSERV_VERSION,
+    PROBE_CONTROLLER_PING, PROBE_PATH_ECHO, PROBE_PEER_ECHO,
 };
 use ocfleet_protocol::rpc::RpcRequest;
 use serde_json::json;
@@ -980,6 +982,39 @@ async fn handle_request_classifies_phase_one_methods() {
         "agent-endpoint-1"
     );
 
+    let capabilities = handle_request(
+        &state,
+        &controller,
+        test_rpc_request(NODE_CAPABILITIES, valid_nonce(14)),
+    )
+    .await;
+    assert!(capabilities.ok, "{capabilities:#?}");
+    let capabilities: NodeCapabilitiesResponse =
+        serde_json::from_value(capabilities.result.expect("capabilities result"))
+            .expect("decode capabilities");
+    capabilities
+        .ensure_controller_compatible(PROTOCOL_VERSION)
+        .expect("agent capabilities are compatible");
+    assert_eq!(capabilities.agent_version, AGENT_VERSION);
+    assert!(
+        capabilities
+            .supported_methods
+            .contains(&FixedRpcMethod::NodeCapabilities)
+    );
+    assert!(!capabilities.controlled_writes.locally_enabled);
+    let capability_json = serde_json::to_string(&capabilities).unwrap();
+    for forbidden_key in [
+        "\"path\":",
+        "\"command\":",
+        "\"unit\":",
+        "\"local_policy\":",
+    ] {
+        assert!(!capability_json.contains(forbidden_key));
+    }
+    for forbidden_value in ["/etc/", "systemctl", "secret", "raw_config"] {
+        assert!(!capability_json.contains(forbidden_value));
+    }
+
     let probe = handle_request(
         &state,
         &controller,
@@ -1241,6 +1276,57 @@ async fn handle_request_allows_enabled_peer_echo() {
             "target_node_id",
             "time_utc"
         ]
+    );
+}
+
+#[tokio::test]
+async fn handle_request_rejects_peer_capability_enumeration() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let peer_id = iroh::SecretKey::generate().public();
+    let mut config = test_agent_config(dir.path(), Vec::new());
+    config.security.peers = vec![PeerConfig {
+        endpoint_id: peer_id.to_string(),
+        enabled: true,
+    }];
+    let state = test_server_state_from_config(config, "agent-endpoint-1");
+    let response = handle_request(
+        &state,
+        &peer_id.to_string(),
+        test_rpc_request(NODE_CAPABILITIES, valid_nonce(67)),
+    )
+    .await;
+    assert_eq!(
+        response.error.as_ref().expect("peer rejected").code,
+        ErrorCode::MethodNotAllowed
+    );
+}
+
+#[test]
+fn node_capabilities_default_build_reports_controlled_writes_disabled() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let config = test_agent_config(dir.path(), Vec::new());
+    let capabilities = collect_node_capabilities(&config);
+    assert_eq!(
+        capabilities.controlled_writes.compiled,
+        cfg!(feature = "controlled-writes")
+    );
+    assert!(!capabilities.controlled_writes.locally_enabled);
+}
+
+#[cfg(feature = "controlled-writes")]
+#[test]
+fn node_capabilities_feature_build_reports_local_control_separately() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let mut config = test_agent_config(dir.path(), Vec::new());
+    config.controlled_writes.enabled = true;
+    let capabilities = collect_node_capabilities(&config);
+    assert!(capabilities.controlled_writes.compiled);
+    assert!(capabilities.controlled_writes.locally_enabled);
+    assert!(
+        capabilities
+            .supported_methods
+            .iter()
+            .all(|method| !method.as_str().starts_with("ocserv.reload"))
     );
 }
 

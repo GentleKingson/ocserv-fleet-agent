@@ -2,13 +2,11 @@ use std::path::{Path, PathBuf};
 
 use ocfleet_protocol::error::ErrorCode;
 use ocfleet_protocol::ocserv::{
-    OcservCollectorStatus, OcservFieldStatus, OcservFreshness, OcservLiveReadonlyMetadata,
-    OcservReadonlyMeta, OcservReadonlySource, OcservServiceEnabledState, OcservServiceState,
-    OcservServiceSummary, OcservServiceSummaryResponse, OcservSessionsSummary,
-    OcservSessionsSummaryResponse, OcservVersionResponse, is_valid_ocserv_collected_at,
-    is_valid_ocserv_version,
+    OcservFieldStatus, OcservFreshness, OcservLiveReadonlyMetadata, OcservReadonlyMeta,
+    OcservReadonlySource, OcservServiceSummary, OcservServiceSummaryResponse,
+    OcservSessionsSummary, OcservSessionsSummaryResponse, OcservVersionResponse,
+    is_valid_ocserv_collected_at, is_valid_ocserv_version,
 };
-use serde::Deserialize;
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::ocserv::{
@@ -16,7 +14,6 @@ use crate::ocserv::{
     trusted_file::{PermissionPolicy, read_bounded_trusted_file},
 };
 
-const COLLECTOR_SNAPSHOT_SCHEMA_VERSION: &str = "ocfleet.ocserv.snapshot.v2";
 const SNAPSHOT_MAX_BYTES: u64 = 16 * 1024;
 const MAX_SNAPSHOT_AGE_SECONDS: i64 = 60 * 60;
 const MAX_FUTURE_SKEW_SECONDS: i64 = 5 * 60;
@@ -26,27 +23,7 @@ pub struct CollectorSnapshotOcservReadonlyProvider {
     path: PathBuf,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CollectorSnapshotDocument {
-    schema_version: String,
-    collected_at: String,
-    collector_status: OcservCollectorStatus,
-    service_state: OcservServiceState,
-    enabled_state: OcservServiceEnabledState,
-    #[serde(default)]
-    version: Option<String>,
-    #[serde(default)]
-    session_total: Option<u32>,
-    #[serde(default)]
-    auth_failure_count_rolling: Option<u64>,
-    #[serde(default)]
-    connection_failure_count_rolling: Option<u64>,
-    #[serde(default)]
-    cert_min_days_remaining: Option<i64>,
-    #[serde(default)]
-    config_fingerprint_short: Option<String>,
-}
+type CollectorSnapshotDocument = ocfleet_snapshot_schema::SnapshotDocument;
 
 impl CollectorSnapshotOcservReadonlyProvider {
     pub fn new(path: PathBuf) -> Self {
@@ -132,9 +109,8 @@ impl OcservReadonlyProvider for CollectorSnapshotOcservReadonlyProvider {
 }
 
 fn validate_snapshot(snapshot: &CollectorSnapshotDocument) -> Result<(), OcservReadonlyError> {
-    if snapshot.schema_version != COLLECTOR_SNAPSHOT_SCHEMA_VERSION {
-        return invalid_data("ocserv live snapshot schema is unsupported");
-    }
+    ocfleet_snapshot_schema::validate(snapshot)
+        .map_err(|_| invalid_data_error("ocserv live snapshot schema is invalid"))?;
     if !is_valid_ocserv_collected_at(&snapshot.collected_at) {
         return invalid_data("ocserv live snapshot timestamp is invalid");
     }

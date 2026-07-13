@@ -2146,6 +2146,11 @@ fn health_evaluation_lifecycle_is_atomic_idempotent_and_actor_bound() {
     StoreWriter::write_health_evaluation_start(&store, &start, TEST_ACTOR)
         .expect("exact start replay");
     assert_eq!(store.audit_count().expect("audit count"), audit_count);
+    let mut later_replay = start.clone();
+    later_replay.started_at = "2026-07-11T01:01:00Z".to_string();
+    StoreWriter::write_health_evaluation_start(&store, &later_replay, TEST_ACTOR)
+        .expect("same deterministic input replay at a later scheduler tick");
+    assert_eq!(store.audit_count().expect("audit count"), audit_count);
     assert!(matches!(
         StoreWriter::write_health_evaluation_start(&store, &start, "different-actor"),
         Err(StoreError::HealthEvaluationConflict { .. })

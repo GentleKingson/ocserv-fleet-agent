@@ -1,18 +1,51 @@
 use ocfleet_cli::controller_rpc::{
-    CONTROLLER_RPC_RESULT_CLASS, ControllerRpcRunner, EndpointTrustRejection, FixedControllerRpc,
-    endpoint_trust_rejection, low_sensitive_fixed_rpc_summary,
+    CAPABILITIES_RESULT_CLASS, CONTROLLER_RPC_RESULT_CLASS, CapabilityDecodeError,
+    ControllerRpcRunner, EndpointTrustRejection, FixedControllerRpc, capabilities_audit_summary,
+    capability_snapshot_from_failure, capability_snapshot_from_success, decode_node_capabilities,
+    endpoint_trust_rejection, legacy_capabilities_fallback, low_sensitive_fixed_rpc_summary,
     low_sensitive_ocserv_observation_summary,
 };
 use ocfleet_cli::store::{NodeInsert, Store};
+use ocfleet_protocol::capabilities::{
+    AgentFeatureFlag, ControlledWritesCapability, FixedRpcMethod, NodeCapabilitiesResponse,
+    ProviderSchemaCapability, ProviderSchemaId, READONLY_FIXED_METHOD_CATALOG,
+};
+use ocfleet_protocol::constants::PROTOCOL_VERSION;
+use ocfleet_protocol::error::ErrorCode;
 use ocfleet_protocol::method::{
-    OCSERV_CERT_EXPIRY, OCSERV_CONFIG_FINGERPRINT, OCSERV_SERVICE_SUMMARY, OCSERV_SESSIONS_SUMMARY,
-    OCSERV_VERSION, PROBE_CONTROLLER_PING, PROBE_PATH_ECHO,
+    NODE_CAPABILITIES, OCSERV_CERT_EXPIRY, OCSERV_CONFIG_FINGERPRINT, OCSERV_SERVICE_SUMMARY,
+    OCSERV_SESSIONS_SUMMARY, OCSERV_VERSION, PROBE_CONTROLLER_PING, PROBE_PATH_ECHO,
 };
 use rusqlite::Connection;
 use serde_json::json;
 
 const TEST_NODE_ID: &str = "node-a";
 const TEST_ACTOR: &str = "controller-rpc-test";
+
+fn capabilities_fixture() -> serde_json::Value {
+    serde_json::to_value(NodeCapabilitiesResponse {
+        protocol_min: PROTOCOL_VERSION,
+        protocol_max: PROTOCOL_VERSION,
+        agent_version: "0.4.0-rc.1".to_string(),
+        supported_methods: READONLY_FIXED_METHOD_CATALOG.to_vec(),
+        provider_schemas: vec![ProviderSchemaCapability {
+            provider: ProviderSchemaId::OcservSnapshot,
+            min_version: 2,
+            max_version: 2,
+        }],
+        feature_flags: vec![
+            AgentFeatureFlag::CapabilityNegotiation,
+            AgentFeatureFlag::HmacConfigFingerprint,
+            AgentFeatureFlag::LocalSnapshotV2,
+            AgentFeatureFlag::OcservReadonly,
+        ],
+        controlled_writes: ControlledWritesCapability {
+            compiled: false,
+            locally_enabled: false,
+        },
+    })
+    .expect("serialize capabilities fixture")
+}
 
 fn seed_active_node(store: &Store) -> String {
     let endpoint_id = iroh::SecretKey::generate().public().to_string();
@@ -377,6 +410,11 @@ fn controller_rpc_path_summary_drops_nested_target_result() {
 #[test]
 fn controller_rpc_fixed_rpc_variants_define_method_and_params() {
     assert_eq!(
+        FixedControllerRpc::NodeCapabilities.method(),
+        NODE_CAPABILITIES
+    );
+    assert_eq!(FixedControllerRpc::NodeCapabilities.params(), json!({}));
+    assert_eq!(
         FixedControllerRpc::ProbeControllerPing.method(),
         PROBE_CONTROLLER_PING
     );
@@ -395,7 +433,97 @@ fn controller_rpc_fixed_rpc_variants_define_method_and_params() {
     let allowlist = FixedControllerRpc::allowlisted_methods();
     assert!(allowlist.contains(&PROBE_CONTROLLER_PING));
     assert!(allowlist.contains(&PROBE_PATH_ECHO));
+    assert!(allowlist.contains(&NODE_CAPABILITIES));
     assert!(!allowlist.contains(&"shell.exec"));
+}
+
+#[test]
+fn controller_decodes_compatible_capabilities_and_emits_bounded_audit_summary() {
+    let fixture = capabilities_fixture();
+    let decoded = decode_node_capabilities(&fixture).expect("compatible capability fixture");
+    assert_eq!(decoded.agent_version, "0.4.0-rc.1");
+    assert!(
+        decoded
+            .supported_methods
+            .contains(&FixedRpcMethod::NodeCapabilities)
+    );
+
+    let summary = capabilities_audit_summary(&fixture).expect("audit summary");
+    assert_eq!(summary["result_class"], CAPABILITIES_RESULT_CLASS);
+    assert_eq!(summary["status"], "compatible");
+    assert_eq!(summary["compatible"], true);
+    assert_eq!(summary["supported_method_count"], 11);
+    assert_eq!(summary["provider_schema_count"], 1);
+    assert_eq!(summary["ocserv_snapshot_min"], 2);
+    assert_eq!(summary["ocserv_snapshot_max"], 2);
+    assert_eq!(summary["feature_flag_count"], 4);
+    assert_eq!(summary["controlled_writes_locally_enabled"], false);
+    for raw_field in ["supported_methods", "provider_schemas", "feature_flags"] {
+        assert!(summary.get(raw_field).is_none());
+    }
+}
+
+#[test]
+fn controller_projects_capability_snapshots_without_raw_local_detail() {
+    let endpoint = iroh::SecretKey::generate().public().to_string();
+    let snapshot = capability_snapshot_from_success(
+        "node-a",
+        &endpoint,
+        "2026-07-12T00:00:00Z",
+        &capabilities_fixture(),
+    )
+    .expect("snapshot");
+    assert_eq!(snapshot.agent_version.as_deref(), Some("0.4.0-rc.1"));
+    assert_eq!(snapshot.ocserv_snapshot_min, Some(2));
+    assert_eq!(snapshot.controlled_writes_locally_enabled, Some(false));
+
+    let legacy = capability_snapshot_from_failure(
+        "node-a",
+        &endpoint,
+        "2026-07-12T00:01:00Z",
+        &ErrorCode::MethodNotFound,
+        &legacy_capabilities_fallback(&ErrorCode::MethodNotFound).unwrap(),
+    )
+    .expect("snapshot outcome")
+    .expect("legacy snapshot");
+    assert!(legacy.agent_version.is_none());
+    assert!(legacy.protocol_min.is_none());
+    assert!(legacy.controlled_writes_compiled.is_none());
+}
+
+#[test]
+fn controller_fails_closed_for_future_or_unsupported_capabilities() {
+    let mut future = capabilities_fixture();
+    future["protocol_min"] = json!(PROTOCOL_VERSION + 1);
+    future["protocol_max"] = json!(PROTOCOL_VERSION + 1);
+    let error = decode_node_capabilities(&future).expect_err("future agent must fail closed");
+    assert_eq!(error, CapabilityDecodeError::IncompatibleProtocol);
+    assert_eq!(error.code(), ErrorCode::SchemaVersionUnsupported);
+
+    let mut missing = capabilities_fixture();
+    missing["supported_methods"] = json!(["node.ping", "node.info"]);
+    assert_eq!(
+        decode_node_capabilities(&missing),
+        Err(CapabilityDecodeError::UnsupportedCapability)
+    );
+
+    let mut unknown = capabilities_fixture();
+    unknown["local_policy"] = json!({"path":"/etc/ocserv/ocserv.conf"});
+    assert_eq!(
+        decode_node_capabilities(&unknown),
+        Err(CapabilityDecodeError::InvalidResponse)
+    );
+}
+
+#[test]
+fn old_agent_method_not_found_has_deterministic_disabled_fallback() {
+    let fallback =
+        legacy_capabilities_fallback(&ErrorCode::MethodNotFound).expect("old agent fallback");
+    assert_eq!(fallback["status"], "legacy_unsupported");
+    assert_eq!(fallback["compatible"], false);
+    assert_eq!(fallback["actions_enabled"], false);
+    assert_eq!(fallback["result_class"], CAPABILITIES_RESULT_CLASS);
+    assert!(legacy_capabilities_fallback(&ErrorCode::InvalidResponse).is_none());
 }
 
 #[test]
@@ -460,8 +588,10 @@ fn controller_rpc_ocserv_observation_summary_drops_raw_dto_fields() {
         OCSERV_CONFIG_FINGERPRINT,
         &json!({
             "fingerprint": {
-                "algorithm": "sha256",
+                "algorithm": "hmac-sha256",
+                "key_id": "key-current",
                 "hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "previous": {"algorithm":"hmac-sha256","key_id":"key-previous","hash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
                 "status": "available",
                 "path": "/etc/ocserv/ocserv.conf"
             },
@@ -469,9 +599,18 @@ fn controller_rpc_ocserv_observation_summary_drops_raw_dto_fields() {
         }),
     )
     .expect("fingerprint summary");
-    assert_eq!(fingerprint["config_fingerprint_algorithm"], "sha256");
+    assert_eq!(fingerprint["config_fingerprint_algorithm"], "hmac-sha256");
+    assert_eq!(fingerprint["config_fingerprint_key_id"], "key-current");
     assert_eq!(fingerprint["config_fingerprint_prefix"], "aaaaaaaaaaaa");
     assert_eq!(fingerprint["config_fingerprint_status"], "available");
+    assert_eq!(
+        fingerprint["config_fingerprint_previous_key_id"],
+        "key-previous"
+    );
+    assert_eq!(
+        fingerprint["config_fingerprint_previous_prefix"],
+        "bbbbbbbbbbbb"
+    );
     assert!(fingerprint.get("hash").is_none());
 
     let combined = json!([service, version, sessions, fingerprint]).to_string();

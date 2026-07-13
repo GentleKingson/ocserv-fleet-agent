@@ -165,11 +165,46 @@ pub struct OcservCertificateConfig {
     pub cert_path: PathBuf,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OcservConfigFingerprintConfig {
     pub name: String,
     pub config_path: PathBuf,
+    #[serde(default)]
+    pub mode: ConfigFingerprintMode,
+    #[serde(default)]
+    pub key_id: Option<String>,
+    #[serde(default)]
+    pub key_path: Option<PathBuf>,
+    #[serde(default)]
+    pub previous_key_id: Option<String>,
+    #[serde(default)]
+    pub previous_key_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigFingerprintMode {
+    #[default]
+    HmacSha256,
+    LegacySha256,
+}
+
+impl std::fmt::Debug for OcservConfigFingerprintConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OcservConfigFingerprintConfig")
+            .field("name", &self.name)
+            .field("mode", &self.mode)
+            .field("key_id", &self.key_id)
+            .field("previous_key_id", &self.previous_key_id)
+            .field("config_path_configured", &true)
+            .field("key_path_configured", &self.key_path.is_some())
+            .field(
+                "previous_key_path_configured",
+                &self.previous_key_path.is_some(),
+            )
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
@@ -649,6 +684,56 @@ fn validate_ocserv_readonly_config(config: &OcservReadonlyConfig) -> Result<(), 
             &fingerprint.config_path,
             "ocserv_readonly.config_fingerprint.config_path",
         )?;
+        match fingerprint.mode {
+            ConfigFingerprintMode::LegacySha256 => {
+                if fingerprint.key_id.is_some()
+                    || fingerprint.key_path.is_some()
+                    || fingerprint.previous_key_id.is_some()
+                    || fingerprint.previous_key_path.is_some()
+                {
+                    return Err(ConfigError::Invalid(
+                        "legacy config fingerprint mode cannot configure HMAC keys".to_string(),
+                    ));
+                }
+            }
+            ConfigFingerprintMode::HmacSha256 => {
+                let key_id = fingerprint.key_id.as_deref().ok_or_else(|| {
+                    ConfigError::Invalid("HMAC config fingerprint requires key_id".to_string())
+                })?;
+                validate_ocserv_logical_name(key_id, "ocserv_readonly.config_fingerprint.key_id")?;
+                validate_absolute_path(
+                    fingerprint.key_path.as_deref().ok_or_else(|| {
+                        ConfigError::Invalid(
+                            "HMAC config fingerprint requires key_path".to_string(),
+                        )
+                    })?,
+                    "ocserv_readonly.config_fingerprint.key_path",
+                )?;
+                if fingerprint.previous_key_id.is_some() != fingerprint.previous_key_path.is_some()
+                {
+                    return Err(ConfigError::Invalid(
+                        "previous HMAC key_id and key_path must be configured together".to_string(),
+                    ));
+                }
+                if let Some(id) = fingerprint.previous_key_id.as_deref() {
+                    validate_ocserv_logical_name(
+                        id,
+                        "ocserv_readonly.config_fingerprint.previous_key_id",
+                    )?;
+                    if Some(id) == fingerprint.key_id.as_deref() {
+                        return Err(ConfigError::Invalid(
+                            "current and previous HMAC key IDs must differ".to_string(),
+                        ));
+                    }
+                }
+                if let Some(path) = fingerprint.previous_key_path.as_deref() {
+                    validate_absolute_path(
+                        path,
+                        "ocserv_readonly.config_fingerprint.previous_key_path",
+                    )?;
+                }
+            }
+        }
     }
     Ok(())
 }

@@ -4,9 +4,9 @@ use ocfleet_protocol::method::{
 };
 use ocfleet_protocol::ocserv::{
     OcservCertExpiry, OcservCertExpiryResponse, OcservCertStatus, OcservCollectorStatus,
-    OcservConfigFingerprint, OcservConfigFingerprintResponse, OcservFieldStatus, OcservFreshness,
-    OcservLiveReadonlyMetadata, OcservReadonlyMeta, OcservReadonlySource,
-    OcservServiceEnabledState, OcservServiceState, OcservServiceSummary,
+    OcservConfigFingerprint, OcservConfigFingerprintDigest, OcservConfigFingerprintResponse,
+    OcservFieldStatus, OcservFreshness, OcservLiveReadonlyMetadata, OcservReadonlyMeta,
+    OcservReadonlySource, OcservServiceEnabledState, OcservServiceState, OcservServiceSummary,
     OcservServiceSummaryRequest, OcservServiceSummaryResponse, OcservSessionsSummary,
     OcservSessionsSummaryRequest, OcservSessionsSummaryResponse, OcservVersionRequest,
     OcservVersionResponse, is_valid_ocserv_collected_at, is_valid_ocserv_name,
@@ -327,7 +327,9 @@ fn ocserv_config_fingerprint_round_trips_without_config_content() {
     let response = OcservConfigFingerprintResponse {
         fingerprint: OcservConfigFingerprint {
             algorithm: "sha256".to_string(),
+            key_id: None,
             hash: Some("c".repeat(64)),
+            previous: None,
             status: OcservFieldStatus::Available,
         },
         meta: meta(),
@@ -342,6 +344,38 @@ fn ocserv_config_fingerprint_round_trips_without_config_content() {
         Some(expected_hash.as_str())
     );
     assert!(!value.to_string().contains("ocserv.conf"));
+}
+
+#[test]
+fn ocserv_hmac_config_fingerprint_round_trips_rotation_metadata() {
+    let response = OcservConfigFingerprintResponse {
+        fingerprint: OcservConfigFingerprint {
+            algorithm: "hmac-sha256".to_string(),
+            key_id: Some("key-2026-07".to_string()),
+            hash: Some("d".repeat(64)),
+            previous: Some(OcservConfigFingerprintDigest {
+                algorithm: "hmac-sha256".to_string(),
+                key_id: "key-2026-06".to_string(),
+                hash: "e".repeat(64),
+            }),
+            status: OcservFieldStatus::Available,
+        },
+        meta: meta(),
+    };
+
+    let value = serde_json::to_value(&response).expect("serialize HMAC fingerprint");
+    let round_trip: OcservConfigFingerprintResponse =
+        serde_json::from_value(value.clone()).expect("deserialize HMAC fingerprint");
+
+    assert_eq!(round_trip, response);
+    assert_eq!(value["fingerprint"]["key_id"], json!("key-2026-07"));
+    assert_eq!(
+        value["fingerprint"]["previous"]["key_id"],
+        json!("key-2026-06")
+    );
+    let text = value.to_string();
+    assert!(!text.contains("key_path"));
+    assert!(!text.contains("material"));
 }
 
 #[test]

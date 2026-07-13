@@ -6,6 +6,7 @@ use clap::Parser;
 use ocfleet_cli::args::RedactionMode;
 
 use crate::auth::AuthToken;
+use crate::cursor_keys::CursorKeyring;
 
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:8080";
 pub const DEFAULT_MAX_LIMIT: u64 = 1_000;
@@ -28,6 +29,8 @@ pub struct ApiCli {
     pub redact: RedactionMode,
     #[arg(long, value_name = "PATH")]
     pub auth_token_file: Option<PathBuf>,
+    #[arg(long, value_name = "PATH")]
+    pub cursor_key_file: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -37,6 +40,7 @@ pub struct ApiConfig {
     pub max_limit: u64,
     pub redact: RedactionMode,
     pub auth_token: Option<AuthToken>,
+    pub cursor_keys: CursorKeyring,
 }
 
 impl ApiConfig {
@@ -58,12 +62,19 @@ impl ApiConfig {
             .map(AuthToken::from_private_file)
             .transpose()
             .context("failed to load --auth-token-file")?;
+        let cursor_key_file = cli
+            .cursor_key_file
+            .as_deref()
+            .context("--cursor-key-file is required for stable signed /api/v1 cursors")?;
+        let cursor_keys = CursorKeyring::from_private_file(cursor_key_file)
+            .context("failed to load --cursor-key-file")?;
         Ok(Self {
             database: cli.database,
             listen: cli.listen,
             max_limit: cli.max_limit,
             redact: cli.redact,
             auth_token,
+            cursor_keys,
         })
     }
 

@@ -1,3 +1,4 @@
+pub mod capabilities;
 pub mod constants;
 #[cfg(feature = "controlled-writes")]
 pub mod controlled_write;

@@ -23,7 +23,7 @@ use crate::audit::AuditEvent;
 use crate::input_validation::{
     validate_actor, validate_agent_fingerprint, validate_agent_public_key, validate_agent_version,
     validate_description, validate_endpoint_id, validate_hostname, validate_label_json,
-    validate_reason,
+    validate_metadata_value, validate_reason,
 };
 use crate::migrations;
 use crate::private_file::{self, PrivateFileError};
@@ -34,8 +34,12 @@ use crate::storage_payloads::{
     RunSummaryPayloadV1, SchedulerPairPayloadV1, SchedulerSelectorPayloadV1, TrustBundlePayloadV1,
     validate_health_payload_relationship, validate_scheduler_payload_relationship,
 };
+use crate::version_governance::{
+    CapabilityNegotiationStatus, CapabilitySnapshot, MAX_VERSION_GOVERNANCE_NODES,
+    VersionGovernanceInput,
+};
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 25;
+pub const CURRENT_SCHEMA_VERSION: i64 = 27;
 pub const DEFAULT_HEALTH_STALE_WINDOW_SECONDS: u64 = 24 * 60 * 60;
 pub const DEFAULT_HEALTH_UNREACHABLE_FAILURES: u64 = 3;
 pub const DEFAULT_HEALTH_CERT_WARNING_DAYS: u64 = 30;
@@ -63,6 +67,12 @@ pub enum StoreError {
         "unsupported future controller database schema {found}; this binary supports up to {supported}"
     )]
     UnsupportedFutureSchema { found: i64, supported: i64 },
+    #[error(
+        "controller database schema {found} must be migrated to {required} before read-only policy review"
+    )]
+    SchemaUpgradeRequired { found: i64, required: i64 },
+    #[error("controller database has an active WAL; checkpoint it before immutable policy review")]
+    ReadOnlySnapshotWalActive,
     #[error("database migration backup failed: {0}")]
     MigrationBackup(String),
     #[error("database integrity check failed ({check}): {detail}")]
@@ -174,6 +184,27 @@ pub struct NodeRecord {
     pub region: String,
     pub role: String,
     pub enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeMetadataRecord {
+    pub node_id: String,
+    pub environment: String,
+    pub site: String,
+    pub owner_team: String,
+    pub service_tier: String,
+    pub labels_json: Value,
+    pub expected_agent_version: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeMaintenanceWindow {
+    pub node_id: String,
+    pub starts_at: String,
+    pub ends_at: String,
+    pub reason: String,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -874,6 +905,58 @@ impl Store {
         })
     }
 
+    /// Opens an existing controller snapshot without creating, migrating, or
+    /// changing it. A missing database is represented by an initialized
+    /// in-memory empty snapshot so review-only policy commands remain pure.
+    pub fn open_read_only_policy_snapshot(path: &Path) -> Result<Self, StoreError> {
+        let database_path = absolute_database_path(path)?;
+        if !database_path.exists() {
+            let mut conn = Connection::open_in_memory()?;
+            conn.pragma_update(None, "foreign_keys", "ON")?;
+            migrations::migrate_to_current(&mut conn, Path::new(":memory:"), true)?;
+            conn.pragma_update(None, "query_only", "ON")?;
+            return Ok(Self {
+                conn,
+                database_path,
+            });
+        }
+
+        validate_database_files(&database_path)?;
+        let [wal_path, _] = sqlite_sidecar_paths(&database_path);
+        if sqlite_wal_has_data(&wal_path)? {
+            return Err(StoreError::ReadOnlySnapshotWalActive);
+        }
+        let uri = immutable_sqlite_uri(&database_path)?;
+        let conn = Connection::open_with_flags(
+            uri,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        )?;
+        conn.pragma_update(None, "query_only", "ON")?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        conn.pragma_update(None, "busy_timeout", 5_000)?;
+        let version = migrations::read_schema_version(&conn)?;
+        if version > CURRENT_SCHEMA_VERSION {
+            return Err(StoreError::UnsupportedFutureSchema {
+                found: version,
+                supported: CURRENT_SCHEMA_VERSION,
+            });
+        }
+        if version < CURRENT_SCHEMA_VERSION {
+            return Err(StoreError::SchemaUpgradeRequired {
+                found: version,
+                required: CURRENT_SCHEMA_VERSION,
+            });
+        }
+        if sqlite_wal_has_data(&wal_path)? {
+            return Err(StoreError::ReadOnlySnapshotWalActive);
+        }
+        validate_database_files(&database_path)?;
+        Ok(Self {
+            conn,
+            database_path,
+        })
+    }
+
     pub(crate) fn database_path(&self) -> &Path {
         &self.database_path
     }
@@ -997,6 +1080,303 @@ impl Store {
         let rows = stmt.query_map([limit], node_from_row)?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(StoreError::from)
+    }
+
+    pub fn list_nodes_by_role_limited(
+        &self,
+        role: &str,
+        limit: u64,
+    ) -> Result<Vec<NodeRecord>, StoreError> {
+        validate_role(role).map_err(|error| StoreError::InvalidInput(error.to_string()))?;
+        let limit = u64_to_i64(limit)?;
+        let mut stmt = self.conn.prepare(
+            "SELECT node_id, endpoint_id, name, region, role, enabled
+             FROM nodes WHERE role = ?1 ORDER BY node_id LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![role, limit], node_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub fn list_nodes_by_metadata_limited(
+        &self,
+        field: &str,
+        expected: &str,
+        limit: u64,
+    ) -> Result<Vec<NodeRecord>, StoreError> {
+        let mut validation = self.conn.prepare(
+            "SELECT node_id, environment, site, owner_team, service_tier, labels_json,
+                    expected_agent_version, updated_at
+             FROM node_metadata ORDER BY node_id",
+        )?;
+        let rows = validation.query_map([], node_metadata_from_row)?;
+        for row in rows {
+            row?;
+        }
+
+        let limit = u64_to_i64(limit)?;
+        let node_columns = "n.node_id, n.endpoint_id, n.name, n.region, n.role, n.enabled";
+        if let Some(key) = field.strip_prefix("label.") {
+            validate_label_json(&json!({key: expected}), "selector label")
+                .map_err(StoreError::InvalidInput)?;
+            let json_path = format!("$.\"{key}\"");
+            let sql = format!(
+                "SELECT {node_columns} FROM nodes n
+                 JOIN node_metadata m ON m.node_id = n.node_id
+                 WHERE json_extract(m.labels_json, ?1) = ?2
+                 ORDER BY n.node_id LIMIT ?3"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(params![json_path, expected, limit], node_from_row)?;
+            return rows
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(StoreError::from);
+        }
+        validate_metadata_value(expected, "selector metadata value")
+            .map_err(StoreError::InvalidInput)?;
+        let column = match field {
+            "environment" => "environment",
+            "site" => "site",
+            "owner_team" => "owner_team",
+            "service_tier" => "service_tier",
+            _ => {
+                return Err(StoreError::InvalidInput(
+                    "unsupported metadata selector field".to_string(),
+                ));
+            }
+        };
+        let sql = format!(
+            "SELECT {node_columns} FROM nodes n
+             JOIN node_metadata m ON m.node_id = n.node_id
+             WHERE m.{column} = ?1 ORDER BY n.node_id LIMIT ?2"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![expected, limit], node_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub fn get_node_metadata(
+        &self,
+        node_id: &str,
+    ) -> Result<Option<NodeMetadataRecord>, StoreError> {
+        validate_node_id(node_id).map_err(|error| StoreError::InvalidInput(error.to_string()))?;
+        self.conn.query_row(
+            "SELECT node_id, environment, site, owner_team, service_tier, labels_json, expected_agent_version, updated_at FROM node_metadata WHERE node_id = ?1",
+            [node_id],
+            node_metadata_from_row,
+        ).optional().map_err(StoreError::from)
+    }
+
+    pub fn get_node_capability_snapshot(
+        &self,
+        node_id: &str,
+    ) -> Result<Option<CapabilitySnapshot>, StoreError> {
+        validate_node_id(node_id).map_err(|error| StoreError::InvalidInput(error.to_string()))?;
+        self.conn
+            .query_row(
+                "SELECT node_id, endpoint_id, observed_at, status, agent_version, protocol_min, protocol_max, ocserv_snapshot_min, ocserv_snapshot_max, controlled_writes_compiled, controlled_writes_locally_enabled FROM node_capability_snapshots WHERE node_id = ?1",
+                [node_id],
+                node_capability_snapshot_from_row,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    pub fn list_version_governance_inputs(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<VersionGovernanceInput>, StoreError> {
+        if limit == 0 || limit > MAX_VERSION_GOVERNANCE_NODES {
+            return Err(StoreError::InvalidInput(format!(
+                "version governance limit must be between 1 and {MAX_VERSION_GOVERNANCE_NODES}"
+            )));
+        }
+        let query_limit = usize_to_i64(limit.saturating_add(1))?;
+        let mut stmt = self.conn.prepare(
+            "SELECT n.node_id, n.enabled, m.expected_agent_version,
+                    c.node_id, c.endpoint_id, c.observed_at, c.status, c.agent_version,
+                    c.protocol_min, c.protocol_max, c.ocserv_snapshot_min,
+                    c.ocserv_snapshot_max, c.controlled_writes_compiled,
+                    c.controlled_writes_locally_enabled
+             FROM nodes n
+             LEFT JOIN node_metadata m ON m.node_id = n.node_id
+             LEFT JOIN node_capability_snapshots c ON c.node_id = n.node_id
+             ORDER BY n.node_id
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([query_limit], |row| {
+            let capability = if row.get::<_, Option<String>>(3)?.is_some() {
+                Some(node_capability_snapshot_from_offset_row(row, 3)?)
+            } else {
+                None
+            };
+            Ok(VersionGovernanceInput {
+                node_id: row.get(0)?,
+                enabled: i64_to_bool(row.get(1)?, 1)?,
+                expected_agent_version: row.get(2)?,
+                capability,
+            })
+        })?;
+        let values = rows.collect::<Result<Vec<_>, _>>()?;
+        if values.len() > limit {
+            return Err(StoreError::InvalidInput(format!(
+                "version governance node count exceeds {limit}"
+            )));
+        }
+        Ok(values)
+    }
+
+    pub(crate) fn upsert_node_capability_snapshot_with_audit(
+        &self,
+        snapshot: &CapabilitySnapshot,
+        audit: &AuditEvent,
+    ) -> Result<(), StoreError> {
+        validate_capability_snapshot(snapshot)?;
+        if audit.node_id.as_deref() != Some(snapshot.node_id.as_str())
+            || audit.endpoint_id.as_deref() != Some(snapshot.endpoint_id.as_str())
+            || audit.method.as_deref() != Some(ocfleet_protocol::method::NODE_CAPABILITIES)
+        {
+            return Err(StoreError::InvalidInput(
+                "capability snapshot does not match its RPC audit".to_string(),
+            ));
+        }
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let current_endpoint: Option<String> = tx
+            .query_row(
+                "SELECT endpoint_id FROM nodes WHERE node_id = ?1",
+                [snapshot.node_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(current_endpoint) = current_endpoint else {
+            return Err(StoreError::NodeNotFound(snapshot.node_id.clone()));
+        };
+        if current_endpoint != snapshot.endpoint_id {
+            return Err(StoreError::InvalidInput(
+                "capability snapshot endpoint is not the node's current endpoint".to_string(),
+            ));
+        }
+        tx.execute(
+            "INSERT INTO node_capability_snapshots
+             (node_id, endpoint_id, observed_at, status, agent_version, protocol_min, protocol_max,
+              ocserv_snapshot_min, ocserv_snapshot_max, controlled_writes_compiled,
+              controlled_writes_locally_enabled)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             ON CONFLICT(node_id) DO UPDATE SET
+               endpoint_id=excluded.endpoint_id, observed_at=excluded.observed_at,
+               status=excluded.status, agent_version=excluded.agent_version,
+               protocol_min=excluded.protocol_min, protocol_max=excluded.protocol_max,
+               ocserv_snapshot_min=excluded.ocserv_snapshot_min,
+               ocserv_snapshot_max=excluded.ocserv_snapshot_max,
+               controlled_writes_compiled=excluded.controlled_writes_compiled,
+               controlled_writes_locally_enabled=excluded.controlled_writes_locally_enabled
+             WHERE excluded.observed_at >= node_capability_snapshots.observed_at",
+            params![
+                snapshot.node_id,
+                snapshot.endpoint_id,
+                snapshot.observed_at,
+                snapshot.status.as_str(),
+                snapshot.agent_version,
+                snapshot.protocol_min,
+                snapshot.protocol_max,
+                snapshot.ocserv_snapshot_min,
+                snapshot.ocserv_snapshot_max,
+                snapshot.controlled_writes_compiled.map(bool_to_i64),
+                snapshot.controlled_writes_locally_enabled.map(bool_to_i64),
+            ],
+        )?;
+        insert_audit_tx(&tx, audit)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn set_node_metadata(
+        &self,
+        metadata: &NodeMetadataRecord,
+        actor: &str,
+    ) -> Result<(), StoreError> {
+        validate_actor(actor).map_err(StoreError::InvalidInput)?;
+        validate_node_metadata_record(metadata)?;
+        let tx = self.conn.unchecked_transaction()?;
+        if get_node_tx(&tx, &metadata.node_id)?.is_none() {
+            return Err(StoreError::NodeNotFound(metadata.node_id.clone()));
+        }
+        let before = get_node_metadata_tx(&tx, &metadata.node_id)?;
+        let labels_json =
+            serde_json::to_string(&metadata.labels_json).expect("validated node labels serialize");
+        tx.execute(
+            "INSERT INTO node_metadata (node_id, environment, site, owner_team, service_tier, labels_json, expected_agent_version, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) ON CONFLICT(node_id) DO UPDATE SET environment=excluded.environment, site=excluded.site, owner_team=excluded.owner_team, service_tier=excluded.service_tier, labels_json=excluded.labels_json, expected_agent_version=excluded.expected_agent_version, updated_at=excluded.updated_at",
+            params![metadata.node_id, metadata.environment, metadata.site, metadata.owner_team, metadata.service_tier, labels_json, metadata.expected_agent_version, metadata.updated_at],
+        )?;
+        let after = get_node_metadata_tx(&tx, &metadata.node_id)?.expect("metadata was inserted");
+        let mut event = AuditEvent::new(actor, "node.metadata.set");
+        event.node_id = Some(metadata.node_id.clone());
+        event.ok = Some(true);
+        event.detail_json = json!({"target_type":"node_metadata","target_id":metadata.node_id,"before":before.as_ref().map(node_metadata_audit_json),"after":node_metadata_audit_json(&after),"result_class":"node_metadata"});
+        insert_audit_tx(&tx, &event)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn get_node_maintenance(
+        &self,
+        node_id: &str,
+    ) -> Result<Option<NodeMaintenanceWindow>, StoreError> {
+        validate_node_id(node_id).map_err(|error| StoreError::InvalidInput(error.to_string()))?;
+        self.conn.query_row("SELECT node_id, starts_at, ends_at, reason, updated_at FROM node_maintenance_windows WHERE node_id=?1", [node_id], node_maintenance_from_row).optional().map_err(StoreError::from)
+    }
+
+    pub fn node_maintenance_active_at(&self, node_id: &str, now: &str) -> Result<bool, StoreError> {
+        let now = validate_bounded_rfc3339(now, "node maintenance check timestamp")?;
+        Ok(self.get_node_maintenance(node_id)?.is_some_and(|window| {
+            let start =
+                OffsetDateTime::parse(&window.starts_at, &Rfc3339).expect("validated start");
+            let end = OffsetDateTime::parse(&window.ends_at, &Rfc3339).expect("validated end");
+            start <= now && now < end
+        }))
+    }
+
+    pub(crate) fn set_node_maintenance(
+        &self,
+        window: &NodeMaintenanceWindow,
+        actor: &str,
+    ) -> Result<(), StoreError> {
+        validate_actor(actor).map_err(StoreError::InvalidInput)?;
+        validate_node_maintenance_record(window)?;
+        let tx = self.conn.unchecked_transaction()?;
+        if get_node_tx(&tx, &window.node_id)?.is_none() {
+            return Err(StoreError::NodeNotFound(window.node_id.clone()));
+        }
+        tx.execute("INSERT INTO node_maintenance_windows (node_id, starts_at, ends_at, reason, updated_at) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(node_id) DO UPDATE SET starts_at=excluded.starts_at, ends_at=excluded.ends_at, reason=excluded.reason, updated_at=excluded.updated_at", params![window.node_id, window.starts_at, window.ends_at, window.reason, window.updated_at])?;
+        let mut event = AuditEvent::new(actor, "node.maintenance.set");
+        event.node_id = Some(window.node_id.clone());
+        event.ok = Some(true);
+        event.detail_json = json!({"target_type":"node_maintenance","target_id":window.node_id,"from":window.starts_at,"to":window.ends_at,"reason":window.reason,"result_class":"scheduling_advisory"});
+        insert_audit_tx(&tx, &event)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn clear_node_maintenance(
+        &self,
+        node_id: &str,
+        actor: &str,
+    ) -> Result<bool, StoreError> {
+        validate_actor(actor).map_err(StoreError::InvalidInput)?;
+        validate_node_id(node_id).map_err(|e| StoreError::InvalidInput(e.to_string()))?;
+        let tx = self.conn.unchecked_transaction()?;
+        let removed = tx.execute(
+            "DELETE FROM node_maintenance_windows WHERE node_id=?1",
+            [node_id],
+        )?;
+        let mut event = AuditEvent::new(actor, "node.maintenance.clear");
+        event.node_id = Some(node_id.to_string());
+        event.ok = Some(true);
+        event.detail_json = json!({"target_type":"node_maintenance","target_id":node_id,"state":if removed == 1 { "cleared" } else { "already_clear" },"result_class":"scheduling_advisory"});
+        insert_audit_tx(&tx, &event)?;
+        tx.commit()?;
+        Ok(removed == 1)
     }
 
     pub fn list_probe_history(
@@ -2373,7 +2753,6 @@ impl Store {
                 && existing.input_watermark == start.input_watermark
                 && existing.policy_version == start.policy_version
                 && existing.computation_version == start.computation_version
-                && existing.started_at == start.started_at
             {
                 let audit_actor = tx
                     .query_row(
@@ -6743,6 +7122,56 @@ fn node_audit_json(node: &NodeRecord) -> Value {
     })
 }
 
+fn node_metadata_audit_json(metadata: &NodeMetadataRecord) -> Value {
+    json!({
+        "environment": metadata.environment,
+        "site": metadata.site,
+        "owner_team": metadata.owner_team,
+        "service_tier": metadata.service_tier,
+        "labels": metadata.labels_json,
+        "expected_agent_version": metadata.expected_agent_version,
+    })
+}
+
+pub fn validate_node_metadata_record(metadata: &NodeMetadataRecord) -> Result<(), StoreError> {
+    validate_node_id(&metadata.node_id).map_err(|e| StoreError::InvalidInput(e.to_string()))?;
+    validate_metadata_value(&metadata.environment, "environment")
+        .map_err(StoreError::InvalidInput)?;
+    validate_metadata_value(&metadata.site, "site").map_err(StoreError::InvalidInput)?;
+    validate_metadata_value(&metadata.owner_team, "owner_team")
+        .map_err(StoreError::InvalidInput)?;
+    validate_metadata_value(&metadata.service_tier, "service_tier")
+        .map_err(StoreError::InvalidInput)?;
+    validate_label_json(&metadata.labels_json, "labels").map_err(StoreError::InvalidInput)?;
+    validate_low_sensitive_json(&metadata.labels_json, "node labels")?;
+    if let Some(version) = &metadata.expected_agent_version {
+        validate_agent_version(version).map_err(StoreError::InvalidInput)?;
+    }
+    validate_bounded_rfc3339(&metadata.updated_at, "metadata updated_at")?;
+    Ok(())
+}
+
+pub fn validate_node_maintenance_record(window: &NodeMaintenanceWindow) -> Result<(), StoreError> {
+    validate_node_id(&window.node_id).map_err(|e| StoreError::InvalidInput(e.to_string()))?;
+    let start = validate_bounded_rfc3339(&window.starts_at, "node maintenance starts_at")?;
+    let end = validate_bounded_rfc3339(&window.ends_at, "node maintenance ends_at")?;
+    if start >= end {
+        return Err(StoreError::InvalidInput(
+            "node maintenance ends_at must be later than starts_at".to_string(),
+        ));
+    }
+    validate_reason(&window.reason).map_err(StoreError::InvalidInput)?;
+    validate_bounded_rfc3339(&window.updated_at, "node maintenance updated_at")?;
+    Ok(())
+}
+
+fn get_node_metadata_tx(
+    tx: &Transaction<'_>,
+    node_id: &str,
+) -> Result<Option<NodeMetadataRecord>, StoreError> {
+    tx.query_row("SELECT node_id, environment, site, owner_team, service_tier, labels_json, expected_agent_version, updated_at FROM node_metadata WHERE node_id=?1",[node_id],node_metadata_from_row).optional().map_err(StoreError::from)
+}
+
 fn scheduler_job_add_audit_detail(job: &ObservabilityJobRecord) -> Value {
     serde_json::json!({
         "actor_type": "user",
@@ -6882,6 +7311,33 @@ fn sqlite_sidecar_paths(path: &Path) -> [PathBuf; 2] {
     [PathBuf::from(wal), PathBuf::from(shm)]
 }
 
+fn sqlite_wal_has_data(path: &Path) -> Result<bool, StoreError> {
+    match path.metadata() {
+        Ok(metadata) => Ok(metadata.len() > 0),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(StoreError::Io(error)),
+    }
+}
+
+fn immutable_sqlite_uri(path: &Path) -> Result<String, StoreError> {
+    let path = path.to_str().ok_or_else(|| {
+        StoreError::InvalidInput(
+            "database path must be UTF-8 for immutable policy review".to_string(),
+        )
+    })?;
+    let mut uri = String::from("file:");
+    for byte in path.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b':' | b'.' | b'_' | b'-' | b'~') {
+            uri.push(byte as char);
+        } else {
+            use std::fmt::Write as _;
+            write!(&mut uri, "%{byte:02X}").expect("write SQLite URI");
+        }
+    }
+    uri.push_str("?immutable=1");
+    Ok(uri)
+}
+
 fn map_private_file_error(err: PrivateFileError) -> StoreError {
     match err {
         PrivateFileError::Io(err) => StoreError::Io(err),
@@ -6901,6 +7357,41 @@ fn node_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NodeRecord> {
         role: row.get(4)?,
         enabled: i64_to_bool(row.get(5)?, 5)?,
     })
+}
+
+fn node_metadata_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NodeMetadataRecord> {
+    let labels: String = row.get(5)?;
+    let labels_json: Value = serde_json::from_str(&labels).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(5, Type::Text, Box::new(error))
+    })?;
+    let metadata = NodeMetadataRecord {
+        node_id: row.get(0)?,
+        environment: row.get(1)?,
+        site: row.get(2)?,
+        owner_team: row.get(3)?,
+        service_tier: row.get(4)?,
+        labels_json,
+        expected_agent_version: row.get(6)?,
+        updated_at: row.get(7)?,
+    };
+    validate_node_metadata_record(&metadata).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(5, Type::Text, Box::new(error))
+    })?;
+    Ok(metadata)
+}
+
+fn node_maintenance_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NodeMaintenanceWindow> {
+    let window = NodeMaintenanceWindow {
+        node_id: row.get(0)?,
+        starts_at: row.get(1)?,
+        ends_at: row.get(2)?,
+        reason: row.get(3)?,
+        updated_at: row.get(4)?,
+    };
+    validate_node_maintenance_record(&window).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(1, Type::Text, Box::new(error))
+    })?;
+    Ok(window)
 }
 
 fn probe_history_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProbeHistoryRecord> {
@@ -9758,6 +10249,135 @@ fn parse_json_column(value: &str, column: usize) -> rusqlite::Result<Value> {
 
 fn compact_json(value: &Value) -> String {
     value.to_string()
+}
+
+fn node_capability_snapshot_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<CapabilitySnapshot> {
+    node_capability_snapshot_from_offset_row(row, 0)
+}
+
+fn node_capability_snapshot_from_offset_row(
+    row: &rusqlite::Row<'_>,
+    offset: usize,
+) -> rusqlite::Result<CapabilitySnapshot> {
+    let status: String = row.get(offset + 3)?;
+    let status = match status.as_str() {
+        "compatible" => CapabilityNegotiationStatus::Compatible,
+        "incompatible_protocol" => CapabilityNegotiationStatus::IncompatibleProtocol,
+        "unsupported_capability" => CapabilityNegotiationStatus::UnsupportedCapability,
+        "legacy_unsupported" => CapabilityNegotiationStatus::LegacyUnsupported,
+        "invalid_response" => CapabilityNegotiationStatus::InvalidResponse,
+        _ => {
+            return Err(rusqlite::Error::FromSqlConversionFailure(
+                offset + 3,
+                Type::Text,
+                Box::new(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid capability negotiation status",
+                )),
+            ));
+        }
+    };
+    Ok(CapabilitySnapshot {
+        node_id: row.get(offset)?,
+        endpoint_id: row.get(offset + 1)?,
+        observed_at: row.get(offset + 2)?,
+        status,
+        agent_version: row.get(offset + 4)?,
+        protocol_min: optional_u32_column(row, offset + 5)?,
+        protocol_max: optional_u32_column(row, offset + 6)?,
+        ocserv_snapshot_min: optional_u32_column(row, offset + 7)?,
+        ocserv_snapshot_max: optional_u32_column(row, offset + 8)?,
+        controlled_writes_compiled: optional_bool_column(row, offset + 9)?,
+        controlled_writes_locally_enabled: optional_bool_column(row, offset + 10)?,
+    })
+}
+
+fn optional_u32_column(row: &rusqlite::Row<'_>, column: usize) -> rusqlite::Result<Option<u32>> {
+    row.get::<_, Option<i64>>(column)?
+        .map(|value| {
+            u32::try_from(value).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(column, Type::Integer, Box::new(error))
+            })
+        })
+        .transpose()
+}
+
+fn optional_bool_column(row: &rusqlite::Row<'_>, column: usize) -> rusqlite::Result<Option<bool>> {
+    row.get::<_, Option<i64>>(column)?
+        .map(|value| i64_to_bool(value, column))
+        .transpose()
+}
+
+fn validate_capability_snapshot(snapshot: &CapabilitySnapshot) -> Result<(), StoreError> {
+    snapshot.validate().map_err(StoreError::InvalidInput)?;
+    validate_node_id(&snapshot.node_id)
+        .map_err(|error| StoreError::InvalidInput(error.to_string()))?;
+    validate_endpoint_id(&snapshot.endpoint_id).map_err(StoreError::InvalidInput)?;
+    validate_rfc3339(&snapshot.observed_at, "capability observed_at")?;
+    if let Some(version) = &snapshot.agent_version {
+        validate_agent_version(version).map_err(StoreError::InvalidInput)?;
+    }
+    for (min, max, field) in [
+        (
+            snapshot.protocol_min,
+            snapshot.protocol_max,
+            "protocol range",
+        ),
+        (
+            snapshot.ocserv_snapshot_min,
+            snapshot.ocserv_snapshot_max,
+            "provider schema range",
+        ),
+    ] {
+        if min.is_some() != max.is_some()
+            || min.is_some_and(|value| value == 0 || value > u16::MAX.into())
+            || max.is_some_and(|value| value == 0 || value > u16::MAX.into())
+            || min.zip(max).is_some_and(|(min, max)| min > max)
+        {
+            return Err(StoreError::InvalidInput(format!(
+                "capability {field} is invalid"
+            )));
+        }
+    }
+    if snapshot.controlled_writes_compiled.is_some()
+        != snapshot.controlled_writes_locally_enabled.is_some()
+        || snapshot.controlled_writes_locally_enabled == Some(true)
+            && snapshot.controlled_writes_compiled != Some(true)
+    {
+        return Err(StoreError::InvalidInput(
+            "capability controlled-write state is invalid".to_string(),
+        ));
+    }
+    let has_trusted_response = snapshot.agent_version.is_some()
+        && snapshot.protocol_min.is_some()
+        && snapshot.ocserv_snapshot_min.is_some()
+        && snapshot.controlled_writes_compiled.is_some();
+    match snapshot.status {
+        CapabilityNegotiationStatus::Compatible
+        | CapabilityNegotiationStatus::IncompatibleProtocol
+        | CapabilityNegotiationStatus::UnsupportedCapability
+            if !has_trusted_response =>
+        {
+            return Err(StoreError::InvalidInput(
+                "capability response status requires bounded response fields".to_string(),
+            ));
+        }
+        CapabilityNegotiationStatus::LegacyUnsupported
+        | CapabilityNegotiationStatus::InvalidResponse
+            if snapshot.agent_version.is_some()
+                || snapshot.protocol_min.is_some()
+                || snapshot.ocserv_snapshot_min.is_some()
+                || snapshot.controlled_writes_compiled.is_some() =>
+        {
+            return Err(StoreError::InvalidInput(
+                "untrusted capability status cannot carry response fields".to_string(),
+            ));
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn bool_to_i64(value: bool) -> i64 {

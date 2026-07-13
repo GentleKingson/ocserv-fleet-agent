@@ -3,11 +3,14 @@ use iroh::{EndpointAddr, EndpointId};
 use ocfleet_config::validation::validate_node_id;
 use ocfleet_protocol::DEFAULT_ALPN;
 use ocfleet_protocol::RpcResponse;
+use ocfleet_protocol::capabilities::{CapabilitiesValidationError, NodeCapabilitiesResponse};
+use ocfleet_protocol::constants::PROTOCOL_VERSION;
 use ocfleet_protocol::enrollment::EndpointStatus;
 use ocfleet_protocol::error::ErrorCode;
 use ocfleet_protocol::method::{
-    NODE_INFO, NODE_PING, OCSERV_CERT_EXPIRY, OCSERV_CONFIG_FINGERPRINT, OCSERV_SERVICE_SUMMARY,
-    OCSERV_SESSIONS_SUMMARY, OCSERV_VERSION, PROBE_CONTROLLER_PING, PROBE_PATH_ECHO,
+    NODE_CAPABILITIES, NODE_INFO, NODE_PING, OCSERV_CERT_EXPIRY, OCSERV_CONFIG_FINGERPRINT,
+    OCSERV_SERVICE_SUMMARY, OCSERV_SESSIONS_SUMMARY, OCSERV_VERSION, PROBE_CONTROLLER_PING,
+    PROBE_PATH_ECHO,
 };
 use ocfleet_protocol::ocserv::{
     OcservCertExpiryResponse, OcservConfigFingerprintResponse, OcservServiceSummaryResponse,
@@ -20,6 +23,7 @@ use std::str::FromStr;
 use std::time::Instant;
 
 use crate::audit::AuditEvent;
+use crate::backend::StoreWriter;
 use crate::identity::{IdentityError, load_secret_key};
 use crate::input_validation::local_actor;
 use crate::ocserv_output::low_sensitive_ocserv_audit_message;
@@ -28,8 +32,10 @@ use crate::rpc_client::{
     validate_path_echo_result, validate_rpc_response,
 };
 use crate::store::{EndpointDispatchBinding, NodeRecord, Store};
+use crate::version_governance::{CapabilityNegotiationStatus, CapabilitySnapshot};
 
 pub const CONTROLLER_RPC_RESULT_CLASS: &str = "controller_rpc_summary";
+pub const CAPABILITIES_RESULT_CLASS: &str = "capability_negotiation";
 pub const OCSERV_RESULT_CLASS: &str = "low_sensitive_summary";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,6 +104,7 @@ impl EndpointTrustRejection {
 const FIXED_CONTROLLER_RPC_METHODS: &[&str] = &[
     NODE_PING,
     NODE_INFO,
+    NODE_CAPABILITIES,
     PROBE_CONTROLLER_PING,
     PROBE_PATH_ECHO,
     OCSERV_SERVICE_SUMMARY,
@@ -111,6 +118,7 @@ const FIXED_CONTROLLER_RPC_METHODS: &[&str] = &[
 pub enum FixedControllerRpc {
     NodePing,
     NodeInfo,
+    NodeCapabilities,
     ProbeControllerPing,
     ProbePathEcho {
         target_node_id: String,
@@ -128,6 +136,7 @@ impl FixedControllerRpc {
         match method {
             NODE_PING => Some(Self::NodePing),
             NODE_INFO => Some(Self::NodeInfo),
+            NODE_CAPABILITIES => Some(Self::NodeCapabilities),
             PROBE_CONTROLLER_PING => Some(Self::ProbeControllerPing),
             OCSERV_SERVICE_SUMMARY => Some(Self::OcservServiceSummary),
             OCSERV_VERSION => Some(Self::OcservVersion),
@@ -147,6 +156,7 @@ impl FixedControllerRpc {
         match self {
             Self::NodePing => NODE_PING,
             Self::NodeInfo => NODE_INFO,
+            Self::NodeCapabilities => NODE_CAPABILITIES,
             Self::ProbeControllerPing => PROBE_CONTROLLER_PING,
             Self::ProbePathEcho { .. } => PROBE_PATH_ECHO,
             Self::OcservServiceSummary => OCSERV_SERVICE_SUMMARY,
@@ -243,6 +253,7 @@ impl<'a> ControllerRpcRunner<'a> {
             );
         };
         let method = rpc.method();
+        let result_class = rpc_result_class(method);
         let params = rpc.params();
         let params_hash = hash_json_value(&params);
         let node = match load_fixed_rpc_node(self.store, node_id) {
@@ -270,7 +281,7 @@ impl<'a> ControllerRpcRunner<'a> {
                     method.to_string(),
                     failure,
                     duration_ms,
-                    CONTROLLER_RPC_RESULT_CLASS,
+                    result_class,
                 );
             }
         };
@@ -287,7 +298,7 @@ impl<'a> ControllerRpcRunner<'a> {
                             Some(success.request_id),
                             json!({
                                 "message": "fixed RPC response summary is invalid",
-                                "result_class": CONTROLLER_RPC_RESULT_CLASS,
+                                "result_class": result_class,
                                 "error_code": "INVALID_RESPONSE",
                             }),
                         );
@@ -297,7 +308,7 @@ impl<'a> ControllerRpcRunner<'a> {
                             method.to_string(),
                             failure,
                             duration_ms,
-                            CONTROLLER_RPC_RESULT_CLASS,
+                            result_class,
                         );
                     }
                 };
@@ -324,7 +335,7 @@ impl<'a> ControllerRpcRunner<'a> {
                         ok: true,
                         error_code: None,
                         duration_ms,
-                        result_class: CONTROLLER_RPC_RESULT_CLASS.to_string(),
+                        result_class: result_class.to_string(),
                         summary_json,
                         message: None,
                     },
@@ -334,7 +345,7 @@ impl<'a> ControllerRpcRunner<'a> {
                         method.to_string(),
                         duration_ms,
                         err.to_string(),
-                        CONTROLLER_RPC_RESULT_CLASS,
+                        result_class,
                     ),
                 }
             }
@@ -361,7 +372,7 @@ impl<'a> ControllerRpcRunner<'a> {
                     method.to_string(),
                     failure,
                     duration_ms,
-                    CONTROLLER_RPC_RESULT_CLASS,
+                    result_class,
                 )
             }
         }
@@ -728,7 +739,9 @@ fn endpoint_trust_failure(
 }
 
 fn rpc_result_class(method: &str) -> &'static str {
-    if method.starts_with("ocserv.") {
+    if method == NODE_CAPABILITIES {
+        CAPABILITIES_RESULT_CLASS
+    } else if method.starts_with("ocserv.") {
         OCSERV_RESULT_CLASS
     } else {
         CONTROLLER_RPC_RESULT_CLASS
@@ -1180,6 +1193,7 @@ pub fn low_sensitive_fixed_rpc_summary(method: &str, result: &Value) -> Result<V
                 copy_string_field(result, &mut summary, field);
             }
         }
+        NODE_CAPABILITIES => return capabilities_audit_summary(result),
         PROBE_CONTROLLER_PING => {
             copy_string_field(result, &mut summary, "message");
             copy_string_field(result, &mut summary, "probe");
@@ -1327,6 +1341,12 @@ pub fn low_sensitive_ocserv_observation_summary(method: &str, result: &Value) ->
                 &["fingerprint", "status"],
                 "config_fingerprint_status",
             );
+            copy_nested_string_field(
+                result,
+                &mut summary,
+                &["fingerprint", "key_id"],
+                "config_fingerprint_key_id",
+            );
             if let Some(hash) =
                 nested_value(result, &["fingerprint", "hash"]).and_then(Value::as_str)
             {
@@ -1334,6 +1354,20 @@ pub fn low_sensitive_ocserv_observation_summary(method: &str, result: &Value) ->
                     "config_fingerprint_prefix".to_string(),
                     Value::String(hash.chars().take(12).collect()),
                 );
+            }
+            if let Some(previous) = nested_value(result, &["fingerprint", "previous"]) {
+                copy_nested_string_field(
+                    previous,
+                    &mut summary,
+                    &["key_id"],
+                    "config_fingerprint_previous_key_id",
+                );
+                if let Some(hash) = previous.get("hash").and_then(Value::as_str) {
+                    summary.insert(
+                        "config_fingerprint_previous_prefix".to_string(),
+                        Value::String(hash.chars().take(12).collect()),
+                    );
+                }
             }
         }
         _ => bail!("unsupported ocserv observation method: {method}"),
@@ -1519,6 +1553,27 @@ fn validate_response_for_method(
             rpc_client_error_detail_json(&err),
         )
     })?;
+    if method == NODE_CAPABILITIES {
+        let result = response.result.as_ref().ok_or_else(|| {
+            RpcCommandFailure::new(
+                ErrorCode::InvalidResponse,
+                "capabilities response missing result",
+                Some(request_id.to_string()),
+                json!({
+                    "message": "capabilities response is invalid",
+                    "result_class": CAPABILITIES_RESULT_CLASS,
+                }),
+            )
+        })?;
+        decode_node_capabilities(result).map_err(|error| {
+            RpcCommandFailure::new(
+                error.code(),
+                error.to_string(),
+                Some(request_id.to_string()),
+                capabilities_failure_audit_summary(result, error),
+            )
+        })?;
+    }
     if method == PROBE_PATH_ECHO {
         let target_endpoint_id = params
             .get("target_agent_endpoint_id")
@@ -1550,6 +1605,267 @@ fn validate_response_for_method(
             })?;
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum CapabilityDecodeError {
+    #[error("capabilities response is invalid")]
+    InvalidResponse,
+    #[error("agent protocol range is incompatible with this controller")]
+    IncompatibleProtocol,
+    #[error("agent omits the required node.capabilities method")]
+    UnsupportedCapability,
+}
+
+impl CapabilityDecodeError {
+    pub fn code(self) -> ErrorCode {
+        match self {
+            Self::InvalidResponse => ErrorCode::InvalidResponse,
+            Self::IncompatibleProtocol | Self::UnsupportedCapability => {
+                ErrorCode::SchemaVersionUnsupported
+            }
+        }
+    }
+
+    fn audit_message(self) -> &'static str {
+        match self {
+            Self::InvalidResponse => "capabilities response is invalid",
+            Self::IncompatibleProtocol => "agent protocol range is incompatible",
+            Self::UnsupportedCapability => "agent omits a required capability",
+        }
+    }
+}
+
+pub fn decode_node_capabilities(
+    result: &Value,
+) -> std::result::Result<NodeCapabilitiesResponse, CapabilityDecodeError> {
+    let response = decode_structural_capabilities(result)?;
+    response
+        .ensure_controller_compatible(PROTOCOL_VERSION)
+        .map_err(|error| match error {
+            CapabilitiesValidationError::IncompatibleProtocol { .. } => {
+                CapabilityDecodeError::IncompatibleProtocol
+            }
+            CapabilitiesValidationError::CapabilityMethodMissing => {
+                CapabilityDecodeError::UnsupportedCapability
+            }
+            CapabilitiesValidationError::InvalidField(_) => CapabilityDecodeError::InvalidResponse,
+        })?;
+    Ok(response)
+}
+
+fn decode_structural_capabilities(
+    result: &Value,
+) -> std::result::Result<NodeCapabilitiesResponse, CapabilityDecodeError> {
+    let response: NodeCapabilitiesResponse = serde_json::from_value(result.clone())
+        .map_err(|_| CapabilityDecodeError::InvalidResponse)?;
+    response
+        .validate()
+        .map_err(|_| CapabilityDecodeError::InvalidResponse)?;
+    Ok(response)
+}
+
+pub fn capabilities_audit_summary(result: &Value) -> Result<Value> {
+    let response = decode_node_capabilities(result).map_err(anyhow::Error::new)?;
+    let provider = response.provider_schemas.first();
+    Ok(json!({
+        "result_class": CAPABILITIES_RESULT_CLASS,
+        "status": "compatible",
+        "compatible": true,
+        "protocol_min": response.protocol_min,
+        "protocol_max": response.protocol_max,
+        "agent_version": response.agent_version,
+        "supported_method_count": response.supported_methods.len(),
+        "provider_schema_count": response.provider_schemas.len(),
+        "ocserv_snapshot_min": provider.map(|value| value.min_version),
+        "ocserv_snapshot_max": provider.map(|value| value.max_version),
+        "feature_flag_count": response.feature_flags.len(),
+        "controlled_writes_compiled": response.controlled_writes.compiled,
+        "controlled_writes_locally_enabled": response.controlled_writes.locally_enabled,
+    }))
+}
+
+fn capabilities_failure_audit_summary(result: &Value, error: CapabilityDecodeError) -> Value {
+    let status = match error {
+        CapabilityDecodeError::InvalidResponse => "invalid_response",
+        CapabilityDecodeError::IncompatibleProtocol => "incompatible_protocol",
+        CapabilityDecodeError::UnsupportedCapability => "unsupported_capability",
+    };
+    let mut summary = serde_json::Map::from_iter([
+        ("message".to_string(), json!(error.audit_message())),
+        ("result_class".to_string(), json!(CAPABILITIES_RESULT_CLASS)),
+        ("status".to_string(), json!(status)),
+        ("compatible".to_string(), json!(false)),
+        ("actions_enabled".to_string(), json!(false)),
+    ]);
+    if let Ok(response) = decode_structural_capabilities(result) {
+        let provider = response.provider_schemas.first();
+        summary.insert("agent_version".to_string(), json!(response.agent_version));
+        summary.insert("protocol_min".to_string(), json!(response.protocol_min));
+        summary.insert("protocol_max".to_string(), json!(response.protocol_max));
+        summary.insert(
+            "ocserv_snapshot_min".to_string(),
+            json!(provider.map(|value| value.min_version)),
+        );
+        summary.insert(
+            "ocserv_snapshot_max".to_string(),
+            json!(provider.map(|value| value.max_version)),
+        );
+        summary.insert(
+            "controlled_writes_compiled".to_string(),
+            json!(response.controlled_writes.compiled),
+        );
+        summary.insert(
+            "controlled_writes_locally_enabled".to_string(),
+            json!(response.controlled_writes.locally_enabled),
+        );
+    }
+    Value::Object(summary)
+}
+
+pub fn legacy_capabilities_fallback(error_code: &ErrorCode) -> Option<Value> {
+    (*error_code == ErrorCode::MethodNotFound).then(|| {
+        json!({
+            "message": "legacy agent does not support capability negotiation",
+            "result_class": CAPABILITIES_RESULT_CLASS,
+            "status": "legacy_unsupported",
+            "compatible": false,
+            "actions_enabled": false,
+        })
+    })
+}
+
+pub fn capability_snapshot_from_success(
+    node_id: &str,
+    endpoint_id: &str,
+    observed_at: &str,
+    result: &Value,
+) -> std::result::Result<CapabilitySnapshot, CapabilityDecodeError> {
+    let response = decode_node_capabilities(result)?;
+    Ok(capability_snapshot_from_response(
+        node_id,
+        endpoint_id,
+        observed_at,
+        CapabilityNegotiationStatus::Compatible,
+        &response,
+    ))
+}
+
+pub fn capability_snapshot_from_failure(
+    node_id: &str,
+    endpoint_id: &str,
+    observed_at: &str,
+    error_code: &ErrorCode,
+    detail: &Value,
+) -> Option<Result<CapabilitySnapshot>> {
+    let status = if *error_code == ErrorCode::MethodNotFound {
+        CapabilityNegotiationStatus::LegacyUnsupported
+    } else if *error_code == ErrorCode::InvalidResponse {
+        CapabilityNegotiationStatus::InvalidResponse
+    } else if *error_code == ErrorCode::SchemaVersionUnsupported {
+        match detail.get("status").and_then(Value::as_str) {
+            Some("incompatible_protocol") => CapabilityNegotiationStatus::IncompatibleProtocol,
+            Some("unsupported_capability") => CapabilityNegotiationStatus::UnsupportedCapability,
+            _ => return Some(Err(anyhow::anyhow!("capability failure status is invalid"))),
+        }
+    } else {
+        return None;
+    };
+    if matches!(
+        status,
+        CapabilityNegotiationStatus::LegacyUnsupported
+            | CapabilityNegotiationStatus::InvalidResponse
+    ) {
+        return Some(Ok(CapabilitySnapshot {
+            node_id: node_id.to_string(),
+            endpoint_id: endpoint_id.to_string(),
+            observed_at: observed_at.to_string(),
+            status,
+            agent_version: None,
+            protocol_min: None,
+            protocol_max: None,
+            ocserv_snapshot_min: None,
+            ocserv_snapshot_max: None,
+            controlled_writes_compiled: None,
+            controlled_writes_locally_enabled: None,
+        }));
+    }
+    Some((|| {
+        Ok(CapabilitySnapshot {
+            node_id: node_id.to_string(),
+            endpoint_id: endpoint_id.to_string(),
+            observed_at: observed_at.to_string(),
+            status,
+            agent_version: Some(required_string(detail, "agent_version")?.to_string()),
+            protocol_min: Some(required_u32(detail, "protocol_min")?),
+            protocol_max: Some(required_u32(detail, "protocol_max")?),
+            ocserv_snapshot_min: Some(required_u32(detail, "ocserv_snapshot_min")?),
+            ocserv_snapshot_max: Some(required_u32(detail, "ocserv_snapshot_max")?),
+            controlled_writes_compiled: Some(required_bool(detail, "controlled_writes_compiled")?),
+            controlled_writes_locally_enabled: Some(required_bool(
+                detail,
+                "controlled_writes_locally_enabled",
+            )?),
+        })
+    })())
+}
+
+pub fn write_capability_rpc_audit(
+    store: &Store,
+    record: RpcAuditRecord,
+    snapshot: &CapabilitySnapshot,
+) -> Result<()> {
+    let event = rpc_audit_event(record);
+    StoreWriter::write_node_capability_snapshot(store, snapshot, &event)?;
+    Ok(())
+}
+
+fn capability_snapshot_from_response(
+    node_id: &str,
+    endpoint_id: &str,
+    observed_at: &str,
+    status: CapabilityNegotiationStatus,
+    response: &NodeCapabilitiesResponse,
+) -> CapabilitySnapshot {
+    let provider = response
+        .provider_schemas
+        .first()
+        .expect("validated provider schema list is non-empty");
+    CapabilitySnapshot {
+        node_id: node_id.to_string(),
+        endpoint_id: endpoint_id.to_string(),
+        observed_at: observed_at.to_string(),
+        status,
+        agent_version: Some(response.agent_version.clone()),
+        protocol_min: Some(response.protocol_min),
+        protocol_max: Some(response.protocol_max),
+        ocserv_snapshot_min: Some(provider.min_version),
+        ocserv_snapshot_max: Some(provider.max_version),
+        controlled_writes_compiled: Some(response.controlled_writes.compiled),
+        controlled_writes_locally_enabled: Some(response.controlled_writes.locally_enabled),
+    }
+}
+
+fn required_string<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("capability field {field} is missing"))
+}
+
+fn required_u32(value: &Value, field: &str) -> Result<u32> {
+    let value = value
+        .get(field)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow::anyhow!("capability field {field} is missing"))?;
+    u32::try_from(value).map_err(anyhow::Error::new)
+}
+
+fn required_bool(value: &Value, field: &str) -> Result<bool> {
+    value
+        .get(field)
+        .and_then(Value::as_bool)
+        .ok_or_else(|| anyhow::anyhow!("capability field {field} is missing"))
 }
 
 fn rpc_client_error_detail_json(err: &RpcClientError) -> Value {

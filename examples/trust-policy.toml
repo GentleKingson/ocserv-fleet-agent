@@ -11,6 +11,12 @@ region = "hk"
 role = "ocserv"
 lifecycle = "active"
 enabled = true
+environment = "production"
+site = "hk-1"
+owner_team = "network"
+service_tier = "tier-1"
+expected_agent_version = "0.4.0"
+labels = { jurisdiction = "hk", color = "blue" }
 
 [[nodes]]
 node_id = "sg-ocserv-01"

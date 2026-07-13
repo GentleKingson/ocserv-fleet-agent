@@ -780,6 +780,7 @@ snapshot_path = "/var/lib/ocfleet-agent/ocserv-readonly.json"
 [ocserv_readonly.config_fingerprint]
 name = "main"
 config_path = "/etc/ocserv/ocserv.conf"
+mode = "legacy_sha256"
 
 [[ocserv_readonly.certificates]]
 name = "server"
@@ -796,6 +797,28 @@ cert_path = "/etc/ocserv/server-cert.pem"
     );
     assert_eq!(config.ocserv_readonly.certificates.len(), 1);
     assert_eq!(config.ocserv_readonly.certificates[0].name, "server");
+}
+
+#[test]
+fn agent_config_omitted_fingerprint_mode_requires_hmac_migration_fields() {
+    let mut config = minimal_agent_config();
+    config.ocserv_readonly.config_fingerprint =
+        Some(ocfleet_config::agent::OcservConfigFingerprintConfig {
+            name: "main".to_string(),
+            config_path: "/etc/ocserv/ocserv.conf".into(),
+            mode: ocfleet_config::agent::ConfigFingerprintMode::default(),
+            key_id: None,
+            key_path: None,
+            previous_key_id: None,
+            previous_key_path: None,
+        });
+
+    let err = validate_agent_config(&config)
+        .expect_err("the HMAC default must fail closed until migration fields are configured");
+    assert!(matches!(
+        err,
+        ConfigError::Invalid(message) if message.contains("HMAC config fingerprint requires key_id")
+    ));
 }
 
 #[test]
@@ -1014,6 +1037,11 @@ fn agent_config_rejects_config_fingerprint_bad_name() {
         Some(ocfleet_config::agent::OcservConfigFingerprintConfig {
             name: "../main".to_string(),
             config_path: "/etc/ocserv/ocserv.conf".into(),
+            mode: ocfleet_config::agent::ConfigFingerprintMode::LegacySha256,
+            key_id: None,
+            key_path: None,
+            previous_key_id: None,
+            previous_key_path: None,
         });
 
     let err = validate_agent_config(&config).expect_err("bad fingerprint name rejected");

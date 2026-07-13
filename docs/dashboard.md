@@ -7,7 +7,7 @@ surface.
 ## Start
 
 ```bash
-ocfleet-api --database controller.sqlite --read-only --listen 127.0.0.1:8080
+ocfleet-api --database controller.sqlite --read-only --cursor-key-file ./cursor-keys.json --listen 127.0.0.1:8080
 ```
 
 Open `http://127.0.0.1:8080/` from the same host. For non-loopback listeners,

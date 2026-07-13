@@ -23,7 +23,7 @@ RPC boundary.
 | Alerts | partially implemented / active implementation | Evaluation and silence/resolve use stale-before checks; hook creation, webhook attempt history, and bounded delivery finalization use atomic audit writers. `ocfleet alert list`, hook management, test/deliver, JSONL, and explicit HTTPS delivery remain available. External I/O is never inside a database transaction. |
 | Retention | partially implemented / active implementation | `ocfleet retention show/set/explain/apply` for observability history scopes |
 | Audit export | partially implemented / active implementation | `ocfleet audit export --from ... --to ... --format jsonl --output ...` |
-| `ocfleet-api` / Web dashboard | partially implemented / active implementation | `ocfleet-api --database controller.sqlite --read-only --listen 127.0.0.1:8080`; read-only `GET` routes and a minimal static dashboard are present |
+| `ocfleet-api` / Web dashboard | partially implemented / active implementation | `ocfleet-api --database controller.sqlite --read-only --cursor-key-file ./cursor-keys.json --listen 127.0.0.1:8080`; read-only `GET` routes and a minimal static dashboard are present |
 | Webhook hooks | partially implemented / active implementation | HTTPS-only webhook delivery with host allowlists, public resolved IP checks, HMAC signing, bounded attempts/timeouts, disabled redirects, and low-sensitive attempt/audit rows |
 
 ## Goals
@@ -571,7 +571,7 @@ and private output path details.
 ### Experimental Read-only Web/API Dashboard
 
 ```bash
-ocfleet-api --database controller.sqlite --read-only --listen 127.0.0.1:8080
+ocfleet-api --database controller.sqlite --read-only --cursor-key-file ./cursor-keys.json --listen 127.0.0.1:8080
 ```
 
 The command above is implemented as an experimental read-only observation

@@ -84,8 +84,23 @@ pub fn config_fingerprint(
     response: OcservConfigFingerprintResponse,
 ) -> Result<OcservConfigFingerprintResponse, OcservReadonlyError> {
     validate_meta(&response.meta)?;
-    if response.fingerprint.algorithm != "sha256" {
+    if !matches!(
+        response.fingerprint.algorithm.as_str(),
+        "sha256" | "hmac-sha256"
+    ) {
         return invalid_data("ocserv config fingerprint algorithm is invalid");
+    }
+    if response.fingerprint.algorithm == "hmac-sha256" {
+        if response
+            .fingerprint
+            .key_id
+            .as_deref()
+            .is_none_or(|id| !is_valid_ocserv_name(id))
+        {
+            return invalid_data("ocserv config fingerprint key ID is invalid");
+        }
+    } else if response.fingerprint.key_id.is_some() || response.fingerprint.previous.is_some() {
+        return invalid_data("legacy config fingerprint cannot contain key data");
     }
     if response
         .fingerprint
@@ -94,6 +109,14 @@ pub fn config_fingerprint(
         .is_some_and(|hash| !is_valid_sha256_hex(hash))
     {
         return invalid_data("ocserv config fingerprint hash is invalid");
+    }
+    if let Some(previous) = &response.fingerprint.previous
+        && (previous.algorithm != "hmac-sha256"
+            || !is_valid_ocserv_name(&previous.key_id)
+            || !is_valid_sha256_hex(&previous.hash)
+            || Some(previous.key_id.as_str()) == response.fingerprint.key_id.as_deref())
+    {
+        return invalid_data("ocserv previous config fingerprint is invalid");
     }
     bounded(response)
 }

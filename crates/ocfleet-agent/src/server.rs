@@ -15,9 +15,9 @@ use ocfleet_config::agent::{AgentConfig, SecurityConfig};
 use ocfleet_protocol::constants::PROTOCOL_VERSION;
 use ocfleet_protocol::error::{ErrorCode, RpcError};
 use ocfleet_protocol::method::{
-    MethodStatus, NODE_INFO, NODE_PING, OCSERV_CERT_EXPIRY, OCSERV_CONFIG_FINGERPRINT,
-    OCSERV_SERVICE_SUMMARY, OCSERV_SESSIONS_SUMMARY, OCSERV_VERSION, PROBE_CONTROLLER_PING,
-    PROBE_PATH_ECHO, PROBE_PEER_ECHO, classify_phase_one_method,
+    MethodStatus, NODE_CAPABILITIES, NODE_INFO, NODE_PING, OCSERV_CERT_EXPIRY,
+    OCSERV_CONFIG_FINGERPRINT, OCSERV_SERVICE_SUMMARY, OCSERV_SESSIONS_SUMMARY, OCSERV_VERSION,
+    PROBE_CONTROLLER_PING, PROBE_PATH_ECHO, PROBE_PEER_ECHO, classify_phase_one_method,
 };
 use ocfleet_protocol::rpc::{RpcRequest, RpcResponse};
 use serde_json::{Value, json};
@@ -29,6 +29,7 @@ use crate::AGENT_VERSION;
 use crate::audit::{AgentAuditEvent, JsonlAuditWriter};
 use crate::audit_limiter::{AuditLimitDecision, RejectedAuditLimiter};
 use crate::authz::{AgentAuthorization, CallerClass, PathProbeDecision};
+use crate::capabilities::collect_node_capabilities;
 use crate::metrics::{AgentMetrics, Resource as MetricResource};
 use crate::node_info::collect_node_info;
 use crate::nonce::{NonceCache, NonceDecision, NonceLimitScope};
@@ -1360,6 +1361,15 @@ async fn dispatch_allowed_method(
                 )
             })
         }
+        NODE_CAPABILITIES => serde_json::to_value(collect_node_capabilities(&state.config))
+            .map_err(|_| {
+                RequestDispatchError::new(
+                    Some(request_id.to_string()),
+                    ErrorCode::InternalError,
+                    "failed to serialize node capabilities",
+                    json!({}),
+                )
+            }),
         OCSERV_SERVICE_SUMMARY
         | OCSERV_VERSION
         | OCSERV_SESSIONS_SUMMARY

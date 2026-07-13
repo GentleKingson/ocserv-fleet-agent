@@ -15,8 +15,10 @@ test("dashboard loads read-only views and audit preview", async ({ page }) => {
   expect(response.status()).toBe(200);
   expect(response.headers()["content-security-policy"]).toContain("default-src 'none'");
   await expect(page.getByRole("heading", { level: 1, name: "ocfleet" })).toBeVisible();
-  await expect(page.getByRole("heading", { level: 2 })).toHaveCount(7);
+  await expect(page.getByRole("heading", { level: 2 })).toHaveCount(8);
+  await expect(page.getByRole("heading", { level: 2, name: "Upgrade Readiness" })).toBeVisible();
   await expect(page.getByRole("status")).toContainText("Updated");
+  await expect(page.locator("#versions")).toContainText("No rows");
   await expect(page.locator("#nodes")).toContainText("No rows");
   await expect(page.locator("#jobs")).toContainText("No rows");
   await expect(page.locator("#alerts")).toContainText("No rows");

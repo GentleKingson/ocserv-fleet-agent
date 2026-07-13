@@ -208,8 +208,20 @@ pub struct OcservConfigFingerprintResponse {
 pub struct OcservConfigFingerprint {
     pub algorithm: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous: Option<OcservConfigFingerprintDigest>,
     pub status: OcservFieldStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OcservConfigFingerprintDigest {
+    pub algorithm: String,
+    pub key_id: String,
+    pub hash: String,
 }
 
 impl std::fmt::Display for OcservServiceState {

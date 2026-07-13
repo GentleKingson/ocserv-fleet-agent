@@ -13,10 +13,12 @@ use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::sync::{Arc, OnceLock};
-use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
+use time::{Duration, OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
+use uuid::Uuid;
 
 use crate::args::ApiConfig;
 use crate::auth::{AuthToken, Principal};
+use crate::cursor_keys::CursorKeyring;
 use crate::metrics::{CONTENT_TYPE as METRICS_CONTENT_TYPE, render_controller};
 use crate::projections::{
     alert_to_json, audit_to_json, health_node_to_json, health_summary_to_json, job_to_json,
@@ -25,8 +27,9 @@ use crate::projections::{
 use crate::readonly_store::{ApiReadStore, ReadOnlyStore};
 use crate::responses::{
     ApiError, ApiResult, ListResponse, SingleResponse, SummaryResponse, list_response, now_rfc3339,
-    single_response, summary_response,
+    single_response, summary_response, with_request_id,
 };
+use crate::v1::v1_router;
 use crate::web::DASHBOARD_HTML;
 
 const DEFAULT_QUERY_LIMIT: u64 = 50;
@@ -34,10 +37,11 @@ static DASHBOARD_CSP: OnceLock<HeaderValue> = OnceLock::new();
 
 #[derive(Clone)]
 pub struct AppState {
-    store: Arc<dyn ApiReadStore>,
-    max_limit: u64,
-    redact: RedactionMode,
-    auth_token: Option<AuthToken>,
+    pub(crate) store: Arc<dyn ApiReadStore>,
+    pub(crate) max_limit: u64,
+    pub(crate) redact: RedactionMode,
+    pub(crate) auth_token: Option<AuthToken>,
+    pub(crate) cursor_keys: Arc<CursorKeyring>,
 }
 
 impl AppState {
@@ -47,6 +51,7 @@ impl AppState {
             max_limit: config.max_limit,
             redact: config.redact,
             auth_token: config.auth_token,
+            cursor_keys: Arc::new(config.cursor_keys),
         }
     }
 
@@ -61,6 +66,7 @@ impl AppState {
 
 pub fn build_router(state: AppState) -> Router {
     Router::new()
+        .nest("/api/v1", v1_router())
         .route("/", get(dashboard))
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics))
@@ -84,15 +90,36 @@ pub fn build_router(state: AppState) -> Router {
 }
 
 async fn response_security_headers(request: Request, next: Next) -> Response {
-    let mut response = next.run(request).await;
-    response
-        .headers_mut()
-        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    let request_id = request
+        .headers()
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| validate_correlation_id(value))
+        .map(str::to_owned)
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let mut response = with_request_id(request_id.clone(), next.run(request)).await;
+    if !response.headers().contains_key(header::CACHE_CONTROL) {
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }
+    response.headers_mut().insert(
+        "x-request-id",
+        HeaderValue::from_str(&request_id).expect("validated request id is a header value"),
+    );
     response.headers_mut().insert(
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
     );
     response
+}
+
+fn validate_correlation_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
 }
 
 async fn dashboard() -> (HeaderMap, Html<&'static str>) {
@@ -200,7 +227,8 @@ async fn health_slo(
         validate_identifier("node_id", node_id)?;
     }
     let to_time = OffsetDateTime::parse(to, &Rfc3339)
-        .map_err(|_| ApiError::bad_request("to must be RFC3339"))?;
+        .map_err(|_| ApiError::bad_request("to must be RFC3339"))?
+        .to_offset(UtcOffset::UTC);
     let bucket_seconds =
         i64::try_from(window.bucket_seconds()).map_err(|_| ApiError::internal())?;
     if to_time.unix_timestamp() % bucket_seconds != 0 {
@@ -420,7 +448,7 @@ async fn audit_export(
     Ok(list_response(max_rows, items))
 }
 
-fn authorize(state: &AppState, headers: &HeaderMap) -> ApiResult<Principal> {
+pub(crate) fn authorize(state: &AppState, headers: &HeaderMap) -> ApiResult<Principal> {
     match &state.auth_token {
         Some(token) => token
             .authenticate_headers(headers)
@@ -429,7 +457,7 @@ fn authorize(state: &AppState, headers: &HeaderMap) -> ApiResult<Principal> {
     }
 }
 
-fn db<T>(result: rusqlite::Result<T>) -> ApiResult<T> {
+pub(crate) fn db<T>(result: rusqlite::Result<T>) -> ApiResult<T> {
     result.map_err(|err| {
         tracing::warn!(error = %err, "read-only API query failed");
         ApiError::internal()

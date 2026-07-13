@@ -2872,6 +2872,24 @@ async fn run_path_probe_job(
         )?;
         return Ok(());
     }
+    if tick_context
+        .store
+        .node_maintenance_active_at(&source.node_id, &now_rfc3339())?
+    {
+        record_path_probe_preflight_observation(
+            tick_context.store,
+            tick_context.actor,
+            PathProbePreflight {
+                run_id,
+                job,
+                node_id: &source.node_id,
+                endpoint_id: Some(&source.endpoint_id),
+                error_code: "NODE_MAINTENANCE",
+            },
+            stats,
+        )?;
+        return Ok(());
+    }
     if let Some(rejection) =
         endpoint_trust_rejection(tick_context.store, &source.node_id, &source.endpoint_id)?
     {
@@ -2915,6 +2933,26 @@ async fn run_path_probe_job(
                 node_id: &source.node_id,
                 endpoint_id: Some(&source.endpoint_id),
                 error_code: "TARGET_NODE_DISABLED",
+            },
+            stats,
+        )?;
+        return Ok(());
+    }
+    if tick_context
+        .store
+        .node_maintenance_active_at(&target.node_id, &now_rfc3339())?
+    {
+        record_path_probe_target_preflight_observation(
+            tick_context.store,
+            tick_context.actor,
+            PathProbeTargetPreflight {
+                run_id,
+                job,
+                source_node_id: &source.node_id,
+                source_endpoint_id: &source.endpoint_id,
+                target_node_id: &target.node_id,
+                target_endpoint_id: &target.endpoint_id,
+                error_code: "TARGET_NODE_MAINTENANCE",
             },
             stats,
         )?;
@@ -3013,9 +3051,12 @@ fn resolve_node_targets(store: &Store, selector: &str) -> anyhow::Result<Vec<Tar
         if node_id.is_empty() {
             bail!("selector node_id must not be empty");
         }
-        return Ok(vec![TargetNode {
-            node_id: node_id.to_string(),
-        }]);
+        return filter_maintained_targets(
+            store,
+            vec![TargetNode {
+                node_id: node_id.to_string(),
+            }],
+        );
     }
     if let Some(role) = selector.strip_prefix("role=") {
         let role = role.trim();
@@ -3023,11 +3064,10 @@ fn resolve_node_targets(store: &Store, selector: &str) -> anyhow::Result<Vec<Tar
             bail!("selector role must not be empty");
         }
         let targets = store
-            .list_nodes()?
+            .list_nodes_by_role_limited(role, (MAX_TARGETS_PER_JOB + 1) as u64)?
             .into_iter()
-            .filter(|node| node.role == role)
             .map(|node| TargetNode {
-                node_id: node.node_id.clone(),
+                node_id: node.node_id,
             })
             .collect::<Vec<_>>();
         if targets.len() > MAX_TARGETS_PER_JOB {
@@ -3036,9 +3076,42 @@ fn resolve_node_targets(store: &Store, selector: &str) -> anyhow::Result<Vec<Tar
                 targets.len()
             );
         }
-        return Ok(targets);
+        return filter_maintained_targets(store, targets);
     }
-    bail!("selector must use role=<role> or node_id=<node-id>")
+    let (field, expected) = selector
+        .split_once('=')
+        .context("selector must use FIELD=VALUE")?;
+    let targets = store
+        .list_nodes_by_metadata_limited(field, expected, (MAX_TARGETS_PER_JOB + 1) as u64)?
+        .into_iter()
+        .map(|node| TargetNode {
+            node_id: node.node_id,
+        })
+        .collect::<Vec<_>>();
+    if targets.len() > MAX_TARGETS_PER_JOB {
+        bail!(
+            "selector matched too many targets: {} > {MAX_TARGETS_PER_JOB}",
+            targets.len()
+        );
+    }
+    filter_maintained_targets(store, targets)
+}
+
+fn filter_maintained_targets(
+    store: &Store,
+    targets: Vec<TargetNode>,
+) -> anyhow::Result<Vec<TargetNode>> {
+    let now = now_rfc3339();
+    targets
+        .into_iter()
+        .filter_map(
+            |target| match store.node_maintenance_active_at(&target.node_id, &now) {
+                Ok(false) => Some(Ok(target)),
+                Ok(true) => None,
+                Err(error) => Some(Err(error.into())),
+            },
+        )
+        .collect()
 }
 
 fn missing_target_outcome(
@@ -3090,6 +3163,11 @@ fn scheduler_selector_class(job: &ObservabilityJobRecord) -> &'static str {
     match selector_label(job) {
         Ok(selector) if selector.starts_with("role=") => "role",
         Ok(selector) if selector.starts_with("node_id=") => "node_id",
+        Ok(selector) if selector.starts_with("label.") => "label",
+        Ok(selector) if selector.starts_with("environment=") => "environment",
+        Ok(selector) if selector.starts_with("site=") => "site",
+        Ok(selector) if selector.starts_with("owner_team=") => "owner_team",
+        Ok(selector) if selector.starts_with("service_tier=") => "service_tier",
         _ => "invalid",
     }
 }
@@ -3528,7 +3606,7 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::NodeInsert;
+    use crate::store::{NodeInsert, NodeMaintenanceWindow, NodeMetadataRecord};
     use rusqlite::Connection;
     use std::collections::{HashMap, HashSet};
     use std::future::Future;
@@ -3715,6 +3793,89 @@ mod tests {
                 .list_observability_runs(10)
                 .expect("list runs")
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn metadata_selectors_are_bounded_and_skip_maintenance() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let database = dir.path().join("controller.sqlite");
+        let store = Store::open(&database).expect("store");
+        for node_id in ["node-a", "node-b"] {
+            StoreWriter::write_node_add(
+                &store,
+                &NodeInsert {
+                    node_id: node_id.to_string(),
+                    endpoint_id: format!("endpoint-{node_id}"),
+                    name: node_id.to_string(),
+                    region: "us-east".to_string(),
+                    role: "ocserv".to_string(),
+                },
+                "operator",
+            )
+            .expect("node");
+            StoreWriter::write_node_metadata(
+                &store,
+                &NodeMetadataRecord {
+                    node_id: node_id.to_string(),
+                    environment: "prod".to_string(),
+                    site: "iad-1".to_string(),
+                    owner_team: "network".to_string(),
+                    service_tier: "tier-1".to_string(),
+                    labels_json: json!({"color":if node_id == "node-a" { "blue" } else { "green" }}),
+                    expected_agent_version: None,
+                    updated_at: "2026-07-12T00:00:00Z".to_string(),
+                },
+                "operator",
+            )
+            .expect("metadata");
+        }
+        StoreWriter::write_node_maintenance_set(
+            &store,
+            &NodeMaintenanceWindow {
+                node_id: "node-b".to_string(),
+                starts_at: "2000-01-01T00:00:00Z".to_string(),
+                ends_at: "2100-01-01T00:00:00Z".to_string(),
+                reason: "planned".to_string(),
+                updated_at: "2026-07-12T00:00:00Z".to_string(),
+            },
+            "operator",
+        )
+        .expect("maintenance");
+
+        for index in 0..51 {
+            StoreWriter::write_node_add(
+                &store,
+                &NodeInsert {
+                    node_id: format!("unmatched-{index:02}"),
+                    endpoint_id: format!("endpoint-unmatched-{index:02}"),
+                    name: format!("unmatched-{index:02}"),
+                    region: "us-west".to_string(),
+                    role: "ocserv".to_string(),
+                },
+                "operator",
+            )
+            .expect("unmatched node");
+        }
+
+        let environment = resolve_node_targets(&store, "environment=prod").expect("selector");
+        assert_eq!(environment.len(), 1);
+        assert_eq!(environment[0].node_id, "node-a");
+        assert_eq!(
+            resolve_node_targets(&store, "label.color=blue").expect("label")[0].node_id,
+            "node-a"
+        );
+
+        rusqlite::Connection::open(&database)
+            .expect("sqlite")
+            .execute(
+                "UPDATE node_metadata SET labels_json = '{\"color\":{\"nested\":true}}' WHERE node_id = 'node-a'",
+                [],
+            )
+            .expect("contaminate labels");
+        assert!(
+            resolve_node_targets(&store, "label.color=blue").is_err(),
+            "SQLite metadata errors must fail the selector instead of silently skipping a node"
         );
     }
 

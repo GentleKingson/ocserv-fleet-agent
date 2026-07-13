@@ -109,7 +109,7 @@ fn open_private_append_create_impl(path: &Path) -> Result<File, PrivateFileError
 #[cfg(unix)]
 fn private_append_options() -> fs::OpenOptions {
     let mut options = fs::OpenOptions::new();
-    options.append(true).write(true);
+    options.read(true).append(true).write(true);
     options
 }
 

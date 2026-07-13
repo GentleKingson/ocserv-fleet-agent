@@ -2,7 +2,9 @@ use ocfleet_agent::ocserv::{
     CertificateExpiryProvider, CollectorSnapshotOcservReadonlyProvider, ConfigFingerprintProvider,
     DisabledOcservReadonlyProvider, OcservReadonlyProvider, SnapshotOcservReadonlyProvider,
 };
-use ocfleet_config::agent::{OcservCertificateConfig, OcservConfigFingerprintConfig};
+use ocfleet_config::agent::{
+    ConfigFingerprintMode, OcservCertificateConfig, OcservConfigFingerprintConfig,
+};
 use ocfleet_protocol::error::ErrorCode;
 use ocfleet_protocol::ocserv::{OcservCertStatus, OcservCollectorStatus, OcservFieldStatus};
 use std::path::Path;
@@ -470,6 +472,11 @@ fn config_fingerprint_provider_returns_only_sha256_hash() {
     let provider = ConfigFingerprintProvider::new(Some(OcservConfigFingerprintConfig {
         name: "main".to_string(),
         config_path,
+        mode: ocfleet_config::agent::ConfigFingerprintMode::LegacySha256,
+        key_id: None,
+        key_path: None,
+        previous_key_id: None,
+        previous_key_path: None,
     }));
 
     let response = provider.config_fingerprint().expect("fingerprint");
@@ -483,6 +490,89 @@ fn config_fingerprint_provider_returns_only_sha256_hash() {
 }
 
 #[test]
+fn hmac_config_fingerprint_is_stable_keyed_rotatable_and_redacted() {
+    let dir = tempfile::tempdir().expect("dir");
+    let config_path = dir.path().join("ocserv.conf");
+    let current = dir.path().join("current.key");
+    let previous = dir.path().join("previous.key");
+    std::fs::write(&config_path, "listen-port = 443\n").unwrap();
+    std::fs::write(&current, b"current-key-material-32-bytes-long!!").unwrap();
+    std::fs::write(&previous, b"previous-key-material-32-bytes-long!").unwrap();
+    make_private(&current);
+    make_private(&previous);
+    let config = OcservConfigFingerprintConfig {
+        name: "main".into(),
+        config_path: config_path.clone(),
+        mode: ConfigFingerprintMode::HmacSha256,
+        key_id: Some("key-2026-07".into()),
+        key_path: Some(current.clone()),
+        previous_key_id: Some("key-2026-06".into()),
+        previous_key_path: Some(previous.clone()),
+    };
+    let debug = format!("{config:?}");
+    assert!(!debug.contains(current.to_string_lossy().as_ref()));
+    assert!(!debug.contains(config_path.to_string_lossy().as_ref()));
+    let provider = ConfigFingerprintProvider::new(Some(config));
+    let first = provider.config_fingerprint().unwrap();
+    let replay = provider.config_fingerprint().unwrap();
+    assert_eq!(first.fingerprint, replay.fingerprint);
+    assert_eq!(first.fingerprint.algorithm, "hmac-sha256");
+    assert_eq!(first.fingerprint.key_id.as_deref(), Some("key-2026-07"));
+    assert!(first.fingerprint.previous.is_some());
+    let text = serde_json::to_string(&first).unwrap();
+    assert!(!text.contains("material"));
+    assert!(!text.contains("ocserv.conf"));
+    std::fs::write(&config_path, "listen-port = 444\n").unwrap();
+    let changed = provider.config_fingerprint().unwrap();
+    assert_ne!(first.fingerprint.hash, changed.fingerprint.hash);
+    let other_path = dir.path().join("other.key");
+    std::fs::write(&other_path, b"another-key-material-32-bytes-long!!").unwrap();
+    make_private(&other_path);
+    let other = ConfigFingerprintProvider::new(Some(OcservConfigFingerprintConfig {
+        name: "main".into(),
+        config_path,
+        mode: ConfigFingerprintMode::HmacSha256,
+        key_id: Some("key-other".into()),
+        key_path: Some(other_path),
+        previous_key_id: None,
+        previous_key_path: None,
+    }))
+    .config_fingerprint()
+    .unwrap();
+    assert_ne!(changed.fingerprint.hash, other.fingerprint.hash);
+}
+
+#[cfg(unix)]
+#[test]
+fn hmac_config_fingerprint_rejects_unsafe_key_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("ocserv.conf");
+    let key = dir.path().join("key");
+    let link = dir.path().join("link");
+    let hardlink = dir.path().join("hardlink");
+    std::fs::write(&config_path, "x").unwrap();
+    std::fs::write(&key, b"key-material-at-least-thirty-two-bytes").unwrap();
+    make_private(&key);
+    std::os::unix::fs::symlink(&key, &link).unwrap();
+    std::fs::hard_link(&key, &hardlink).unwrap();
+    for key_path in [link, hardlink] {
+        let provider = ConfigFingerprintProvider::new(Some(OcservConfigFingerprintConfig {
+            name: "main".into(),
+            config_path: config_path.clone(),
+            mode: ConfigFingerprintMode::HmacSha256,
+            key_id: Some("key-1".into()),
+            key_path: Some(key_path),
+            previous_key_id: None,
+            previous_key_path: None,
+        }));
+        assert_eq!(
+            provider.config_fingerprint().unwrap_err().code(),
+            ErrorCode::OcservProviderUnsafeSource
+        );
+    }
+}
+
+#[test]
 fn config_fingerprint_provider_rejects_files_over_1_mib() {
     let dir = tempfile::tempdir().expect("temp dir");
     let config_path = dir.path().join("ocserv.conf");
@@ -490,6 +580,11 @@ fn config_fingerprint_provider_rejects_files_over_1_mib() {
     let provider = ConfigFingerprintProvider::new(Some(OcservConfigFingerprintConfig {
         name: "main".to_string(),
         config_path,
+        mode: ocfleet_config::agent::ConfigFingerprintMode::LegacySha256,
+        key_id: None,
+        key_path: None,
+        previous_key_id: None,
+        previous_key_path: None,
     }));
 
     let err = provider
@@ -511,6 +606,11 @@ fn config_fingerprint_provider_rejects_group_writable_config_file() {
     let provider = ConfigFingerprintProvider::new(Some(OcservConfigFingerprintConfig {
         name: "main".to_string(),
         config_path,
+        mode: ocfleet_config::agent::ConfigFingerprintMode::LegacySha256,
+        key_id: None,
+        key_path: None,
+        previous_key_id: None,
+        previous_key_path: None,
     }));
 
     let err = provider

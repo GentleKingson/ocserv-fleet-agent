@@ -147,6 +147,9 @@ snapshot_path = "/var/lib/ocfleet-agent/ocserv-readonly.json"
 [ocserv_readonly.config_fingerprint]
 name = "main"
 config_path = "/etc/ocserv/ocserv.conf"
+mode = "hmac_sha256"
+key_id = "fleet-key-2026-07"
+key_path = "/etc/ocfleet-agent/fingerprint.key"
 
 [[ocserv_readonly.certificates]]
 name = "server"

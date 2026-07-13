@@ -1,12 +1,17 @@
 use ocfleet_protocol::method::{
-    MethodStatus, NODE_INFO, NODE_PING, OCSERV_CONFIG_APPLY, OCSERV_CONFIG_ROLLBACK, OCSERV_RELOAD,
-    OCSERV_RESTART, OCSERV_SESSION_DISCONNECT, PROBE_CONTROLLER_PING, PROBE_PATH_ECHO,
-    PROBE_PEER_ECHO, classify_phase_one_method,
+    MethodStatus, NODE_CAPABILITIES, NODE_INFO, NODE_PING, OCSERV_CONFIG_APPLY,
+    OCSERV_CONFIG_ROLLBACK, OCSERV_RELOAD, OCSERV_RESTART, OCSERV_SESSION_DISCONNECT,
+    PROBE_CONTROLLER_PING, PROBE_PATH_ECHO, PROBE_PEER_ECHO, classify_phase_one_method,
 };
 
 #[test]
 fn phase_one_methods_include_controller_probe_ping() {
-    for method in [NODE_PING, NODE_INFO, PROBE_CONTROLLER_PING] {
+    for method in [
+        NODE_PING,
+        NODE_INFO,
+        NODE_CAPABILITIES,
+        PROBE_CONTROLLER_PING,
+    ] {
         assert_eq!(classify_phase_one_method(method), MethodStatus::Allowed);
     }
 }

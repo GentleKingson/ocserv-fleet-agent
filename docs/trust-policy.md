@@ -1,7 +1,7 @@
 # Trust Policy As Code
 
 Trust policy files describe the intended controller registry/trust shape. The
-current implementation supports local validation and diff only:
+base workflow supports validation and advisory diff:
 
 ```bash
 ocfleet trust policy validate ./trust-policy.toml
@@ -19,9 +19,15 @@ do not modify SQLite trust state, do not approve enrollment, and do not generate
 path-probe authorization.
 
 `validate` is a pure file operation and does not open, create, or migrate the
-controller database. `diff` opens the controller store through the normal CLI
-store lifecycle to compare declared state; it performs no trust mutation or
-audit insert.
+controller database. `diff` and the signed `plan` workflow open existing state
+immutable, read-only, and query-only; an absent database is represented in
+memory and is not created. Older schemas and non-empty WAL snapshots are
+rejected rather than migrated, checkpointed, or recovered.
+
+Stage B6 adds detached signing, deterministic CI plans, Markdown review,
+signed approval records, bounded history, and drift-alert projection. See
+[`trust-policy-gitops.md`](trust-policy-gitops.md). It deliberately adds no
+policy apply path.
 
 ## TOML And YAML Schema
 

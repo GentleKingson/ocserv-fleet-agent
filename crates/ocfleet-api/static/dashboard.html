@@ -113,6 +113,7 @@
     }
     .stat strong { display: block; font-size: 22px; line-height: 1.1; }
     .stat span { color: var(--muted); }
+    #versions { margin-top: 12px; }
     .table-wrap { overflow-x: auto; }
     table {
       width: 100%;
@@ -148,6 +149,11 @@
     <section>
       <h2>Fleet Summary</h2>
       <div id="summary" class="stats"></div>
+    </section>
+    <section>
+      <h2>Upgrade Readiness</h2>
+      <div id="version-summary" class="stats"></div>
+      <div id="versions" class="table-wrap"></div>
     </section>
     <section>
       <h2>Node Health</h2>
@@ -265,8 +271,9 @@
     }
     async function refresh() {
       statusEl.textContent = "Loading";
-      const [summary, nodes, jobs, alerts, runs, observations] = await Promise.all([
+      const [summary, versions, nodes, jobs, alerts, runs, observations] = await Promise.all([
         loadJson("/health/summary"),
+        loadJson("/api/v1/version/readiness"),
         loadJson("/health/nodes"),
         loadJson("/jobs"),
         loadJson("/alerts?state=open&limit=25"),
@@ -274,6 +281,34 @@
         loadJson("/observations?limit=10")
       ]);
       renderSummary(summary.summary || {});
+      const versionData = versions.data || {};
+      const versionSummary = {
+        ready: versionData.ready_count,
+        blocked: versionData.blocked_count,
+        unknown: versionData.unknown_count,
+        alerts: versionData.alert_count
+      };
+      const versionContainer = document.querySelector("#version-summary");
+      const versionStats = Object.entries(versionSummary).map(([key, value]) => {
+        const item = document.createElement("div");
+        item.className = "stat";
+        const number = document.createElement("strong");
+        number.textContent = text(value);
+        const label = document.createElement("span");
+        label.textContent = key;
+        item.append(number, label);
+        return item;
+      });
+      versionContainer.replaceChildren(...versionStats);
+      renderTable("#versions", [
+        { label: "node", value: row => row.node_id },
+        { label: "observed", value: row => row.observed_agent_version },
+        { label: "expected", value: row => row.expected_agent_version },
+        { label: "version", value: row => row.version_status },
+        { label: "protocol", value: row => row.protocol_status },
+        { label: "provider", value: row => row.provider_schema_status },
+        { label: "readiness", value: row => row.readiness, className: value => `status-${cls(value)}` }
+      ], versionData.nodes || []);
       renderTable("#nodes", [
         { label: "node", value: row => row.node_id },
         { label: "role", value: row => row.role },

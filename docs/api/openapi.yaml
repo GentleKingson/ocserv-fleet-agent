@@ -22,7 +22,105 @@
     "non_loopback": "bearer-required-viewer-only",
     "transport": "plain-http-upstream-requires-tls-reverse-proxy"
   },
+  "x-ocfleet-cursor-signing": {
+    "key_file": "required-private-persistent-keyring",
+    "algorithm": "hmac-sha256",
+    "lifetime_seconds_min": 86400,
+    "lifetime_seconds_max": 172800,
+    "rotation": "current-and-optional-previous"
+  },
   "paths": {
+    "/api/v1/fleet/summary": {
+      "get": {
+        "operationId": "getV1FleetSummary",
+        "summary": "Stable v1 exact fleet health summary",
+        "responses": {
+          "200": { "description": "Exact bounded-field fleet summary", "headers": { "ETag": { "schema": { "type": "string" } }, "X-Request-ID": { "schema": { "type": "string", "maxLength": 128 } } }, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/V1FleetSummaryEnvelope" } } } },
+          "304": { "description": "Representation has not changed" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/api/v1/version/readiness": {
+      "get": {
+        "operationId": "getV1VersionReadiness",
+        "summary": "Bounded read-only fleet version and upgrade readiness projection",
+        "responses": {
+          "200": { "description": "Version distribution, compatibility, readiness, and derived alerts", "headers": { "ETag": { "schema": { "type": "string" } }, "X-Request-ID": { "schema": { "type": "string", "maxLength": 128 } } }, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/V1VersionReadinessEnvelope" } } } },
+          "304": { "description": "Representation has not changed" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/api/v1/nodes": {
+      "get": {
+        "operationId": "listV1Nodes",
+        "summary": "Stable v1 cursor-paginated node health and metadata projection",
+        "parameters": [
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 10000, "default": 50 } },
+          { "name": "cursor", "in": "query", "schema": { "type": "string", "maxLength": 2048 } },
+          { "name": "region", "in": "query", "schema": { "type": "string", "maxLength": 128 } },
+          { "name": "role", "in": "query", "schema": { "type": "string", "maxLength": 128 } },
+          { "name": "environment", "in": "query", "schema": { "type": "string", "maxLength": 128 } },
+          { "name": "label", "in": "query", "description": "Exact key=value string-label match", "schema": { "type": "string", "maxLength": 193 } },
+          { "name": "status", "in": "query", "schema": { "type": "string", "enum": ["healthy", "degraded", "unreachable", "stale", "disabled", "unknown"] } }
+        ],
+        "responses": {
+          "200": { "description": "Cursor page", "headers": { "ETag": { "schema": { "type": "string" } }, "X-Request-ID": { "schema": { "type": "string", "maxLength": 128 } } }, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/V1NodePageEnvelope" } } } },
+          "304": { "description": "Representation has not changed" },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/api/v1/nodes/{node_id}": {
+      "get": {
+        "operationId": "getV1Node",
+        "summary": "Stable v1 single node projection",
+        "parameters": [{ "$ref": "#/components/parameters/NodeId" }],
+        "responses": { "200": { "$ref": "#/components/responses/V1Single" }, "304": { "description": "Representation has not changed" }, "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" } }
+      }
+    },
+    "/api/v1/health/history": {
+      "get": {
+        "operationId": "listV1HealthHistory",
+        "summary": "Cursor-paginated health history in a half-open time window",
+        "parameters": [
+          { "name": "from", "in": "query", "required": true, "schema": { "type": "string", "format": "date-time" } },
+          { "name": "to", "in": "query", "required": true, "schema": { "type": "string", "format": "date-time" } },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 10000 } },
+          { "name": "cursor", "in": "query", "schema": { "type": "string", "maxLength": 2048 } },
+          { "name": "node_id", "in": "query", "schema": { "type": "string", "maxLength": 128 } },
+          { "name": "status", "in": "query", "schema": { "type": "string", "enum": ["healthy", "degraded", "unreachable", "stale", "disabled", "unknown"] } }
+        ],
+        "responses": { "200": { "$ref": "#/components/responses/V1Page" }, "304": { "description": "Representation has not changed" }, "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" } }
+      }
+    },
+    "/api/v1/alerts": {
+      "get": {
+        "operationId": "listV1Alerts",
+        "summary": "Cursor-paginated alerts with reason and half-open time filters",
+        "parameters": [
+          { "name": "from", "in": "query", "required": true, "schema": { "type": "string", "format": "date-time" } },
+          { "name": "to", "in": "query", "required": true, "schema": { "type": "string", "format": "date-time" } },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 10000 } },
+          { "name": "cursor", "in": "query", "schema": { "type": "string", "maxLength": 2048 } },
+          { "name": "state", "in": "query", "schema": { "type": "string", "enum": ["open", "silenced", "resolved"] } },
+          { "name": "severity", "in": "query", "schema": { "type": "string", "enum": ["warning", "critical"] } },
+          { "name": "node_id", "in": "query", "schema": { "type": "string", "maxLength": 128 } },
+          { "name": "reason", "in": "query", "schema": { "type": "string", "maxLength": 128 } }
+        ],
+        "responses": { "200": { "$ref": "#/components/responses/V1Page" }, "304": { "description": "Representation has not changed" }, "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" } }
+      }
+    },
+    "/api/v1/alerts/{dedupe_key_or_alert_id}": {
+      "get": {
+        "operationId": "getV1Alert",
+        "summary": "Stable v1 single alert projection",
+        "parameters": [{ "name": "dedupe_key_or_alert_id", "in": "path", "required": true, "schema": { "type": "string", "maxLength": 256 } }],
+        "responses": { "200": { "$ref": "#/components/responses/V1Single" }, "304": { "description": "Representation has not changed" }, "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" } }
+      }
+    },
     "/": {
       "get": {
         "operationId": "getDashboard",
@@ -547,6 +645,16 @@
       }
     },
     "responses": {
+      "V1Page": {
+        "description": "Signed cursor page with conditional caching",
+        "headers": { "ETag": { "schema": { "type": "string" } }, "X-Request-ID": { "schema": { "type": "string", "maxLength": 128 } } },
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/V1GenericPageEnvelope" } } }
+      },
+      "V1Single": {
+        "description": "Stable v1 single-record envelope",
+        "headers": { "ETag": { "schema": { "type": "string" } }, "X-Request-ID": { "schema": { "type": "string", "maxLength": 128 } } },
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/V1SingleEnvelope" } } }
+      },
       "HealthSummary": {
         "description": "Fleet health counts computed from stored snapshots",
         "content": {
@@ -1226,6 +1334,7 @@
             "type": "string",
             "enum": [
               "BAD_REQUEST",
+              "INVALID_CURSOR",
               "UNAUTHORIZED",
               "NOT_FOUND",
               "METHOD_NOT_ALLOWED",
@@ -1238,6 +1347,86 @@
           },
           "request_id": {
             "$ref": "#/components/schemas/SafeIdentifier"
+          }
+        },
+        "additionalProperties": false
+      },
+      "V1NodePageEnvelope": {
+        "type": "object",
+        "required": ["data"],
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": ["schema", "limit", "count", "next_cursor", "items"],
+            "properties": {
+              "schema": { "const": "ocfleet.api.v1.page" },
+              "limit": { "type": "integer", "minimum": 1, "maximum": 10000 },
+              "count": { "type": "integer", "minimum": 0, "maximum": 10000 },
+              "next_cursor": { "type": ["string", "null"], "maxLength": 2048 },
+              "items": { "type": "array", "maxItems": 10000, "items": { "$ref": "#/components/schemas/HealthNode" } }
+            },
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      },
+      "V1GenericPageEnvelope": {
+        "type": "object",
+        "required": ["data"],
+        "properties": {
+          "data": { "type": "object", "required": ["schema", "limit", "count", "next_cursor", "items"], "properties": { "schema": { "const": "ocfleet.api.v1.page" }, "limit": { "type": "integer", "minimum": 1, "maximum": 10000 }, "count": { "type": "integer", "minimum": 0, "maximum": 10000 }, "next_cursor": { "type": ["string", "null"], "maxLength": 2048 }, "items": { "type": "array", "maxItems": 10000, "items": { "type": "object" } } }, "additionalProperties": false }
+        },
+        "additionalProperties": false
+      },
+      "V1SingleEnvelope": {
+        "type": "object",
+        "required": ["data"],
+        "properties": { "data": { "type": "object", "required": ["schema", "item"], "properties": { "schema": { "type": "string", "enum": ["ocfleet.api.v1.node", "ocfleet.api.v1.alert"] }, "item": { "type": "object" } }, "additionalProperties": false } },
+        "additionalProperties": false
+      },
+      "V1FleetSummaryEnvelope": {
+        "type": "object",
+        "required": ["data"],
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": ["schema", "total", "status"],
+            "properties": {
+              "schema": { "const": "ocfleet.api.v1.fleet-summary" },
+              "total": { "type": "integer", "minimum": 0 },
+              "status": { "type": "object", "required": ["healthy", "degraded", "unreachable", "stale", "disabled", "unknown"], "additionalProperties": { "type": "integer", "minimum": 0 } }
+            },
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      },
+      "V1VersionReadinessEnvelope": {
+        "type": "object",
+        "required": ["data"],
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": ["schema", "required_protocol", "required_ocserv_snapshot_schema", "node_count", "ready_count", "blocked_count", "unknown_count", "disabled_count", "outdated_count", "protocol_incompatible_count", "provider_incompatible_count", "alert_count", "distribution", "nodes", "alerts", "actions_enabled"],
+            "properties": {
+              "schema": { "const": "ocfleet.version-readiness.v1" },
+              "required_protocol": { "type": "integer", "minimum": 1, "maximum": 65535 },
+              "required_ocserv_snapshot_schema": { "type": "integer", "minimum": 1, "maximum": 65535 },
+              "node_count": { "type": "integer", "minimum": 0, "maximum": 1000 },
+              "ready_count": { "type": "integer", "minimum": 0, "maximum": 1000 },
+              "blocked_count": { "type": "integer", "minimum": 0, "maximum": 1000 },
+              "unknown_count": { "type": "integer", "minimum": 0, "maximum": 1000 },
+              "disabled_count": { "type": "integer", "minimum": 0, "maximum": 1000 },
+              "outdated_count": { "type": "integer", "minimum": 0, "maximum": 1000 },
+              "protocol_incompatible_count": { "type": "integer", "minimum": 0, "maximum": 1000 },
+              "provider_incompatible_count": { "type": "integer", "minimum": 0, "maximum": 1000 },
+              "alert_count": { "type": "integer", "minimum": 0, "maximum": 3000 },
+              "distribution": { "type": "array", "maxItems": 1000, "items": { "type": "object", "required": ["version", "node_count"], "properties": { "version": { "type": "string", "maxLength": 64 }, "node_count": { "type": "integer", "minimum": 1, "maximum": 1000 } }, "additionalProperties": false } },
+              "nodes": { "type": "array", "maxItems": 1000, "items": { "type": "object", "required": ["node_id", "enabled", "expected_agent_version", "observed_agent_version", "observed_at", "negotiation_status", "version_status", "protocol_status", "provider_schema_status", "readiness", "actions_enabled"], "properties": { "node_id": { "$ref": "#/components/schemas/SafeIdentifier" }, "enabled": { "type": "boolean" }, "expected_agent_version": { "type": ["string", "null"], "maxLength": 64 }, "observed_agent_version": { "type": ["string", "null"], "maxLength": 64 }, "observed_at": { "type": ["string", "null"], "format": "date-time" }, "negotiation_status": { "type": ["string", "null"], "enum": ["compatible", "incompatible_protocol", "unsupported_capability", "legacy_unsupported", "invalid_response", null] }, "version_status": { "type": "string", "enum": ["current", "ahead", "outdated", "policy_missing", "unknown_version", "invalid_expected_version", "invalid_observed_version"] }, "protocol_status": { "type": "string", "enum": ["compatible", "incompatible", "unknown"] }, "provider_schema_status": { "type": "string", "enum": ["compatible", "incompatible", "unknown"] }, "readiness": { "type": "string", "enum": ["ready", "blocked", "unknown", "disabled"] }, "actions_enabled": { "const": false } }, "additionalProperties": false } },
+              "alerts": { "type": "array", "maxItems": 3000, "items": { "type": "object", "required": ["node_id", "severity", "reason_code", "version_status", "protocol_status", "provider_schema_status", "observed_agent_version", "expected_agent_version"], "properties": { "node_id": { "$ref": "#/components/schemas/SafeIdentifier" }, "severity": { "type": "string", "enum": ["warning", "critical"] }, "reason_code": { "type": "string", "enum": ["AGENT_VERSION_OUTDATED", "PROTOCOL_INCOMPATIBLE", "PROVIDER_SCHEMA_INCOMPATIBLE"] }, "version_status": { "type": "string" }, "protocol_status": { "type": "string" }, "provider_schema_status": { "type": "string" }, "observed_agent_version": { "type": ["string", "null"], "maxLength": 64 }, "expected_agent_version": { "type": ["string", "null"], "maxLength": 64 } }, "additionalProperties": false } },
+              "actions_enabled": { "const": false }
+            },
+            "additionalProperties": false
           }
         },
         "additionalProperties": false

@@ -8,7 +8,9 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
-use crate::input_validation::{validate_description, validate_label_json, validate_reason};
+use crate::input_validation::{
+    validate_description, validate_label_json, validate_metadata_value, validate_reason,
+};
 
 pub const SCHEDULER_SELECTOR_SCHEMA_V1: &str = "ocfleet.scheduler.selector.v1";
 pub const SCHEDULER_PAIR_SCHEMA_V1: &str = "ocfleet.scheduler.pair.v1";
@@ -1257,11 +1259,13 @@ fn is_known_audit_detail_key(key: &str) -> bool {
     matches!(
         key,
         "action"
+            | "actions_enabled"
             | "active_endpoint"
             | "actor_type"
             | "after"
             | "after_state"
             | "agent_controllers"
+            | "agent_version"
             | "agent_path_probes"
             | "agent_peers"
             | "alert_count"
@@ -1295,6 +1299,9 @@ fn is_known_audit_detail_key(key: &str) -> bool {
             | "claimed_at"
             | "code"
             | "computed_at"
+            | "compatible"
+            | "controlled_writes_compiled"
+            | "controlled_writes_locally_enabled"
             | "content_sha256"
             | "correlation_id"
             | "created_at"
@@ -1332,6 +1339,7 @@ fn is_known_audit_detail_key(key: &str) -> bool {
             | "expires_at"
             | "failed_observation_count"
             | "failed_observations"
+            | "feature_flag_count"
             | "fence_token"
             | "fingerprint_present"
             | "finished_at"
@@ -1397,6 +1405,8 @@ fn is_known_audit_detail_key(key: &str) -> bool {
             | "observation_id"
             | "observations"
             | "observed_at"
+            | "ocserv_snapshot_max"
+            | "ocserv_snapshot_min"
             | "ok"
             | "old_endpoint"
             | "old_value"
@@ -1409,6 +1419,9 @@ fn is_known_audit_detail_key(key: &str) -> bool {
             | "planned_delete_count"
             | "policy_class"
             | "previous_endpoint_id"
+            | "protocol_max"
+            | "protocol_min"
+            | "provider_schema_count"
             | "queue_id"
             | "reason"
             | "reason_code"
@@ -1470,6 +1483,7 @@ fn is_known_audit_detail_key(key: &str) -> bool {
             | "status_counts"
             | "summary"
             | "summary_json"
+            | "supported_method_count"
             | "supported_probe_methods"
             | "target_agent_endpoint_id"
             | "target_count"
@@ -1539,8 +1553,11 @@ pub struct ObservationSummaryFieldsV1 {
     pub cert_count: Option<u64>,
     pub days_remaining: Option<i64>,
     pub config_fingerprint_algorithm: Option<String>,
+    pub config_fingerprint_key_id: Option<String>,
     pub config_fingerprint_status: Option<String>,
     pub config_fingerprint_prefix: Option<String>,
+    pub config_fingerprint_previous_key_id: Option<String>,
+    pub config_fingerprint_previous_prefix: Option<String>,
     pub request_id: Option<String>,
     pub target_node_id: Option<String>,
     pub target_endpoint_id: Option<String>,
@@ -1687,9 +1704,20 @@ impl SchedulerSelectorPayloadV1 {
             validate_role(role).map_err(|error| error.to_string())?;
         } else if let Some(node_id) = self.selector.strip_prefix("node_id=") {
             validate_node_id(node_id).map_err(|error| error.to_string())?;
+        } else if let Some((field, value)) = self.selector.split_once('=') {
+            if matches!(
+                field,
+                "environment" | "site" | "owner_team" | "service_tier"
+            ) {
+                validate_metadata_value(value, "selector value")?;
+            } else if let Some(key) = field.strip_prefix("label.") {
+                validate_label_json(&serde_json::json!({key:value}), "selector label")?;
+            } else {
+                return Err("scheduler selector field is not allowed".to_string());
+            }
         } else {
             return Err(
-                "scheduler selector must use role=<role>, node_id=<node-id>, or explicit-pair"
+                "scheduler selector must use a bounded node, role, metadata, or label field"
                     .to_string(),
             );
         }
@@ -1818,6 +1846,10 @@ mod tests {
             .is_err()
         );
         assert!(SchedulerSelectorPayloadV1::new("role=/etc/passwd".to_string(), None).is_err());
+        assert!(SchedulerSelectorPayloadV1::new("environment=prod".to_string(), None).is_ok());
+        assert!(SchedulerSelectorPayloadV1::new("label.color=blue".to_string(), None).is_ok());
+        assert!(SchedulerSelectorPayloadV1::new("label../bad=x".to_string(), None).is_err());
+        assert!(SchedulerSelectorPayloadV1::new("trust=active".to_string(), None).is_err());
         assert!(
             SchedulerSelectorPayloadV1::new("role=ocserv".to_string(), Some("x".repeat(257)))
                 .is_err()

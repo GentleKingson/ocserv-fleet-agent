@@ -27,8 +27,9 @@
   treat legacy `METHOD_NOT_FOUND` deterministically without enabling features.
 - B6 adds detached Ed25519 trust-policy revisions, deterministic bounded CI
   plans and Markdown reports, closed drift-alert projections, signed approval
-  records, bounded append-only history, and a read-only/no-create SQLite review
-  path. No policy apply or agent RPC path exists.
+  records rooted in an actor-bound reviewer keyring, truncated-plan rejection,
+  cross-process locked append-only history, and a read-only/no-create SQLite
+  review path. No policy apply or agent RPC path exists.
 - B5 adds agent-local HMAC-SHA-256 configuration fingerprints with key IDs,
   one-key dual-report rotation, legacy SHA-256 compatibility, prefix-only
   controller/CLI projections, and private key-file enforcement.

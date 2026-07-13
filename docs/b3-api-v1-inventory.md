@@ -7,9 +7,9 @@ namespace without removing or changing the experimental legacy routes.
 
 - `GET /api/v1/fleet/summary` computes exact fleet status counts in SQLite.
 - `GET /api/v1/nodes` provides keyset cursor pagination ordered by `node_id`.
-- `GET /api/v1/health/history` provides bounded half-open time windows, node
+- `GET /api/v1/health/history` provides bounded half-open UTC-normalized time windows, node
   and status filters, and signed composite keyset pagination.
-- `GET /api/v1/alerts` provides bounded half-open time windows, node, state,
+- `GET /api/v1/alerts` provides bounded half-open UTC-normalized time windows, node, state,
   severity, and alert-reason filters with signed composite pagination.
 - Cursors are HMAC-SHA-256 signed with a required private persistent keyring,
   carry a key ID and deterministic 24-48-hour expiry, are bound to the resource and canonical

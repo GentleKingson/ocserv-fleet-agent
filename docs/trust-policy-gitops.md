@@ -72,15 +72,34 @@ digest change.
 ## Approval and history
 
 Approval is a separate signed artifact bound to the exact canonical plan hash
-and the global `--actor` identity:
+and the global `--actor` identity. The trust root is an independently managed,
+owner-only reviewer keyring; approval artifacts carry only `key_id`, never a
+self-asserted public key. Each key ID is globally unique and binds one actor to
+one Ed25519 public key:
+
+```json
+{
+  "schema": "ocfleet.trust_policy.reviewer-keyring.v1",
+  "reviewers": [{
+    "actor": "security-reviewer",
+    "key_id": "security-review-2026",
+    "public_key": "<base64-encoded 32-byte Ed25519 public key>"
+  }]
+}
+```
 
 ```sh
 ocfleet --actor security-reviewer trust policy approve \
   .policy-artifacts/trust-policy-plan.json \
   --key-file /run/secrets/review-approval.pk8 \
   --key-id security-review-2026 \
+  --reviewer-keyring /run/secrets/reviewer-keyring.json \
   --output .policy-artifacts/approval.json
 ```
+
+The signing key must match the actor/key ID binding in the keyring. Truncated
+plans cannot be approved; regenerate a review artifact that covers the complete
+change set before approval.
 
 Append the verified plan and approval link to the bounded append-only history:
 
@@ -88,13 +107,17 @@ Append the verified plan and approval link to the bounded append-only history:
 ocfleet trust policy history record \
   .policy-artifacts/trust-policy-plan.json \
   --approval .policy-artifacts/approval.json \
+  --reviewer-keyring /run/secrets/reviewer-keyring.json \
   --history .policy-artifacts/history.jsonl
 
 ocfleet trust policy history list .policy-artifacts/history.jsonl --json
 ```
 
-History rejects duplicate revisions, invalid approval signatures, mismatched
-plan hashes, unknown fields, more than 256 entries, and files over 1 MiB.
+History verifies approvals only against the external reviewer keyring and
+rejects duplicate revisions, invalid approval signatures, mismatched plan
+hashes, unknown fields, more than 256 entries, and files over 1 MiB. Record
+holds an exclusive cross-process lock across validation and the single-buffer
+append, so concurrent writers cannot admit the same revision.
 
 ## Non-mutation boundary
 

@@ -1619,6 +1619,47 @@ fn parses_trust_policy_gitops_commands() {
     assert_eq!(output, PathBuf::from("plan.json"));
     assert_eq!(markdown_output, Some(PathBuf::from("review.md")));
     assert!(json);
+
+    let approval = Cli::parse_from([
+        "ocfleet",
+        "--actor",
+        "security-reviewer",
+        "trust",
+        "policy",
+        "approve",
+        "plan.json",
+        "--key-file",
+        "reviewer.pk8",
+        "--key-id",
+        "reviewer-2026",
+        "--reviewer-keyring",
+        "reviewer-keyring.json",
+        "--output",
+        "approval.json",
+    ]);
+    assert!(matches!(
+        approval.command,
+        Command::Trust {
+            command: TrustCommand::Policy {
+                command: ocfleet_cli::args::TrustPolicyCommand::Approve { .. }
+            }
+        }
+    ));
+
+    let missing_keyring = Cli::try_parse_from([
+        "ocfleet",
+        "trust",
+        "policy",
+        "history",
+        "record",
+        "plan.json",
+        "--approval",
+        "approval.json",
+        "--history",
+        "history.jsonl",
+    ])
+    .expect_err("approval history must require a reviewer keyring");
+    assert!(missing_keyring.to_string().contains("--reviewer-keyring"));
 }
 
 #[test]

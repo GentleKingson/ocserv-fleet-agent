@@ -232,3 +232,7 @@ issuer, serial, private keys, raw config content, or raw logs.
 an aligned RFC3339 `to`, and an optional `node_id`. It returns bounded,
 low-sensitive projections from stored rollups only and never triggers probes or
 agent RPC. Missing coverage is explicit and excluded from health-sample ratios.
+All RFC3339 window boundaries for `/health/slo`, `/api/v1/health/history`, and
+`/api/v1/alerts` are normalized to UTC before SQLite comparison. The v1 cursor
+filter hash uses the same canonical UTC values, so equivalent `Z`, positive
+offset, and negative offset windows share pagination semantics.

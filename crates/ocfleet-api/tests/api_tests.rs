@@ -309,8 +309,9 @@ async fn health_slo_is_bounded_read_only_and_preserves_missing_coverage() {
     .expect("write rollup");
     drop(store);
     let before = table_counts(&fixture.database);
+    let router = fixture.router(None);
     let (status, body) = json_request(
-        fixture.router(None),
+        router.clone(),
         Method::GET,
         "/health/slo?window=24h&to=2026-07-12T00:00:00Z&node_id=node-a",
         None,
@@ -324,6 +325,17 @@ async fn health_slo_is_bounded_read_only_and_preserves_missing_coverage() {
         body["projections"][0]["service_available_basis_points"],
         10_000
     );
+    let (status, offset_body) = json_request(
+        router,
+        Method::GET,
+        "/health/slo?window=24h&to=2026-07-12T08:00:00%2B08:00&node_id=node-a",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(offset_body["from"], "2026-07-11T00:00:00Z");
+    assert_eq!(offset_body["to"], "2026-07-12T00:00:00Z");
+    assert_eq!(offset_body["projections"], body["projections"]);
     let spec: Value = serde_json::from_str(OPENAPI).expect("OpenAPI JSON");
     let required = spec["components"]["schemas"]["HealthSloProjection"]["required"]
         .as_array()
@@ -673,6 +685,9 @@ async fn api_v1_history_and_alerts_enforce_windows_and_reason_filters() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(history["data"]["count"], 1);
     assert_eq!(history["data"]["items"][0]["status"], "unreachable");
+    let (status,positive_offset)=json_request(router.clone(),Method::GET,"/api/v1/health/history?from=2026-07-09T08:00:00%2B08:00&to=2026-07-10T08:00:00%2B08:00&node_id=node-a&status=unreachable&limit=1",None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(positive_offset["data"], history["data"]);
     let (status,alerts)=json_request(router.clone(),Method::GET,"/api/v1/alerts?from=2026-07-09T00:00:00Z&to=2026-07-10T00:00:00Z&reason=NODE_UNREACHABLE&state=open",None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(alerts["data"]["count"], 1);
@@ -680,6 +695,9 @@ async fn api_v1_history_and_alerts_enforce_windows_and_reason_filters() {
         alerts["data"]["items"][0]["reason_code"],
         "NODE_UNREACHABLE"
     );
+    let (status,negative_offset)=json_request(router.clone(),Method::GET,"/api/v1/alerts?from=2026-07-08T17:00:00-07:00&to=2026-07-09T17:00:00-07:00&reason=NODE_UNREACHABLE&state=open",None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(negative_offset["data"], alerts["data"]);
     for uri in [
         "/api/v1/health/history?from=2026-07-10T00:00:00Z&to=2026-07-09T00:00:00Z",
         "/api/v1/alerts?from=2026-07-09T00:00:00Z&to=2026-07-10T00:00:00Z&unknown=x",

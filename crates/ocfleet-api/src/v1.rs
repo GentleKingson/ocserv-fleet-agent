@@ -11,7 +11,7 @@ use ocfleet_cli::version_governance::{MAX_VERSION_GOVERNANCE_NODES, build_fleet_
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use time::OffsetDateTime;
+use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
 
 use crate::cursor_keys::CursorKeyring;
 use crate::projections::{alert_to_json, health_node_to_json};
@@ -244,7 +244,7 @@ async fn health_history(
     authorize(&state, &headers)?;
     let Query(query) =
         query.map_err(|_| ApiError::bad_request("invalid or unsupported query parameters"))?;
-    validate_window(&query.from, &query.to).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let (from, to) = normalize_window(&query.from, &query.to)?;
     let limit = page_limit(query.limit, state.max_limit)?;
     if let Some(v) = query.node_id.as_deref() {
         validate_filter_value("node_id", v)?;
@@ -258,7 +258,7 @@ async fn health_history(
         return Err(ApiError::bad_request("status is not supported"));
     }
     let hash = generic_filter_hash(
-        &json!({"from":query.from,"to":query.to,"node_id":query.node_id,"status":query.status}),
+        &json!({"from":from,"to":to,"node_id":query.node_id,"status":query.status}),
     );
     let after = query
         .cursor
@@ -272,8 +272,8 @@ async fn health_history(
             after: parts.as_ref().map(|p| (p[0], p[1], p[2])),
             node_id: query.node_id.as_deref(),
             status: query.status.as_deref(),
-            from: &query.from,
-            to: &query.to,
+            from: &from,
+            to: &to,
         },
     ))?;
     let more = rows.len() > limit as usize;
@@ -309,7 +309,7 @@ async fn alerts(
     authorize(&state, &headers)?;
     let Query(query) =
         query.map_err(|_| ApiError::bad_request("invalid or unsupported query parameters"))?;
-    validate_window(&query.from, &query.to).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let (from, to) = normalize_window(&query.from, &query.to)?;
     let limit = page_limit(query.limit, state.max_limit)?;
     for (field, value) in [
         ("node_id", query.node_id.as_deref()),
@@ -330,7 +330,7 @@ async fn alerts(
         return Err(ApiError::bad_request("severity is not supported"));
     }
     let hash = generic_filter_hash(
-        &json!({"from":query.from,"to":query.to,"state":query.state,"severity":query.severity,"node_id":query.node_id,"reason":query.reason}),
+        &json!({"from":from,"to":to,"state":query.state,"severity":query.severity,"node_id":query.node_id,"reason":query.reason}),
     );
     let after = query
         .cursor
@@ -346,8 +346,8 @@ async fn alerts(
             severity: query.severity.as_deref(),
             node_id: query.node_id.as_deref(),
             reason: query.reason.as_deref(),
-            from: &query.from,
-            to: &query.to,
+            from: &from,
+            to: &to,
         },
     ))?;
     let more = rows.len() > limit as usize;
@@ -448,6 +448,20 @@ fn parse_label_filter(value: &str) -> ApiResult<(&str, &str)> {
         .ok_or_else(|| ApiError::bad_request("label must use key=value"))?;
     validate_label_json(&json!({key:value}), "label").map_err(ApiError::bad_request)?;
     Ok((key, value))
+}
+
+fn normalize_window(from: &str, to: &str) -> ApiResult<(String, String)> {
+    let (from, to) =
+        validate_window(from, to).map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let from = from
+        .to_offset(UtcOffset::UTC)
+        .format(&Rfc3339)
+        .map_err(|_| ApiError::internal())?;
+    let to = to
+        .to_offset(UtcOffset::UTC)
+        .format(&Rfc3339)
+        .map_err(|_| ApiError::internal())?;
+    Ok((from, to))
 }
 
 fn filter_hash(query: &NodesQuery) -> String {
@@ -653,5 +667,22 @@ mod tests {
         let signature = hex(&hmac_sha256(keys.current().key(), encoded.as_bytes()));
         let cursor = format!("{encoded}.{signature}");
         assert!(decode_cursor(&cursor, &keys, "nodes", "filters-a").is_err());
+    }
+
+    #[test]
+    fn equivalent_offset_windows_have_one_canonical_filter_hash() {
+        let utc =
+            normalize_window("2026-07-09T00:00:00Z", "2026-07-10T00:00:00Z").expect("UTC window");
+        let positive = normalize_window("2026-07-09T08:00:00+08:00", "2026-07-10T08:00:00+08:00")
+            .expect("positive offset window");
+        let negative = normalize_window("2026-07-08T17:00:00-07:00", "2026-07-09T17:00:00-07:00")
+            .expect("negative offset window");
+        assert_eq!(utc, positive);
+        assert_eq!(utc, negative);
+        let hash = |window: &(String, String)| {
+            generic_filter_hash(&json!({"from":window.0,"to":window.1}))
+        };
+        assert_eq!(hash(&utc), hash(&positive));
+        assert_eq!(hash(&utc), hash(&negative));
     }
 }

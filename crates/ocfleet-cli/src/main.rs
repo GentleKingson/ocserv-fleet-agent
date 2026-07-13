@@ -533,18 +533,32 @@ async fn main() -> anyhow::Result<()> {
                     plan,
                     key_file,
                     key_id,
+                    reviewer_keyring,
                     output,
                     json,
-                } => run_trust_policy_approve(&plan, &key_file, &key_id, &actor, &output, json)?,
+                } => run_trust_policy_approve(
+                    &plan,
+                    &key_file,
+                    &key_id,
+                    &actor,
+                    &reviewer_keyring,
+                    &output,
+                    json,
+                )?,
                 TrustPolicyCommand::History { command } => match command {
                     TrustPolicyHistoryCommand::Record {
                         plan,
                         approval,
+                        reviewer_keyring,
                         history,
                         json,
-                    } => {
-                        run_trust_policy_history_record(&plan, approval.as_deref(), &history, json)?
-                    }
+                    } => run_trust_policy_history_record(
+                        &plan,
+                        approval.as_deref(),
+                        reviewer_keyring.as_deref(),
+                        &history,
+                        json,
+                    )?,
                     TrustPolicyHistoryCommand::List { history, json } => {
                         run_trust_policy_history_list(&history, json)?
                     }

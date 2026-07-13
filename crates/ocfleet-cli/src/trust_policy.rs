@@ -11,7 +11,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::str::FromStr;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -32,12 +34,15 @@ const MAX_DIFF_ITEMS: usize = 512;
 const MAX_SIGNATURE_BYTES: u64 = 16 * 1024;
 const MAX_SIGNING_KEY_BYTES: u64 = 16 * 1024;
 const MAX_PLAN_BYTES: u64 = 512 * 1024;
+const MAX_REVIEWER_KEYRING_BYTES: u64 = 64 * 1024;
+const MAX_REVIEWER_KEYS: usize = 128;
 const MAX_HISTORY_BYTES: u64 = 1024 * 1024;
 const MAX_HISTORY_ENTRIES: usize = 256;
 const POLICY_SIGNATURE_SCHEMA: &str = "ocfleet.trust_policy.signature.v1";
 const POLICY_PUBLIC_KEY_SCHEMA: &str = "ocfleet.trust_policy.public_key.v1";
 const POLICY_PLAN_SCHEMA: &str = "ocfleet.trust_policy.plan.v1";
-const POLICY_APPROVAL_SCHEMA: &str = "ocfleet.trust_policy.approval.v1";
+const POLICY_APPROVAL_SCHEMA: &str = "ocfleet.trust_policy.approval.v2";
+const POLICY_REVIEWER_KEYRING_SCHEMA: &str = "ocfleet.trust_policy.reviewer-keyring.v1";
 const POLICY_HISTORY_SCHEMA: &str = "ocfleet.trust_policy.history.v1";
 
 pub fn run_trust_policy_validate(
@@ -230,6 +235,7 @@ pub fn run_trust_policy_approve(
     key_file: &Path,
     key_id: &str,
     approver: &str,
+    reviewer_keyring_path: &Path,
     output: &Path,
     json: bool,
 ) -> anyhow::Result<()> {
@@ -238,9 +244,17 @@ pub fn run_trust_policy_approve(
     let plan: TrustPolicyPlan =
         read_artifact_json_bounded(plan_path, MAX_PLAN_BYTES, "policy plan")?;
     validate_plan(&plan)?;
+    if plan.truncated {
+        bail!("truncated policy plans cannot be approved");
+    }
+    let reviewer_keys = load_reviewer_keyring(reviewer_keyring_path)?;
+    let trusted_key = trusted_reviewer_key(&reviewer_keys, approver, key_id)?;
     let key_bytes = read_private_bounded(key_file, MAX_SIGNING_KEY_BYTES, "approval key")?;
     let key_pair = Ed25519KeyPair::from_pkcs8(&key_bytes)
         .map_err(|_| anyhow::anyhow!("invalid Ed25519 PKCS#8 approval signing key"))?;
+    if key_pair.public_key().as_ref() != trusted_key.public_key.as_slice() {
+        bail!("approval key is not authorized for the approver and key_id");
+    }
     let approved_at = now_rfc3339();
     let plan_sha256 = sha256_hex(&serde_json::to_vec(&plan)?);
     let payload = approval_signature_payload(
@@ -257,7 +271,6 @@ pub fn run_trust_policy_approve(
         approver: approver.to_string(),
         approved_at,
         key_id: key_id.to_string(),
-        public_key: BASE64.encode(key_pair.public_key().as_ref()),
         signature: BASE64.encode(key_pair.sign(&payload).as_ref()),
     };
     write_private_json(output, &approval, "policy approval")?;
@@ -276,22 +289,13 @@ pub fn run_trust_policy_approve(
 pub fn run_trust_policy_history_record(
     plan_path: &Path,
     approval_path: Option<&Path>,
+    reviewer_keyring_path: Option<&Path>,
     history_path: &Path,
     json: bool,
 ) -> anyhow::Result<()> {
     let plan: TrustPolicyPlan =
         read_artifact_json_bounded(plan_path, MAX_PLAN_BYTES, "policy plan")?;
     validate_plan(&plan)?;
-    let entries = read_history_entries(history_path, true)?;
-    if entries
-        .iter()
-        .any(|entry| entry.policy_revision == plan.policy_revision)
-    {
-        bail!("policy revision is already present in history");
-    }
-    if entries.len() >= MAX_HISTORY_ENTRIES {
-        bail!("policy history exceeds the bounded limit of {MAX_HISTORY_ENTRIES} entries");
-    }
     let approval = approval_path
         .map(|path| {
             read_artifact_json_bounded::<TrustPolicyApproval>(
@@ -301,8 +305,13 @@ pub fn run_trust_policy_history_record(
             )
         })
         .transpose()?;
-    if let Some(approval) = &approval {
-        validate_approval(approval, &plan)?;
+    match (&approval, reviewer_keyring_path) {
+        (Some(approval), Some(keyring_path)) => {
+            let reviewer_keys = load_reviewer_keyring(keyring_path)?;
+            validate_approval(approval, &plan, &reviewer_keys)?;
+        }
+        (None, None) => {}
+        _ => bail!("--approval and --reviewer-keyring must be provided together"),
     }
     let entry = TrustPolicyHistoryEntry {
         schema: POLICY_HISTORY_SCHEMA.to_string(),
@@ -319,10 +328,29 @@ pub fn run_trust_policy_history_record(
             .transpose()?,
         recorded_at: now_rfc3339(),
     };
+    let mut encoded = serde_json::to_vec(&entry).context("failed to serialize policy history")?;
+    encoded.push(b'\n');
     let mut file = private_file::open_private_append_create(history_path)
         .context("failed to open private policy history")?;
-    serde_json::to_writer(&mut file, &entry).context("failed to serialize policy history")?;
-    file.write_all(b"\n")
+    lock_history_exclusive(&file).context("failed to lock policy history")?;
+    let entries = read_history_entries_from_file(&mut file)?;
+    if entries
+        .iter()
+        .any(|existing| existing.policy_revision == plan.policy_revision)
+    {
+        bail!("policy revision is already present in history");
+    }
+    if entries.len() >= MAX_HISTORY_ENTRIES {
+        bail!("policy history exceeds the bounded limit of {MAX_HISTORY_ENTRIES} entries");
+    }
+    let current_len = file
+        .metadata()
+        .context("failed to inspect policy history")?
+        .len();
+    if current_len.saturating_add(encoded.len() as u64) > MAX_HISTORY_BYTES {
+        bail!("policy history exceeds the bounded size limit");
+    }
+    file.write_all(&encoded)
         .context("failed to append policy history")?;
     file.sync_all().context("failed to sync policy history")?;
     if json {
@@ -555,8 +583,28 @@ struct TrustPolicyApproval {
     approver: String,
     approved_at: String,
     key_id: String,
-    public_key: String,
     signature: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReviewerKeyringFile {
+    schema: String,
+    reviewers: Vec<ReviewerKeyFile>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReviewerKeyFile {
+    actor: String,
+    key_id: String,
+    public_key: String,
+}
+
+struct TrustedReviewerKey {
+    actor: String,
+    key_id: String,
+    public_key: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1056,11 +1104,63 @@ fn validate_plan(plan: &TrustPolicyPlan) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn validate_approval(approval: &TrustPolicyApproval, plan: &TrustPolicyPlan) -> anyhow::Result<()> {
+fn load_reviewer_keyring(path: &Path) -> anyhow::Result<Vec<TrustedReviewerKey>> {
+    let keyring: ReviewerKeyringFile =
+        read_artifact_json_bounded(path, MAX_REVIEWER_KEYRING_BYTES, "reviewer keyring")?;
+    if keyring.schema != POLICY_REVIEWER_KEYRING_SCHEMA
+        || keyring.reviewers.is_empty()
+        || keyring.reviewers.len() > MAX_REVIEWER_KEYS
+    {
+        bail!("reviewer keyring is invalid");
+    }
+    let mut actors_and_keys = BTreeSet::new();
+    let mut key_ids = BTreeSet::new();
+    let mut trusted = Vec::with_capacity(keyring.reviewers.len());
+    for reviewer in keyring.reviewers {
+        validate_actor(&reviewer.actor).map_err(anyhow::Error::msg)?;
+        validate_metadata_label("reviewer key_id", &reviewer.key_id)?;
+        if !actors_and_keys.insert((reviewer.actor.clone(), reviewer.key_id.clone()))
+            || !key_ids.insert(reviewer.key_id.clone())
+        {
+            bail!("reviewer keyring contains a duplicate reviewer key");
+        }
+        let public_key = BASE64
+            .decode(&reviewer.public_key)
+            .map_err(|_| anyhow::anyhow!("reviewer keyring public key is invalid"))?;
+        if public_key.len() != 32 {
+            bail!("reviewer keyring public key is invalid");
+        }
+        trusted.push(TrustedReviewerKey {
+            actor: reviewer.actor,
+            key_id: reviewer.key_id,
+            public_key,
+        });
+    }
+    Ok(trusted)
+}
+
+fn trusted_reviewer_key<'a>(
+    keys: &'a [TrustedReviewerKey],
+    actor: &str,
+    key_id: &str,
+) -> anyhow::Result<&'a TrustedReviewerKey> {
+    keys.iter()
+        .find(|key| key.actor == actor && key.key_id == key_id)
+        .ok_or_else(|| {
+            anyhow::anyhow!("approval key is not authorized for the approver and key_id")
+        })
+}
+
+fn validate_approval(
+    approval: &TrustPolicyApproval,
+    plan: &TrustPolicyPlan,
+    reviewer_keys: &[TrustedReviewerKey],
+) -> anyhow::Result<()> {
     let expected_plan_sha256 = sha256_hex(&serde_json::to_vec(plan)?);
     if approval.schema != POLICY_APPROVAL_SCHEMA
         || approval.policy_revision != plan.policy_revision
         || approval.plan_sha256 != expected_plan_sha256
+        || plan.truncated
     {
         bail!("policy approval does not match the review plan");
     }
@@ -1068,13 +1168,12 @@ fn validate_approval(approval: &TrustPolicyApproval, plan: &TrustPolicyPlan) -> 
     validate_actor(&approval.approver).map_err(anyhow::Error::msg)?;
     OffsetDateTime::parse(&approval.approved_at, &Rfc3339)
         .context("policy approval timestamp is invalid")?;
-    let public_key = BASE64
-        .decode(&approval.public_key)
-        .map_err(|_| anyhow::anyhow!("policy approval public key is invalid"))?;
+    let public_key =
+        &trusted_reviewer_key(reviewer_keys, &approval.approver, &approval.key_id)?.public_key;
     let signature = BASE64
         .decode(&approval.signature)
         .map_err(|_| anyhow::anyhow!("policy approval signature is invalid"))?;
-    if public_key.len() != 32 || signature.len() != 64 {
+    if signature.len() != 64 {
         bail!("policy approval signature is invalid");
     }
     UnparsedPublicKey::new(&ED25519, public_key)
@@ -1089,6 +1188,24 @@ fn validate_approval(approval: &TrustPolicyApproval, plan: &TrustPolicyPlan) -> 
             &signature,
         )
         .map_err(|_| anyhow::anyhow!("policy approval signature verification failed"))
+}
+
+#[cfg(unix)]
+fn lock_history_exclusive(file: &fs::File) -> std::io::Result<()> {
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(unix))]
+fn lock_history_exclusive(_file: &fs::File) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "policy history locking is unsupported on this platform",
+    ))
 }
 
 fn is_sha256_hex(value: &str) -> bool {
@@ -1106,7 +1223,33 @@ fn read_history_entries(
         return Ok(Vec::new());
     }
     let bytes = read_private_bounded(path, MAX_HISTORY_BYTES, "policy history")?;
-    let text = std::str::from_utf8(&bytes).context("policy history is not UTF-8")?;
+    parse_history_entries(&bytes)
+}
+
+fn read_history_entries_from_file(
+    file: &mut fs::File,
+) -> anyhow::Result<Vec<TrustPolicyHistoryEntry>> {
+    let len = file
+        .metadata()
+        .context("failed to inspect policy history")?
+        .len();
+    if len > MAX_HISTORY_BYTES {
+        bail!("policy history exceeds the bounded size limit");
+    }
+    file.seek(SeekFrom::Start(0))
+        .context("failed to seek policy history")?;
+    let mut bytes = Vec::with_capacity(len as usize);
+    file.take(MAX_HISTORY_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .context("failed to read policy history")?;
+    if bytes.len() as u64 > MAX_HISTORY_BYTES {
+        bail!("policy history exceeds the bounded size limit");
+    }
+    parse_history_entries(&bytes)
+}
+
+fn parse_history_entries(bytes: &[u8]) -> anyhow::Result<Vec<TrustPolicyHistoryEntry>> {
+    let text = std::str::from_utf8(bytes).context("policy history is not UTF-8")?;
     let mut entries = Vec::new();
     let mut revisions = BTreeSet::new();
     for line in text.lines() {

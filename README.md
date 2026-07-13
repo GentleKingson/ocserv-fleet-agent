@@ -529,7 +529,9 @@ target/debug/ocfleet --database ./controller.sqlite trust policy plan ./trust-po
   --markdown-output ./trust-policy-review/review.md
 target/debug/ocfleet --actor security-reviewer trust policy approve \
   ./trust-policy-review/plan.json --key-file /run/secrets/review.pk8 \
-  --key-id security-review-2026 --output ./trust-policy-review/approval.json
+  --key-id security-review-2026 \
+  --reviewer-keyring /run/secrets/reviewer-keyring.json \
+  --output ./trust-policy-review/approval.json
 ```
 
 These commands operate inside the controller boundary. Scheduler jobs use only

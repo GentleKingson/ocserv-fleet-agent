@@ -1,7 +1,7 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use ocfleet_cli::store::{NodeInsert, Store, StoreError};
 use ring::rand::SystemRandom;
-use ring::signature::{ED25519, Ed25519KeyPair, UnparsedPublicKey};
+use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
 use rusqlite::Connection;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -149,6 +149,23 @@ fn write_signing_key(path: &Path) {
     fs::write(path, key.as_ref()).expect("write signing key");
     #[cfg(unix)]
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("chmod signing key");
+}
+
+fn write_reviewer_keyring(path: &Path, key_path: &Path, actor: &str, key_id: &str) {
+    let key_bytes = fs::read(key_path).expect("read reviewer signing key");
+    let key_pair = Ed25519KeyPair::from_pkcs8(&key_bytes).expect("parse reviewer signing key");
+    let keyring = serde_json::json!({
+        "schema": "ocfleet.trust_policy.reviewer-keyring.v1",
+        "reviewers": [{
+            "actor": actor,
+            "key_id": key_id,
+            "public_key": BASE64.encode(key_pair.public_key().as_ref()),
+        }],
+    });
+    fs::write(path, serde_json::to_vec(&keyring).expect("keyring JSON"))
+        .expect("write reviewer keyring");
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("chmod reviewer keyring");
 }
 
 fn database_files(database: &Path) -> Vec<(String, String)> {
@@ -796,6 +813,35 @@ fn trust_policy_diff_output_is_bounded_and_reports_truncation() {
     assert_eq!(plan["total_change_count"], 520);
     assert_eq!(plan["truncated"], true);
     assert_eq!(plan["changes"].as_array().unwrap().len(), 512);
+
+    let approval_key = dir.path().join("approval.pk8");
+    let reviewer_keyring = dir.path().join("reviewer-keyring.json");
+    let approval = dir.path().join("approval.json");
+    write_signing_key(&approval_key);
+    write_reviewer_keyring(
+        &reviewer_keyring,
+        &approval_key,
+        "security-reviewer",
+        "approval-1",
+    );
+    let rejected = run_ocfleet_failure(&[
+        "--actor",
+        "security-reviewer",
+        "trust",
+        "policy",
+        "approve",
+        &dir.path().join("plan.json").to_string_lossy(),
+        "--key-file",
+        &approval_key.to_string_lossy(),
+        "--key-id",
+        "approval-1",
+        "--reviewer-keyring",
+        &reviewer_keyring.to_string_lossy(),
+        "--output",
+        &approval.to_string_lossy(),
+    ]);
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("truncated"));
+    assert!(!approval.exists());
 }
 
 #[test]
@@ -1060,8 +1106,15 @@ fn trust_policy_signed_plan_approval_and_history_form_review_only_chain() {
     }
 
     let approval_key = dir.path().join("approval.pk8");
+    let reviewer_keyring = dir.path().join("reviewer-keyring.json");
     let approval_path = dir.path().join("approval.json");
     write_signing_key(&approval_key);
+    write_reviewer_keyring(
+        &reviewer_keyring,
+        &approval_key,
+        "security-reviewer",
+        "approval-1",
+    );
     run_ocfleet(&[
         "--actor",
         "security-reviewer",
@@ -1073,15 +1126,19 @@ fn trust_policy_signed_plan_approval_and_history_form_review_only_chain() {
         &approval_key.to_string_lossy(),
         "--key-id",
         "approval-1",
+        "--reviewer-keyring",
+        &reviewer_keyring.to_string_lossy(),
         "--output",
         &approval_path.to_string_lossy(),
         "--json",
     ]);
     let approval: Value = serde_json::from_slice(&fs::read(&approval_path).unwrap()).unwrap();
+    assert_eq!(approval["schema"], "ocfleet.trust_policy.approval.v2");
     assert_eq!(approval["policy_revision"], "rev-1");
     assert_eq!(approval["approver"], "security-reviewer");
+    assert!(approval.get("public_key").is_none());
     let payload = format!(
-        "ocfleet.trust_policy.approval.v1\n{}\n{}\n{}\n{}\n{}\n",
+        "ocfleet.trust_policy.approval.v2\n{}\n{}\n{}\n{}\n{}\n",
         approval["policy_revision"].as_str().unwrap(),
         approval["plan_sha256"].as_str().unwrap(),
         approval["approver"].as_str().unwrap(),
@@ -1090,9 +1147,10 @@ fn trust_policy_signed_plan_approval_and_history_form_review_only_chain() {
     );
     UnparsedPublicKey::new(
         &ED25519,
-        BASE64
-            .decode(approval["public_key"].as_str().unwrap())
-            .unwrap(),
+        Ed25519KeyPair::from_pkcs8(&fs::read(&approval_key).unwrap())
+            .unwrap()
+            .public_key()
+            .as_ref(),
     )
     .verify(
         payload.as_bytes(),
@@ -1101,6 +1159,57 @@ fn trust_policy_signed_plan_approval_and_history_form_review_only_chain() {
             .unwrap(),
     )
     .expect("approval signature verifies");
+
+    let attacker_key = dir.path().join("attacker.pk8");
+    let attacker_approval = dir.path().join("attacker-approval.json");
+    write_signing_key(&attacker_key);
+    let rejected = run_ocfleet_failure(&[
+        "--actor",
+        "security-reviewer",
+        "trust",
+        "policy",
+        "approve",
+        &plan_a.to_string_lossy(),
+        "--key-file",
+        &attacker_key.to_string_lossy(),
+        "--key-id",
+        "approval-1",
+        "--reviewer-keyring",
+        &reviewer_keyring.to_string_lossy(),
+        "--output",
+        &attacker_approval.to_string_lossy(),
+    ]);
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("not authorized"));
+    assert!(!attacker_approval.exists());
+
+    let attacker_pair =
+        Ed25519KeyPair::from_pkcs8(&fs::read(&attacker_key).unwrap()).expect("attacker key");
+    let mut forged_approval = approval.clone();
+    forged_approval["signature"] =
+        Value::String(BASE64.encode(attacker_pair.sign(payload.as_bytes()).as_ref()));
+    fs::write(
+        &attacker_approval,
+        serde_json::to_vec(&forged_approval).unwrap(),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&attacker_approval, fs::Permissions::from_mode(0o600)).unwrap();
+    let attacker_history = dir.path().join("attacker-history.jsonl");
+    let rejected = run_ocfleet_failure(&[
+        "trust",
+        "policy",
+        "history",
+        "record",
+        &plan_a.to_string_lossy(),
+        "--approval",
+        &attacker_approval.to_string_lossy(),
+        "--reviewer-keyring",
+        &reviewer_keyring.to_string_lossy(),
+        "--history",
+        &attacker_history.to_string_lossy(),
+    ]);
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("verification failed"));
+    assert!(!attacker_history.exists());
 
     let tampered_approval_path = dir.path().join("tampered-approval.json");
     let mut tampered_approval = approval.clone();
@@ -1121,10 +1230,12 @@ fn trust_policy_signed_plan_approval_and_history_form_review_only_chain() {
         &plan_a.to_string_lossy(),
         "--approval",
         &tampered_approval_path.to_string_lossy(),
+        "--reviewer-keyring",
+        &reviewer_keyring.to_string_lossy(),
         "--history",
         &rejected_history.to_string_lossy(),
     ]);
-    assert!(String::from_utf8_lossy(&rejected.stderr).contains("verification failed"));
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("not authorized"));
     assert!(!rejected_history.exists());
 
     let history = dir.path().join("policy-history.jsonl");
@@ -1136,6 +1247,8 @@ fn trust_policy_signed_plan_approval_and_history_form_review_only_chain() {
         &plan_a.to_string_lossy(),
         "--approval",
         &approval_path.to_string_lossy(),
+        "--reviewer-keyring",
+        &reviewer_keyring.to_string_lossy(),
         "--history",
         &history.to_string_lossy(),
         "--json",
@@ -1160,10 +1273,41 @@ fn trust_policy_signed_plan_approval_and_history_form_review_only_chain() {
         &plan_a.to_string_lossy(),
         "--approval",
         &approval_path.to_string_lossy(),
+        "--reviewer-keyring",
+        &reviewer_keyring.to_string_lossy(),
         "--history",
         &history.to_string_lossy(),
     ]);
     assert!(String::from_utf8_lossy(&duplicate.stderr).contains("already present"));
+
+    let concurrent_history = dir.path().join("concurrent-history.jsonl");
+    let mut writers = Vec::new();
+    for _ in 0..2 {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_ocfleet"));
+        command
+            .args(["trust", "policy", "history", "record"])
+            .arg(&plan_a)
+            .arg("--history")
+            .arg(&concurrent_history)
+            .env("USER", "trust-policy-user")
+            .env_remove("OCFLEET_ACTOR");
+        writers.push(command.spawn().expect("spawn concurrent history writer"));
+    }
+    let statuses = writers
+        .into_iter()
+        .map(|mut child| child.wait().expect("wait for history writer"))
+        .collect::<Vec<_>>();
+    assert_eq!(statuses.iter().filter(|status| status.success()).count(), 1);
+    let concurrent_list = run_ocfleet(&[
+        "trust",
+        "policy",
+        "history",
+        "list",
+        &concurrent_history.to_string_lossy(),
+        "--json",
+    ]);
+    let concurrent_entries: Value = serde_json::from_slice(&concurrent_list.stdout).unwrap();
+    assert_eq!(concurrent_entries.as_array().unwrap().len(), 1);
 }
 
 #[test]

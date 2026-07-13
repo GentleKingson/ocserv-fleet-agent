@@ -510,6 +510,8 @@ pub enum TrustPolicyCommand {
         #[arg(long)]
         key_id: String,
         #[arg(long)]
+        reviewer_keyring: PathBuf,
+        #[arg(long)]
         output: PathBuf,
         #[arg(long)]
         json: bool,
@@ -524,8 +526,10 @@ pub enum TrustPolicyCommand {
 pub enum TrustPolicyHistoryCommand {
     Record {
         plan: PathBuf,
-        #[arg(long)]
+        #[arg(long, requires = "reviewer_keyring")]
         approval: Option<PathBuf>,
+        #[arg(long, requires = "approval")]
+        reviewer_keyring: Option<PathBuf>,
         #[arg(long)]
         history: PathBuf,
         #[arg(long)]

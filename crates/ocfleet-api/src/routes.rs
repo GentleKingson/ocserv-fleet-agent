@@ -13,7 +13,7 @@ use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::sync::{Arc, OnceLock};
-use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
+use time::{Duration, OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
 use crate::args::ApiConfig;
@@ -227,7 +227,8 @@ async fn health_slo(
         validate_identifier("node_id", node_id)?;
     }
     let to_time = OffsetDateTime::parse(to, &Rfc3339)
-        .map_err(|_| ApiError::bad_request("to must be RFC3339"))?;
+        .map_err(|_| ApiError::bad_request("to must be RFC3339"))?
+        .to_offset(UtcOffset::UTC);
     let bucket_seconds =
         i64::try_from(window.bucket_seconds()).map_err(|_| ApiError::internal())?;
     if to_time.unix_timestamp() % bucket_seconds != 0 {

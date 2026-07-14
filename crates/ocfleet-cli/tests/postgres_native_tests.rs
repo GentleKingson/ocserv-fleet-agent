@@ -6,9 +6,16 @@ use std::os::unix::fs::PermissionsExt;
 use std::sync::{Arc, Barrier};
 use std::thread;
 
+use ocfleet_cli::audit::AuditEvent;
 use ocfleet_cli::postgres_backend::{PostgresConnectionSource, PostgresError};
 use ocfleet_cli::postgres_native::{NATIVE_BACKEND_SCHEMA_VERSION, connect_native};
-use ocfleet_cli::store::NodeInsert;
+use ocfleet_cli::store::{
+    ApprovalInput, EnrollmentTokenInsert, JoinRequestInsert, LegacyEnrollmentClaimInput,
+    NodeInsert, NodeMaintenanceWindow, NodeMetadataRecord, Store,
+};
+use ocfleet_cli::version_governance::{CapabilityNegotiationStatus, CapabilitySnapshot};
+use ocfleet_protocol::method::NODE_CAPABILITIES;
+use serde_json::json;
 use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::SyncRunner;
 use testcontainers::{GenericImage, ImageExt};
@@ -112,6 +119,135 @@ fn native_postgres_core_is_relational_atomic_and_future_schema_safe() {
         .get(0);
     assert_eq!(audit_schema, "ocfleet.audit.detail.v1");
 
+    let metadata = NodeMetadataRecord {
+        node_id: node.node_id.clone(),
+        environment: "test".into(),
+        site: "lab-a".into(),
+        owner_team: "platform".into(),
+        service_tier: "tier-1".into(),
+        labels_json: json!({"purpose": "native-parity"}),
+        expected_agent_version: Some("0.3.0".into()),
+        updated_at: "2026-07-14T12:00:00Z".into(),
+    };
+    store
+        .set_node_metadata(&metadata, "operator-a")
+        .expect("set native node metadata");
+    assert_eq!(
+        store
+            .get_node_metadata(&node.node_id)
+            .expect("get native node metadata"),
+        Some(metadata)
+    );
+    assert_eq!(
+        store
+            .list_nodes_by_role_limited("ocserv", 10)
+            .expect("list native nodes by role")
+            .len(),
+        1
+    );
+    assert_eq!(
+        store
+            .list_nodes_by_metadata_limited("label.purpose", "native-parity", 10)
+            .expect("list native nodes by label")
+            .len(),
+        1
+    );
+    let maintenance = NodeMaintenanceWindow {
+        node_id: node.node_id.clone(),
+        starts_at: "2026-07-14T13:00:00Z".into(),
+        ends_at: "2026-07-14T14:00:00Z".into(),
+        reason: "native maintenance test".into(),
+        updated_at: "2026-07-14T12:00:00Z".into(),
+    };
+    store
+        .set_node_maintenance(&maintenance, "operator-a")
+        .expect("set native maintenance");
+    assert_eq!(
+        store
+            .get_node_maintenance(&node.node_id)
+            .expect("get native maintenance"),
+        Some(maintenance)
+    );
+    assert!(
+        store
+            .node_maintenance_active_at(&node.node_id, "2026-07-14T13:30:00Z")
+            .expect("check native active maintenance")
+    );
+    assert!(
+        store
+            .clear_node_maintenance(&node.node_id, "operator-a")
+            .expect("clear native maintenance")
+    );
+
+    let capability = CapabilitySnapshot {
+        node_id: node.node_id.clone(),
+        endpoint_id: node.endpoint_id.clone(),
+        observed_at: "2026-07-14T12:01:00Z".into(),
+        status: CapabilityNegotiationStatus::Compatible,
+        agent_version: Some("0.3.0".into()),
+        protocol_min: Some(1),
+        protocol_max: Some(1),
+        ocserv_snapshot_min: Some(2),
+        ocserv_snapshot_max: Some(2),
+        controlled_writes_compiled: Some(false),
+        controlled_writes_locally_enabled: Some(false),
+    };
+    let mut capability_audit = AuditEvent::new("controller", "node.capability.observe");
+    capability_audit.node_id = Some(node.node_id.clone());
+    capability_audit.endpoint_id = Some(node.endpoint_id.clone());
+    capability_audit.method = Some(NODE_CAPABILITIES.into());
+    capability_audit.ok = Some(true);
+    capability_audit.detail_json = json!({"result_class": "compatible"});
+    store
+        .upsert_node_capability_snapshot_with_audit(&capability, &capability_audit)
+        .expect("upsert native capability");
+    assert_eq!(
+        store
+            .get_node_capability_snapshot(&node.node_id)
+            .expect("get native capability"),
+        Some(capability)
+    );
+    assert_eq!(
+        store
+            .list_version_governance_inputs(10)
+            .expect("list native version governance inputs")
+            .len(),
+        1
+    );
+
+    let rotated_endpoint = iroh::SecretKey::generate().public().to_string();
+    let rotated = store
+        .rotate_endpoint(
+            &node.endpoint_id,
+            &rotated_endpoint,
+            "operator-a",
+            "scheduled key rotation",
+        )
+        .expect("rotate native endpoint");
+    assert_eq!(rotated.endpoint_id, rotated_endpoint);
+    assert_eq!(rotated.generation, 2);
+    assert_eq!(
+        store
+            .get_node(&node.node_id)
+            .expect("get rotated native node")
+            .expect("rotated node exists")
+            .endpoint_id,
+        rotated.endpoint_id
+    );
+    assert_eq!(
+        store
+            .trust_snapshot(None)
+            .expect("native trust snapshot")
+            .endpoints
+            .len(),
+        2
+    );
+    let quarantined = store
+        .quarantine_endpoint(&rotated.endpoint_id, "operator-a", "test quarantine")
+        .expect("quarantine native endpoint");
+    assert_eq!(quarantined.status.as_str(), "quarantined");
+    assert!(store.enable_node(&node.node_id, "operator-a").is_err());
+
     admin
         .batch_execute(
             r#"
@@ -157,6 +293,210 @@ FOR EACH ROW EXECUTE FUNCTION fail_native_node_audit();
              DROP FUNCTION fail_native_node_audit();",
         )
         .expect("remove audit failure trigger");
+
+    let token_plaintext = "native-enrollment-secret";
+    let token = EnrollmentTokenInsert {
+        token_id: "tok-native-c1-2".into(),
+        token_hash: Store::hash_enrollment_token(token_plaintext),
+        expires_at: "2030-01-01T00:00:00Z".into(),
+        max_uses: 3,
+        description: Some("native C1.2 integration".into()),
+        labels_json: json!({"environment": "test"}),
+        scope_json: json!({"role": "ocserv"}),
+    };
+    let created_token = store
+        .create_enrollment_token(&token, "enrollment-admin")
+        .expect("create native enrollment token");
+    assert_eq!(created_token.used_count, 0);
+
+    let enrolled_endpoint = iroh::SecretKey::generate().public().to_string();
+    let request = JoinRequestInsert {
+        request_id: "join-11111111-1111-4111-8111-111111111111".into(),
+        token_plaintext: token_plaintext.into(),
+        agent_public_key: "agent-public-key-a".into(),
+        fingerprint: "sha256:fingerprint-a".into(),
+        requested_endpoint_id: Some(enrolled_endpoint.clone()),
+        hostname: "native-a.example.test".into(),
+        agent_version: "0.3.0".into(),
+        requested_labels_json: json!({"site": "lab-a"}),
+    };
+    let pending = store
+        .submit_join_request(&request, "enrollment-agent")
+        .expect("submit native join request");
+    assert_eq!(pending.status.as_str(), "pending");
+    let approval = ApprovalInput {
+        request_id: request.request_id.clone(),
+        endpoint_id: enrolled_endpoint.clone(),
+        node_id: "node-native-enrolled".into(),
+        region: "test".into(),
+        role: "ocserv".into(),
+        reason: "approved in native integration".into(),
+        approved_labels_json: json!({"site": "lab-a", "approved": true}),
+    };
+    let approved = store
+        .approve_join_request(&approval, "enrollment-admin")
+        .expect("approve native join request");
+    assert_eq!(approved.status.as_str(), "approved");
+    assert_eq!(
+        store
+            .get_endpoint_trust(&enrolled_endpoint)
+            .expect("get enrolled endpoint")
+            .expect("enrolled endpoint exists")
+            .fingerprint
+            .as_deref(),
+        Some("sha256:fingerprint-a")
+    );
+    admin
+        .execute(
+            "DELETE FROM ocfleet_native.nodes WHERE node_id = $1",
+            &[&approval.node_id],
+        )
+        .expect("remove native node to emulate legacy approved state");
+    admin
+        .execute(
+            "UPDATE ocfleet_native.endpoint_trust SET node_id = NULL WHERE endpoint_id = $1",
+            &[&enrolled_endpoint],
+        )
+        .expect("unbind native legacy endpoint");
+    let claim = LegacyEnrollmentClaimInput {
+        request_id: request.request_id.clone(),
+        endpoint_id: enrolled_endpoint.clone(),
+        node_id: approval.node_id.clone(),
+        region: approval.region.clone(),
+        role: approval.role.clone(),
+        reason: "claim imported legacy binding".into(),
+    };
+    admin
+        .execute(
+            "UPDATE ocfleet_native.endpoint_trust SET fingerprint = $1 WHERE endpoint_id = $2",
+            &[&"sha256:wrong-legacy-origin", &enrolled_endpoint],
+        )
+        .expect("corrupt native legacy endpoint origin");
+    assert!(
+        store
+            .claim_legacy_enrollment(&claim, "enrollment-admin")
+            .is_err()
+    );
+    assert!(
+        store
+            .get_node(&claim.node_id)
+            .expect("query rejected native legacy claim")
+            .is_none()
+    );
+    admin
+        .execute(
+            "UPDATE ocfleet_native.endpoint_trust SET fingerprint = $1 WHERE endpoint_id = $2",
+            &[&request.fingerprint, &enrolled_endpoint],
+        )
+        .expect("restore native legacy endpoint origin");
+    store
+        .claim_legacy_enrollment(&claim, "enrollment-admin")
+        .expect("claim native legacy enrollment");
+    assert!(
+        store
+            .get_node(&claim.node_id)
+            .expect("get claimed native node")
+            .is_some()
+    );
+
+    let rejected_request = JoinRequestInsert {
+        request_id: "join-22222222-2222-4222-8222-222222222222".into(),
+        token_plaintext: token_plaintext.into(),
+        agent_public_key: "agent-public-key-b".into(),
+        fingerprint: "sha256:fingerprint-b".into(),
+        requested_endpoint_id: None,
+        hostname: "native-b.example.test".into(),
+        agent_version: "0.3.0".into(),
+        requested_labels_json: json!({}),
+    };
+    store
+        .submit_join_request(&rejected_request, "enrollment-agent")
+        .expect("submit rejected native request");
+    let rejected_join = store
+        .reject_join_request(
+            &rejected_request.request_id,
+            "enrollment-admin",
+            "inventory mismatch",
+        )
+        .expect("reject native request");
+    assert_eq!(rejected_join.status.as_str(), "rejected");
+
+    let rollback_endpoint = iroh::SecretKey::generate().public().to_string();
+    let rollback_request = JoinRequestInsert {
+        request_id: "join-33333333-3333-4333-8333-333333333333".into(),
+        token_plaintext: token_plaintext.into(),
+        agent_public_key: "agent-public-key-c".into(),
+        fingerprint: "sha256:fingerprint-c".into(),
+        requested_endpoint_id: Some(rollback_endpoint.clone()),
+        hostname: "native-c.example.test".into(),
+        agent_version: "0.3.0".into(),
+        requested_labels_json: json!({}),
+    };
+    store
+        .submit_join_request(&rollback_request, "enrollment-agent")
+        .expect("submit rollback native request");
+    admin
+        .batch_execute(
+            r#"
+CREATE FUNCTION fail_native_approval_audit() RETURNS trigger AS $$
+BEGIN
+  IF NEW.event = 'enrollment.approve' THEN
+    RAISE EXCEPTION 'injected native approval audit failure';
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER fail_native_approval_audit
+BEFORE INSERT ON ocfleet_native.controller_audit_log
+FOR EACH ROW EXECUTE FUNCTION fail_native_approval_audit();
+"#,
+        )
+        .expect("install native approval failure trigger");
+    let rollback_approval = ApprovalInput {
+        request_id: rollback_request.request_id.clone(),
+        endpoint_id: rollback_endpoint.clone(),
+        node_id: "node-native-enrollment-rollback".into(),
+        region: "test".into(),
+        role: "ocserv".into(),
+        reason: "exercise atomic rollback".into(),
+        approved_labels_json: json!({}),
+    };
+    assert!(
+        store
+            .approve_join_request(&rollback_approval, "enrollment-admin")
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .get_join_request(&rollback_request.request_id)
+            .expect("get rolled-back native request")
+            .expect("rolled-back native request exists")
+            .status
+            .as_str(),
+        "pending"
+    );
+    assert!(
+        store
+            .get_node(&rollback_approval.node_id)
+            .expect("get rolled-back enrollment node")
+            .is_none()
+    );
+    assert!(
+        store
+            .get_endpoint_trust(&rollback_endpoint)
+            .expect("get rolled-back enrollment endpoint")
+            .is_none()
+    );
+    admin
+        .batch_execute(
+            "DROP TRIGGER fail_native_approval_audit ON ocfleet_native.controller_audit_log;
+             DROP FUNCTION fail_native_approval_audit();",
+        )
+        .expect("remove native approval failure trigger");
+    let revoked_token = store
+        .revoke_enrollment_token(&token.token_id, "enrollment-admin", "integration complete")
+        .expect("revoke native enrollment token");
+    assert_eq!(revoked_token.status.as_str(), "revoked");
 
     let public_rows: i64 = admin
         .query_one("SELECT COUNT(*) FROM public.nodes", &[])
@@ -247,4 +587,77 @@ FOR EACH ROW EXECUTE FUNCTION fail_native_node_audit();
         .expect("check incompatible object")
         .get(0);
     assert!(incompatible_survived);
+
+    admin
+        .batch_execute(
+            r#"
+DROP SCHEMA ocfleet_native CASCADE;
+CREATE SCHEMA ocfleet_native;
+CREATE TABLE ocfleet_native.migrations (
+  version INTEGER PRIMARY KEY CHECK (version > 0),
+  name TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 128),
+  applied_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+);
+CREATE TABLE ocfleet_native.nodes (
+  node_id TEXT PRIMARY KEY CHECK (length(node_id) BETWEEN 1 AND 128),
+  endpoint_id TEXT NOT NULL UNIQUE CHECK (length(endpoint_id) BETWEEN 1 AND 128),
+  name TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 128),
+  region TEXT NOT NULL CHECK (length(region) BETWEEN 1 AND 64),
+  role TEXT NOT NULL CHECK (length(role) BETWEEN 1 AND 64),
+  enabled BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+);
+CREATE TABLE ocfleet_native.endpoint_trust (
+  endpoint_id TEXT PRIMARY KEY REFERENCES ocfleet_native.nodes(endpoint_id) ON DELETE CASCADE,
+  node_id TEXT NOT NULL UNIQUE REFERENCES ocfleet_native.nodes(node_id) ON DELETE CASCADE,
+  fingerprint TEXT,
+  status TEXT NOT NULL CHECK (status IN ('active', 'rotated', 'revoked', 'quarantined')),
+  generation BIGINT NOT NULL CHECK (generation > 0),
+  previous_endpoint_id TEXT,
+  rotated_to TEXT,
+  trust_bundle_json JSONB NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+);
+CREATE TABLE ocfleet_native.controller_audit_log (
+  id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  ts TIMESTAMPTZ NOT NULL,
+  actor TEXT NOT NULL CHECK (length(actor) BETWEEN 1 AND 128),
+  event TEXT NOT NULL CHECK (length(event) BETWEEN 1 AND 128),
+  node_id TEXT,
+  endpoint_id TEXT,
+  method TEXT,
+  request_id TEXT,
+  params_hash TEXT,
+  ok BOOLEAN,
+  error_code TEXT,
+  duration_ms BIGINT CHECK (duration_ms IS NULL OR duration_ms >= 0),
+  detail_json JSONB NOT NULL
+);
+CREATE INDEX idx_native_audit_ts_id
+  ON ocfleet_native.controller_audit_log(ts, id);
+INSERT INTO ocfleet_native.migrations (version, name)
+VALUES (1, '0001_native_core');
+"#,
+        )
+        .expect("install native v1 schema");
+    let upgraded = connect_native(&source).expect("upgrade native v1 to v2");
+    assert_eq!(
+        upgraded.schema_version().expect("upgraded native version"),
+        NATIVE_BACKEND_SCHEMA_VERSION
+    );
+    let registry_tables: i64 = admin
+        .query_one(
+            "SELECT COUNT(*) FROM information_schema.tables
+             WHERE table_schema = 'ocfleet_native'
+               AND table_name IN (
+                 'node_metadata', 'node_maintenance_windows',
+                 'node_capability_snapshots', 'enrollment_tokens', 'join_requests'
+               )",
+            &[],
+        )
+        .expect("count upgraded registry tables")
+        .get(0);
+    assert_eq!(registry_tables, 5);
 }

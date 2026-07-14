@@ -21,6 +21,7 @@ const MAX_AUTH_ENTRIES: usize = 256;
 const MAX_JWT_SEGMENT_BYTES: usize = 12 * 1024;
 const MTLS_VERIFIED_HEADER: &str = "x-ocfleet-mtls-verified";
 const MTLS_SUBJECT_HEADER: &str = "x-ocfleet-mtls-subject";
+const MTLS_PROXY_SECRET_HEADER: &str = "x-ocfleet-mtls-proxy-secret";
 
 static AUTH_MISSING_TOTAL: AtomicU64 = AtomicU64::new(0);
 static AUTH_INVALID_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -232,6 +233,10 @@ impl fmt::Debug for Authenticator {
             .field("service_account_count", &self.config.service_accounts.len())
             .field("oidc_enabled", &self.config.oidc.is_some())
             .field("mtls_subject_count", &self.config.mtls_subjects.len())
+            .field(
+                "mtls_proxy_secret",
+                &self.config.mtls_proxy_secret_digest.is_some(),
+            )
             .field("break_glass_enabled", &self.config.break_glass.is_some())
             .finish()
     }
@@ -302,6 +307,20 @@ impl Authenticator {
             .and_then(|value| value.to_str().ok())
             == Some("SUCCESS")
         {
+            let proxy_secret = headers
+                .get(MTLS_PROXY_SECRET_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .ok_or(AuthFailure::Invalid)?;
+            let expected_proxy_secret = self
+                .config
+                .mtls_proxy_secret_digest
+                .as_ref()
+                .ok_or(AuthFailure::Invalid)?;
+            let proxy_secret_valid = validate_token(proxy_secret).is_ok()
+                & constant_time_eq(expected_proxy_secret, &digest(proxy_secret.as_bytes()));
+            if !proxy_secret_valid {
+                return Err(AuthFailure::Invalid);
+            }
             let subject = headers
                 .get(MTLS_SUBJECT_HEADER)
                 .and_then(|value| value.to_str().ok())
@@ -359,6 +378,7 @@ pub fn auth_failure_counts() -> [u64; 4] {
 #[serde(default, deny_unknown_fields)]
 struct AuthConfigFile {
     local_development: bool,
+    mtls_proxy_secret_sha256: Option<String>,
     service_accounts: Vec<ServiceAccountFile>,
     oidc: Option<OidcFile>,
     mtls_subjects: Vec<MtlsIdentityFile>,
@@ -368,6 +388,7 @@ struct AuthConfigFile {
 #[derive(Clone, Default)]
 struct AuthConfig {
     local_development: bool,
+    mtls_proxy_secret_digest: Option<[u8; 32]>,
     service_accounts: Vec<ServiceAccount>,
     oidc: Option<OidcVerifier>,
     mtls_subjects: BTreeMap<String, MtlsIdentity>,
@@ -383,6 +404,17 @@ impl AuthConfig {
             || file.mtls_subjects.len() > MAX_AUTH_ENTRIES
         {
             bail!("auth config contains too many identities");
+        }
+        let mtls_proxy_secret_digest = file
+            .mtls_proxy_secret_sha256
+            .as_deref()
+            .map(|value| parse_sha256(value, "mtls_proxy_secret_sha256"))
+            .transpose()?;
+        if file.mtls_subjects.is_empty() && mtls_proxy_secret_digest.is_some() {
+            bail!("mTLS proxy secret requires at least one mTLS subject mapping");
+        }
+        if !file.mtls_subjects.is_empty() && mtls_proxy_secret_digest.is_none() {
+            bail!("mTLS subject mappings require mtls_proxy_secret_sha256");
         }
         let service_accounts = file
             .service_accounts
@@ -417,6 +449,7 @@ impl AuthConfig {
         }
         Ok(Self {
             local_development: file.local_development,
+            mtls_proxy_secret_digest,
             service_accounts,
             oidc: file.oidc.map(OidcVerifier::try_from).transpose()?,
             mtls_subjects,
@@ -463,7 +496,7 @@ impl TryFrom<ServiceAccountFile> for ServiceAccount {
     fn try_from(value: ServiceAccountFile) -> Result<Self, Self::Error> {
         Ok(Self {
             principal_id: validate_identity_text(&value.principal_id, "principal_id")?,
-            token_digest: parse_sha256(&value.token_sha256)?,
+            token_digest: parse_sha256(&value.token_sha256, "token_sha256")?,
             expires_at: OffsetDateTime::parse(&value.expires_at, &Rfc3339)
                 .context("service-account expiry must be RFC3339")?,
             roles: parse_roles(value.roles)?,
@@ -773,18 +806,18 @@ fn parse_roles(values: Vec<String>) -> anyhow::Result<BTreeSet<Role>> {
         .collect()
 }
 
-fn parse_sha256(value: &str) -> anyhow::Result<[u8; 32]> {
+fn parse_sha256(value: &str, field: &str) -> anyhow::Result<[u8; 32]> {
     if value.len() != 64
         || !value
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
     {
-        bail!("token_sha256 must be lowercase SHA-256 hex");
+        bail!("{field} must be lowercase SHA-256 hex");
     }
     let mut output = [0_u8; 32];
     for (index, slot) in output.iter_mut().enumerate() {
         *slot = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
-            .context("token_sha256 is invalid")?;
+            .with_context(|| format!("{field} is invalid"))?;
     }
     Ok(output)
 }

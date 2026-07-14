@@ -418,4 +418,71 @@ fn postgres_migration_contention_and_transactional_fencing() {
         .expect("takeover after commit-time expiry")
         .expect("takeover lease");
     assert!(takeover.fencing_token > expiring_lease.fencing_token);
+
+    admin
+        .execute(
+            "INSERT INTO ocfleet_backend_migrations(version) VALUES (4)",
+            &[],
+        )
+        .expect("inject future backend schema");
+    let migrations_before = admin
+        .query(
+            "SELECT version,
+                    to_char(applied_at AT TIME ZONE 'UTC',
+                            'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')
+             FROM ocfleet_backend_migrations ORDER BY version",
+            &[],
+        )
+        .expect("future migration rows")
+        .into_iter()
+        .map(|row| (row.get::<_, i32>(0), row.get::<_, String>(1)))
+        .collect::<Vec<_>>();
+    let state_before = admin
+        .query_one(
+            "SELECT state_revision, state_sha256, octet_length(state_bytes)::BIGINT,
+                    to_char(updated_at AT TIME ZONE 'UTC',
+                            'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')
+             FROM ocfleet_runtime_state WHERE singleton = TRUE",
+            &[],
+        )
+        .expect("state before future-schema rejection");
+    let state_before = (
+        state_before.get::<_, i64>(0),
+        state_before.get::<_, String>(1),
+        state_before.get::<_, i64>(2),
+        state_before.get::<_, String>(3),
+    );
+    assert!(matches!(
+        connect(&source),
+        Err(PostgresError::UnsupportedBackendSchema(4))
+    ));
+    let migrations_after = admin
+        .query(
+            "SELECT version,
+                    to_char(applied_at AT TIME ZONE 'UTC',
+                            'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')
+             FROM ocfleet_backend_migrations ORDER BY version",
+            &[],
+        )
+        .expect("migration rows after future-schema rejection")
+        .into_iter()
+        .map(|row| (row.get::<_, i32>(0), row.get::<_, String>(1)))
+        .collect::<Vec<_>>();
+    let state_after = admin
+        .query_one(
+            "SELECT state_revision, state_sha256, octet_length(state_bytes)::BIGINT,
+                    to_char(updated_at AT TIME ZONE 'UTC',
+                            'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')
+             FROM ocfleet_runtime_state WHERE singleton = TRUE",
+            &[],
+        )
+        .expect("state after future-schema rejection");
+    let state_after = (
+        state_after.get::<_, i64>(0),
+        state_after.get::<_, String>(1),
+        state_after.get::<_, i64>(2),
+        state_after.get::<_, String>(3),
+    );
+    assert_eq!(migrations_after, migrations_before);
+    assert_eq!(state_after, state_before);
 }

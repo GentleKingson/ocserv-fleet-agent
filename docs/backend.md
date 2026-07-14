@@ -206,6 +206,11 @@ one checksummed `BYTEA` in the singleton `ocfleet_runtime_state` row. It is
 therefore named `PostgresSnapshot` in the backend contract and reports
 `backend_kind=postgres-wrapped-sqlite-snapshot` from `doctor`.
 
+Startup checks the highest existing `ocfleet_backend_migrations` version before
+running any DDL or initializing state. A database created by a newer backend
+schema fails closed, so an older binary cannot silently downgrade or replace its
+snapshot under obsolete assumptions.
+
 Every mutation globally serializes and performs this full-image sequence:
 
 1. acquire the writer advisory lock and lock the current controller lease;

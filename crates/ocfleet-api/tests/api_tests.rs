@@ -1251,6 +1251,7 @@ async fn bearer_auth_accepts_configured_token_and_rejects_others() {
 #[tokio::test]
 async fn service_account_and_mtls_principals_use_explicit_route_permissions() {
     let fixture = Fixture::new();
+    let mtls_proxy_secret = "mtls-proxy-secret-token-123456789";
     let viewer_token = "viewer-service-account-token-123456789";
     let approver_token = "approver-service-account-token-123456";
     let auditor_token = "auditor-service-account-token-12345678";
@@ -1259,6 +1260,8 @@ async fn service_account_and_mtls_principals_use_explicit_route_permissions() {
         .expect("expiry");
     let config = format!(
         r#"
+mtls_proxy_secret_sha256 = "{}"
+
 [[service_accounts]]
 principal_id = "service:viewer"
 token_sha256 = "{}"
@@ -1282,6 +1285,7 @@ subject = "CN=fleet-auditor,O=Example"
 principal_id = "mtls:fleet-auditor"
 roles = ["auditor"]
 "#,
+        hex_sha256(mtls_proxy_secret),
         hex_sha256(viewer_token),
         expires,
         hex_sha256(approver_token),
@@ -1321,7 +1325,7 @@ roles = ["auditor"]
         raw_request(router.clone(), Method::GET, "/metrics", Some(auditor_token)).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 
-    let response = router
+    let spoofed_local_request = router
         .clone()
         .oneshot(
             Request::builder()
@@ -1333,18 +1337,77 @@ roles = ["auditor"]
         )
         .await
         .expect("response");
-    assert_eq!(response.status(), StatusCode::OK);
-    let spoof = router
+    assert_eq!(spoofed_local_request.status(), StatusCode::UNAUTHORIZED);
+    let wrong_proxy_secret = router
+        .clone()
         .oneshot(
             Request::builder()
                 .uri("/audit/export?from=2026-07-09T00:00:00Z&to=2026-07-10T00:00:00Z&max_rows=10")
+                .header("x-ocfleet-mtls-verified", "SUCCESS")
                 .header("x-ocfleet-mtls-subject", "CN=fleet-auditor,O=Example")
+                .header(
+                    "x-ocfleet-mtls-proxy-secret",
+                    "wrong-mtls-proxy-secret-123456789",
+                )
                 .body(Body::empty())
                 .expect("request"),
         )
         .await
         .expect("response");
-    assert_eq!(spoof.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(wrong_proxy_secret.status(), StatusCode::UNAUTHORIZED);
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/audit/export?from=2026-07-09T00:00:00Z&to=2026-07-10T00:00:00Z&max_rows=10")
+                .header("x-ocfleet-mtls-verified", "SUCCESS")
+                .header("x-ocfleet-mtls-subject", "CN=fleet-auditor,O=Example")
+                .header("x-ocfleet-mtls-proxy-secret", mtls_proxy_secret)
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let missing_verified_marker = router
+        .oneshot(
+            Request::builder()
+                .uri("/audit/export?from=2026-07-09T00:00:00Z&to=2026-07-10T00:00:00Z&max_rows=10")
+                .header("x-ocfleet-mtls-subject", "CN=fleet-auditor,O=Example")
+                .header("x-ocfleet-mtls-proxy-secret", mtls_proxy_secret)
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(missing_verified_marker.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[test]
+fn mtls_subject_mappings_require_an_independent_proxy_secret() {
+    let fixture = Fixture::new();
+    let auth_config = fixture.write_auth_config(
+        r#"
+[[mtls_subjects]]
+subject = "CN=fleet-auditor,O=Example"
+principal_id = "mtls:fleet-auditor"
+roles = ["auditor"]
+"#,
+    );
+    let cli = ApiCli {
+        database: fixture.database.clone(),
+        read_only: true,
+        listen: "127.0.0.1:0".parse::<SocketAddr>().expect("addr"),
+        max_limit: 1_000,
+        redact: RedactionMode::Default,
+        auth_token_file: None,
+        auth_config_file: Some(auth_config),
+        cursor_key_file: Some(fixture.cursor_key_file.clone()),
+    };
+    let error = ApiConfig::from_cli(cli).expect_err("mTLS proxy secret must be required");
+    assert!(
+        format!("{error:#}").contains("mTLS subject mappings require mtls_proxy_secret_sha256")
+    );
 }
 
 #[tokio::test]

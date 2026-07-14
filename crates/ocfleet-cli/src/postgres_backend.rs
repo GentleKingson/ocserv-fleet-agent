@@ -171,6 +171,8 @@ pub enum PostgresError {
     Checksum,
     #[error("Postgres state format {0} is unsupported")]
     UnsupportedFormat(i32),
+    #[error("Postgres backend schema {0} is newer than this binary supports")]
+    UnsupportedBackendSchema(i32),
     #[error("Postgres imported state is invalid: {0}")]
     InvalidState(String),
     #[error("Postgres StoreWriter requires a current controller lease")]
@@ -291,6 +293,23 @@ impl PostgresSnapshotStore {
         let mut conn = self.connection()?;
         let mut tx = conn.transaction()?;
         tx.query_one("SELECT pg_advisory_xact_lock($1)", &[&MIGRATION_LOCK_ID])?;
+        if tx
+            .query_one(
+                "SELECT to_regclass('ocfleet_backend_migrations') IS NOT NULL",
+                &[],
+            )?
+            .get::<_, bool>(0)
+        {
+            let existing = tx
+                .query_one(
+                    "SELECT COALESCE(MAX(version), 0) FROM ocfleet_backend_migrations",
+                    &[],
+                )?
+                .get::<_, i32>(0);
+            if existing > BACKEND_SCHEMA_VERSION {
+                return Err(PostgresError::UnsupportedBackendSchema(existing));
+            }
+        }
         tx.batch_execute(
             "CREATE TABLE IF NOT EXISTS ocfleet_backend_migrations (
                version INTEGER PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now());

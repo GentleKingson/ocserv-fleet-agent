@@ -101,16 +101,23 @@ cache containing `OKP`/`Ed25519` signing keys. Multiple key IDs support a
 rotation window. Updating the pinned cache requires a controlled API restart;
 the API never follows token-provided key URLs.
 
-Forwarded mTLS identity is accepted only on a loopback listener. A trusted TLS
-proxy must remove client-supplied `X-Ocfleet-Mtls-*` headers, verify the client
-certificate, set `X-Ocfleet-Mtls-Verified: SUCCESS`, and forward the exact
-certificate subject in `X-Ocfleet-Mtls-Subject`. Direct non-loopback startup
-with mTLS subject mappings is rejected.
+Forwarded mTLS identity is accepted only on a loopback listener and only with an
+independent proxy-auth secret. A trusted TLS proxy must remove all
+client-supplied `X-Ocfleet-Mtls-*` headers, verify the client certificate, set
+`X-Ocfleet-Mtls-Verified: SUCCESS`, forward the exact certificate subject in
+`X-Ocfleet-Mtls-Subject`, and set `X-Ocfleet-Mtls-Proxy-Secret` to a private
+random token of at least 32 bytes. The API validates its configured SHA-256
+digest with a constant-time comparison before trusting the subject. This makes
+direct loopback requests from other local processes fail closed. Direct
+non-loopback startup with mTLS subject mappings is also rejected. The proxy must
+not log the secret header and should rotate it through the same private secret
+distribution used for service credentials.
 
 Example owner-only auth config:
 
 ```toml
 local_development = false
+mtls_proxy_secret_sha256 = "<lowercase-sha256-of-32+-byte-proxy-secret>"
 
 [[service_accounts]]
 principal_id = "service:inventory-reader"

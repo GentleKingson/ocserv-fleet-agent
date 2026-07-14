@@ -491,7 +491,7 @@
         "type": "apiKey",
         "in": "header",
         "name": "X-Ocfleet-Mtls-Subject",
-        "description": "Available only on a loopback listener behind the trusted TLS reverse proxy. The proxy must verify the client certificate and set both the fixed verified marker and exact mapped subject header."
+        "description": "Available only on a loopback listener behind the trusted TLS reverse proxy. The proxy must verify the client certificate, remove client-supplied X-Ocfleet-Mtls-* headers, and set the fixed verified marker, exact mapped subject, and private X-Ocfleet-Mtls-Proxy-Secret. The API constant-time verifies the configured proxy-secret digest before trusting the subject."
       }
     },
     "parameters": {

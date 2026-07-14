@@ -8,7 +8,9 @@ use std::fmt;
 use std::str::FromStr;
 
 use ocfleet_config::validation::{validate_node_id, validate_region, validate_role};
-use ocfleet_protocol::enrollment::{EndpointStatus, EnrollmentTokenStatus, JoinRequestStatus};
+use ocfleet_protocol::enrollment::{
+    EndpointStatus, EnrollmentTokenStatus, JoinRequestStatus, TrustBundle,
+};
 use postgres::{Config, GenericClient, NoTls, Transaction};
 use r2d2::{Pool, PooledConnection};
 use r2d2_postgres::PostgresConnectionManager;
@@ -993,11 +995,14 @@ CREATE INDEX idx_native_join_token_status
                     "native endpoint was rotated to a different endpoint".to_string(),
                 ));
             }
-            return get_endpoint_trust_tx(&mut tx, &new_endpoint_id)?.ok_or_else(|| {
+            let new_after = get_endpoint_trust_tx(&mut tx, &new_endpoint_id)?.ok_or_else(|| {
                 PostgresError::InvalidState(
                     "native endpoint rotation lineage is broken".to_string(),
                 )
-            });
+            })?;
+            validate_rotation_edge(&mut tx, &old_before, &new_after)?;
+            validate_rotation_binding_tx(&mut tx, &new_after)?;
+            return Ok(new_after);
         }
         if !matches!(
             old_before.status,
@@ -1012,11 +1017,8 @@ CREATE INDEX idx_native_join_token_status
                 "native endpoint already exists".to_string(),
             ));
         }
-        if old_before.previous_endpoint_id.is_some() && old_before.rotated_to.is_some() {
-            return Err(PostgresError::InvalidState(
-                "native endpoint lineage is inconsistent".to_string(),
-            ));
-        }
+        validate_unrotated_lineage(&mut tx, &old_before)?;
+        let node_before = validate_rotation_binding_tx(&mut tx, &old_before)?;
         let generation = old_before.generation.checked_add(1).ok_or_else(|| {
             PostgresError::InvalidState("native endpoint generation exhausted".to_string())
         })?;
@@ -1052,28 +1054,25 @@ CREATE INDEX idx_native_join_token_status
                 &new_payload.to_string(),
             ],
         )?;
-        let node_before = if let Some(node_id) = old_before.node_id.as_deref() {
-            get_node_tx(&mut tx, node_id)?
-        } else {
-            None
-        };
-        let node_after = if let Some(node) = node_before.as_ref() {
-            if node.endpoint_id != old_endpoint_id {
-                return Err(PostgresError::InvalidState(
-                    "native node endpoint binding is inconsistent".to_string(),
-                ));
-            }
-            let enabled = node.enabled && old_before.status != EndpointStatus::Quarantined;
-            tx.execute(
-                "UPDATE ocfleet_native.nodes
-                 SET endpoint_id = $1, enabled = $2, updated_at = clock_timestamp()
-                 WHERE node_id = $3 AND endpoint_id = $4",
-                &[&new_endpoint_id, &enabled, &node.node_id, &old_endpoint_id],
-            )?;
-            get_node_tx(&mut tx, &node.node_id)?
-        } else {
-            None
-        };
+        let enabled = node_before.enabled && old_before.status != EndpointStatus::Quarantined;
+        let affected = tx.execute(
+            "UPDATE ocfleet_native.nodes
+             SET endpoint_id = $1, enabled = $2, updated_at = clock_timestamp()
+             WHERE node_id = $3 AND endpoint_id = $4",
+            &[
+                &new_endpoint_id,
+                &enabled,
+                &node_before.node_id,
+                &old_endpoint_id,
+            ],
+        )?;
+        if affected != 1 {
+            return Err(PostgresError::InvalidState(
+                "native node endpoint binding changed during rotation".to_string(),
+            ));
+        }
+        let node_after = get_node_tx(&mut tx, &node_before.node_id)?
+            .ok_or_else(|| PostgresError::InvalidState("native bound node is missing".into()))?;
         let old_after = get_endpoint_trust_tx(&mut tx, &old_endpoint_id)?
             .expect("rotated native endpoint exists");
         let new_after =
@@ -1086,8 +1085,8 @@ CREATE INDEX idx_native_join_token_status
             "actor_type": "user",
             "target_type": "endpoint_rotation",
             "target_id": old_endpoint_id,
-            "before": {"node": node_before.as_ref().map(node_audit_json), "old_endpoint": endpoint_audit_json(&old_before)},
-            "after": {"node": node_after.as_ref().map(node_audit_json), "old_endpoint": endpoint_audit_json(&old_after), "new_endpoint": endpoint_audit_json(&new_after)},
+            "before": {"node": node_audit_json(&node_before), "old_endpoint": endpoint_audit_json(&old_before)},
+            "after": {"node": node_audit_json(&node_after), "old_endpoint": endpoint_audit_json(&old_after), "new_endpoint": endpoint_audit_json(&new_after)},
             "reason": reason,
         });
         insert_audit(&mut tx, &event)?;
@@ -1223,6 +1222,13 @@ CREATE INDEX idx_native_join_token_status
         let mut tx = conn.transaction()?;
         if let Some(existing) = get_enrollment_token_tx(&mut tx, &token.token_id)? {
             if enrollment_token_matches(&existing, token, actor) {
+                validate_enrollment_token_audit_provenance_tx(
+                    &mut tx,
+                    "enrollment.token.create",
+                    &token.token_id,
+                    actor,
+                    None,
+                )?;
                 return Ok(existing);
             }
             return Err(PostgresError::InvalidState(
@@ -1263,13 +1269,8 @@ CREATE INDEX idx_native_join_token_status
             .expect("native enrollment token inserted");
         let mut event = AuditEvent::new(actor, "enrollment.token.create");
         event.ok = Some(true);
-        event.detail_json = json_detail(
-            "enrollment_token",
-            &token.token_id,
-            None,
-            Some(enrollment_token_audit_json(&after)),
-            None,
-        );
+        event.detail_json =
+            enrollment_token_transition_audit_json(&token.token_id, None, Some(&after), None);
         insert_audit(&mut tx, &event)?;
         tx.commit()?;
         Ok(after)
@@ -1299,6 +1300,13 @@ CREATE INDEX idx_native_join_token_status
             PostgresError::InvalidState("native enrollment token not found".to_string())
         })?;
         if before.status == EnrollmentTokenStatus::Revoked {
+            validate_enrollment_token_audit_provenance_tx(
+                &mut tx,
+                "enrollment.token.revoke",
+                token_id,
+                actor,
+                Some(reason),
+            )?;
             return Ok(before);
         }
         if before.status != EnrollmentTokenStatus::Active || token_is_expired(&before.expires_at) {
@@ -1315,11 +1323,10 @@ CREATE INDEX idx_native_join_token_status
             .expect("native revoked enrollment token exists");
         let mut event = AuditEvent::new(actor, "enrollment.token.revoke");
         event.ok = Some(true);
-        event.detail_json = json_detail(
-            "enrollment_token",
+        event.detail_json = enrollment_token_transition_audit_json(
             token_id,
-            Some(enrollment_token_audit_json(&before)),
-            Some(enrollment_token_audit_json(&after)),
+            Some(&before),
+            Some(&after),
             Some(reason),
         );
         insert_audit(&mut tx, &event)?;
@@ -1382,6 +1389,7 @@ CREATE INDEX idx_native_join_token_status
                 &token.token_id,
                 requested_endpoint_id.as_deref(),
             ) {
+                validate_join_submission_audit_provenance_tx(&mut tx, &existing, actor)?;
                 return Ok(existing);
             }
             return Err(PostgresError::InvalidState(
@@ -1403,11 +1411,29 @@ CREATE INDEX idx_native_join_token_status
             )));
         }
         if token_is_expired(&token.expires_at) {
-            tx.execute(
+            let affected = tx.execute(
                 "UPDATE ocfleet_native.enrollment_tokens
                  SET status = 'expired' WHERE token_id = $1 AND status = 'active'",
                 &[&token.token_id],
             )?;
+            if affected != 1 {
+                return Err(PostgresError::InvalidState(
+                    "native enrollment token changed during expiry".to_string(),
+                ));
+            }
+            let expired = get_enrollment_token_tx(&mut tx, &token.token_id)?.ok_or_else(|| {
+                PostgresError::InvalidState("native expired token is missing".into())
+            })?;
+            let mut expire_event = AuditEvent::new(actor, "enrollment.token.expire");
+            expire_event.ok = Some(true);
+            expire_event.request_id = Some(request.request_id.clone());
+            expire_event.detail_json = enrollment_token_transition_audit_json(
+                &token.token_id,
+                Some(&token),
+                Some(&expired),
+                Some("expired"),
+            );
+            insert_audit(&mut tx, &expire_event)?;
             insert_enrollment_rejection_audit(
                 &mut tx,
                 actor,
@@ -1471,19 +1497,12 @@ CREATE INDEX idx_native_join_token_status
         }
         let joined = get_join_request_tx(&mut tx, &request.request_id)?
             .expect("native join request inserted");
+        let token_after = get_enrollment_token_tx(&mut tx, &token.token_id)?
+            .ok_or_else(|| PostgresError::InvalidState("native used token is missing".into()))?;
         let mut event = AuditEvent::new(actor, "enrollment.token.use");
         event.ok = Some(true);
         event.request_id = Some(request.request_id.clone());
-        event.detail_json = json_detail(
-            "enrollment_token_use",
-            &token.token_id,
-            Some(json!({"used_count": token.used_count})),
-            Some(json!({
-                "used_count": token.used_count + 1,
-                "request_id": request.request_id,
-            })),
-            None,
-        );
+        event.detail_json = enrollment_token_use_audit_json(&token, &token_after, &joined);
         insert_audit(&mut tx, &event)?;
         tx.commit()?;
         Ok(joined)
@@ -1514,6 +1533,7 @@ CREATE INDEX idx_native_join_token_status
         })?;
         if before.status == JoinRequestStatus::Rejected {
             if before.rejection_reason.as_deref() == Some(reason) {
+                validate_join_rejection_audit_provenance_tx(&mut tx, request_id, actor, reason)?;
                 return Ok(before);
             }
             return Err(PostgresError::InvalidState(
@@ -1536,13 +1556,8 @@ CREATE INDEX idx_native_join_token_status
         let mut event = AuditEvent::new(actor, "enrollment.reject");
         event.ok = Some(true);
         event.request_id = Some(request_id.to_string());
-        event.detail_json = json_detail(
-            "join_request",
-            request_id,
-            Some(join_request_audit_json(&before)),
-            Some(join_request_audit_json(&after)),
-            Some(reason),
-        );
+        event.detail_json =
+            enrollment_request_transition_audit_json(request_id, &before, &after, reason);
         insert_audit(&mut tx, &event)?;
         tx.commit()?;
         Ok(after)
@@ -1580,20 +1595,48 @@ CREATE INDEX idx_native_join_token_status
             PostgresError::InvalidState("native join request not found".to_string())
         })?;
         if before.status == JoinRequestStatus::Approved {
-            if before.assigned_endpoint_id.as_deref() == Some(node.endpoint_id.as_str())
-                && get_node_tx(&mut tx, &node.node_id)?.is_some()
-            {
-                return Ok(before);
+            validate_approved_join_provenance_tx(&mut tx, &before, &node.endpoint_id)?;
+            let endpoint = get_endpoint_trust_tx(&mut tx, &node.endpoint_id)?.ok_or_else(|| {
+                invalid_enrollment_binding(
+                    &approval.request_id,
+                    "approved endpoint trust is missing",
+                )
+            })?;
+            validate_enrollment_endpoint_origin(&before, &endpoint, &approval.request_id)?;
+            if endpoint.node_id.is_none() {
+                validate_approved_join_audit_provenance_tx(
+                    &mut tx,
+                    &before,
+                    &node.endpoint_id,
+                    None,
+                )?;
+                return Err(invalid_enrollment_binding(
+                    &approval.request_id,
+                    "legacy claim required",
+                ));
             }
-            return Err(PostgresError::InvalidState(
-                "native approved enrollment binding is inconsistent".to_string(),
-            ));
+            validate_approved_join_audit_provenance_tx(
+                &mut tx,
+                &before,
+                &node.endpoint_id,
+                Some(&node.node_id),
+            )?;
+            validate_exact_enrollment_binding_tx(
+                &mut tx,
+                &before,
+                &endpoint,
+                &node,
+                Some(&approval.approved_labels_json),
+                "approval retry does not match the existing binding",
+            )?;
+            return Ok(before);
         }
         if before.status != JoinRequestStatus::Pending {
             return Err(PostgresError::InvalidState(
                 "native join request is not pending".to_string(),
             ));
         }
+        validate_pending_join_for_approval(&before)?;
         if before
             .requested_endpoint_id
             .as_deref()
@@ -1604,7 +1647,9 @@ CREATE INDEX idx_native_join_token_status
             ));
         }
         if get_node_tx(&mut tx, &node.node_id)?.is_some()
+            || get_node_by_endpoint_tx(&mut tx, &node.endpoint_id)?.is_some()
             || get_endpoint_trust_tx(&mut tx, &node.endpoint_id)?.is_some()
+            || endpoint_trust_count_for_node_tx(&mut tx, &node.node_id)? != 0
         {
             return Err(PostgresError::InvalidState(
                 "native enrollment node or endpoint already exists".to_string(),
@@ -1656,19 +1701,29 @@ CREATE INDEX idx_native_join_token_status
         let node_after = get_node_tx(&mut tx, &node.node_id)?.expect("native approved node exists");
         let endpoint_after = get_endpoint_trust_tx(&mut tx, &node.endpoint_id)?
             .expect("native approved endpoint exists");
+        validate_exact_enrollment_binding_tx(
+            &mut tx,
+            &after,
+            &endpoint_after,
+            &node,
+            Some(&approval.approved_labels_json),
+            "approved binding is inconsistent",
+        )?;
         let mut event = AuditEvent::new(actor, "enrollment.approve");
         event.ok = Some(true);
         event.request_id = Some(approval.request_id.clone());
         event.node_id = Some(node.node_id.clone());
         event.endpoint_id = Some(node.endpoint_id.clone());
-        event.detail_json = json!({
-            "actor_type": "user",
-            "target_type": "enrollment_binding",
-            "target_id": approval.request_id,
-            "before": {"join_request": join_request_audit_json(&before), "node": Value::Null, "endpoint": Value::Null},
-            "after": {"join_request": join_request_audit_json(&after), "node": node_audit_json(&node_after), "endpoint": endpoint_audit_json(&endpoint_after)},
-            "reason": approval.reason,
-        });
+        event.detail_json = enrollment_binding_audit_json(
+            &approval.request_id,
+            &before,
+            &after,
+            None,
+            Some(&node_after),
+            None,
+            Some(&endpoint_after),
+            &approval.reason,
+        );
         insert_audit(&mut tx, &event)?;
         tx.commit()?;
         Ok(after)
@@ -1695,44 +1750,38 @@ CREATE INDEX idx_native_join_token_status
         let join = get_join_request_tx(&mut tx, &claim.request_id)?.ok_or_else(|| {
             PostgresError::InvalidState("native join request not found".to_string())
         })?;
-        if join.status != JoinRequestStatus::Approved
-            || join.assigned_endpoint_id.as_deref() != Some(node.endpoint_id.as_str())
-        {
-            return Err(PostgresError::InvalidState(
-                "native legacy enrollment is not an approved endpoint binding".to_string(),
-            ));
-        }
+        validate_approved_join_provenance_tx(&mut tx, &join, &node.endpoint_id)?;
+        validate_approved_join_audit_provenance_tx(&mut tx, &join, &node.endpoint_id, None)?;
         let endpoint_before =
             get_endpoint_trust_tx(&mut tx, &node.endpoint_id)?.ok_or_else(|| {
                 PostgresError::InvalidState("native approved endpoint is missing".to_string())
             })?;
-        if endpoint_before.status != EndpointStatus::Active
-            || endpoint_before.generation != 1
-            || endpoint_before.previous_endpoint_id.is_some()
-            || endpoint_before.rotated_to.is_some()
-            || endpoint_before.fingerprint.as_deref() != Some(join.fingerprint.as_str())
+        validate_enrollment_endpoint_origin(&join, &endpoint_before, &claim.request_id)?;
+        if endpoint_before.node_id.is_some() {
+            validate_enrollment_claim_audit_provenance_tx(
+                &mut tx,
+                &join,
+                &node.endpoint_id,
+                &node.node_id,
+                actor,
+                &claim.reason,
+            )?;
+            validate_exact_enrollment_binding_tx(
+                &mut tx,
+                &join,
+                &endpoint_before,
+                &node,
+                None,
+                "claim retry does not match the existing binding",
+            )?;
+            return Ok(join);
+        }
+        if get_node_tx(&mut tx, &node.node_id)?.is_some()
+            || get_node_by_endpoint_tx(&mut tx, &node.endpoint_id)?.is_some()
+            || endpoint_trust_count_for_node_tx(&mut tx, &node.node_id)? != 0
         {
             return Err(PostgresError::InvalidState(
-                "native legacy endpoint origin or lineage is invalid".to_string(),
-            ));
-        }
-        if let Some(bound_node_id) = endpoint_before.node_id.as_deref() {
-            if bound_node_id == node.node_id
-                && get_node_tx(&mut tx, &node.node_id)?.is_some_and(|existing| {
-                    existing.endpoint_id == node.endpoint_id
-                        && existing.region == node.region
-                        && existing.role == node.role
-                })
-            {
-                return Ok(join);
-            }
-            return Err(PostgresError::InvalidState(
-                "native legacy endpoint is already bound".to_string(),
-            ));
-        }
-        if get_node_tx(&mut tx, &node.node_id)?.is_some() {
-            return Err(PostgresError::InvalidState(
-                "native legacy node already exists".to_string(),
+                "native legacy node or endpoint binding already exists".to_string(),
             ));
         }
         tx.execute(
@@ -1763,19 +1812,29 @@ CREATE INDEX idx_native_join_token_status
             get_node_tx(&mut tx, &node.node_id)?.expect("native claimed legacy node exists");
         let endpoint_after = get_endpoint_trust_tx(&mut tx, &node.endpoint_id)?
             .expect("native claimed legacy endpoint exists");
+        validate_exact_enrollment_binding_tx(
+            &mut tx,
+            &join,
+            &endpoint_after,
+            &node,
+            None,
+            "claimed binding is inconsistent",
+        )?;
         let mut event = AuditEvent::new(actor, "enrollment.claim");
         event.ok = Some(true);
         event.request_id = Some(claim.request_id.clone());
         event.node_id = Some(node.node_id.clone());
         event.endpoint_id = Some(node.endpoint_id.clone());
-        event.detail_json = json!({
-            "actor_type": "user",
-            "target_type": "enrollment_binding",
-            "target_id": claim.request_id,
-            "before": {"join_request": join_request_audit_json(&join), "node": Value::Null, "endpoint": endpoint_audit_json(&endpoint_before)},
-            "after": {"join_request": join_request_audit_json(&join), "node": node_audit_json(&node_after), "endpoint": endpoint_audit_json(&endpoint_after)},
-            "reason": claim.reason,
-        });
+        event.detail_json = enrollment_binding_audit_json(
+            &claim.request_id,
+            &join,
+            &join,
+            None,
+            Some(&node_after),
+            Some(&endpoint_before),
+            Some(&endpoint_after),
+            &claim.reason,
+        );
         insert_audit(&mut tx, &event)?;
         tx.commit()?;
         Ok(join)
@@ -2457,37 +2516,585 @@ fn token_is_expired(expires_at: &str) -> bool {
         .unwrap_or(true)
 }
 
+fn invalid_enrollment_binding(request_id: &str, detail: &str) -> PostgresError {
+    PostgresError::InvalidState(format!(
+        "native enrollment binding {request_id} is invalid: {detail}"
+    ))
+}
+
+fn get_node_by_endpoint_tx(
+    tx: &mut Transaction<'_>,
+    endpoint_id: &str,
+) -> Result<Option<NodeRecord>, PostgresError> {
+    tx.query_opt(
+        "SELECT node_id, endpoint_id, name, region, role, enabled
+         FROM ocfleet_native.nodes WHERE endpoint_id = $1 FOR UPDATE",
+        &[&endpoint_id],
+    )?
+    .map(|row| node_from_row(&row))
+    .transpose()
+}
+
+fn get_active_endpoint_trust_for_node_tx(
+    tx: &mut Transaction<'_>,
+    node_id: &str,
+) -> Result<Vec<EndpointTrustRecord>, PostgresError> {
+    tx.query(
+        "SELECT endpoint_id, node_id, fingerprint, status, generation,
+                previous_endpoint_id, rotated_to, trust_bundle_json::text,
+                created_at, updated_at
+         FROM ocfleet_native.endpoint_trust
+         WHERE node_id = $1 AND status = 'active'
+         ORDER BY endpoint_id LIMIT 2 FOR UPDATE",
+        &[&node_id],
+    )?
+    .iter()
+    .map(endpoint_trust_from_row)
+    .collect()
+}
+
+fn endpoint_trust_count_for_node_tx(
+    tx: &mut Transaction<'_>,
+    node_id: &str,
+) -> Result<i64, PostgresError> {
+    Ok(tx
+        .query_one(
+            "SELECT COUNT(*) FROM ocfleet_native.endpoint_trust WHERE node_id = $1",
+            &[&node_id],
+        )?
+        .try_get(0)?)
+}
+
+fn approved_join_assignment_count_tx(
+    tx: &mut Transaction<'_>,
+    endpoint_id: &str,
+) -> Result<i64, PostgresError> {
+    Ok(tx
+        .query_one(
+            "SELECT COUNT(*) FROM ocfleet_native.join_requests
+             WHERE status = 'approved' AND assigned_endpoint_id = $1",
+            &[&endpoint_id],
+        )?
+        .try_get(0)?)
+}
+
+fn validate_enrollment_token_audit_provenance_tx(
+    tx: &mut Transaction<'_>,
+    event: &str,
+    token_id: &str,
+    actor: &str,
+    reason: Option<&str>,
+) -> Result<(), PostgresError> {
+    let count: i64 = tx
+        .query_one(
+            "SELECT COUNT(*) FROM ocfleet_native.controller_audit_log
+             WHERE event = $1 AND ok = TRUE
+               AND detail_json->>'target_id' = $2
+               AND actor = $3
+               AND ($4::text IS NULL OR detail_json->>'reason' = $4)",
+            &[&event, &token_id, &actor, &reason],
+        )?
+        .try_get(0)?;
+    if count != 1 {
+        return Err(PostgresError::InvalidState(
+            "native enrollment token audit provenance is missing or ambiguous".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_join_submission_audit_provenance_tx(
+    tx: &mut Transaction<'_>,
+    join: &JoinRequestRecord,
+    actor: &str,
+) -> Result<(), PostgresError> {
+    let count: i64 = tx
+        .query_one(
+            "SELECT COUNT(*) FROM ocfleet_native.controller_audit_log
+             WHERE event = 'enrollment.token.use'
+               AND request_id = $1 AND ok = TRUE
+               AND detail_json->>'target_id' = $1
+               AND actor = $2",
+            &[&join.request_id, &actor],
+        )?
+        .try_get(0)?;
+    if count != 1 {
+        return Err(PostgresError::InvalidState(format!(
+            "native enrollment request {} submission audit provenance is missing or ambiguous",
+            join.request_id
+        )));
+    }
+    Ok(())
+}
+
+fn validate_join_rejection_audit_provenance_tx(
+    tx: &mut Transaction<'_>,
+    request_id: &str,
+    actor: &str,
+    reason: &str,
+) -> Result<(), PostgresError> {
+    let count: i64 = tx
+        .query_one(
+            "SELECT COUNT(*) FROM ocfleet_native.controller_audit_log
+             WHERE event = 'enrollment.reject'
+               AND request_id = $1 AND ok = TRUE
+               AND detail_json->>'target_id' = $1
+               AND actor = $2 AND detail_json->>'reason' = $3",
+            &[&request_id, &actor, &reason],
+        )?
+        .try_get(0)?;
+    if count != 1 {
+        return Err(PostgresError::InvalidState(format!(
+            "native enrollment request {request_id} rejection audit provenance is missing or ambiguous"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_approved_join_audit_provenance_tx(
+    tx: &mut Transaction<'_>,
+    join: &JoinRequestRecord,
+    endpoint_id: &str,
+    node_id: Option<&str>,
+) -> Result<(), PostgresError> {
+    let count: i64 = tx
+        .query_one(
+            "SELECT COUNT(*) FROM ocfleet_native.controller_audit_log
+             WHERE event = 'enrollment.approve'
+               AND request_id = $1 AND endpoint_id = $2
+               AND actor = $3 AND ok = TRUE
+               AND node_id IS NOT DISTINCT FROM $4
+               AND detail_json->>'target_id' = $1",
+            &[&join.request_id, &endpoint_id, &join.approved_by, &node_id],
+        )?
+        .try_get(0)?;
+    if count != 1 {
+        return Err(invalid_enrollment_binding(
+            &join.request_id,
+            "approval audit provenance is missing or ambiguous",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_enrollment_claim_audit_provenance_tx(
+    tx: &mut Transaction<'_>,
+    join: &JoinRequestRecord,
+    endpoint_id: &str,
+    node_id: &str,
+    actor: &str,
+    reason: &str,
+) -> Result<(), PostgresError> {
+    let count: i64 = tx
+        .query_one(
+            "SELECT COUNT(*) FROM ocfleet_native.controller_audit_log
+             WHERE event = 'enrollment.claim'
+               AND request_id = $1 AND endpoint_id = $2 AND node_id = $3
+               AND actor = $4 AND ok = TRUE
+               AND detail_json->>'target_id' = $1
+               AND detail_json->>'reason' = $5",
+            &[&join.request_id, &endpoint_id, &node_id, &actor, &reason],
+        )?
+        .try_get(0)?;
+    if count != 1 {
+        return Err(invalid_enrollment_binding(
+            &join.request_id,
+            "claim retry audit provenance is missing or ambiguous",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_pending_join_for_approval(join: &JoinRequestRecord) -> Result<(), PostgresError> {
+    if join.status != JoinRequestStatus::Pending
+        || join.assigned_endpoint_id.is_some()
+        || join.approved_at.is_some()
+        || join.approved_by.is_some()
+        || join.rejection_reason.is_some()
+        || join
+            .approved_labels_json
+            .as_object()
+            .is_none_or(|labels| !labels.is_empty())
+    {
+        return Err(invalid_enrollment_binding(
+            &join.request_id,
+            "pending join request has decision metadata",
+        ));
+    }
+    validate_agent_public_key(&join.agent_public_key).map_err(|_| {
+        invalid_enrollment_binding(&join.request_id, "stored public key is invalid")
+    })?;
+    validate_agent_fingerprint(&join.fingerprint).map_err(|_| {
+        invalid_enrollment_binding(&join.request_id, "stored fingerprint is invalid")
+    })?;
+    validate_hostname(&join.hostname)
+        .map_err(|_| invalid_enrollment_binding(&join.request_id, "stored hostname is invalid"))?;
+    validate_agent_version(&join.agent_version).map_err(|_| {
+        invalid_enrollment_binding(&join.request_id, "stored agent version is invalid")
+    })?;
+    validate_label_json(&join.requested_labels_json, "requested_labels").map_err(|_| {
+        invalid_enrollment_binding(&join.request_id, "stored requested labels are invalid")
+    })?;
+    Ok(())
+}
+
+fn validate_approved_join_provenance_tx(
+    tx: &mut Transaction<'_>,
+    join: &JoinRequestRecord,
+    endpoint_id: &str,
+) -> Result<(), PostgresError> {
+    if join.status != JoinRequestStatus::Approved
+        || join.assigned_endpoint_id.as_deref() != Some(endpoint_id)
+        || join
+            .requested_endpoint_id
+            .as_deref()
+            .is_some_and(|requested| requested != endpoint_id)
+    {
+        return Err(invalid_enrollment_binding(
+            &join.request_id,
+            "approved endpoint provenance does not match",
+        ));
+    }
+    let approved_by = join.approved_by.as_deref().ok_or_else(|| {
+        invalid_enrollment_binding(&join.request_id, "approval metadata is incomplete")
+    })?;
+    if validate_actor(approved_by).is_err()
+        || join
+            .approved_at
+            .as_deref()
+            .is_none_or(|value| parse_postgres_timestamp(value, "approved_at").is_err())
+        || join.rejection_reason.is_some()
+    {
+        return Err(invalid_enrollment_binding(
+            &join.request_id,
+            "approval metadata is invalid",
+        ));
+    }
+    validate_agent_fingerprint(&join.fingerprint).map_err(|_| {
+        invalid_enrollment_binding(&join.request_id, "stored fingerprint is invalid")
+    })?;
+    validate_label_json(&join.approved_labels_json, "approved_labels")
+        .map_err(|_| invalid_enrollment_binding(&join.request_id, "approved labels are invalid"))?;
+    if approved_join_assignment_count_tx(tx, endpoint_id)? != 1 {
+        return Err(invalid_enrollment_binding(
+            &join.request_id,
+            "approved endpoint assignment is ambiguous",
+        ));
+    }
+    Ok(())
+}
+
+fn empty_trust_bundle(
+    endpoint_id: &str,
+    generation: u64,
+    status: EndpointStatus,
+) -> Result<Value, PostgresError> {
+    Ok(TrustBundlePayloadV1::new(
+        endpoint_id.to_string(),
+        generation,
+        status.as_str().to_string(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    )
+    .map_err(PostgresError::InvalidInput)?
+    .public_bundle())
+}
+
+fn validate_endpoint_bundle_projection(
+    endpoint: &EndpointTrustRecord,
+) -> Result<(), PostgresError> {
+    let bundle: TrustBundle =
+        serde_json::from_value(endpoint.trust_bundle_json.clone()).map_err(|_| {
+            PostgresError::InvalidState("native endpoint trust bundle is invalid".into())
+        })?;
+    if bundle.endpoint_id != endpoint.endpoint_id
+        || bundle.generation != endpoint.generation
+        || bundle.status != endpoint.status
+    {
+        return Err(PostgresError::InvalidState(
+            "native endpoint trust bundle projection is inconsistent".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_enrollment_endpoint_origin(
+    join: &JoinRequestRecord,
+    endpoint: &EndpointTrustRecord,
+    request_id: &str,
+) -> Result<(), PostgresError> {
+    if endpoint.endpoint_id != join.assigned_endpoint_id.as_deref().unwrap_or_default()
+        || endpoint.status != EndpointStatus::Active
+        || endpoint.generation != 1
+        || endpoint.previous_endpoint_id.is_some()
+        || endpoint.rotated_to.is_some()
+        || endpoint.fingerprint.as_deref() != Some(join.fingerprint.as_str())
+    {
+        return Err(invalid_enrollment_binding(
+            request_id,
+            "endpoint trust is not an original active enrollment",
+        ));
+    }
+    validate_endpoint_bundle_projection(endpoint).map_err(|_| {
+        invalid_enrollment_binding(request_id, "endpoint trust bundle is inconsistent")
+    })?;
+    if endpoint.trust_bundle_json
+        != empty_trust_bundle(&endpoint.endpoint_id, 1, EndpointStatus::Active)?
+    {
+        return Err(invalid_enrollment_binding(
+            request_id,
+            "endpoint trust bundle is not the empty enrollment bundle",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_exact_enrollment_binding_tx(
+    tx: &mut Transaction<'_>,
+    join: &JoinRequestRecord,
+    endpoint: &EndpointTrustRecord,
+    expected_node: &NodeInsert,
+    expected_approved_labels: Option<&Value>,
+    failure_detail: &str,
+) -> Result<(), PostgresError> {
+    validate_approved_join_provenance_tx(tx, join, &expected_node.endpoint_id)?;
+    validate_enrollment_endpoint_origin(join, endpoint, &join.request_id)?;
+    if expected_approved_labels.is_some_and(|expected| expected != &join.approved_labels_json)
+        || endpoint.node_id.as_deref() != Some(expected_node.node_id.as_str())
+    {
+        return Err(invalid_enrollment_binding(&join.request_id, failure_detail));
+    }
+    let node = get_node_tx(tx, &expected_node.node_id)?
+        .ok_or_else(|| invalid_enrollment_binding(&join.request_id, failure_detail))?;
+    if node.node_id != expected_node.node_id
+        || node.endpoint_id != expected_node.endpoint_id
+        || node.name != expected_node.name
+        || node.region != expected_node.region
+        || node.role != expected_node.role
+        || get_node_by_endpoint_tx(tx, &expected_node.endpoint_id)?
+            .is_none_or(|by_endpoint| by_endpoint.node_id != expected_node.node_id)
+    {
+        return Err(invalid_enrollment_binding(&join.request_id, failure_detail));
+    }
+    let active = get_active_endpoint_trust_for_node_tx(tx, &expected_node.node_id)?;
+    if active.len() != 1 || active[0].endpoint_id != expected_node.endpoint_id {
+        return Err(invalid_enrollment_binding(&join.request_id, failure_detail));
+    }
+    Ok(())
+}
+
+fn validate_unrotated_lineage(
+    tx: &mut Transaction<'_>,
+    endpoint: &EndpointTrustRecord,
+) -> Result<(), PostgresError> {
+    validate_endpoint_bundle_projection(endpoint)?;
+    if endpoint.rotated_to.is_some() {
+        return Err(PostgresError::InvalidState(
+            "native endpoint lineage is inconsistent".to_string(),
+        ));
+    }
+    let Some(previous_endpoint_id) = endpoint.previous_endpoint_id.as_deref() else {
+        return Ok(());
+    };
+    let previous = get_endpoint_trust_tx(tx, previous_endpoint_id)?.ok_or_else(|| {
+        PostgresError::InvalidState("native endpoint rotation predecessor is missing".to_string())
+    })?;
+    validate_endpoint_bundle_projection(&previous)?;
+    if previous.status != EndpointStatus::Rotated
+        || previous.rotated_to.as_deref() != Some(endpoint.endpoint_id.as_str())
+        || previous.node_id != endpoint.node_id
+        || previous.fingerprint != endpoint.fingerprint
+        || previous.generation > endpoint.generation
+    {
+        return Err(PostgresError::InvalidState(
+            "native endpoint rotation lineage is inconsistent".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_rotation_edge(
+    tx: &mut Transaction<'_>,
+    old: &EndpointTrustRecord,
+    new: &EndpointTrustRecord,
+) -> Result<(), PostgresError> {
+    validate_endpoint_bundle_projection(old)?;
+    validate_endpoint_bundle_projection(new)?;
+    if old.status != EndpointStatus::Rotated
+        || old.rotated_to.as_deref() != Some(new.endpoint_id.as_str())
+        || new.previous_endpoint_id.as_deref() != Some(old.endpoint_id.as_str())
+        || old.node_id != new.node_id
+        || old.fingerprint != new.fingerprint
+        || old.generation > new.generation
+    {
+        return Err(PostgresError::InvalidState(
+            "native endpoint rotation lineage is inconsistent".to_string(),
+        ));
+    }
+    if new.status != EndpointStatus::Rotated {
+        validate_unrotated_lineage(tx, new)?;
+    }
+    if let Some(previous_endpoint_id) = old.previous_endpoint_id.as_deref() {
+        let previous = get_endpoint_trust_tx(tx, previous_endpoint_id)?.ok_or_else(|| {
+            PostgresError::InvalidState(
+                "native endpoint rotation predecessor is missing".to_string(),
+            )
+        })?;
+        if previous.status != EndpointStatus::Rotated
+            || previous.rotated_to.as_deref() != Some(old.endpoint_id.as_str())
+        {
+            return Err(PostgresError::InvalidState(
+                "native endpoint rotation lineage is inconsistent".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_rotation_binding_tx(
+    tx: &mut Transaction<'_>,
+    endpoint: &EndpointTrustRecord,
+) -> Result<NodeRecord, PostgresError> {
+    let node_id = endpoint.node_id.as_deref().ok_or_else(|| {
+        PostgresError::InvalidState("native unbound endpoint cannot be rotated".to_string())
+    })?;
+    let node = get_node_tx(tx, node_id)?.ok_or_else(|| {
+        PostgresError::InvalidState("native endpoint bound node is missing".to_string())
+    })?;
+    if node.endpoint_id != endpoint.endpoint_id {
+        return Err(PostgresError::InvalidState(
+            "native bound node does not point to the endpoint".to_string(),
+        ));
+    }
+    let active = get_active_endpoint_trust_for_node_tx(tx, node_id)?;
+    let clean = match endpoint.status {
+        EndpointStatus::Active => {
+            active.len() == 1 && active[0].endpoint_id == endpoint.endpoint_id
+        }
+        EndpointStatus::Quarantined => active.is_empty(),
+        EndpointStatus::Revoked | EndpointStatus::Rotated => false,
+    };
+    if !clean {
+        return Err(PostgresError::InvalidState(
+            "native node has an inconsistent active endpoint binding".to_string(),
+        ));
+    }
+    Ok(node)
+}
+
 fn enrollment_token_audit_json(token: &EnrollmentTokenRecord) -> Value {
     json!({
         "token_id": token.token_id,
-        "created_by": token.created_by,
+        "status": token.status.as_str(),
         "expires_at": token.expires_at,
         "max_uses": token.max_uses,
         "used_count": token.used_count,
-        "status": token.status.as_str(),
         "description_present": token.description.is_some(),
-        "labels": token.labels_json,
-        "scope": token.scope_json,
+        "label_count": token.labels_json.as_object().map_or(0, serde_json::Map::len),
+        "scope_count": token.scope_json.as_object().map_or(0, serde_json::Map::len),
     })
 }
 
-fn join_request_audit_json(join: &JoinRequestRecord) -> Value {
+fn enrollment_join_audit_json(join: &JoinRequestRecord) -> Value {
     json!({
         "request_id": join.request_id,
-        "token_id": join.token_id,
         "status": join.status.as_str(),
-        "requested_endpoint_id": join.requested_endpoint_id,
+        "requested_endpoint_id_present": join.requested_endpoint_id.is_some(),
         "assigned_endpoint_id": join.assigned_endpoint_id,
-        "agent_version": join.agent_version,
-        "requested_labels": join.requested_labels_json,
-        "approved_labels": join.approved_labels_json,
-        "approved_at": join.approved_at,
-        "approved_by": join.approved_by,
-        "rejection_reason": join.rejection_reason,
-        "audit_correlation_id": join.audit_correlation_id,
-        "agent_public_key_present": true,
-        "fingerprint_present": true,
-        "hostname_present": true,
+    })
+}
+
+fn enrollment_token_transition_audit_json(
+    token_id: &str,
+    before: Option<&EnrollmentTokenRecord>,
+    after: Option<&EnrollmentTokenRecord>,
+    reason: Option<&str>,
+) -> Value {
+    json!({
+        "actor_type": "user",
+        "target_type": "enrollment_token",
+        "target_id": token_id,
+        "before": before.map(enrollment_token_audit_json),
+        "after": after.map(enrollment_token_audit_json),
+        "reason": reason,
+    })
+}
+
+fn enrollment_token_use_audit_json(
+    before: &EnrollmentTokenRecord,
+    after: &EnrollmentTokenRecord,
+    join: &JoinRequestRecord,
+) -> Value {
+    json!({
+        "actor_type": "user",
+        "target_type": "join_request",
+        "target_id": join.request_id,
+        "before": {
+            "issuance": enrollment_token_audit_json(before),
+            "join_request": Value::Null,
+        },
+        "after": {
+            "issuance": enrollment_token_audit_json(after),
+            "join_request": {
+                "request_id": join.request_id,
+                "token_id": join.token_id,
+                "status": join.status.as_str(),
+                "fingerprint_present": !join.fingerprint.is_empty(),
+                "requested_endpoint_id_present": join.requested_endpoint_id.is_some(),
+                "requested_label_count": join
+                    .requested_labels_json
+                    .as_object()
+                    .map_or(0, serde_json::Map::len),
+                "correlation_id": join.audit_correlation_id,
+            },
+        },
+        "reason": Value::Null,
+    })
+}
+
+fn enrollment_request_transition_audit_json(
+    request_id: &str,
+    before: &JoinRequestRecord,
+    after: &JoinRequestRecord,
+    reason: &str,
+) -> Value {
+    json!({
+        "actor_type": "user",
+        "target_type": "join_request",
+        "target_id": request_id,
+        "before": enrollment_join_audit_json(before),
+        "after": enrollment_join_audit_json(after),
+        "reason": reason,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn enrollment_binding_audit_json(
+    request_id: &str,
+    join_before: &JoinRequestRecord,
+    join_after: &JoinRequestRecord,
+    node_before: Option<&NodeRecord>,
+    node_after: Option<&NodeRecord>,
+    endpoint_before: Option<&EndpointTrustRecord>,
+    endpoint_after: Option<&EndpointTrustRecord>,
+    reason: &str,
+) -> Value {
+    json!({
+        "actor_type": "user",
+        "target_type": "enrollment_binding",
+        "target_id": request_id,
+        "before": {
+            "join_request": enrollment_join_audit_json(join_before),
+            "node": node_before.map(node_audit_json),
+            "endpoint": endpoint_before.map(endpoint_audit_json),
+        },
+        "after": {
+            "join_request": enrollment_join_audit_json(join_after),
+            "node": node_after.map(node_audit_json),
+            "endpoint": endpoint_after.map(endpoint_audit_json),
+        },
+        "reason": reason,
     })
 }
 
@@ -2498,17 +3105,17 @@ fn insert_enrollment_rejection_audit(
     token_id: Option<&str>,
     reason: &str,
 ) -> Result<(), PostgresError> {
-    let mut event = AuditEvent::new(actor, "enrollment.request.reject");
+    let mut event = AuditEvent::new(actor, "enrollment.token.reject");
     event.ok = Some(false);
     event.request_id = Some(request_id.to_string());
-    event.error_code = Some(reason.to_string());
-    event.detail_json = json_detail(
-        "join_request",
-        request_id,
-        None,
-        Some(json!({"state": "rejected", "token_id": token_id})),
-        Some(reason),
-    );
+    event.error_code = Some("ENROLLMENT_REJECTED".to_string());
+    event.detail_json = json!({
+        "actor_type": "user",
+        "action": "enrollment.token.reject",
+        "target_type": "enrollment_token",
+        "target_id": token_id,
+        "reason": reason,
+    });
     insert_audit(tx, &event)
 }
 

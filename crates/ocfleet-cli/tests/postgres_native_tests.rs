@@ -220,6 +220,60 @@ fn native_postgres_core_is_relational_atomic_and_future_schema_safe() {
         1
     );
 
+    for (suffix, node_id) in [("unbound", None), ("missing-node", Some("node-missing"))] {
+        let endpoint_id = iroh::SecretKey::generate().public().to_string();
+        let payload = TrustBundlePayloadV1::new(
+            endpoint_id.clone(),
+            1,
+            "active".into(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("valid invalid-binding fixture payload")
+        .to_value();
+        admin
+            .execute(
+                "INSERT INTO ocfleet_native.endpoint_trust
+                 (endpoint_id, node_id, status, generation, trust_bundle_json)
+                 VALUES ($1, $2, 'active', 1, CAST($3 AS text)::jsonb)",
+                &[&endpoint_id, &node_id, &payload.to_string()],
+            )
+            .expect("insert invalid rotation binding fixture");
+        let destination = iroh::SecretKey::generate().public().to_string();
+        assert!(
+            store
+                .rotate_endpoint(
+                    &endpoint_id,
+                    &destination,
+                    "operator-a",
+                    &format!("reject {suffix} rotation"),
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .get_endpoint_trust(&endpoint_id)
+                .expect("load rejected rotation source")
+                .expect("rejected rotation source exists")
+                .status
+                .as_str(),
+            "active"
+        );
+        assert!(
+            store
+                .get_endpoint_trust(&destination)
+                .expect("load rejected rotation destination")
+                .is_none()
+        );
+        admin
+            .execute(
+                "DELETE FROM ocfleet_native.endpoint_trust WHERE endpoint_id = $1",
+                &[&endpoint_id],
+            )
+            .expect("remove invalid rotation binding fixture");
+    }
+
     let rotated_endpoint = iroh::SecretKey::generate().public().to_string();
     let rotated = store
         .rotate_endpoint(
@@ -246,6 +300,42 @@ fn native_postgres_core_is_relational_atomic_and_future_schema_safe() {
             .endpoints
             .len(),
         2
+    );
+    admin
+        .execute(
+            "UPDATE ocfleet_native.endpoint_trust
+             SET previous_endpoint_id = NULL WHERE endpoint_id = $1",
+            &[&rotated_endpoint],
+        )
+        .expect("corrupt rotation child lineage");
+    assert!(
+        store
+            .rotate_endpoint(
+                &node.endpoint_id,
+                &rotated_endpoint,
+                "operator-a",
+                "retry corrupt rotation",
+            )
+            .is_err()
+    );
+    admin
+        .execute(
+            "UPDATE ocfleet_native.endpoint_trust
+             SET previous_endpoint_id = $1 WHERE endpoint_id = $2",
+            &[&node.endpoint_id, &rotated_endpoint],
+        )
+        .expect("restore rotation child lineage");
+    assert_eq!(
+        store
+            .rotate_endpoint(
+                &node.endpoint_id,
+                &rotated_endpoint,
+                "operator-a",
+                "retry valid rotation",
+            )
+            .expect("retry valid rotation")
+            .endpoint_id,
+        rotated_endpoint
     );
     let quarantined = store
         .quarantine_endpoint(&rotated.endpoint_id, "operator-a", "test quarantine")
@@ -306,8 +396,8 @@ FOR EACH ROW EXECUTE FUNCTION fail_native_node_audit();
         expires_at: "2030-01-01T08:00:00+08:00".into(),
         max_uses: 3,
         description: Some("native C1.2 integration".into()),
-        labels_json: json!({"environment": "test"}),
-        scope_json: json!({"role": "ocserv"}),
+        labels_json: json!({"environment": "audit-secret-token-label"}),
+        scope_json: json!({"role": "audit-secret-token-scope"}),
     };
     let created_token = store
         .create_enrollment_token(&token, "enrollment-admin")
@@ -362,12 +452,24 @@ FOR EACH ROW EXECUTE FUNCTION fail_native_node_audit();
         requested_endpoint_id: Some(enrolled_endpoint.clone()),
         hostname: "native-a.example.test".into(),
         agent_version: "0.3.0".into(),
-        requested_labels_json: json!({"site": "lab-a"}),
+        requested_labels_json: json!({"site": "audit-secret-request-label"}),
     };
     let pending = store
         .submit_join_request(&request, "enrollment-agent")
         .expect("submit native join request");
     assert_eq!(pending.status.as_str(), "pending");
+    assert_eq!(
+        store
+            .submit_join_request(&request, "enrollment-agent")
+            .expect("same-actor native join retry")
+            .request_id,
+        request.request_id
+    );
+    assert!(
+        store
+            .submit_join_request(&request, "different-enrollment-agent")
+            .is_err()
+    );
     let approval = ApprovalInput {
         request_id: request.request_id.clone(),
         endpoint_id: enrolled_endpoint.clone(),
@@ -375,12 +477,28 @@ FOR EACH ROW EXECUTE FUNCTION fail_native_node_audit();
         region: "test".into(),
         role: "ocserv".into(),
         reason: "approved in native integration".into(),
-        approved_labels_json: json!({"site": "lab-a", "approved": true}),
+        approved_labels_json: json!({"site": "audit-secret-approved-label", "approved": true}),
     };
     let approved = store
         .approve_join_request(&approval, "enrollment-admin")
         .expect("approve native join request");
     assert_eq!(approved.status.as_str(), "approved");
+    assert_eq!(
+        store
+            .approve_join_request(&approval, "enrollment-admin")
+            .expect("retry exact native approval")
+            .request_id,
+        request.request_id
+    );
+    let wrong_node_approval = ApprovalInput {
+        node_id: node.node_id.clone(),
+        ..approval.clone()
+    };
+    assert!(
+        store
+            .approve_join_request(&wrong_node_approval, "enrollment-admin")
+            .is_err()
+    );
     assert_eq!(
         store
             .get_endpoint_trust(&enrolled_endpoint)
@@ -402,6 +520,13 @@ FOR EACH ROW EXECUTE FUNCTION fail_native_node_audit();
             &[&enrolled_endpoint],
         )
         .expect("unbind native legacy endpoint");
+    admin
+        .execute(
+            "UPDATE ocfleet_native.controller_audit_log SET node_id = NULL
+             WHERE event = 'enrollment.approve' AND request_id = $1",
+            &[&request.request_id],
+        )
+        .expect("make native approval audit legacy-compatible");
     let claim = LegacyEnrollmentClaimInput {
         request_id: request.request_id.clone(),
         endpoint_id: enrolled_endpoint.clone(),
@@ -433,6 +558,45 @@ FOR EACH ROW EXECUTE FUNCTION fail_native_node_audit();
             &[&request.fingerprint, &enrolled_endpoint],
         )
         .expect("restore native legacy endpoint origin");
+    let nonempty_legacy_payload = TrustBundlePayloadV1::new(
+        enrolled_endpoint.clone(),
+        1,
+        "active".into(),
+        vec!["controller-unexpected".into()],
+        Vec::new(),
+        Vec::new(),
+    )
+    .expect("valid nonempty legacy payload")
+    .to_value();
+    admin
+        .execute(
+            "UPDATE ocfleet_native.endpoint_trust
+             SET trust_bundle_json = CAST($1 AS text)::jsonb WHERE endpoint_id = $2",
+            &[&nonempty_legacy_payload.to_string(), &enrolled_endpoint],
+        )
+        .expect("install nonempty legacy trust bundle");
+    assert!(
+        store
+            .claim_legacy_enrollment(&claim, "enrollment-admin")
+            .is_err()
+    );
+    let empty_legacy_payload = TrustBundlePayloadV1::new(
+        enrolled_endpoint.clone(),
+        1,
+        "active".into(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    )
+    .expect("valid empty legacy payload")
+    .to_value();
+    admin
+        .execute(
+            "UPDATE ocfleet_native.endpoint_trust
+             SET trust_bundle_json = CAST($1 AS text)::jsonb WHERE endpoint_id = $2",
+            &[&empty_legacy_payload.to_string(), &enrolled_endpoint],
+        )
+        .expect("restore empty legacy trust bundle");
     store
         .claim_legacy_enrollment(&claim, "enrollment-admin")
         .expect("claim native legacy enrollment");
@@ -441,6 +605,14 @@ FOR EACH ROW EXECUTE FUNCTION fail_native_node_audit();
             .get_node(&claim.node_id)
             .expect("get claimed native node")
             .is_some()
+    );
+    store
+        .claim_legacy_enrollment(&claim, "enrollment-admin")
+        .expect("retry exact native legacy claim");
+    assert!(
+        store
+            .claim_legacy_enrollment(&claim, "different-enrollment-admin")
+            .is_err()
     );
 
     let rejected_request = JoinRequestInsert {
@@ -464,6 +636,125 @@ FOR EACH ROW EXECUTE FUNCTION fail_native_node_audit();
         )
         .expect("reject native request");
     assert_eq!(rejected_join.status.as_str(), "rejected");
+    store
+        .reject_join_request(
+            &rejected_request.request_id,
+            "enrollment-admin",
+            "inventory mismatch",
+        )
+        .expect("retry exact native rejection");
+    assert!(
+        store
+            .reject_join_request(
+                &rejected_request.request_id,
+                "different-enrollment-admin",
+                "inventory mismatch",
+            )
+            .is_err()
+    );
+    assert!(
+        store
+            .reject_join_request(
+                &rejected_request.request_id,
+                "enrollment-admin",
+                "different reason",
+            )
+            .is_err()
+    );
+
+    let expired_plaintext = "native-expired-enrollment-secret";
+    let expired_token = EnrollmentTokenInsert {
+        token_id: "tok-native-expired".into(),
+        token_hash: Store::hash_enrollment_token(expired_plaintext),
+        expires_at: "2020-01-01T00:00:00Z".into(),
+        max_uses: 1,
+        description: Some("native lazy expiry".into()),
+        labels_json: json!({}),
+        scope_json: json!({}),
+    };
+    store
+        .create_enrollment_token(&expired_token, "enrollment-admin")
+        .expect("create expired native token fixture");
+    let expired_request = JoinRequestInsert {
+        request_id: "join-44444444-4444-4444-8444-444444444444".into(),
+        token_plaintext: expired_plaintext.into(),
+        agent_public_key: "agent-public-key-expired".into(),
+        fingerprint: "sha256:fingerprint-expired".into(),
+        requested_endpoint_id: None,
+        hostname: "expired.example.test".into(),
+        agent_version: "0.3.0".into(),
+        requested_labels_json: json!({}),
+    };
+    admin
+        .batch_execute(
+            r#"
+CREATE FUNCTION fail_native_expiry_rejection_audit() RETURNS trigger AS $$
+BEGIN
+  IF NEW.event = 'enrollment.token.reject' THEN
+    RAISE EXCEPTION 'injected native expiry rejection audit failure';
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER fail_native_expiry_rejection_audit
+BEFORE INSERT ON ocfleet_native.controller_audit_log
+FOR EACH ROW EXECUTE FUNCTION fail_native_expiry_rejection_audit();
+"#,
+        )
+        .expect("install expiry rejection audit failure trigger");
+    assert!(
+        store
+            .submit_join_request(&expired_request, "enrollment-agent")
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .get_enrollment_token(&expired_token.token_id)
+            .expect("load rolled-back expired token")
+            .expect("rolled-back expired token exists")
+            .status
+            .as_str(),
+        "active"
+    );
+    assert_eq!(
+        store
+            .audit_count("enrollment.token.expire")
+            .expect("rolled-back expiry audit count"),
+        0
+    );
+    admin
+        .batch_execute(
+            "DROP TRIGGER fail_native_expiry_rejection_audit
+               ON ocfleet_native.controller_audit_log;
+             DROP FUNCTION fail_native_expiry_rejection_audit();",
+        )
+        .expect("remove expiry rejection audit failure trigger");
+    assert!(
+        store
+            .submit_join_request(&expired_request, "enrollment-agent")
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .get_enrollment_token(&expired_token.token_id)
+            .expect("load lazily expired token")
+            .expect("lazily expired token exists")
+            .status
+            .as_str(),
+        "expired"
+    );
+    assert_eq!(
+        store
+            .audit_count("enrollment.token.expire")
+            .expect("expiry audit count"),
+        1
+    );
+    assert_eq!(
+        store
+            .audit_count("enrollment.token.reject")
+            .expect("enrollment rejection audit count"),
+        1
+    );
 
     let rollback_endpoint = iroh::SecretKey::generate().public().to_string();
     let rollback_request = JoinRequestInsert {
@@ -541,6 +832,44 @@ FOR EACH ROW EXECUTE FUNCTION fail_native_approval_audit();
         .revoke_enrollment_token(&token.token_id, "enrollment-admin", "integration complete")
         .expect("revoke native enrollment token");
     assert_eq!(revoked_token.status.as_str(), "revoked");
+    store
+        .revoke_enrollment_token(&token.token_id, "enrollment-admin", "integration complete")
+        .expect("retry exact native token revocation");
+    assert!(
+        store
+            .revoke_enrollment_token(
+                &token.token_id,
+                "different-enrollment-admin",
+                "integration complete",
+            )
+            .is_err()
+    );
+    assert!(
+        store
+            .revoke_enrollment_token(&token.token_id, "enrollment-admin", "different reason")
+            .is_err()
+    );
+
+    let enrollment_audits: String = admin
+        .query_one(
+            "SELECT COALESCE(string_agg(detail_json::text, E'\\n'), '')
+             FROM ocfleet_native.controller_audit_log
+             WHERE event LIKE 'enrollment.%'",
+            &[],
+        )
+        .expect("load enrollment audit projections")
+        .get(0);
+    for secret in [
+        "audit-secret-token-label",
+        "audit-secret-token-scope",
+        "audit-secret-request-label",
+        "audit-secret-approved-label",
+    ] {
+        assert!(
+            !enrollment_audits.contains(secret),
+            "enrollment audit leaked label/scope value {secret}"
+        );
+    }
 
     let mut overflow_tx = admin
         .transaction()

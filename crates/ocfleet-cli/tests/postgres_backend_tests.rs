@@ -55,7 +55,9 @@ fn postgres_migration_contention_and_transactional_fencing() {
     barrier.wait();
     let first = clients.remove(0).join().expect("first client");
     let second = clients.remove(0).join().expect("second client");
-    assert_eq!(first.doctor().expect("doctor").schema_version, 28);
+    let first_doctor = first.doctor().expect("doctor");
+    assert_eq!(first_doctor.backend_schema_version, 2);
+    assert_eq!(first_doctor.schema_version, 28);
     assert_eq!(second.doctor().expect("doctor").schema_version, 28);
 
     let unfenced_node = NodeInsert {
@@ -94,6 +96,7 @@ fn postgres_migration_contention_and_transactional_fencing() {
         .import_sqlite(&import_path, true)
         .expect("unfenced dry-run import");
     assert!(dry_run.dry_run);
+    assert!(!dry_run.already_current);
     assert!(matches!(
         first.import_sqlite(&import_path, false),
         Err(PostgresError::FenceRequired)
@@ -101,6 +104,12 @@ fn postgres_migration_contention_and_transactional_fencing() {
     writer_one
         .import_sqlite(&import_path, false)
         .expect("fenced import");
+    assert!(
+        writer_one
+            .import_sqlite(&import_path, false)
+            .expect("idempotent resumed import")
+            .already_current
+    );
     assert!(
         StoreReader::read_node(&writer_one, "node-pg-imported")
             .expect("read imported node")
@@ -148,5 +157,46 @@ fn postgres_migration_contention_and_transactional_fencing() {
         StoreReader::read_node(&writer_two, "node-pg-stale")
             .expect("read")
             .is_some()
+    );
+
+    let export_dir = tempfile::tempdir().expect("export dir");
+    #[cfg(unix)]
+    fs::set_permissions(export_dir.path(), fs::Permissions::from_mode(0o700))
+        .expect("private export dir");
+    let export_path = export_dir.path().join("exported.sqlite3");
+    let export = writer_two
+        .export_sqlite(&export_path)
+        .expect("verified SQLite export");
+    assert_eq!(export.schema_version, 28);
+    assert!(export.counts_verified >= 1);
+    let exported = Store::open(&export_path).expect("open exported state");
+    assert!(exported.get_node("node-pg-stale").expect("node").is_some());
+
+    let rollback_dir = tempfile::tempdir().expect("rollback fixture dir");
+    let rollback_path = rollback_dir.path().join("rollback.sqlite3");
+    drop(Store::open(&rollback_path).expect("rollback fixture store"));
+    let rollback_conn = rusqlite::Connection::open(&rollback_path).expect("open rollback fixture");
+    rollback_conn
+        .execute_batch(
+            "CREATE TRIGGER reject_controller_audit BEFORE INSERT ON controller_audit_log
+             BEGIN SELECT RAISE(ABORT, 'injected audit failure'); END;",
+        )
+        .expect("install audit trigger");
+    drop(rollback_conn);
+    writer_two
+        .import_sqlite(&rollback_path, false)
+        .expect("import audit-failure fixture");
+    let rollback_node = NodeInsert {
+        node_id: "node-pg-rollback".into(),
+        endpoint_id: iroh::SecretKey::generate().public().to_string(),
+        name: "node-pg-rollback".into(),
+        region: "test".into(),
+        role: "ocserv".into(),
+    };
+    assert!(StoreWriter::write_node_add(&writer_two, &rollback_node, "operator").is_err());
+    assert!(
+        StoreReader::read_node(&writer_two, "node-pg-rollback")
+            .expect("read rolled-back state")
+            .is_none()
     );
 }

@@ -44,8 +44,9 @@ future schema.
 
 ## Auth
 
-Loopback listeners may run without auth for local operator workflows.
-Non-loopback listeners fail closed unless `--auth-token-file` is provided.
+Loopback listeners may run without auth for local development. Non-loopback
+listeners fail closed unless `--auth-token-file` or a remote method in a private
+`--auth-config-file` is provided.
 
 `ocfleet-api` serves plain HTTP and does not terminate TLS. Never expose port
 8080 directly to the public Internet and never send its bearer token over a
@@ -83,17 +84,61 @@ UTC-day boundary 24-48 hours after issuance; keep `previous` for 48 hours
 before removing it. Instances behind one load balancer must read the same key
 file. Key material is never returned or logged.
 
-The token file must be private: regular file, owned by the current user, no
+The legacy token file must be private: regular file, owned by the current user, no
 symlink or hardlink, not group/world readable, and under a private parent
 directory. Clients send `Authorization: Bearer <token>`.
 
-The current API role is `viewer`: all implemented data routes are read-only
-`GET` observation routes. A configured bearer token resolves to an
-authenticated `viewer` principal; it does not unlock another route or
-operation. The RBAC foundation reserves `operator` and `security-admin` for
-future authenticated mutation surfaces, but no such routes exist today. Any
-future non-GET API route must require authentication and an explicit role
-check.
+The private auth config supports expiring service accounts, OIDC, forwarded
+mTLS identity, and an explicitly enabled one-hour break-glass principal. The
+fixed roles are `viewer`, `operator`, `security-admin`, `change-approver`, and
+`auditor`. Every route calls an explicit permission check; unmatched roles and
+OIDC groups are denied. Legacy bearer tokens retain viewer compatibility.
+
+OIDC accepts only EdDSA JWTs and validates signature, pinned `kid`, issuer,
+audience, `exp`, `nbf`, subject, and an explicit group-to-role mapping. Keys may
+be listed in the auth config or loaded from an absolute private standard JWKS
+cache containing `OKP`/`Ed25519` signing keys. Multiple key IDs support a
+rotation window. Updating the pinned cache requires a controlled API restart;
+the API never follows token-provided key URLs.
+
+Forwarded mTLS identity is accepted only on a loopback listener. A trusted TLS
+proxy must remove client-supplied `X-Ocfleet-Mtls-*` headers, verify the client
+certificate, set `X-Ocfleet-Mtls-Verified: SUCCESS`, and forward the exact
+certificate subject in `X-Ocfleet-Mtls-Subject`. Direct non-loopback startup
+with mTLS subject mappings is rejected.
+
+Example owner-only auth config:
+
+```toml
+local_development = false
+
+[[service_accounts]]
+principal_id = "service:inventory-reader"
+token_sha256 = "<lowercase-sha256-of-32+-byte-token>"
+expires_at = "2026-07-15T00:00:00Z"
+roles = ["viewer"]
+
+[oidc]
+issuer = "https://identity.example"
+audience = "ocfleet-api"
+groups_claim = "groups"
+jwks_file = "/run/secrets/ocfleet-oidc-jwks.json"
+
+[[oidc.role_mappings]]
+group = "ocfleet-operators"
+role = "operator"
+
+[[mtls_subjects]]
+subject = "CN=ocfleet-auditor,O=Example"
+principal_id = "mtls:ocfleet-auditor"
+roles = ["auditor"]
+```
+
+Authentication failures and permission denials increment only the fixed
+`missing`, `invalid`, `expired`, and `forbidden` metric labels. Logs never
+include tokens, JWT claims, subjects, configured hashes, keys, or private file
+paths. All implemented data routes remain read-only `GET` observation routes;
+there is still no authenticated mutation or agent-RPC trigger route.
 
 `GET /` serves only the static dashboard shell and remains loadable when bearer
 auth is configured. Every JSON data request made by that page still requires

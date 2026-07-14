@@ -37,14 +37,19 @@ The role model is intentionally small:
 | --- | --- |
 | `viewer` | Read-only queries: node list/info, health, observations, jobs, runs, alerts, audit export views. |
 | `operator` | Controller-local operational mutations: scheduler job create/enable/disable/run, retention policy changes, alert silence/resolve/delivery. |
-| `security-admin` | Enrollment approval, EndpointID rotate/revoke/quarantine, trust policy review, and future explicitly audited trust apply operations. |
+| `security-admin` | Enrollment approval, EndpointID rotate/revoke/quarantine, trust policy review, controlled-write approval, and future explicitly audited trust apply operations. |
+| `change-approver` | Approve or reject a reviewed controlled-write request; does not inherit fleet read or operator permissions. |
+| `auditor` | Audit and health-read projections only; does not inherit metrics, operator, approval, or security administration. |
 
-`ocfleet_cli::governance` implements this fixed policy vocabulary and tests the
-three role boundaries. The local CLI does not enforce RBAC in this slice; it
-relies on OS user, file permissions, and the resolved audit actor. The API
-returns only `viewer` principals for local or bearer-authenticated requests and
-exposes only read-only `GET` routes. Any future API write route must require
-authenticated RBAC and must not be available anonymously.
+`ocfleet_cli::governance` retains the local three-role policy vocabulary. The
+local CLI relies on OS user, file permissions, actor-bound intent signatures,
+and the resolved audit actor. The API uses the five-role model above for local
+development, legacy bearer, OIDC, mTLS, service-account, and break-glass
+principals. Every API handler names a permission and default-denies an
+unmatched principal. The API still exposes only read-only `GET` routes. Any
+future API write route must additionally require authenticated RBAC, strict
+method/content type, Origin/CSRF protection, rate limiting, signed approval,
+and atomic audit, and must not be available anonymously.
 
 ## Audit Model
 

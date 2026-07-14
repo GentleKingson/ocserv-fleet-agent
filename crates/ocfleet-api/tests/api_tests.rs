@@ -43,7 +43,7 @@ fn openapi_contract_is_get_only_and_matches_router_paths() {
     );
     assert_eq!(
         spec["x-ocfleet-listener-auth"]["non_loopback"],
-        "bearer-required-viewer-only"
+        "configured-remote-auth-required"
     );
     assert_eq!(
         spec["components"]["schemas"]["ObservationMethods"]["maxItems"],
@@ -951,10 +951,11 @@ fn non_loopback_without_auth_token_file_fails_closed() {
         max_limit: 1_000,
         redact: RedactionMode::Default,
         auth_token_file: None,
+        auth_config_file: None,
         cursor_key_file: Some(fixture.cursor_key_file.clone()),
     };
     let err = ApiConfig::from_cli(cli).expect_err("must reject non-loopback no-auth");
-    assert!(err.to_string().contains("--auth-token-file is required"));
+    assert!(err.to_string().contains("--auth-token-file or"));
 }
 
 #[test]
@@ -968,6 +969,7 @@ fn max_limit_is_bounded_at_startup() {
             max_limit,
             redact: RedactionMode::Default,
             auth_token_file: None,
+            auth_config_file: None,
             cursor_key_file: Some(fixture.cursor_key_file.clone()),
         };
         let err = ApiConfig::from_cli(cli).expect_err("must reject unsafe max limit");
@@ -1138,6 +1140,7 @@ fn bearer_token_file_must_be_private() {
         max_limit: 1_000,
         redact: RedactionMode::Default,
         auth_token_file: Some(token_file),
+        auth_config_file: None,
         cursor_key_file: Some(fixture.cursor_key_file.clone()),
     };
     let err = ApiConfig::from_cli(cli).expect_err("must reject public token file");
@@ -1154,6 +1157,7 @@ fn read_only_flag_is_required() {
         max_limit: 1_000,
         redact: RedactionMode::Default,
         auth_token_file: None,
+        auth_config_file: None,
         cursor_key_file: Some(fixture.cursor_key_file.clone()),
     };
     let err = ApiConfig::from_cli(cli).expect_err("must reject missing read-only flag");
@@ -1170,6 +1174,7 @@ fn cursor_key_file_is_required() {
         max_limit: 1_000,
         redact: RedactionMode::Default,
         auth_token_file: None,
+        auth_config_file: None,
         cursor_key_file: None,
     };
     let err = ApiConfig::from_cli(cli).expect_err("must require persistent cursor keys");
@@ -1193,6 +1198,7 @@ fn cursor_key_file_must_be_private_and_closed() {
         max_limit: 1_000,
         redact: RedactionMode::Default,
         auth_token_file: None,
+        auth_config_file: None,
         cursor_key_file: Some(public),
     };
     let err = ApiConfig::from_cli(cli).expect_err("must reject public cursor key file");
@@ -1213,6 +1219,7 @@ fn cursor_key_file_must_be_private_and_closed() {
         max_limit: 1_000,
         redact: RedactionMode::Default,
         auth_token_file: None,
+        auth_config_file: None,
         cursor_key_file: Some(contaminated),
     };
     let err = ApiConfig::from_cli(cli).expect_err("must reject unknown key fields");
@@ -1239,6 +1246,119 @@ async fn bearer_auth_accepts_configured_token_and_rejects_others() {
     let (status, body) = json_request(router, Method::GET, "/healthz", Some(TOKEN)).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["auth_enabled"], true);
+}
+
+#[tokio::test]
+async fn service_account_and_mtls_principals_use_explicit_route_permissions() {
+    let fixture = Fixture::new();
+    let viewer_token = "viewer-service-account-token-123456789";
+    let approver_token = "approver-service-account-token-123456";
+    let auditor_token = "auditor-service-account-token-12345678";
+    let expires = (time::OffsetDateTime::now_utc() + time::Duration::hours(1))
+        .format(&time::format_description::well_known::Rfc3339)
+        .expect("expiry");
+    let config = format!(
+        r#"
+[[service_accounts]]
+principal_id = "service:viewer"
+token_sha256 = "{}"
+expires_at = "{}"
+roles = ["viewer"]
+
+[[service_accounts]]
+principal_id = "service:approver"
+token_sha256 = "{}"
+expires_at = "{}"
+roles = ["change-approver"]
+
+[[service_accounts]]
+principal_id = "service:auditor"
+token_sha256 = "{}"
+expires_at = "{}"
+roles = ["auditor"]
+
+[[mtls_subjects]]
+subject = "CN=fleet-auditor,O=Example"
+principal_id = "mtls:fleet-auditor"
+roles = ["auditor"]
+"#,
+        hex_sha256(viewer_token),
+        expires,
+        hex_sha256(approver_token),
+        expires,
+        hex_sha256(auditor_token),
+        expires,
+    );
+    let auth_config = fixture.write_auth_config(&config);
+    let router = fixture.router_with_auth_config(auth_config);
+
+    let (status, _) = json_request(
+        router.clone(),
+        Method::GET,
+        "/api/v1/nodes",
+        Some(viewer_token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = json_request(
+        router.clone(),
+        Method::GET,
+        "/api/v1/nodes",
+        Some(approver_token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error_code"], "FORBIDDEN");
+    let (status, _) = json_request(
+        router.clone(),
+        Method::GET,
+        "/audit/export?from=2026-07-09T00:00:00Z&to=2026-07-10T00:00:00Z&max_rows=10",
+        Some(auditor_token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _, _) =
+        raw_request(router.clone(), Method::GET, "/metrics", Some(auditor_token)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/audit/export?from=2026-07-09T00:00:00Z&to=2026-07-10T00:00:00Z&max_rows=10")
+                .header("x-ocfleet-mtls-verified", "SUCCESS")
+                .header("x-ocfleet-mtls-subject", "CN=fleet-auditor,O=Example")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let spoof = router
+        .oneshot(
+            Request::builder()
+                .uri("/audit/export?from=2026-07-09T00:00:00Z&to=2026-07-10T00:00:00Z&max_rows=10")
+                .header("x-ocfleet-mtls-subject", "CN=fleet-auditor,O=Example")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(spoof.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn expired_service_account_fails_closed() {
+    let fixture = Fixture::new();
+    let token = "expired-service-account-token-123456789";
+    let config = format!(
+        "[[service_accounts]]\nprincipal_id = \"service:expired\"\ntoken_sha256 = \"{}\"\nexpires_at = \"2020-01-01T00:00:00Z\"\nroles = [\"viewer\"]\n",
+        hex_sha256(token)
+    );
+    let auth_config = fixture.write_auth_config(&config);
+    let router = fixture.router_with_auth_config(auth_config);
+    let (status, _) = json_request(router, Method::GET, "/api/v1/nodes", Some(token)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
@@ -1602,6 +1722,22 @@ impl Fixture {
         build_router(self.state(auth_token_file))
     }
 
+    fn router_with_auth_config(&self, auth_config_file: std::path::PathBuf) -> Router {
+        let cli = ApiCli {
+            database: self.database.clone(),
+            read_only: true,
+            listen: "127.0.0.1:0".parse::<SocketAddr>().expect("addr"),
+            max_limit: 1_000,
+            redact: RedactionMode::Default,
+            auth_token_file: None,
+            auth_config_file: Some(auth_config_file),
+            cursor_key_file: Some(self.cursor_key_file.clone()),
+        };
+        build_router(AppState::from_config(
+            ApiConfig::from_cli(cli).expect("config"),
+        ))
+    }
+
     fn state(&self, auth_token_file: Option<std::path::PathBuf>) -> AppState {
         let cli = ApiCli {
             database: self.database.clone(),
@@ -1610,6 +1746,7 @@ impl Fixture {
             max_limit: 1_000,
             redact: RedactionMode::Default,
             auth_token_file,
+            auth_config_file: None,
             cursor_key_file: Some(self.cursor_key_file.clone()),
         };
         let config = ApiConfig::from_cli(cli).expect("config");
@@ -1627,6 +1764,25 @@ impl Fixture {
         }
         path
     }
+
+    fn write_auth_config(&self, config: &str) -> std::path::PathBuf {
+        let path = self
+            ._dir
+            .path()
+            .join(format!("api-auth-{}.toml", uuid::Uuid::new_v4()));
+        std::fs::write(&path, config).expect("write auth config");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .expect("permissions");
+        }
+        path
+    }
+}
+
+fn hex_sha256(value: &str) -> String {
+    format!("{:x}", Sha256::digest(value.as_bytes()))
 }
 
 fn state_for_database(database: std::path::PathBuf) -> AppState {
@@ -1639,6 +1795,7 @@ fn state_for_database(database: std::path::PathBuf) -> AppState {
         max_limit: 1_000,
         redact: RedactionMode::Default,
         auth_token_file: None,
+        auth_config_file: None,
         cursor_key_file: Some(cursor_key_file),
     };
     AppState::from_config(ApiConfig::from_cli(cli).expect("config"))

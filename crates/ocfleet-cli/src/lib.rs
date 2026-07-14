@@ -8,6 +8,8 @@ pub mod audit_export;
 pub mod backend;
 pub mod backup;
 #[cfg(feature = "controlled-writes")]
+pub mod change;
+#[cfg(feature = "controlled-writes")]
 pub mod controlled_writes;
 pub mod controller_rpc;
 pub mod doctor;
@@ -21,6 +23,8 @@ pub mod observation;
 pub mod ocserv_output;
 #[cfg(feature = "postgres-backend")]
 pub mod postgres_backend;
+#[cfg(feature = "postgres-backend")]
+pub mod postgres_commands;
 pub mod private_file;
 pub mod retention;
 pub mod rpc_client;

@@ -26,6 +26,9 @@ const MIN_NONCE_BYTES: usize = 16;
 const MAX_NONCE_BYTES: usize = 128;
 const MAX_KEYRING_BYTES: usize = 64 * 1024;
 const MAX_TRUSTED_KEYS: usize = 64;
+const MAX_INTENT_BYTES: usize = 64 * 1024;
+const MAX_SIGNATURE_FILE_BYTES: usize = 4 * 1024;
+const MAX_POLICY_BYTES: usize = 16 * 1024;
 
 #[derive(Clone)]
 pub struct TrustedIntentKeyring {
@@ -125,6 +128,118 @@ impl TrustedIntentKeyring {
         }
         Ok(key)
     }
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnsignedChangeIntent {
+    pub request_id: String,
+    pub operation_id: String,
+    pub operation_kind: ControlledWriteOperationKind,
+    pub endpoint_id: String,
+    pub reason: String,
+    pub change_ticket: String,
+    pub nonce: String,
+    pub expires_at: String,
+    pub params_summary: Value,
+}
+
+impl fmt::Debug for UnsignedChangeIntent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("UnsignedChangeIntent")
+            .field("request_id", &self.request_id)
+            .field("operation_id", &self.operation_id)
+            .field("operation_kind", &self.operation_kind)
+            .field("endpoint_id", &self.endpoint_id)
+            .field("reason", &"<redacted>")
+            .field("change_ticket", &self.change_ticket)
+            .field("nonce", &"<redacted>")
+            .field("expires_at", &self.expires_at)
+            .field("params_summary", &"<typed-summary-only>")
+            .finish()
+    }
+}
+
+impl UnsignedChangeIntent {
+    pub fn from_private_file(path: &Path) -> Result<Self, StoreError> {
+        let text = read_private_text(path, MAX_INTENT_BYTES, "change intent")?;
+        serde_json::from_str(&text).map_err(|_| invalid("change intent JSON is invalid"))
+    }
+
+    pub fn build_request(
+        &self,
+        actor: &str,
+        key_id: &str,
+        signature: String,
+    ) -> Result<CreateChangeRequest, StoreError> {
+        let mut request = CreateChangeRequest {
+            request_id: self.request_id.clone(),
+            operation_id: self.operation_id.clone(),
+            operation_kind: self.operation_kind,
+            endpoint_id: self.endpoint_id.clone(),
+            actor: actor.to_string(),
+            reason: self.reason.clone(),
+            change_ticket: self.change_ticket.clone(),
+            nonce: self.nonce.clone(),
+            expires_at: self.expires_at.clone(),
+            params_summary: self.params_summary.clone(),
+            signed_intent: SignedControlledWriteIntent {
+                key_id: key_id.to_string(),
+                algorithm: "Ed25519".into(),
+                payload_sha256: String::new(),
+                signature,
+            },
+        };
+        request.signed_intent.payload_sha256 = operation_digest(&request)?;
+        Ok(request)
+    }
+
+    pub fn digest(&self, actor: &str, now: &str) -> Result<String, StoreError> {
+        let request = self.build_request(actor, "digest-preview", "AA==".into())?;
+        validate_create(&request, now)?;
+        operation_digest(&request)
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ControlledWritePolicy {
+    pub enabled: bool,
+    pub allowed_operations: BTreeSet<String>,
+}
+
+impl ControlledWritePolicy {
+    pub fn from_private_file(path: &Path) -> Result<Self, StoreError> {
+        let text = read_private_text(path, MAX_POLICY_BYTES, "controlled-write policy")?;
+        let policy: Self =
+            toml::from_str(&text).map_err(|_| invalid("controlled-write policy is invalid"))?;
+        for operation in &policy.allowed_operations {
+            if !matches!(
+                operation.as_str(),
+                "ocserv_reload"
+                    | "ocserv_restart"
+                    | "ocserv_config_apply"
+                    | "ocserv_config_rollback"
+            ) {
+                return Err(invalid(
+                    "controlled-write policy contains an unsupported operation",
+                ));
+            }
+        }
+        Ok(policy)
+    }
+
+    pub fn allows(&self, operation: &str) -> bool {
+        self.enabled && self.allowed_operations.contains(operation)
+    }
+}
+
+pub fn read_private_signature(path: &Path) -> Result<String, StoreError> {
+    let text = read_private_text(path, MAX_SIGNATURE_FILE_BYTES, "signature")?;
+    let signature = text.trim_end_matches(['\r', '\n']);
+    decode_signature(signature)?;
+    Ok(signature.to_string())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -244,6 +359,21 @@ pub struct ApprovalDecision {
     pub role: String,
     pub reason: String,
     pub expires_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ChangeAuditRecord {
+    pub id: i64,
+    pub timestamp: String,
+    pub request_id: String,
+    pub operation_id: String,
+    pub operation_kind: String,
+    pub actor: String,
+    pub approval_id: Option<String>,
+    pub state_from: Option<String>,
+    pub state_to: String,
+    pub ok: Option<bool>,
+    pub error_code: Option<String>,
 }
 
 impl Store {
@@ -539,6 +669,40 @@ impl Store {
             .map_err(StoreError::from)
     }
 
+    pub fn list_change_audit(
+        &self,
+        request_id: &str,
+        limit: u64,
+    ) -> Result<Vec<ChangeAuditRecord>, StoreError> {
+        validate_id(request_id, "request_id")?;
+        if limit == 0 || limit > MAX_ROWS {
+            return Err(invalid("change audit limit must be between 1 and 1000"));
+        }
+        let limit = i64::try_from(limit).map_err(|_| invalid("change audit limit is invalid"))?;
+        let mut statement = self.conn.prepare(
+            "SELECT id, ts, request_id, operation_id, operation_kind, actor, approval_id,
+                    state_from, state_to, ok, error_code
+             FROM write_operation_audit WHERE request_id = ?1 ORDER BY id LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![request_id, limit], |row| {
+            Ok(ChangeAuditRecord {
+                id: row.get(0)?,
+                timestamp: row.get(1)?,
+                request_id: row.get(2)?,
+                operation_id: row.get(3)?,
+                operation_kind: row.get(4)?,
+                actor: row.get(5)?,
+                approval_id: row.get(6)?,
+                state_from: row.get(7)?,
+                state_to: row.get(8)?,
+                ok: row.get(9)?,
+                error_code: row.get(10)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
     fn persist_expiry_if_needed(&self, request_id: &str, now: &str) -> Result<(), StoreError> {
         validate_id(request_id, "request_id")?;
         let now_time = parse_time(now, "now")?;
@@ -808,6 +972,19 @@ fn json_error(error: serde_json::Error) -> StoreError {
     invalid(format!("controlled write JSON is invalid: {error}"))
 }
 
+fn read_private_text(path: &Path, max_bytes: usize, label: &str) -> Result<String, StoreError> {
+    let file = crate::private_file::open_existing_private_read(path)
+        .map_err(|_| invalid(format!("{label} file could not be read")))?;
+    let mut text = String::new();
+    file.take((max_bytes + 1) as u64)
+        .read_to_string(&mut text)
+        .map_err(|_| invalid(format!("{label} file could not be read")))?;
+    if text.len() > max_bytes {
+        return Err(invalid(format!("{label} file is too large")));
+    }
+    Ok(text)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1019,5 +1196,45 @@ mod tests {
             operation_kind(ControlledWriteOperationKind::OcservSessionDisconnect),
             "ocserv_session_disconnect"
         );
+    }
+
+    #[test]
+    fn transition_audit_failure_rolls_back_change_creation() {
+        let (_dir, store, request, keyring) = fixture();
+        store
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER reject_write_audit BEFORE INSERT ON write_operation_audit
+                 BEGIN SELECT RAISE(ABORT, 'injected audit failure'); END;",
+            )
+            .expect("install trigger");
+        assert!(
+            store
+                .create_change_request(&request, &keyring, "2026-07-13T00:00:00Z")
+                .is_err()
+        );
+        assert!(
+            store
+                .get_change_request(&request.request_id)
+                .expect("read")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn change_audit_projection_is_bounded_and_excludes_signed_material() {
+        let (_dir, store, request, keyring) = fixture();
+        store
+            .create_change_request(&request, &keyring, "2026-07-13T00:00:00Z")
+            .expect("create");
+        let audit = store
+            .list_change_audit(&request.request_id, 10)
+            .expect("audit");
+        assert_eq!(audit.len(), 1);
+        let output = serde_json::to_string(&audit).expect("serialize");
+        assert!(!output.contains(&request.signed_intent.signature));
+        assert!(!output.contains(&request.nonce));
+        assert!(store.list_change_audit(&request.request_id, 0).is_err());
+        assert!(store.list_change_audit(&request.request_id, 1_001).is_err());
     }
 }

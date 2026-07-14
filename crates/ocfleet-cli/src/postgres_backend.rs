@@ -41,6 +41,7 @@ use crate::version_governance::CapabilitySnapshot;
 
 const MIGRATION_LOCK_ID: i64 = 0x4f43464c454554;
 const FORMAT_VERSION: i32 = 1;
+const BACKEND_SCHEMA_VERSION: i32 = 2;
 const DEFAULT_POOL_SIZE: u32 = 8;
 const MAX_DSN_BYTES: usize = 8_192;
 const MAX_STATE_IMAGE_BYTES: u64 = 512 * 1024 * 1024;
@@ -259,6 +260,14 @@ impl PostgresStore {
             "INSERT INTO ocfleet_backend_migrations(version) VALUES ($1) ON CONFLICT DO NOTHING",
             &[&FORMAT_VERSION],
         )?;
+        tx.batch_execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_ocfleet_imports_source
+               ON ocfleet_imports(source_sha256, source_size);",
+        )?;
+        tx.execute(
+            "INSERT INTO ocfleet_backend_migrations(version) VALUES ($1) ON CONFLICT DO NOTHING",
+            &[&BACKEND_SCHEMA_VERSION],
+        )?;
         if tx
             .query_opt(
                 "SELECT 1 FROM ocfleet_runtime_state WHERE singleton = TRUE",
@@ -281,6 +290,10 @@ impl PostgresStore {
         let checksum: String = row.get(2);
         Ok(PostgresDoctor {
             connected: true,
+            backend_schema_version: conn
+                .query_one("SELECT max(version) FROM ocfleet_backend_migrations", &[])?
+                .get::<_, Option<i32>>(0)
+                .unwrap_or_default(),
             format_version: row.get(0),
             schema_version: row.get(1),
             checksum_valid: sha256(&image) == checksum,
@@ -306,20 +319,60 @@ impl PostgresStore {
         }
         let source_sha256 = sha256(&image);
         let (schema_version, counts) = verify_image(&image)?;
-        if !dry_run {
+        let already_current = if !dry_run {
             let mut conn = self.connection()?;
             let mut tx = conn.transaction()?;
             tx.query_one("SELECT pg_advisory_xact_lock($1)", &[&MIGRATION_LOCK_ID])?;
             self.lock_write_fence(&mut tx)?;
-            insert_state(&mut tx, &image)?;
+            let current_sha256 = tx
+                .query_one(
+                    "SELECT state_sha256 FROM ocfleet_runtime_state WHERE singleton = TRUE FOR UPDATE",
+                    &[],
+                )?
+                .get::<_, String>(0);
+            let already_current = current_sha256 == source_sha256;
+            if !already_current {
+                insert_state(&mut tx, &image)?;
+            }
+            let import_id = uuid::Uuid::new_v4().to_string();
+            tx.execute(
+                "INSERT INTO ocfleet_imports
+                   (import_id, source_sha256, source_size, verified, completed_at)
+                 VALUES ($1::text::uuid, $2, $3, TRUE, now())
+                 ON CONFLICT(source_sha256, source_size) DO UPDATE SET
+                   verified = TRUE, completed_at = COALESCE(ocfleet_imports.completed_at, now())",
+                &[&import_id, &source_sha256, &(image.len() as i64)],
+            )?;
             tx.commit()?;
-        }
+            already_current
+        } else {
+            let mut conn = self.connection()?;
+            load_state(&mut conn).map(|state| sha256(&state) == source_sha256)?
+        };
         Ok(ImportReport {
             dry_run,
+            already_current,
             source_sha256,
             source_size: image.len() as u64,
             schema_version,
             counts_verified: counts,
+        })
+    }
+
+    pub fn export_sqlite(&self, path: &Path) -> Result<ExportReport, PostgresError> {
+        let mut conn = self.connection()?;
+        let image = load_state(&mut conn)?;
+        let (schema_version, counts_verified) = verify_image(&image)?;
+        let state_sha256 = sha256(&image);
+        let mut output = private_file::open_private_create_new_strict(path)?;
+        output.write_all(&image)?;
+        output.flush()?;
+        output.sync_all()?;
+        Ok(ExportReport {
+            state_sha256,
+            state_size: image.len() as u64,
+            schema_version,
+            counts_verified,
         })
     }
 
@@ -459,6 +512,7 @@ impl PostgresStore {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PostgresDoctor {
     pub connected: bool,
+    pub backend_schema_version: i32,
     pub format_version: i32,
     pub schema_version: i64,
     pub checksum_valid: bool,
@@ -467,8 +521,16 @@ pub struct PostgresDoctor {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ImportReport {
     pub dry_run: bool,
+    pub already_current: bool,
     pub source_sha256: String,
     pub source_size: u64,
+    pub schema_version: i64,
+    pub counts_verified: u64,
+}
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ExportReport {
+    pub state_sha256: String,
+    pub state_size: u64,
     pub schema_version: i64,
     pub counts_verified: u64,
 }

@@ -16,8 +16,8 @@ operator model with simple deployment:
 - local controller audit table
 - no external service dependency
 
-The existing SQLite safety checks must remain in place even if Postgres support
-is added later.
+The existing SQLite safety checks remain in place when Postgres support is
+compiled.
 
 ## Optional Postgres Goals
 
@@ -231,5 +231,25 @@ deployment platform.
 - Backup sidecars written next to the database.
 - Tests that inspect SQLite tables directly.
 
-Before adding Postgres, create compatibility tests around low-sensitive
-projections and audit semantics so SQLite and Postgres behavior stays aligned.
+Compatibility tests around low-sensitive projections and audit semantics keep
+SQLite and Postgres behavior aligned as the neutral contract expands.
+
+## Explicit Lifecycle Commands
+
+The feature-enabled CLI never discovers or silently selects Postgres. An
+operator selects it with the `postgres` command and an absolute private config
+path:
+
+```text
+ocfleet postgres doctor --config /run/secrets/ocfleet-postgres.toml --json
+ocfleet postgres import --config /run/secrets/ocfleet-postgres.toml --source controller.sqlite --dry-run --json
+ocfleet postgres import --config /run/secrets/ocfleet-postgres.toml --source controller.sqlite --lease-owner controller-a --json
+ocfleet postgres export --config /run/secrets/ocfleet-postgres.toml --output /var/lib/ocfleet/export/controller.sqlite --json
+```
+
+Non-dry-run import requires the bounded `controller-writer` lease and validates
+its fencing token inside the replacing transaction. Export writes a new private
+SQLite file only after the stored image checksum, schema, bounds, and selected
+table counts pass. Existing output files are never overwritten. Legacy CLI
+commands and `ocfleet-api` still open SQLite; broad command/API backend
+selection remains a C1 follow-up rather than an implicit fallback.

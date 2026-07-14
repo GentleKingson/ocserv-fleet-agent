@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
 
+use crate::auth::Permission;
 use crate::cursor_keys::CursorKeyring;
 use crate::projections::{alert_to_json, health_node_to_json};
 use crate::readonly_store::{AlertPageFilters, HistoryPageFilters, NodeListFilters};
@@ -95,7 +96,7 @@ async fn fleet_summary(
     headers: HeaderMap,
     query: Result<Query<EmptyQuery>, QueryRejection>,
 ) -> ApiResult<Response> {
-    authorize(&state, &headers)?;
+    authorize(&state, &headers, Permission::FleetRead)?;
     query.map_err(|_| ApiError::bad_request("query parameters are not supported"))?;
     let counts = db(state.store.fleet_health_summary())?;
     let data = json!({
@@ -118,7 +119,7 @@ async fn version_readiness(
     headers: HeaderMap,
     query: Result<Query<EmptyQuery>, QueryRejection>,
 ) -> ApiResult<Response> {
-    authorize(&state, &headers)?;
+    authorize(&state, &headers, Permission::FleetRead)?;
     query.map_err(|_| ApiError::bad_request("query parameters are not supported"))?;
     let fetch_limit =
         u64::try_from(MAX_VERSION_GOVERNANCE_NODES + 1).map_err(|_| ApiError::internal())?;
@@ -136,7 +137,7 @@ async fn node(
     headers: HeaderMap,
     query: Result<Query<EmptyQuery>, QueryRejection>,
 ) -> ApiResult<Response> {
-    authorize(&state, &headers)?;
+    authorize(&state, &headers, Permission::FleetRead)?;
     query.map_err(|_| ApiError::bad_request("query parameters are not supported"))?;
     validate_filter_value("node_id", &node_id)?;
     let record = db(state.store.get_node_health(&node_id))?
@@ -152,7 +153,7 @@ async fn nodes(
     headers: HeaderMap,
     query: Result<Query<NodesQuery>, QueryRejection>,
 ) -> ApiResult<Response> {
-    authorize(&state, &headers)?;
+    authorize(&state, &headers, Permission::FleetRead)?;
     let Query(query) =
         query.map_err(|_| ApiError::bad_request("invalid or unsupported query parameters"))?;
     let limit = query.limit.unwrap_or(DEFAULT_LIMIT.min(state.max_limit));
@@ -241,7 +242,7 @@ async fn health_history(
     headers: HeaderMap,
     query: Result<Query<HistoryQuery>, QueryRejection>,
 ) -> ApiResult<Response> {
-    authorize(&state, &headers)?;
+    authorize(&state, &headers, Permission::HealthRead)?;
     let Query(query) =
         query.map_err(|_| ApiError::bad_request("invalid or unsupported query parameters"))?;
     let (from, to) = normalize_window(&query.from, &query.to)?;
@@ -306,7 +307,7 @@ async fn alerts(
     headers: HeaderMap,
     query: Result<Query<AlertsQuery>, QueryRejection>,
 ) -> ApiResult<Response> {
-    authorize(&state, &headers)?;
+    authorize(&state, &headers, Permission::FleetRead)?;
     let Query(query) =
         query.map_err(|_| ApiError::bad_request("invalid or unsupported query parameters"))?;
     let (from, to) = normalize_window(&query.from, &query.to)?;
@@ -378,7 +379,7 @@ async fn alert(
     headers: HeaderMap,
     query: Result<Query<EmptyQuery>, QueryRejection>,
 ) -> ApiResult<Response> {
-    authorize(&state, &headers)?;
+    authorize(&state, &headers, Permission::FleetRead)?;
     query.map_err(|_| ApiError::bad_request("query parameters are not supported"))?;
     validate_lookup(&lookup)?;
     let record = db(state.store.get_alert(&lookup))?

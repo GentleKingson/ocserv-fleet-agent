@@ -10,11 +10,14 @@ use std::fmt;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::time::Duration;
 
 use postgres::config::Host;
 use postgres::{Config, NoTls, Transaction};
 use r2d2::{Pool, PooledConnection};
 use r2d2_postgres::PostgresConnectionManager;
+use rusqlite::backup::Backup;
+use rusqlite::{Connection, OpenFlags};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tempfile::{NamedTempFile, TempDir};
@@ -45,6 +48,8 @@ const BACKEND_SCHEMA_VERSION: i32 = 2;
 const DEFAULT_POOL_SIZE: u32 = 8;
 const MAX_DSN_BYTES: usize = 8_192;
 const MAX_STATE_IMAGE_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_VERIFICATION_ROWS_PER_TABLE: u64 = 1_000_000;
+const BACKUP_PAGES_PER_STEP: i32 = 128;
 
 #[derive(Clone, PartialEq, Eq)]
 pub enum PostgresConnectionSource {
@@ -173,6 +178,8 @@ pub enum PostgresError {
     Io(#[source] std::io::Error),
     #[error("store operation failed: {0}")]
     Store(#[source] StoreError),
+    #[error("Postgres backend SQLite snapshot failed")]
+    Sqlite(#[source] rusqlite::Error),
 }
 
 impl From<postgres::Error> for PostgresError {
@@ -198,6 +205,11 @@ impl From<std::io::Error> for PostgresError {
 impl From<StoreError> for PostgresError {
     fn from(value: StoreError) -> Self {
         Self::Store(value)
+    }
+}
+impl From<rusqlite::Error> for PostgresError {
+    fn from(value: rusqlite::Error) -> Self {
+        Self::Sqlite(value)
     }
 }
 
@@ -288,6 +300,16 @@ impl PostgresStore {
         let row = conn.query_one("SELECT format_version, sqlite_schema_version, state_sha256, state_bytes FROM ocfleet_runtime_state WHERE singleton = TRUE", &[])?;
         let image: Vec<u8> = row.get(3);
         let checksum: String = row.get(2);
+        let schema_version: i64 = row.get(1);
+        let checksum_valid = sha256(&image) == checksum;
+        if checksum_valid {
+            let (image_schema_version, _) = verify_image(&image)?;
+            if image_schema_version != schema_version {
+                return Err(PostgresError::InvalidState(
+                    "stored schema metadata does not match the SQLite image".into(),
+                ));
+            }
+        }
         Ok(PostgresDoctor {
             connected: true,
             backend_schema_version: conn
@@ -295,30 +317,15 @@ impl PostgresStore {
                 .get::<_, Option<i32>>(0)
                 .unwrap_or_default(),
             format_version: row.get(0),
-            schema_version: row.get(1),
-            checksum_valid: sha256(&image) == checksum,
+            schema_version,
+            checksum_valid,
             pool_max_size: self.pool.max_size(),
         })
     }
 
     pub fn import_sqlite(&self, path: &Path, dry_run: bool) -> Result<ImportReport, PostgresError> {
-        let metadata = std::fs::metadata(path)?;
-        if metadata.len() > MAX_STATE_IMAGE_BYTES {
-            return Err(PostgresError::InvalidState(
-                "SQLite import exceeds the state image limit".into(),
-            ));
-        }
-        let file = std::fs::File::open(path)?;
-        let mut image = Vec::with_capacity(metadata.len() as usize);
-        file.take(MAX_STATE_IMAGE_BYTES + 1)
-            .read_to_end(&mut image)?;
-        if image.len() as u64 > MAX_STATE_IMAGE_BYTES {
-            return Err(PostgresError::InvalidState(
-                "SQLite import exceeds the state image limit".into(),
-            ));
-        }
+        let (image, schema_version, counts) = snapshot_sqlite(path)?;
         let source_sha256 = sha256(&image);
-        let (schema_version, counts) = verify_image(&image)?;
         let already_current = if !dry_run {
             let mut conn = self.connection()?;
             let mut tx = conn.transaction()?;
@@ -829,9 +836,8 @@ fn private_tempdir() -> Result<TempDir, std::io::Error> {
 }
 
 fn materialize(image: &[u8]) -> Result<(PrivateTempFile, Store), PostgresError> {
-    let mut temp = PrivateTempFile::new()?;
-    temp.write_all(image)?;
-    temp.flush()?;
+    let temp = stage_image(image)?;
+    verify_staged_image(temp.path())?;
     let store = Store::open(temp.path())?;
     Ok((temp, store))
 }
@@ -842,24 +848,161 @@ fn verify_image(image: &[u8]) -> Result<(i64, u64), PostgresError> {
             "source is not a SQLite database".into(),
         ));
     }
-    let (_temp, store) = materialize(image)?;
-    let schema = store.current_schema_version()?;
+    let temp = stage_image(image)?;
+    verify_staged_image(temp.path())
+}
+
+fn stage_image(image: &[u8]) -> Result<PrivateTempFile, PostgresError> {
+    if image.len() as u64 > MAX_STATE_IMAGE_BYTES {
+        return Err(PostgresError::InvalidState(
+            "state image exceeds the configured limit".into(),
+        ));
+    }
+    let mut temp = PrivateTempFile::new()?;
+    temp.write_all(image)?;
+    temp.flush()?;
+    Ok(temp)
+}
+
+fn verify_staged_image(path: &Path) -> Result<(i64, u64), PostgresError> {
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    connection.pragma_update(None, "query_only", "ON")?;
+    connection.pragma_update(None, "busy_timeout", 5_000)?;
+
+    let integrity: String = connection.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+    if integrity != "ok" {
+        return Err(PostgresError::InvalidState(
+            "SQLite quick_check failed".into(),
+        ));
+    }
+    let (migration_count, minimum_schema, schema): (i64, Option<i64>, Option<i64>) = connection
+        .query_row(
+            "SELECT COUNT(*), MIN(version), MAX(version) FROM schema_migrations",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+    let schema = schema.unwrap_or_default();
     if schema != CURRENT_SCHEMA_VERSION {
         return Err(PostgresError::InvalidState(format!(
             "source schema {schema} does not match required schema {CURRENT_SCHEMA_VERSION}"
         )));
     }
-    let counts = store.list_nodes()?.len() as u64
-        + store.list_observability_jobs()?.len() as u64
-        + store
-            .list_alert_events_limited(MAX_STORE_READER_ROWS)?
-            .len() as u64;
+    if minimum_schema != Some(1) || migration_count != CURRENT_SCHEMA_VERSION {
+        return Err(PostgresError::InvalidState(
+            "source schema migration history is incomplete".into(),
+        ));
+    }
+    let mut counts = 0_u64;
+    for table in ["nodes", "observability_jobs", "alert_events"] {
+        let count = bounded_table_count(&connection, table)?;
+        counts = counts.checked_add(count).ok_or_else(|| {
+            PostgresError::InvalidState("verified row count exceeds the supported range".into())
+        })?;
+    }
     Ok((schema, counts))
+}
+
+fn bounded_table_count(connection: &Connection, table: &str) -> Result<u64, PostgresError> {
+    let sql = format!("SELECT COUNT(*) FROM (SELECT 1 FROM {table} LIMIT ?1)");
+    let count: i64 = connection.query_row(
+        &sql,
+        [i64::try_from(MAX_VERIFICATION_ROWS_PER_TABLE + 1).expect("bounded row limit")],
+        |row| row.get(0),
+    )?;
+    if count < 0 || count as u64 > MAX_VERIFICATION_ROWS_PER_TABLE {
+        return Err(PostgresError::InvalidState(format!(
+            "SQLite table {table} exceeds the verification row limit"
+        )));
+    }
+    Ok(count as u64)
+}
+
+fn snapshot_sqlite(path: &Path) -> Result<(Vec<u8>, i64, u64), PostgresError> {
+    validate_sqlite_source(path)?;
+    let source = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    source.pragma_update(None, "query_only", "ON")?;
+    source.pragma_update(None, "busy_timeout", 5_000)?;
+    let page_count: i64 = source.query_row("PRAGMA page_count", [], |row| row.get(0))?;
+    let page_size: i64 = source.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+    let logical_size = page_count.checked_mul(page_size).ok_or_else(|| {
+        PostgresError::InvalidState("SQLite import size is outside the supported range".into())
+    })?;
+    if logical_size < 0 || logical_size as u64 > MAX_STATE_IMAGE_BYTES {
+        return Err(PostgresError::InvalidState(
+            "SQLite import exceeds the state image limit".into(),
+        ));
+    }
+
+    let snapshot = PrivateTempFile::new()?;
+    let mut destination = Connection::open(snapshot.path())?;
+    {
+        let backup = Backup::new(&source, &mut destination)?;
+        backup.run_to_completion(BACKUP_PAGES_PER_STEP, Duration::from_millis(10), None)?;
+    }
+    drop(destination);
+    drop(source);
+    validate_sqlite_source(path)?;
+
+    let size = std::fs::metadata(snapshot.path())?.len();
+    if size > MAX_STATE_IMAGE_BYTES {
+        return Err(PostgresError::InvalidState(
+            "SQLite import exceeds the state image limit".into(),
+        ));
+    }
+    let (schema_version, counts) = verify_staged_image(snapshot.path())?;
+    let file = std::fs::File::open(snapshot.path())?;
+    let mut image = Vec::with_capacity(size as usize);
+    file.take(MAX_STATE_IMAGE_BYTES + 1)
+        .read_to_end(&mut image)?;
+    if image.len() as u64 > MAX_STATE_IMAGE_BYTES {
+        return Err(PostgresError::InvalidState(
+            "SQLite import exceeds the state image limit".into(),
+        ));
+    }
+    if image.len() < 16 || &image[..16] != b"SQLite format 3\0" {
+        return Err(PostgresError::InvalidState(
+            "source is not a SQLite database".into(),
+        ));
+    }
+    Ok((image, schema_version, counts))
+}
+
+fn validate_sqlite_source(path: &Path) -> Result<(), PostgresError> {
+    let invalid_source = || {
+        PostgresError::InvalidState(
+            "SQLite source and sidecars must be private regular files".into(),
+        )
+    };
+    private_file::validate_existing_private_file(path).map_err(|_| invalid_source())?;
+    for sidecar in sqlite_sidecar_paths(path) {
+        match std::fs::symlink_metadata(&sidecar) {
+            Ok(_) => private_file::validate_existing_private_file(&sidecar)
+                .map_err(|_| invalid_source())?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+fn sqlite_sidecar_paths(path: &Path) -> [PathBuf; 2] {
+    let mut wal = path.as_os_str().to_os_string();
+    wal.push("-wal");
+    let mut shm = path.as_os_str().to_os_string();
+    shm.push("-shm");
+    [PathBuf::from(wal), PathBuf::from(shm)]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::NodeInsert;
     #[test]
     fn connection_sources_never_debug_dsn_or_path() {
         let env = PostgresConnectionSource::Environment {
@@ -880,5 +1023,78 @@ mod tests {
         assert!(validate_transport(&remote).is_err());
         let loopback = Config::from_str("postgresql://127.0.0.1/ocfleet").expect("config");
         assert!(validate_transport(&loopback).is_ok());
+    }
+
+    #[test]
+    fn snapshot_includes_committed_active_wal_records() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join("active.sqlite3");
+        let store = Store::open(&path).expect("store");
+        store
+            .add_node(
+                &NodeInsert {
+                    node_id: "node-active-wal".into(),
+                    endpoint_id: iroh::SecretKey::generate().public().to_string(),
+                    name: "node-active-wal".into(),
+                    region: "test".into(),
+                    role: "ocserv".into(),
+                },
+                "operator",
+            )
+            .expect("commit node");
+        let [wal, _] = sqlite_sidecar_paths(&path);
+        assert!(std::fs::metadata(wal).expect("WAL").len() > 0);
+
+        let (image, _, _) = snapshot_sqlite(&path).expect("online snapshot");
+        let snapshot = stage_image(&image).expect("stage snapshot");
+        let connection = Connection::open_with_flags(
+            snapshot.path(),
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .expect("inspect snapshot");
+        let present: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM nodes WHERE node_id = 'node-active-wal'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read snapshotted node");
+        assert_eq!(present, 1);
+        drop(store);
+    }
+
+    #[test]
+    fn snapshot_rejects_schema_27_without_migrating_source() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join("schema-27.sqlite3");
+        drop(Store::open(&path).expect("store"));
+        let connection = Connection::open(&path).expect("downgrade fixture");
+        connection
+            .execute_batch(
+                "DROP TABLE signed_bundles;
+                 DROP TABLE write_operation_audit;
+                 DROP TABLE write_operation_attempts;
+                 DROP TABLE change_approvals;
+                 DROP TABLE change_requests;
+                 DELETE FROM schema_migrations WHERE version = 28;",
+            )
+            .expect("schema 27 fixture");
+        drop(connection);
+
+        assert!(matches!(
+            snapshot_sqlite(&path),
+            Err(PostgresError::InvalidState(_))
+        ));
+        let connection = Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .expect("inspect source");
+        let schema: i64 = connection
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .expect("schema");
+        assert_eq!(schema, 27);
     }
 }

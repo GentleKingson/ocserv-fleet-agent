@@ -9,6 +9,7 @@ use std::thread;
 use ocfleet_cli::backend::{StoreReader, StoreWriter};
 use ocfleet_cli::postgres_backend::{PostgresConnectionSource, PostgresError, connect};
 use ocfleet_cli::store::{NodeInsert, Store};
+use rusqlite::OpenFlags;
 use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::SyncRunner;
 use testcontainers::{GenericImage, ImageExt};
@@ -79,6 +80,39 @@ fn postgres_migration_contention_and_transactional_fencing() {
     let writer_one = first.fenced(lease_one.clone()).expect("fenced writer");
 
     let import_dir = tempfile::tempdir().expect("import dir");
+    let old_schema_path = import_dir.path().join("schema-27.sqlite3");
+    drop(Store::open(&old_schema_path).expect("create schema 27 fixture"));
+    let old_schema = rusqlite::Connection::open(&old_schema_path).expect("open schema 27 fixture");
+    old_schema
+        .execute_batch(
+            "DROP TABLE signed_bundles;
+             DROP TABLE write_operation_audit;
+             DROP TABLE write_operation_attempts;
+             DROP TABLE change_approvals;
+             DROP TABLE change_requests;
+             DELETE FROM schema_migrations WHERE version = 28;",
+        )
+        .expect("downgrade fixture to schema 27");
+    drop(old_schema);
+    assert!(matches!(
+        first.import_sqlite(&old_schema_path, true),
+        Err(PostgresError::InvalidState(_))
+    ));
+    let old_schema = rusqlite::Connection::open_with_flags(
+        &old_schema_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .expect("inspect rejected schema 27 fixture");
+    let old_version: i64 = old_schema
+        .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+            row.get(0)
+        })
+        .expect("read old schema without migration");
+    assert_eq!(
+        old_version, 27,
+        "import validation must not migrate its source"
+    );
+
     let import_path = import_dir.path().join("controller.sqlite3");
     let import_store = Store::open(&import_path).expect("create import source");
     let imported_node = NodeInsert {
@@ -115,6 +149,37 @@ fn postgres_migration_contention_and_transactional_fencing() {
             .expect("read imported node")
             .is_some()
     );
+
+    let wal_path = import_dir.path().join("controller-active-wal.sqlite3");
+    let wal_store = Store::open(&wal_path).expect("create active WAL source");
+    let wal_node = NodeInsert {
+        node_id: "node-pg-active-wal".into(),
+        endpoint_id: iroh::SecretKey::generate().public().to_string(),
+        name: "node-pg-active-wal".into(),
+        region: "test".into(),
+        role: "ocserv".into(),
+    };
+    wal_store
+        .add_node(&wal_node, "operator")
+        .expect("commit node into active WAL");
+    let wal_sidecar = std::path::PathBuf::from(format!("{}-wal", wal_path.display()));
+    assert!(
+        fs::metadata(&wal_sidecar)
+            .expect("active WAL sidecar")
+            .len()
+            > 0,
+        "fixture must retain committed data in WAL"
+    );
+    writer_one
+        .import_sqlite(&wal_path, false)
+        .expect("online backup import with active WAL");
+    assert!(
+        StoreReader::read_node(&writer_one, "node-pg-active-wal")
+            .expect("read WAL-backed imported node")
+            .is_some(),
+        "successful import must include committed WAL data"
+    );
+    drop(wal_store);
 
     let node_one = NodeInsert {
         node_id: "node-pg-one".into(),
@@ -169,8 +234,44 @@ fn postgres_migration_contention_and_transactional_fencing() {
         .expect("verified SQLite export");
     assert_eq!(export.schema_version, 28);
     assert!(export.counts_verified >= 1);
+    let exported_schema = rusqlite::Connection::open_with_flags(
+        &export_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .expect("inspect export without migrations");
+    let exported_version: i64 = exported_schema
+        .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+            row.get(0)
+        })
+        .expect("read exported schema");
+    assert_eq!(exported_version, export.schema_version);
+    drop(exported_schema);
     let exported = Store::open(&export_path).expect("open exported state");
     assert!(exported.get_node("node-pg-stale").expect("node").is_some());
+
+    admin
+        .execute(
+            "UPDATE ocfleet_runtime_state SET sqlite_schema_version = 27 WHERE singleton = TRUE",
+            &[],
+        )
+        .expect("inject mismatched schema metadata");
+    assert!(matches!(
+        writer_two.doctor(),
+        Err(PostgresError::InvalidState(_))
+    ));
+    admin
+        .execute(
+            "UPDATE ocfleet_runtime_state SET sqlite_schema_version = 28 WHERE singleton = TRUE",
+            &[],
+        )
+        .expect("restore schema metadata");
+    assert_eq!(
+        writer_two
+            .doctor()
+            .expect("consistent doctor")
+            .schema_version,
+        28
+    );
 
     let rollback_dir = tempfile::tempdir().expect("rollback fixture dir");
     let rollback_path = rollback_dir.path().join("rollback.sqlite3");

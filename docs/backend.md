@@ -210,12 +210,19 @@ implementation in a later reviewed change, not by weakening this restriction.
 State images are capped at 512 MiB before import, database retrieval, checksum,
 or replacement.
 
-`import_sqlite(path, true)` validates the SQLite header, current schema, and
-bounded table counts without changing Postgres. A non-dry-run import holds the
-migration advisory lock and replaces the state only after full checksum/schema
-verification. Interrupted imports leave the previous singleton state valid.
-`doctor()` reports connection, format/schema, pool size, and checksum status
-without connection details.
+`import_sqlite(path, true)` opens the source read-only and uses SQLite's online
+backup API to create a transactionally consistent snapshot, including committed
+records that are still in an active WAL. Import accepts only the current schema;
+validation reads `schema_migrations` directly and never migrates the source or
+the snapshot. It also checks the SQLite header, `quick_check`, bounded logical
+size, and bounded table counts without changing Postgres. A non-dry-run import
+holds the migration advisory lock and replaces the state only after full
+checksum/schema verification. Interrupted imports leave the previous singleton
+state valid. Import report size and checksum fields describe this consistent
+snapshot rather than an incomplete main-file-only copy. `doctor()` verifies
+that the relational schema metadata matches the schema recorded inside a
+checksum-valid SQLite image, then reports connection, format/schema, pool size,
+and checksum status without connection details.
 
 Back up Postgres with the deployment's normal encrypted `pg_dump` workflow and
 restore into a separate database before validation. Do not copy the private DSN

@@ -276,11 +276,6 @@ impl Authenticator {
             {
                 return Ok(Principal::authenticated_viewer());
             }
-            if token.matches('.').count() == 2
-                && let Some(oidc) = &self.config.oidc
-            {
-                return oidc.authenticate(token);
-            }
             let token_digest = digest(token.as_bytes());
             let now = OffsetDateTime::now_utc();
             for account in &self.config.service_accounts {
@@ -293,6 +288,11 @@ impl Authenticator {
             {
                 tracing::warn!("break-glass authentication used");
                 return account.principal(now, AuthenticationMethod::BreakGlass);
+            }
+            if token.matches('.').count() == 2
+                && let Some(oidc) = &self.config.oidc
+            {
+                return oidc.authenticate(token);
             }
             return Err(AuthFailure::Invalid);
         }
@@ -925,6 +925,62 @@ mod tests {
         assert_eq!(
             expired.authenticate(&bearer_headers(raw)),
             Err(AuthFailure::Expired)
+        );
+    }
+
+    #[test]
+    fn static_dotted_tokens_are_checked_before_oidc() {
+        let key = generate_key();
+        let oidc = OidcVerifier::try_from(OidcFile {
+            issuer: "https://issuer.example".into(),
+            audience: "ocfleet-api".into(),
+            groups_claim: "groups".into(),
+            keys: vec![key_file("current", &key)],
+            jwks_file: None,
+            role_mappings: vec![RoleMappingFile {
+                group: "fleet-operators".into(),
+                role: "operator".into(),
+            }],
+        })
+        .expect("verifier");
+        let service_token = "service-account-token.with.two-dots-1234567890";
+        let break_glass_token = "break-glass-token.with.two-dots-1234567890";
+        assert_eq!(service_token.matches('.').count(), 2);
+        assert_eq!(break_glass_token.matches('.').count(), 2);
+        let expires_at = OffsetDateTime::now_utc() + time::Duration::minutes(30);
+        let authenticator = Authenticator {
+            legacy_bearer: None,
+            config: AuthConfig {
+                service_accounts: vec![ServiceAccount {
+                    principal_id: "service:automation".into(),
+                    token_digest: digest(service_token.as_bytes()),
+                    expires_at,
+                    roles: [Role::Operator].into_iter().collect(),
+                }],
+                oidc: Some(oidc),
+                break_glass: Some(ServiceAccount {
+                    principal_id: "break-glass:incident-2".into(),
+                    token_digest: digest(break_glass_token.as_bytes()),
+                    expires_at,
+                    roles: [Role::SecurityAdmin].into_iter().collect(),
+                }),
+                ..AuthConfig::default()
+            },
+        };
+
+        let service = authenticator
+            .authenticate(&bearer_headers(service_token))
+            .expect("dotted service-account token");
+        assert_eq!(
+            service.authentication_method(),
+            AuthenticationMethod::ServiceAccount
+        );
+        let break_glass = authenticator
+            .authenticate(&bearer_headers(break_glass_token))
+            .expect("dotted break-glass token");
+        assert_eq!(
+            break_glass.authentication_method(),
+            AuthenticationMethod::BreakGlass
         );
     }
 

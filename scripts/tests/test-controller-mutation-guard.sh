@@ -32,6 +32,10 @@ printf '%s\n' \
   '}' \
   > "$cli_src/postgres_backend.rs"
 printf '%s\n' \
+  'pub const SQL: &str = "CREATE TABLE nodes (node_id TEXT PRIMARY KEY)";' \
+  'pub const WRITE: &str = "INSERT INTO nodes (node_id) VALUES ($1)";' \
+  > "$cli_src/postgres_native.rs"
+printf '%s\n' \
   'pub const QUERY: &str = "SELECT node_id FROM nodes";' \
   '#[cfg(test)]' \
   'mod tests {' \

@@ -10,8 +10,8 @@ native parity.
 | Slice | Scope | Status |
 | --- | --- | --- |
 | C1.1 Native core | Private connection source reuse, advisory-locked and future-version-safe native migrations, relational nodes/endpoint trust/audit, atomic node-add audit, Docker failure injection | merged |
-| C1.2 Registry and trust | Node metadata/maintenance/capability, enrollment, endpoint lifecycle, and atomic audit surface | implemented on the Issue #49 branch; shared contract gate remains C1.5 |
-| C1.3 Scheduler and observations | Jobs, claims, runs, outcomes, observations, maintenance, retention, fencing, and indexes | pending |
+| C1.2 Registry and trust | Node metadata/maintenance/capability, enrollment, endpoint lifecycle, and atomic audit surface | merged; shared contract gate remains C1.5 |
+| C1.3 Scheduler and observations | Jobs, claims, runs, outcomes, observations, maintenance, retention, fencing, and indexes | implemented on the Issue #49 branch; shared contract gate remains C1.5 |
 | C1.4 Health and alerts | Health policy/evaluation/history/rollups, alerts, webhook queue/delivery, recovery, and retention | pending |
 | C1.5 Migration and parity gate | Verified SQLite-to-native import/export, full shared contract suite, TLS remote connections, backup/restore, performance and failure tests | pending |
 
@@ -82,9 +82,41 @@ audit failures that must roll back every registry and trust mutation. It also
 covers offset and fractional timestamp retries plus a 1,001-row trust snapshot
 overflow.
 
+## C1.3 Scheduler And Observations Boundary
+
+Native migration `0003_scheduler_observations` adds fully qualified relational
+jobs, runs, observations, claims, scheduler maintenance, retention policies,
+and retention-operation provenance. Typed selector, pair, run-summary, and
+observation-summary payloads remain closed versioned `JSONB` values and are
+validated against their relational columns when read.
+
+The dormant native store now covers:
+
+- bounded job, run, and observation readers plus atomic job state/audit writes;
+- transactionally fenced job acquisition, renewal, release, expired-lease
+  takeover, and abandoned-run recovery with monotonic fence tokens;
+- claimed run start, bounded multi-observation outcomes, run completion, job
+  clocks, and audit records in the same Postgres transaction;
+- scheduler maintenance set/clear with atomic audit;
+- observation/run retention policy, candidate reporting, bounded batched
+  deletion, and actor/request-bound idempotent operation replay.
+
+Postgres claims use row locks and `SKIP LOCKED` for concurrent due-job selection.
+Every run-bound outcome and finish validates the active run and unexpired lease
+at the event timestamp; a stale owner cannot append observations or complete a
+run after takeover. Retention operation provenance is stored atomically with
+the deletion result and audit, so exact retries return the original result and
+mismatched actors or inputs fail closed.
+
+The Docker regression covers typed fractional timestamps, claim contention,
+fence increments, stale-owner rejection, claimed start/outcome/finish, bounded
+observation reads, scheduler maintenance, retention deletion, and exact replay.
+Migration concurrency, future-schema rejection, and the dormant runtime
+boundary continue to run with the complete native integration suite.
+
 ## Completion Rule
 
-Issue `#49` must remain open until C1.2-C1.5 are complete and the same bounded,
+Issue `#49` must remain open until C1.4-C1.5 are complete and the same bounded,
 redacted, actor-bound contract suite passes against SQLite and native Postgres.
 Only then may runtime selection report `postgres-native` or the roadmap advance
 C1 beyond active implementation.

@@ -57,6 +57,7 @@ ALLOWED_FILES = {
     ("crates", "ocfleet-cli", "src", "controlled_writes.rs"),
     ("crates", "ocfleet-cli", "src", "migrations.rs"),
     ("crates", "ocfleet-cli", "src", "postgres_backend.rs"),
+    ("crates", "ocfleet-cli", "src", "postgres_native.rs"),
     ("crates", "ocfleet-cli", "src", "store.rs"),
 }
 ALLOWED_DIRECTORIES = {

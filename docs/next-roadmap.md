@@ -21,7 +21,7 @@ automatic trust, automatic peer mesh, or automatic path-probe authorization.
 | Controller schema | SQLite schema version `25`; migrations `0001` through `0025` |
 | RPC protocol | Protocol version `1`; ALPN `/com.github.gentlekingson.ocfleet.mgmt/1` |
 | Other schemas | Config version `1`; trust-policy version `1`; collector snapshot `ocfleet.ocserv.snapshot.v2`; OpenAPI `3.1.1` |
-| Features | Every crate has an empty default feature set. `controlled-writes` exists in protocol/config/agent and is propagated by the agent. `postgres-backend` exists in the CLI. Both tracks are default-off. |
+| Features | Every crate has an empty default feature set. `controlled-writes` exists in protocol/config/agent and is propagated by the agent. `postgres-backend` exists in the CLI; the dormant native C1 work additionally requires `postgres-native-experimental`. All tracks are default-off. |
 | Runtime backends | SQLite only. The Postgres feature is a non-connecting scaffold. |
 | HTTP API | Read-only version `0.3.0`; sixteen declared `GET` paths including the dashboard root and metrics; API data access is SQLite read-only. |
 
@@ -401,7 +401,7 @@ verification. It is published in pull request `#108`.
 
 | ID | Issue | Status | Depends on | Release target | Acceptance and required evidence |
 | --- | --- | --- | --- | --- | --- |
-| C1 Experimental Postgres snapshot foundation | `#49` | scaffold | A1, A2, A3, A6 | `v0.5.0` | Default-off Postgres-wrapped SQLite stores one checksummed complete image and provides verified import/export, persistent revision, wall-clock lease fencing, and shared contract tests. It globally serializes full-image writes, recommends at most 64 MiB, and is not a native Postgres schema or production scale backend. SQLite remains default; native Postgres parity is still required by C-READY. |
+| C1 Native Postgres backend | `#49` | active implementation | A1, A2, A3, A6 | `v0.5.0` | The existing default-off Postgres-wrapped SQLite snapshot remains experimental. C1.1 adds an unreachable native relational core with fail-closed advisory-locked migrations and atomic node/trust/audit storage. Registry/trust, scheduler/observations, health/alerts, verified migration, TLS, and full shared contract parity remain required before runtime selection or C-READY. `docs/c1-native-postgres-inventory.md` tracks the slices. |
 | C2 OIDC, mTLS, and enforced RBAC | `#50` | implemented API layer | A1, B3 | `v0.5.0` | Unified principals support local/bearer compatibility, pinned-JWKS EdDSA OIDC, trusted-proxy mTLS, expiring service accounts, issuer/audience/time validation, explicit group mapping, key rotation, fixed failure metrics, and one-hour break glass. Every existing API route names a default-deny permission and no mutation or agent-RPC trigger route exists. CLI-wide remote RBAC remains outside the current local OS-owned command model. |
 | C3 Controller high availability | `#51` | planned | A3, A4, A5, C1, C2 | `v0.5.0` | Replicas, leader scheduler/evaluator, lease/fencing, idempotent claims, delivery claims, failover, duplicate suppression, rolling upgrade, readiness, and partition recovery pass split-brain tests without duplicate RPC or non-atomic audit. |
 | C-READY Scale and governance gate | n/a | planned | C1, C2, C3 | `v0.5.0` | Postgres parity, authenticated multi-operator behavior, HA failure tests, migration leadership, and atomic audit pass in isolated CI while SQLite standalone operation remains supported. |

@@ -46,6 +46,14 @@ impl ApiError {
         )
     }
 
+    pub fn forbidden() -> Self {
+        Self::new(
+            StatusCode::FORBIDDEN,
+            "FORBIDDEN",
+            "authenticated principal is not permitted for this route",
+        )
+    }
+
     pub fn not_found(message: impl Into<String>) -> Self {
         Self::new(StatusCode::NOT_FOUND, "NOT_FOUND", message)
     }

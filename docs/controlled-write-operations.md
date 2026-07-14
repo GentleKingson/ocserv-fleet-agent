@@ -93,11 +93,11 @@ Trust policy and enrollment flows must not auto-generate approvals.
 
 Dry-run is mandatory for all operation kinds:
 
-1. Controller records a dry-run change request.
-2. Agent validates local policy, signed intent, operation kind, and target
-   metadata.
-3. Agent returns a typed low-sensitive summary.
-4. Controller records dry-run audit before any non-dry-run approval can be used.
+1. Controller records a signed change request.
+2. D0 validates the explicit private controller policy, signed intent,
+   operation kind, and exact target metadata without contacting an agent.
+3. Controller records a typed low-sensitive policy result and transition audit.
+4. Approval remains unavailable until that dry-run succeeds.
 
 Dry-run must not reload, restart, apply config, roll back config, disconnect a
 session, write raw config, or call a raw command.
@@ -179,10 +179,39 @@ Responses must not contain raw stdout/stderr, raw occtl/systemctl/journalctl
 output, raw config, raw certificate material, username, client IP, session ID, or
 secret values.
 
-## SQLite Schema Draft
+## D0 CLI Workflow
 
-No migration is implemented in this phase. A future migration should be additive
-or a safe rebuild with the existing backup and integrity-check rules.
+The `change` command exists only in a `controlled-writes` build. Its verbs are
+`digest`, `create`, `list`, `show`, `dry-run`, `approve`, `reject`, `cancel`,
+and `audit`; there is deliberately no dispatch or execute verb.
+
+`digest` and `create` read a bounded private JSON intent. `create` additionally
+reads a private detached Ed25519 signature and private actor-bound keyring. The
+actor always comes from the resolved CLI principal (`--actor`,
+`OCFLEET_ACTOR`, or the local CLI fallback), not from intent JSON. Dry-run has a
+default-deny policy: omitting `--policy-file` records `dry_run_failed`; an
+owner-only TOML policy must set `enabled = true` and name the exact operation in
+`allowed_operations` to record success. Approval and rejection derive the
+approver from the current CLI principal and accept only `change-approver` or
+`security-admin` roles.
+
+Every returned record states `dispatch_available=false`. The audit projection
+is bounded to 1,000 rows and omits the nonce, signature, signed payload, reason,
+and parameter summary.
+
+## SQLite State Schema
+
+Schema migration `0028_controlled_write_state` implements the additive D0
+tables. The default build cannot access the state-machine module and the agent
+still has no write dispatch. The abbreviated schema below documents the core
+relationships; the migration is authoritative for constraints and indexes.
+
+Intent verification never accepts a caller-supplied public key. The controller
+loads a private TOML keyring whose entries bind a `key_id` and Ed25519 public
+key to an explicit set of actors. The canonical signed payload includes actor,
+reason, exact EndpointID, operation, ticket, nonce, expiry, and typed parameter
+summary. Storage retains the signature, payload digest, key ID, and public-key
+fingerprint so the decision can be reverified without trusting request input.
 
 ```sql
 CREATE TABLE change_requests (

@@ -110,8 +110,11 @@ The current implementation is intentionally narrow. It does not provide:
 - automatic active trust on first contact or TOFU registration
 - Web/API endpoints that trigger agent RPCs, run scheduler jobs, resolve or
   silence alerts, mutate retention policy, modify trust, or change node state
-- a Postgres controller backend; SQLite remains the implemented backend, while
-  Postgres is an optional future design track
+- transparent Postgres selection for the read-only API or every legacy CLI
+  command; the default-off experimental Postgres-wrapped SQLite snapshot
+  foundation exposes only `postgres doctor|import|export`, globally serializes
+  full-image writes, and is not a native Postgres data layer, while SQLite
+  remains the default command/API backend
 
 All local capabilities must be exposed through fixed RPC methods. There is no `shell.exec`, `command.run`, `occtl.raw`, `journalctl.raw`, or equivalent generic execution interface.
 
@@ -160,7 +163,9 @@ target/debug/ocfleet-api \
 
 The API opens SQLite in read-only mode and serves only `GET` observation routes.
 Every listener requires a private persistent cursor keyring; see `docs/api.md`.
-Non-loopback listeners additionally require `--auth-token-file`.
+Non-loopback listeners additionally require `--auth-token-file` or a remote
+OIDC/service-account method from an owner-only `--auth-config-file`. Forwarded
+mTLS identity is loopback-only behind a trusted certificate-verifying proxy.
 
 Optionally generate a local ocserv metadata collector config and write a private
 snapshot for the agent `collector_snapshot` provider:
@@ -671,7 +676,7 @@ Networking must allow the controller to reach the agent through iroh using the r
 - `docs/a2-storage-inventory.md`: A2 payload-family closure inventory and
   migration/read-boundary evidence.
 - `docs/trust-policy.md`: trust policy as code schema, validation, and diff behavior.
-- `docs/backend.md`: SQLite contract and optional Postgres backend plan.
+- `docs/backend.md`: SQLite contract and experimental Postgres-wrapped SQLite snapshot boundaries.
 - `docs/archive-export.md`: long-term history archive and signed audit export guidance.
 
 ## Security Notes

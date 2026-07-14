@@ -23,6 +23,15 @@ printf '%s\n' \
   'pub const SQL: &str = "CREATE TABLE nodes (node_id TEXT PRIMARY KEY)";' \
   > "$cli_src/migrations.rs"
 printf '%s\n' \
+  'pub const SQL: &str = "INSERT INTO change_requests (request_id) VALUES (?1)";' \
+  > "$cli_src/controlled_writes.rs"
+printf '%s\n' \
+  'pub const SQL: &str = "CREATE TABLE runtime_state (state_bytes BYTEA)";' \
+  'pub fn forward(store: &Store) {' \
+  '    store.set_observability_job_enabled("job", true, "actor");' \
+  '}' \
+  > "$cli_src/postgres_backend.rs"
+printf '%s\n' \
   'pub const QUERY: &str = "SELECT node_id FROM nodes";' \
   '#[cfg(test)]' \
   'mod tests {' \

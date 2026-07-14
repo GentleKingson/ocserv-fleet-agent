@@ -17,7 +17,7 @@ use time::{Duration, OffsetDateTime, UtcOffset, format_description::well_known::
 use uuid::Uuid;
 
 use crate::args::ApiConfig;
-use crate::auth::{AuthToken, Principal};
+use crate::auth::{Authenticator, Permission, Principal, auth_failure_counts, record_forbidden};
 use crate::cursor_keys::CursorKeyring;
 use crate::metrics::{CONTENT_TYPE as METRICS_CONTENT_TYPE, render_controller};
 use crate::projections::{
@@ -40,7 +40,7 @@ pub struct AppState {
     pub(crate) store: Arc<dyn ApiReadStore>,
     pub(crate) max_limit: u64,
     pub(crate) redact: RedactionMode,
-    pub(crate) auth_token: Option<AuthToken>,
+    pub(crate) authenticator: Authenticator,
     pub(crate) cursor_keys: Arc<CursorKeyring>,
 }
 
@@ -50,7 +50,7 @@ impl AppState {
             store: Arc::new(ReadOnlyStore::new(config.database)),
             max_limit: config.max_limit,
             redact: config.redact,
-            auth_token: config.auth_token,
+            authenticator: config.authenticator,
             cursor_keys: Arc::new(config.cursor_keys),
         }
     }
@@ -150,21 +150,35 @@ async fn healthz(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> ApiResult<Json<serde_json::Value>> {
-    authorize(&state, &headers)?;
+    authorize(&state, &headers, Permission::HealthRead)?;
     db(state.store.check_readable())?;
     Ok(Json(json!({
         "generated_at": now_rfc3339(),
         "status": "ok",
         "read_only": true,
-        "auth_enabled": state.auth_token.is_some(),
+        "auth_enabled": state.authenticator.enabled(),
     })))
 }
 
 async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Response> {
-    authorize(&state, &headers)?;
+    authorize(&state, &headers, Permission::MetricsRead)?;
     let generated_at = now_rfc3339();
     let snapshot = db(state.store.controller_metrics(&generated_at))?;
-    let mut response = render_controller(&snapshot).into_response();
+    let mut body = render_controller(&snapshot);
+    let failures = auth_failure_counts();
+    body.push_str("# HELP ocfleet_controller_auth_failures_total Authentication and authorization failures.\n");
+    body.push_str("# TYPE ocfleet_controller_auth_failures_total counter\n");
+    for (reason, value) in [
+        ("missing", failures[0]),
+        ("invalid", failures[1]),
+        ("expired", failures[2]),
+        ("forbidden", failures[3]),
+    ] {
+        body.push_str(&format!(
+            "ocfleet_controller_auth_failures_total{{reason=\"{reason}\"}} {value}\n"
+        ));
+    }
+    let mut response = body.into_response();
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static(METRICS_CONTENT_TYPE),
@@ -176,7 +190,7 @@ async fn health_summary(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> ApiResult<Json<SummaryResponse>> {
-    authorize(&state, &headers)?;
+    authorize(&state, &headers, Permission::HealthRead)?;
     let records = db(state.store.list_node_health(state.max_limit))?;
     Ok(summary_response(health_summary_to_json(&records)))
 }
@@ -185,7 +199,7 @@ async fn health_nodes(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> ApiResult<Json<ListResponse>> {
-    authorize(&state, &headers)?;
+    authorize(&state, &headers, Permission::HealthRead)?;
     let records = db(state.store.list_node_health(state.max_limit))?;
     let items = records.iter().map(health_node_to_json).collect();
     Ok(list_response(state.max_limit, items))
@@ -196,7 +210,7 @@ async fn health_node(
     headers: HeaderMap,
     AxumPath(node_id): AxumPath<String>,
 ) -> ApiResult<Json<SingleResponse>> {
-    authorize(&state, &headers)?;
+    authorize(&state, &headers, Permission::HealthRead)?;
     validate_identifier("node_id", &node_id)?;
     let record = db(state.store.get_node_health(&node_id))?
         .ok_or_else(|| ApiError::not_found(format!("node not found: {node_id}")))?;
@@ -208,7 +222,7 @@ async fn health_slo(
     headers: HeaderMap,
     query: Result<Query<HealthSloQuery>, QueryRejection>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    authorize(&state, &headers)?;
+    authorize(&state, &headers, Permission::HealthRead)?;
     let query = parse_query(query)?;
     let to = query
         .to
@@ -282,7 +296,7 @@ async fn health_slo(
 }
 
 async fn jobs(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Json<ListResponse>> {
-    authorize(&state, &headers)?;
+    authorize(&state, &headers, Permission::FleetRead)?;
     let jobs = db(state.store.list_jobs(state.max_limit))?;
     let items = jobs.iter().map(job_to_json).collect();
     Ok(list_response(state.max_limit, items))
@@ -293,7 +307,7 @@ async fn job(
     headers: HeaderMap,
     AxumPath(job_id): AxumPath<String>,
 ) -> ApiResult<Json<SingleResponse>> {
-    authorize(&state, &headers)?;
+    authorize(&state, &headers, Permission::FleetRead)?;
     validate_identifier("job_id", &job_id)?;
     let job = db(state.store.get_job(&job_id))?
         .ok_or_else(|| ApiError::not_found(format!("job not found: {job_id}")))?;
@@ -305,7 +319,7 @@ async fn runs(
     headers: HeaderMap,
     query: Result<Query<RunsQuery>, QueryRejection>,
 ) -> ApiResult<Json<ListResponse>> {
-    authorize(&state, &headers)?;
+    authorize(&state, &headers, Permission::FleetRead)?;
     let query = parse_query(query)?;
     let limit = bounded_limit(query.limit, state.max_limit)?;
     if let Some(job_id) = &query.job_id {
@@ -330,7 +344,7 @@ async fn run(
     headers: HeaderMap,
     AxumPath(run_id): AxumPath<String>,
 ) -> ApiResult<Json<SingleResponse>> {
-    authorize(&state, &headers)?;
+    authorize(&state, &headers, Permission::FleetRead)?;
     validate_identifier("run_id", &run_id)?;
     let run = db(state.store.get_run(&run_id))?
         .ok_or_else(|| ApiError::not_found(format!("run not found: {run_id}")))?;
@@ -342,7 +356,7 @@ async fn observations(
     headers: HeaderMap,
     query: Result<Query<ObservationsQuery>, QueryRejection>,
 ) -> ApiResult<Json<ListResponse>> {
-    authorize(&state, &headers)?;
+    authorize(&state, &headers, Permission::FleetRead)?;
     let query = parse_query(query)?;
     let limit = bounded_limit(query.limit, state.max_limit)?;
     if let Some(node_id) = &query.node_id {
@@ -368,7 +382,7 @@ async fn observation(
     headers: HeaderMap,
     AxumPath(observation_id): AxumPath<String>,
 ) -> ApiResult<Json<SingleResponse>> {
-    authorize(&state, &headers)?;
+    authorize(&state, &headers, Permission::FleetRead)?;
     validate_identifier("observation_id", &observation_id)?;
     let observation = db(state.store.get_observation(&observation_id))?
         .ok_or_else(|| ApiError::not_found(format!("observation not found: {observation_id}")))?;
@@ -380,7 +394,7 @@ async fn alerts(
     headers: HeaderMap,
     query: Result<Query<AlertsQuery>, QueryRejection>,
 ) -> ApiResult<Json<ListResponse>> {
-    authorize(&state, &headers)?;
+    authorize(&state, &headers, Permission::FleetRead)?;
     let query = parse_query(query)?;
     let limit = bounded_limit(query.limit, state.max_limit)?;
     if let Some(state_filter) = &query.state {
@@ -407,7 +421,7 @@ async fn alert(
     headers: HeaderMap,
     AxumPath(lookup): AxumPath<String>,
 ) -> ApiResult<Json<SingleResponse>> {
-    authorize(&state, &headers)?;
+    authorize(&state, &headers, Permission::FleetRead)?;
     validate_identifier("alert lookup", &lookup)?;
     let alert = db(state.store.get_alert(&lookup))?
         .ok_or_else(|| ApiError::not_found(format!("alert not found: {lookup}")))?;
@@ -419,7 +433,7 @@ async fn audit_export(
     headers: HeaderMap,
     query: Result<Query<AuditExportQuery>, QueryRejection>,
 ) -> ApiResult<Json<ListResponse>> {
-    authorize(&state, &headers)?;
+    authorize(&state, &headers, Permission::AuditRead)?;
     let query = parse_query(query)?;
     let from = query
         .from
@@ -448,13 +462,23 @@ async fn audit_export(
     Ok(list_response(max_rows, items))
 }
 
-pub(crate) fn authorize(state: &AppState, headers: &HeaderMap) -> ApiResult<Principal> {
-    match &state.auth_token {
-        Some(token) => token
-            .authenticate_headers(headers)
-            .ok_or_else(ApiError::unauthorized),
-        None => Ok(Principal::local_viewer()),
+pub(crate) fn authorize(
+    state: &AppState,
+    headers: &HeaderMap,
+    permission: Permission,
+) -> ApiResult<Principal> {
+    let principal = state
+        .authenticator
+        .authenticate(headers)
+        .map_err(|failure| {
+            failure.record();
+            ApiError::unauthorized()
+        })?;
+    if !principal.permits(permission) {
+        record_forbidden();
+        return Err(ApiError::forbidden());
     }
+    Ok(principal)
 }
 
 pub(crate) fn db<T>(result: rusqlite::Result<T>) -> ApiResult<T> {

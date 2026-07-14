@@ -11,6 +11,8 @@ use ocfleet_cli::audit::AuditEvent;
 use ocfleet_cli::audit_export::run_audit_command;
 use ocfleet_cli::backend::StoreWriter;
 use ocfleet_cli::backup::{run_backup_command, run_restore_command};
+#[cfg(feature = "controlled-writes")]
+use ocfleet_cli::change::run_change_command;
 use ocfleet_cli::controller_rpc::{
     FixedControllerRpc, OcservCommandAudit, RpcAuditRecord, RpcCommandFailure,
     capability_snapshot_from_failure, capability_snapshot_from_success, elapsed_ms,
@@ -32,6 +34,8 @@ use ocfleet_cli::ocserv_output::{
     OcservStatusView, assert_low_sensitive_ocserv_output, format_cert_human, format_cert_json,
     format_sessions_human, format_status_json, format_status_view_human,
 };
+#[cfg(feature = "postgres-backend")]
+use ocfleet_cli::postgres_commands::run_postgres_command;
 use ocfleet_cli::retention::run_retention_command;
 use ocfleet_cli::scheduler::run_schedule_command;
 use ocfleet_cli::store::{
@@ -606,6 +610,13 @@ async fn main() -> anyhow::Result<()> {
             let store = Store::open(&cli.database).context("failed to open controller database")?;
             run_alert_command(&store, command).await?;
         }
+        #[cfg(feature = "controlled-writes")]
+        Command::Change { command } => {
+            let store = Store::open(&cli.database).context("failed to open controller database")?;
+            run_change_command(&store, &actor, command)?;
+        }
+        #[cfg(feature = "postgres-backend")]
+        Command::Postgres { command } => run_postgres_command(command)?,
     }
 
     Ok(())

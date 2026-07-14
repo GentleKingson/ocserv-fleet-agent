@@ -20,7 +20,7 @@ not claim Postgres runtime parity, alert delivery, or controlled-write behavior.
 | Crash recovery | Startup recovery terminalizes at most 100 abandoned runs per transaction with fixed `HEALTH_EVALUATION_ABANDONED` | `health_evaluation_recovery_is_bounded_atomic_and_instant_ordered` | proven |
 | Clock correctness | Recovery parses RFC 3339 instants and handles equivalent offset timestamps instead of text ordering | `health_evaluation_recovery_is_bounded_atomic_and_instant_ordered` | proven |
 | Graceful shutdown and restart | Signal handlers precede evaluation; admitted work finishes; restart reuses durable replay and leaves no running row | `health_evaluator_daemon_drains_on_sigterm_and_restarts_cleanly` | proven |
-| Backend-neutral mutations | Start, finish, failure, and recovery are actor-bound `StoreWriter` methods | SQLite compiler coverage; controller mutation guard | proven for contract, Postgres runtime remains C1 |
+| Backend-neutral mutations | Start, finish, failure, and recovery are actor-bound `StoreWriter` methods | SQLite compiler coverage; controller mutation guard | proven for contract; the experimental Postgres snapshot foundation remains C1 |
 
 ## Security Invariants
 

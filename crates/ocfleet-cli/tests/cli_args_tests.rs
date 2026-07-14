@@ -11,6 +11,11 @@ use ocfleet_cli::args::{
 };
 use std::path::PathBuf;
 
+#[cfg(feature = "postgres-backend")]
+use ocfleet_cli::args::PostgresCommand;
+#[cfg(feature = "controlled-writes")]
+use ocfleet_cli::args::{ChangeApproverRole, ChangeCommand};
+
 #[test]
 fn parses_backup_commands() {
     let create = Cli::parse_from([
@@ -1917,4 +1922,101 @@ fn parses_fixed_health_slo_windows() {
         ])
         .is_err()
     );
+}
+
+#[cfg(feature = "controlled-writes")]
+#[test]
+fn parses_controlled_write_commands_without_dispatch_surface() {
+    let create = Cli::parse_from([
+        "ocfleet",
+        "--actor",
+        "operator-a",
+        "change",
+        "create",
+        "--intent",
+        "intent.json",
+        "--trusted-keyring",
+        "trusted.toml",
+        "--key-id",
+        "operator-key",
+        "--signature-file",
+        "intent.sig",
+        "--json",
+    ]);
+    assert!(matches!(
+        create.command,
+        Command::Change {
+            command: ChangeCommand::Create { json: true, .. }
+        }
+    ));
+
+    let approve = Cli::parse_from([
+        "ocfleet",
+        "change",
+        "approve",
+        "018f2f5e-4c44-7b55-9000-000000000001",
+        "--approval-id",
+        "approval-1",
+        "--role",
+        "change-approver",
+        "--reason",
+        "Reviewed exact endpoint",
+        "--expires-at",
+        "2026-07-15T00:00:00Z",
+    ]);
+    assert!(matches!(
+        approve.command,
+        Command::Change {
+            command: ChangeCommand::Approve {
+                role: ChangeApproverRole::ChangeApprover,
+                ..
+            }
+        }
+    ));
+
+    for forbidden in ["dispatch", "execute", "reload", "restart", "apply"] {
+        assert!(Cli::try_parse_from(["ocfleet", "change", forbidden]).is_err());
+    }
+}
+
+#[cfg(feature = "postgres-backend")]
+#[test]
+fn parses_explicit_postgres_management_commands() {
+    let import = Cli::parse_from([
+        "ocfleet",
+        "postgres",
+        "import",
+        "--config",
+        "/run/secrets/postgres.toml",
+        "--source",
+        "controller.sqlite",
+        "--dry-run",
+        "--json",
+    ]);
+    assert!(matches!(
+        import.command,
+        Command::Postgres {
+            command: PostgresCommand::Import {
+                dry_run: true,
+                json: true,
+                ..
+            }
+        }
+    ));
+
+    let export = Cli::parse_from([
+        "ocfleet",
+        "postgres",
+        "export",
+        "--config",
+        "/run/secrets/postgres.toml",
+        "--output",
+        "/var/lib/ocfleet/export.sqlite",
+    ]);
+    assert!(matches!(
+        export.command,
+        Command::Postgres {
+            command: PostgresCommand::Export { .. }
+        }
+    ));
 }

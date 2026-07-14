@@ -86,6 +86,146 @@ pub enum Command {
         #[command(subcommand)]
         command: RestoreCommand,
     },
+    #[cfg(feature = "controlled-writes")]
+    Change {
+        #[command(subcommand)]
+        command: ChangeCommand,
+    },
+    #[cfg(feature = "postgres-backend")]
+    /// Experimental Postgres-wrapped SQLite snapshot lifecycle commands.
+    Postgres {
+        #[command(subcommand)]
+        command: PostgresCommand,
+    },
+}
+
+#[cfg(feature = "postgres-backend")]
+#[derive(Debug, Subcommand)]
+pub enum PostgresCommand {
+    Doctor {
+        #[arg(long, value_name = "PATH")]
+        config: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    Import {
+        #[arg(long, value_name = "PATH")]
+        config: PathBuf,
+        #[arg(long, value_name = "PATH")]
+        source: PathBuf,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        lease_owner: Option<String>,
+        #[arg(long, default_value_t = 300)]
+        lease_ttl_seconds: u32,
+        #[arg(long)]
+        json: bool,
+    },
+    Export {
+        #[arg(long, value_name = "PATH")]
+        config: PathBuf,
+        #[arg(long, value_name = "PATH")]
+        output: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[cfg(feature = "controlled-writes")]
+#[derive(Debug, Subcommand)]
+pub enum ChangeCommand {
+    Digest {
+        #[arg(long, value_name = "PATH")]
+        intent: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    Create {
+        #[arg(long, value_name = "PATH")]
+        intent: PathBuf,
+        #[arg(long, value_name = "PATH")]
+        trusted_keyring: PathBuf,
+        #[arg(long)]
+        key_id: String,
+        #[arg(long, value_name = "PATH")]
+        signature_file: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    List {
+        #[arg(long, default_value_t = 100)]
+        limit: u64,
+        #[arg(long)]
+        json: bool,
+    },
+    Show {
+        request_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    DryRun {
+        request_id: String,
+        #[arg(long, value_name = "PATH")]
+        policy_file: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    Approve {
+        request_id: String,
+        #[arg(long)]
+        approval_id: String,
+        #[arg(long, value_enum)]
+        role: ChangeApproverRole,
+        #[arg(long)]
+        reason: String,
+        #[arg(long)]
+        expires_at: String,
+        #[arg(long)]
+        json: bool,
+    },
+    Reject {
+        request_id: String,
+        #[arg(long)]
+        approval_id: String,
+        #[arg(long, value_enum)]
+        role: ChangeApproverRole,
+        #[arg(long)]
+        reason: String,
+        #[arg(long)]
+        expires_at: String,
+        #[arg(long)]
+        json: bool,
+    },
+    Cancel {
+        request_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    Audit {
+        request_id: String,
+        #[arg(long, default_value_t = 100)]
+        limit: u64,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[cfg(feature = "controlled-writes")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ChangeApproverRole {
+    ChangeApprover,
+    SecurityAdmin,
+}
+
+#[cfg(feature = "controlled-writes")]
+impl ChangeApproverRole {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ChangeApprover => "change-approver",
+            Self::SecurityAdmin => "security-admin",
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]

@@ -5,7 +5,7 @@ use anyhow::{Context, bail};
 use clap::Parser;
 use ocfleet_cli::args::RedactionMode;
 
-use crate::auth::AuthToken;
+use crate::auth::{AuthToken, Authenticator};
 use crate::cursor_keys::CursorKeyring;
 
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:8080";
@@ -30,6 +30,8 @@ pub struct ApiCli {
     #[arg(long, value_name = "PATH")]
     pub auth_token_file: Option<PathBuf>,
     #[arg(long, value_name = "PATH")]
+    pub auth_config_file: Option<PathBuf>,
+    #[arg(long, value_name = "PATH")]
     pub cursor_key_file: Option<PathBuf>,
 }
 
@@ -39,7 +41,7 @@ pub struct ApiConfig {
     pub listen: SocketAddr,
     pub max_limit: u64,
     pub redact: RedactionMode,
-    pub auth_token: Option<AuthToken>,
+    pub authenticator: Authenticator,
     pub cursor_keys: CursorKeyring,
 }
 
@@ -53,15 +55,24 @@ impl ApiConfig {
         if cli.max_limit == 0 || cli.max_limit > ABSOLUTE_MAX_LIMIT {
             bail!("--max-limit must be between 1 and {ABSOLUTE_MAX_LIMIT}");
         }
-        if !cli.listen.ip().is_loopback() && cli.auth_token_file.is_none() {
-            bail!("--auth-token-file is required when --listen is not loopback");
-        }
         let auth_token = cli
             .auth_token_file
             .as_deref()
             .map(AuthToken::from_private_file)
             .transpose()
             .context("failed to load --auth-token-file")?;
+        let authenticator = Authenticator::load(auth_token, cli.auth_config_file.as_deref())
+            .context("failed to load authentication configuration")?;
+        if !cli.listen.ip().is_loopback() && !authenticator.enabled() {
+            bail!(
+                "--auth-token-file or a remote method in --auth-config-file is required when --listen is not loopback"
+            );
+        }
+        if !cli.listen.ip().is_loopback() && authenticator.mtls_proxy_enabled() {
+            bail!(
+                "mTLS forwarded identity headers require a loopback listener behind a trusted TLS proxy"
+            );
+        }
         let cursor_key_file = cli
             .cursor_key_file
             .as_deref()
@@ -73,12 +84,12 @@ impl ApiConfig {
             listen: cli.listen,
             max_limit: cli.max_limit,
             redact: cli.redact,
-            auth_token,
+            authenticator,
             cursor_keys,
         })
     }
 
     pub fn auth_enabled(&self) -> bool {
-        self.auth_token.is_some()
+        self.authenticator.enabled()
     }
 }

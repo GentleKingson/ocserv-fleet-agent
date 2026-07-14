@@ -15,11 +15,14 @@
     {
       "BearerAuth": []
     },
+    {
+      "ForwardedMutualTLS": []
+    },
     {}
   ],
   "x-ocfleet-listener-auth": {
-    "loopback": "bearer-optional-local-viewer",
-    "non_loopback": "bearer-required-viewer-only",
+    "loopback": "local-development-or-configured-auth",
+    "non_loopback": "configured-remote-auth-required",
     "transport": "plain-http-upstream-requires-tls-reverse-proxy"
   },
   "x-ocfleet-cursor-signing": {
@@ -482,7 +485,13 @@
       "BearerAuth": {
         "type": "http",
         "scheme": "bearer",
-        "description": "Required for non-loopback listeners via a private --auth-token-file and resolves only to the viewer role. The API is plain HTTP: non-loopback deployments must use a TLS-terminating reverse proxy plus firewall/private-network controls, and must not expose port 8080 directly to the public Internet. Loopback local-operator listeners may run unauthenticated."
+        "description": "Legacy viewer tokens, expiring service-account tokens, and signed OIDC EdDSA JWTs are accepted according to the private auth configuration. OIDC validates issuer, audience, expiry, not-before, signature, pinned JWKS key ID, and explicit group-to-role mappings."
+      },
+      "ForwardedMutualTLS": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-Ocfleet-Mtls-Subject",
+        "description": "Available only on a loopback listener behind the trusted TLS reverse proxy. The proxy must verify the client certificate, remove client-supplied X-Ocfleet-Mtls-* headers, and set the fixed verified marker, exact mapped subject, and private X-Ocfleet-Mtls-Proxy-Secret. The API constant-time verifies the configured proxy-secret digest before trusting the subject."
       }
     },
     "parameters": {

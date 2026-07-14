@@ -197,6 +197,12 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         description: "Add bounded latest capability observations for read-only version governance.",
         apply: apply_0027_node_capability_snapshots,
     },
+    Migration {
+        version: 28,
+        name: "0028_controlled_write_state",
+        description: "Add the default-off controlled-write approval and audit state machine.",
+        apply: apply_0028_controlled_write_state,
+    },
 ];
 
 pub(crate) fn migrate_to_current(
@@ -1745,6 +1751,88 @@ CREATE TABLE node_capability_snapshots (
 );
 CREATE INDEX idx_node_capability_snapshots_observed
   ON node_capability_snapshots(observed_at, node_id);
+"#,
+    )?;
+    Ok(())
+}
+
+fn apply_0028_controlled_write_state(tx: &Transaction<'_>) -> Result<(), StoreError> {
+    tx.execute_batch(
+        r#"
+CREATE TABLE change_requests (
+  request_id TEXT PRIMARY KEY CHECK (length(request_id) BETWEEN 1 AND 128),
+  operation_id TEXT NOT NULL UNIQUE CHECK (length(operation_id) BETWEEN 1 AND 128),
+  operation_kind TEXT NOT NULL CHECK (operation_kind IN ('ocserv_reload', 'ocserv_restart', 'ocserv_config_apply', 'ocserv_config_rollback')),
+  endpoint_id TEXT NOT NULL CHECK (length(endpoint_id) BETWEEN 1 AND 128),
+  actor TEXT NOT NULL CHECK (length(actor) BETWEEN 1 AND 128),
+  reason TEXT NOT NULL CHECK (length(reason) BETWEEN 1 AND 256),
+  change_ticket TEXT NOT NULL CHECK (length(change_ticket) BETWEEN 1 AND 128),
+  operation_digest TEXT NOT NULL CHECK (length(operation_digest) = 64),
+  nonce TEXT NOT NULL UNIQUE CHECK (length(nonce) BETWEEN 16 AND 128),
+  signer_key_id TEXT NOT NULL CHECK (length(signer_key_id) BETWEEN 1 AND 128),
+  signed_intent_json TEXT NOT NULL CHECK (json_valid(signed_intent_json)),
+  params_summary_json TEXT NOT NULL CHECK (json_valid(params_summary_json)),
+  state TEXT NOT NULL CHECK (state IN ('draft', 'dry_run_pending', 'dry_run_succeeded', 'dry_run_failed', 'approval_pending', 'approved', 'rejected', 'dispatching', 'succeeded', 'failed', 'rollback_pending', 'rolled_back', 'cancelled', 'expired')),
+  expires_at TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX idx_change_requests_state_updated
+  ON change_requests(state, updated_at, request_id);
+CREATE INDEX idx_change_requests_endpoint_updated
+  ON change_requests(endpoint_id, updated_at, request_id);
+
+CREATE TABLE change_approvals (
+  approval_id TEXT PRIMARY KEY CHECK (length(approval_id) BETWEEN 1 AND 128),
+  request_id TEXT NOT NULL REFERENCES change_requests(request_id) ON DELETE RESTRICT,
+  approver_actor TEXT NOT NULL CHECK (length(approver_actor) BETWEEN 1 AND 128),
+  approver_role TEXT NOT NULL CHECK (approver_role IN ('change-approver', 'security-admin')),
+  decision TEXT NOT NULL CHECK (decision IN ('approved', 'rejected')),
+  reason TEXT NOT NULL CHECK (length(reason) BETWEEN 1 AND 256),
+  expires_at TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE(request_id, approver_actor)
+);
+CREATE INDEX idx_change_approvals_request ON change_approvals(request_id, created_at);
+
+CREATE TABLE write_operation_attempts (
+  attempt_id TEXT PRIMARY KEY CHECK (length(attempt_id) BETWEEN 1 AND 128),
+  request_id TEXT NOT NULL REFERENCES change_requests(request_id) ON DELETE RESTRICT,
+  attempt_kind TEXT NOT NULL CHECK (attempt_kind IN ('dry_run', 'dispatch', 'rollback')),
+  status TEXT NOT NULL CHECK (status IN ('pending', 'succeeded', 'failed')),
+  validation_code TEXT,
+  created_at TEXT NOT NULL,
+  completed_at TEXT
+);
+CREATE INDEX idx_write_attempts_request ON write_operation_attempts(request_id, created_at);
+
+CREATE TABLE write_operation_audit (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts TEXT NOT NULL,
+  request_id TEXT NOT NULL REFERENCES change_requests(request_id) ON DELETE RESTRICT,
+  operation_id TEXT NOT NULL,
+  operation_kind TEXT NOT NULL,
+  actor TEXT NOT NULL,
+  approval_id TEXT,
+  state_from TEXT,
+  state_to TEXT NOT NULL,
+  ok INTEGER CHECK (ok IS NULL OR ok IN (0, 1)),
+  error_code TEXT,
+  detail_json TEXT NOT NULL CHECK (json_valid(detail_json))
+);
+CREATE INDEX idx_write_audit_request ON write_operation_audit(request_id, id);
+CREATE INDEX idx_write_audit_ts ON write_operation_audit(ts, id);
+
+CREATE TABLE signed_bundles (
+  bundle_id TEXT PRIMARY KEY CHECK (length(bundle_id) BETWEEN 1 AND 128),
+  bundle_sha256 TEXT NOT NULL CHECK (length(bundle_sha256) = 64),
+  signer_key_id TEXT NOT NULL CHECK (length(signer_key_id) BETWEEN 1 AND 128),
+  signature_algorithm TEXT NOT NULL CHECK (signature_algorithm = 'Ed25519'),
+  signature TEXT NOT NULL,
+  expected_previous_bundle_id TEXT,
+  rollback_bundle_id TEXT,
+  created_at TEXT NOT NULL
+);
 "#,
     )?;
     Ok(())

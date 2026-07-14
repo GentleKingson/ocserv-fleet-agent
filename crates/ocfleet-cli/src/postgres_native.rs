@@ -13,7 +13,7 @@ use postgres::{Config, GenericClient, NoTls, Transaction};
 use r2d2::{Pool, PooledConnection};
 use r2d2_postgres::PostgresConnectionManager;
 use serde_json::{Value, json};
-use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
 use crate::audit::AuditEvent;
@@ -609,6 +609,8 @@ CREATE INDEX idx_native_join_token_status
     ) -> Result<(), PostgresError> {
         validate_actor(actor).map_err(PostgresError::InvalidInput)?;
         map_store_validation(validate_node_metadata_record(metadata))?;
+        let updated_at =
+            parse_postgres_timestamp(&metadata.updated_at, "node metadata updated_at")?;
         let mut conn = self.connection()?;
         let mut tx = conn.transaction()?;
         if get_node_tx(&mut tx, &metadata.node_id)?.is_none() {
@@ -621,8 +623,7 @@ CREATE INDEX idx_native_join_token_status
             "INSERT INTO ocfleet_native.node_metadata
              (node_id, environment, site, owner_team, service_tier, expected_agent_version,
               labels_json, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, CAST($7 AS text)::jsonb,
-                     CAST($8 AS text)::timestamptz)
+             VALUES ($1, $2, $3, $4, $5, $6, CAST($7 AS text)::jsonb, $8)
              ON CONFLICT (node_id) DO UPDATE SET
                environment = EXCLUDED.environment,
                site = EXCLUDED.site,
@@ -639,7 +640,7 @@ CREATE INDEX idx_native_join_token_status
                 &metadata.service_tier,
                 &metadata.expected_agent_version,
                 &metadata.labels_json.to_string(),
-                &metadata.updated_at,
+                &updated_at,
             ],
         )?;
         let after = get_node_metadata_tx(&mut tx, &metadata.node_id)?
@@ -676,6 +677,10 @@ CREATE INDEX idx_native_join_token_status
     ) -> Result<(), PostgresError> {
         validate_actor(actor).map_err(PostgresError::InvalidInput)?;
         map_store_validation(validate_node_maintenance_record(window))?;
+        let starts_at = parse_postgres_timestamp(&window.starts_at, "node maintenance starts_at")?;
+        let ends_at = parse_postgres_timestamp(&window.ends_at, "node maintenance ends_at")?;
+        let updated_at =
+            parse_postgres_timestamp(&window.updated_at, "node maintenance updated_at")?;
         let mut conn = self.connection()?;
         let mut tx = conn.transaction()?;
         if get_node_tx(&mut tx, &window.node_id)?.is_none() {
@@ -686,8 +691,7 @@ CREATE INDEX idx_native_join_token_status
         tx.execute(
             "INSERT INTO ocfleet_native.node_maintenance_windows
              (node_id, starts_at, ends_at, reason, updated_at)
-             VALUES ($1, CAST($2 AS text)::timestamptz, CAST($3 AS text)::timestamptz,
-                     $4, CAST($5 AS text)::timestamptz)
+             VALUES ($1, $2, $3, $4, $5)
              ON CONFLICT (node_id) DO UPDATE SET
                starts_at = EXCLUDED.starts_at,
                ends_at = EXCLUDED.ends_at,
@@ -695,10 +699,10 @@ CREATE INDEX idx_native_join_token_status
                updated_at = EXCLUDED.updated_at",
             &[
                 &window.node_id,
-                &window.starts_at,
-                &window.ends_at,
+                &starts_at,
+                &ends_at,
                 &window.reason,
-                &window.updated_at,
+                &updated_at,
             ],
         )?;
         let mut event = AuditEvent::new(actor, "node.maintenance.set");
@@ -725,11 +729,7 @@ CREATE INDEX idx_native_join_token_status
             .map_err(|error| PostgresError::InvalidInput(error.to_string()))?;
         let mut conn = self.connection()?;
         conn.query_opt(
-            "SELECT node_id,
-                    to_char(starts_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),
-                    to_char(ends_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),
-                    reason,
-                    to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')
+            "SELECT node_id, starts_at, ends_at, reason, updated_at
              FROM ocfleet_native.node_maintenance_windows WHERE node_id = $1",
             &[&node_id],
         )?
@@ -744,15 +744,15 @@ CREATE INDEX idx_native_join_token_status
     ) -> Result<bool, PostgresError> {
         validate_node_id(node_id)
             .map_err(|error| PostgresError::InvalidInput(error.to_string()))?;
-        validate_rfc3339(now, "node maintenance check timestamp")?;
+        let now = parse_postgres_timestamp(now, "node maintenance check timestamp")?;
         let mut conn = self.connection()?;
         Ok(conn
             .query_one(
                 "SELECT EXISTS (
                    SELECT 1 FROM ocfleet_native.node_maintenance_windows
                    WHERE node_id = $1
-                     AND starts_at <= CAST($2 AS text)::timestamptz
-                     AND CAST($2 AS text)::timestamptz < ends_at
+                     AND starts_at <= $2
+                     AND $2 < ends_at
                  )",
                 &[&node_id, &now],
             )?
@@ -796,7 +796,8 @@ CREATE INDEX idx_native_join_token_status
         validate_node_id(&snapshot.node_id)
             .map_err(|error| PostgresError::InvalidInput(error.to_string()))?;
         validate_endpoint_id(&snapshot.endpoint_id).map_err(PostgresError::InvalidInput)?;
-        validate_rfc3339(&snapshot.observed_at, "capability observed_at")?;
+        let observed_at =
+            parse_postgres_timestamp(&snapshot.observed_at, "capability observed_at")?;
         if audit.node_id.as_deref() != Some(snapshot.node_id.as_str())
             || audit.endpoint_id.as_deref() != Some(snapshot.endpoint_id.as_str())
             || audit.method.as_deref() != Some(ocfleet_protocol::method::NODE_CAPABILITIES)
@@ -823,7 +824,7 @@ CREATE INDEX idx_native_join_token_status
              (node_id, endpoint_id, observed_at, status, agent_version,
               protocol_min, protocol_max, ocserv_snapshot_min, ocserv_snapshot_max,
               controlled_writes_compiled, controlled_writes_locally_enabled)
-             VALUES ($1, $2, CAST($3 AS text)::timestamptz, $4, $5, $6, $7, $8, $9, $10, $11)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
              ON CONFLICT (node_id) DO UPDATE SET
                endpoint_id = EXCLUDED.endpoint_id,
                observed_at = EXCLUDED.observed_at,
@@ -839,7 +840,7 @@ CREATE INDEX idx_native_join_token_status
             &[
                 &snapshot.node_id,
                 &snapshot.endpoint_id,
-                &snapshot.observed_at,
+                &observed_at,
                 &snapshot.status.as_str(),
                 &snapshot.agent_version,
                 &protocol_min,
@@ -863,9 +864,7 @@ CREATE INDEX idx_native_join_token_status
             .map_err(|error| PostgresError::InvalidInput(error.to_string()))?;
         let mut conn = self.connection()?;
         conn.query_opt(
-            "SELECT node_id, endpoint_id,
-                    to_char(observed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),
-                    status, agent_version, protocol_min, protocol_max,
+            "SELECT node_id, endpoint_id, observed_at, status, agent_version, protocol_min, protocol_max,
                     ocserv_snapshot_min, ocserv_snapshot_max,
                     controlled_writes_compiled, controlled_writes_locally_enabled
              FROM ocfleet_native.node_capability_snapshots WHERE node_id = $1",
@@ -890,9 +889,7 @@ CREATE INDEX idx_native_join_token_status
         let mut conn = self.connection()?;
         let rows = conn.query(
             "SELECT n.node_id, n.enabled, m.expected_agent_version,
-                    c.node_id, c.endpoint_id,
-                    CASE WHEN c.observed_at IS NULL THEN NULL ELSE
-                      to_char(c.observed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') END,
+                    c.node_id, c.endpoint_id, c.observed_at,
                     c.status, c.agent_version, c.protocol_min, c.protocol_max,
                     c.ocserv_snapshot_min, c.ocserv_snapshot_max,
                     c.controlled_writes_compiled, c.controlled_writes_locally_enabled
@@ -943,15 +940,22 @@ CREATE INDEX idx_native_join_token_status
             });
         }
         let mut conn = self.connection()?;
+        let query_limit = i64::try_from(MAX_STORE_READER_ROWS.saturating_add(1)).map_err(|_| {
+            PostgresError::InvalidState("native trust snapshot bound exceeds i64".to_string())
+        })?;
         let rows = conn.query(
             "SELECT endpoint_id, node_id, fingerprint, status, generation,
                     previous_endpoint_id, rotated_to, trust_bundle_json::text,
-                    to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),
-                    to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')
+                    created_at, updated_at
              FROM ocfleet_native.endpoint_trust ORDER BY endpoint_id
              LIMIT $1",
-            &[&(MAX_STORE_READER_ROWS as i64)],
+            &[&query_limit],
         )?;
+        if rows.len() > MAX_STORE_READER_ROWS as usize {
+            return Err(PostgresError::InvalidState(format!(
+                "native trust snapshot exceeds bounded limit of {MAX_STORE_READER_ROWS} endpoints"
+            )));
+        }
         Ok(TrustSnapshot {
             endpoints: rows
                 .iter()
@@ -1213,6 +1217,8 @@ CREATE INDEX idx_native_join_token_status
             enrollment_metadata_payload(EnrollmentMetadataKindV1::TokenScope, &token.scope_json)?;
         let max_uses = i32::try_from(token.max_uses)
             .map_err(|_| PostgresError::InvalidInput("token max uses exceeds i32".into()))?;
+        let expires_at =
+            parse_postgres_timestamp(&token.expires_at, "enrollment token expires_at")?;
         let mut conn = self.connection()?;
         let mut tx = conn.transaction()?;
         if let Some(existing) = get_enrollment_token_tx(&mut tx, &token.token_id)? {
@@ -1240,13 +1246,13 @@ CREATE INDEX idx_native_join_token_status
             "INSERT INTO ocfleet_native.enrollment_tokens
              (token_id, token_hash, created_by, expires_at, max_uses, status,
               description, labels_json, scope_json)
-             VALUES ($1, $2, $3, CAST($4 AS text)::timestamptz, $5, 'active', $6,
+             VALUES ($1, $2, $3, $4, $5, 'active', $6,
                      CAST($7 AS text)::jsonb, CAST($8 AS text)::jsonb)",
             &[
                 &token.token_id,
                 &token.token_hash,
                 &actor,
-                &token.expires_at,
+                &expires_at,
                 &max_uses,
                 &token.description,
                 &labels.to_string(),
@@ -1894,13 +1900,41 @@ fn checked_query_limit(limit: u64) -> Result<i64, PostgresError> {
         .map_err(|_| PostgresError::InvalidInput("query limit exceeds i64".to_string()))
 }
 
-fn validate_rfc3339(value: &str, field: &str) -> Result<(), PostgresError> {
-    if value.is_empty() || value.len() > 64 || OffsetDateTime::parse(value, &Rfc3339).is_err() {
+fn parse_postgres_timestamp(value: &str, field: &str) -> Result<OffsetDateTime, PostgresError> {
+    if value.is_empty() || value.len() > 64 {
         return Err(PostgresError::InvalidInput(format!(
             "{field} must be bounded RFC3339"
         )));
     }
-    Ok(())
+    let parsed = OffsetDateTime::parse(value, &Rfc3339)
+        .map_err(|_| PostgresError::InvalidInput(format!("{field} must be bounded RFC3339")))?;
+    parsed
+        .replace_nanosecond((parsed.nanosecond() / 1_000) * 1_000)
+        .map_err(|_| {
+            PostgresError::InvalidInput(format!(
+                "{field} cannot be represented at Postgres microsecond precision"
+            ))
+        })
+}
+
+fn format_postgres_timestamp(value: OffsetDateTime, field: &str) -> Result<String, PostgresError> {
+    let value = value
+        .replace_nanosecond((value.nanosecond() / 1_000) * 1_000)
+        .map_err(|_| PostgresError::InvalidState(format!("native {field} is invalid")))?;
+    value
+        .to_offset(UtcOffset::UTC)
+        .format(&Rfc3339)
+        .map_err(|_| PostgresError::InvalidState(format!("native {field} is invalid")))
+}
+
+fn postgres_timestamps_equal(left: &str, right: &str) -> bool {
+    matches!(
+        (
+            parse_postgres_timestamp(left, "timestamp"),
+            parse_postgres_timestamp(right, "timestamp"),
+        ),
+        (Ok(left), Ok(right)) if left == right
+    )
 }
 
 fn get_node_tx(
@@ -1922,8 +1956,7 @@ fn get_node_metadata_conn<C: GenericClient>(
 ) -> Result<Option<NodeMetadataRecord>, PostgresError> {
     conn.query_opt(
         "SELECT node_id, environment, site, owner_team, service_tier,
-                labels_json::text, expected_agent_version,
-                to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')
+                labels_json::text, expected_agent_version, updated_at
          FROM ocfleet_native.node_metadata WHERE node_id = $1",
         &[&node_id],
     )?
@@ -1951,17 +1984,17 @@ fn node_metadata_from_row(row: &postgres::Row) -> Result<NodeMetadataRecord, Pos
         service_tier: row.try_get(4)?,
         labels_json,
         expected_agent_version: row.try_get(6)?,
-        updated_at: row.try_get(7)?,
+        updated_at: format_postgres_timestamp(row.try_get(7)?, "node metadata updated_at")?,
     })
 }
 
 fn node_maintenance_from_row(row: &postgres::Row) -> Result<NodeMaintenanceWindow, PostgresError> {
     Ok(NodeMaintenanceWindow {
         node_id: row.try_get(0)?,
-        starts_at: row.try_get(1)?,
-        ends_at: row.try_get(2)?,
+        starts_at: format_postgres_timestamp(row.try_get(1)?, "node maintenance starts_at")?,
+        ends_at: format_postgres_timestamp(row.try_get(2)?, "node maintenance ends_at")?,
         reason: row.try_get(3)?,
-        updated_at: row.try_get(4)?,
+        updated_at: format_postgres_timestamp(row.try_get(4)?, "node maintenance updated_at")?,
     })
 }
 
@@ -1989,7 +2022,7 @@ fn capability_from_offset_row(
     let snapshot = CapabilitySnapshot {
         node_id: row.try_get(offset)?,
         endpoint_id: row.try_get(offset + 1)?,
-        observed_at: row.try_get(offset + 2)?,
+        observed_at: format_postgres_timestamp(row.try_get(offset + 2)?, "capability observed_at")?,
         status,
         agent_version: row.try_get(offset + 4)?,
         protocol_min: optional_i32_to_u32(row.try_get(offset + 5)?)?,
@@ -2055,14 +2088,12 @@ fn get_endpoint_trust_conn<C: GenericClient>(
     let sql = if for_update {
         "SELECT endpoint_id, node_id, fingerprint, status, generation,
                 previous_endpoint_id, rotated_to, trust_bundle_json::text,
-                to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),
-                to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')
+                created_at, updated_at
          FROM ocfleet_native.endpoint_trust WHERE endpoint_id = $1 FOR UPDATE"
     } else {
         "SELECT endpoint_id, node_id, fingerprint, status, generation,
                 previous_endpoint_id, rotated_to, trust_bundle_json::text,
-                to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),
-                to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')
+                created_at, updated_at
          FROM ocfleet_native.endpoint_trust WHERE endpoint_id = $1"
     };
     conn.query_opt(sql, &[&endpoint_id])?
@@ -2103,8 +2134,8 @@ fn endpoint_trust_from_row(row: &postgres::Row) -> Result<EndpointTrustRecord, P
         previous_endpoint_id: row.try_get(5)?,
         rotated_to: row.try_get(6)?,
         trust_bundle_json: payload.public_bundle(),
-        created_at: row.try_get(8)?,
-        updated_at: row.try_get(9)?,
+        created_at: format_postgres_timestamp(row.try_get(8)?, "endpoint created_at")?,
+        updated_at: format_postgres_timestamp(row.try_get(9)?, "endpoint updated_at")?,
     })
 }
 
@@ -2213,7 +2244,7 @@ fn validate_enrollment_token_input(token: &EnrollmentTokenInsert) -> Result<(), 
             "enrollment token hash must be lowercase BLAKE3 hex".to_string(),
         ));
     }
-    validate_rfc3339(&token.expires_at, "enrollment token expires_at")?;
+    parse_postgres_timestamp(&token.expires_at, "enrollment token expires_at")?;
     if token.max_uses == 0 || token.max_uses > MAX_ENROLLMENT_TOKEN_USES {
         return Err(PostgresError::InvalidInput(format!(
             "enrollment token max uses must be 1-{MAX_ENROLLMENT_TOKEN_USES}"
@@ -2237,17 +2268,11 @@ fn get_enrollment_token_conn<C: GenericClient>(
     for_update: bool,
 ) -> Result<Option<EnrollmentTokenRecord>, PostgresError> {
     let sql = if for_update {
-        "SELECT token_id, token_hash,
-                to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),
-                created_by,
-                to_char(expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),
+        "SELECT token_id, token_hash, created_at, created_by, expires_at,
                 max_uses, used_count, status, description, labels_json::text, scope_json::text
          FROM ocfleet_native.enrollment_tokens WHERE token_id = $1 FOR UPDATE"
     } else {
-        "SELECT token_id, token_hash,
-                to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),
-                created_by,
-                to_char(expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),
+        "SELECT token_id, token_hash, created_at, created_by, expires_at,
                 max_uses, used_count, status, description, labels_json::text, scope_json::text
          FROM ocfleet_native.enrollment_tokens WHERE token_id = $1"
     };
@@ -2268,10 +2293,7 @@ fn get_enrollment_token_by_hash_tx(
     token_hash: &str,
 ) -> Result<Option<EnrollmentTokenRecord>, PostgresError> {
     tx.query_opt(
-        "SELECT token_id, token_hash,
-                to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),
-                created_by,
-                to_char(expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),
+        "SELECT token_id, token_hash, created_at, created_by, expires_at,
                 max_uses, used_count, status, description, labels_json::text, scope_json::text
          FROM ocfleet_native.enrollment_tokens WHERE token_hash = $1 FOR UPDATE",
         &[&token_hash],
@@ -2296,9 +2318,9 @@ fn enrollment_token_from_row(row: &postgres::Row) -> Result<EnrollmentTokenRecor
     Ok(EnrollmentTokenRecord {
         token_id: row.try_get(0)?,
         token_hash: row.try_get(1)?,
-        created_at: row.try_get(2)?,
+        created_at: format_postgres_timestamp(row.try_get(2)?, "enrollment token created_at")?,
         created_by: row.try_get(3)?,
-        expires_at: row.try_get(4)?,
+        expires_at: format_postgres_timestamp(row.try_get(4)?, "enrollment token expires_at")?,
         max_uses: u32::try_from(row.try_get::<_, i32>(5)?).map_err(|_| {
             PostgresError::InvalidState("native enrollment max uses is invalid".into())
         })?,
@@ -2331,19 +2353,13 @@ fn get_join_request_conn<C: GenericClient>(
     let sql = if for_update {
         "SELECT request_id, token_id, status, agent_public_key, fingerprint,
                 requested_endpoint_id, assigned_endpoint_id, hostname, agent_version,
-                requested_labels_json::text, approved_labels_json::text,
-                to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),
-                CASE WHEN approved_at IS NULL THEN NULL ELSE
-                  to_char(approved_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') END,
+                requested_labels_json::text, approved_labels_json::text, created_at, approved_at,
                 approved_by, rejection_reason, audit_correlation_id
          FROM ocfleet_native.join_requests WHERE request_id = $1 FOR UPDATE"
     } else {
         "SELECT request_id, token_id, status, agent_public_key, fingerprint,
                 requested_endpoint_id, assigned_endpoint_id, hostname, agent_version,
-                requested_labels_json::text, approved_labels_json::text,
-                to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),
-                CASE WHEN approved_at IS NULL THEN NULL ELSE
-                  to_char(approved_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') END,
+                requested_labels_json::text, approved_labels_json::text, created_at, approved_at,
                 approved_by, rejection_reason, audit_correlation_id
          FROM ocfleet_native.join_requests WHERE request_id = $1"
     };
@@ -2393,8 +2409,11 @@ fn join_request_from_row(row: &postgres::Row) -> Result<JoinRequestRecord, Postg
         agent_version: row.try_get(8)?,
         requested_labels_json: requested_labels,
         approved_labels_json: approved_labels,
-        created_at: row.try_get(11)?,
-        approved_at: row.try_get(12)?,
+        created_at: format_postgres_timestamp(row.try_get(11)?, "join request created_at")?,
+        approved_at: row
+            .try_get::<_, Option<OffsetDateTime>>(12)?
+            .map(|value| format_postgres_timestamp(value, "join request approved_at"))
+            .transpose()?,
         approved_by: row.try_get(13)?,
         rejection_reason: row.try_get(14)?,
         audit_correlation_id: row.try_get(15)?,
@@ -2409,7 +2428,7 @@ fn enrollment_token_matches(
     existing.token_id == requested.token_id
         && existing.token_hash == requested.token_hash
         && existing.created_by == actor
-        && existing.expires_at == requested.expires_at
+        && postgres_timestamps_equal(&existing.expires_at, &requested.expires_at)
         && existing.max_uses == requested.max_uses
         && existing.description == requested.description
         && existing.labels_json == requested.labels_json
@@ -2433,7 +2452,7 @@ fn join_request_matches(
 }
 
 fn token_is_expired(expires_at: &str) -> bool {
-    OffsetDateTime::parse(expires_at, &Rfc3339)
+    parse_postgres_timestamp(expires_at, "enrollment token expires_at")
         .map(|expires| expires <= OffsetDateTime::now_utc())
         .unwrap_or(true)
 }
@@ -2535,14 +2554,11 @@ fn node_audit_json(node: &NodeRecord) -> Value {
 
 fn insert_audit(tx: &mut Transaction<'_>, event: &AuditEvent) -> Result<(), PostgresError> {
     validate_actor(&event.actor).map_err(PostgresError::InvalidInput)?;
-    if event.ts.len() > 64 || OffsetDateTime::parse(&event.ts, &Rfc3339).is_err() {
-        return Err(PostgresError::InvalidInput(
-            "audit timestamp must be bounded RFC3339".to_string(),
-        ));
-    }
+    let audit_ts = parse_postgres_timestamp(&event.ts, "audit timestamp")?;
+    let canonical_audit_ts = format_postgres_timestamp(audit_ts, "audit timestamp")?;
     validate_low_sensitive_json(&event.detail_json, "audit detail")?;
     let detail = AuditDetailPayloadV1::new(
-        event.ts.clone(),
+        canonical_audit_ts,
         event.actor.clone(),
         event.event.clone(),
         event.node_id.clone(),
@@ -2565,10 +2581,10 @@ fn insert_audit(tx: &mut Transaction<'_>, event: &AuditEvent) -> Result<(), Post
         "INSERT INTO ocfleet_native.controller_audit_log
          (ts, actor, event, node_id, endpoint_id, method, request_id, params_hash,
           ok, error_code, duration_ms, detail_json)
-         VALUES (CAST($1 AS text)::timestamptz, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
                  CAST($12 AS text)::jsonb)",
         &[
-            &event.ts,
+            &audit_ts,
             &event.actor,
             &event.event,
             &event.node_id,

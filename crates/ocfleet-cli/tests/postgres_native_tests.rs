@@ -7,8 +7,10 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 
 use ocfleet_cli::audit::AuditEvent;
+use ocfleet_cli::backend::MAX_STORE_READER_ROWS;
 use ocfleet_cli::postgres_backend::{PostgresConnectionSource, PostgresError};
 use ocfleet_cli::postgres_native::{NATIVE_BACKEND_SCHEMA_VERSION, connect_native};
+use ocfleet_cli::storage_payloads::TrustBundlePayloadV1;
 use ocfleet_cli::store::{
     ApprovalInput, EnrollmentTokenInsert, JoinRequestInsert, LegacyEnrollmentClaimInput,
     NodeInsert, NodeMaintenanceWindow, NodeMetadataRecord, Store,
@@ -127,17 +129,18 @@ fn native_postgres_core_is_relational_atomic_and_future_schema_safe() {
         service_tier: "tier-1".into(),
         labels_json: json!({"purpose": "native-parity"}),
         expected_agent_version: Some("0.3.0".into()),
-        updated_at: "2026-07-14T12:00:00Z".into(),
+        updated_at: "2026-07-14T20:00:00.123456+08:00".into(),
     };
     store
         .set_node_metadata(&metadata, "operator-a")
         .expect("set native node metadata");
-    assert_eq!(
-        store
-            .get_node_metadata(&node.node_id)
-            .expect("get native node metadata"),
-        Some(metadata)
-    );
+    let stored_metadata = store
+        .get_node_metadata(&node.node_id)
+        .expect("get native node metadata")
+        .expect("stored native node metadata");
+    assert_eq!(stored_metadata.updated_at, "2026-07-14T12:00:00.123456Z");
+    assert_eq!(stored_metadata.node_id, metadata.node_id);
+    assert_eq!(stored_metadata.labels_json, metadata.labels_json);
     assert_eq!(
         store
             .list_nodes_by_role_limited("ocserv", 10)
@@ -154,23 +157,24 @@ fn native_postgres_core_is_relational_atomic_and_future_schema_safe() {
     );
     let maintenance = NodeMaintenanceWindow {
         node_id: node.node_id.clone(),
-        starts_at: "2026-07-14T13:00:00Z".into(),
-        ends_at: "2026-07-14T14:00:00Z".into(),
+        starts_at: "2026-07-14T21:00:00.123456+08:00".into(),
+        ends_at: "2026-07-14T07:00:00.999999-07:00".into(),
         reason: "native maintenance test".into(),
-        updated_at: "2026-07-14T12:00:00Z".into(),
+        updated_at: "2026-07-14T20:00:00.654321+08:00".into(),
     };
     store
         .set_node_maintenance(&maintenance, "operator-a")
         .expect("set native maintenance");
-    assert_eq!(
-        store
-            .get_node_maintenance(&node.node_id)
-            .expect("get native maintenance"),
-        Some(maintenance)
-    );
+    let stored_maintenance = store
+        .get_node_maintenance(&node.node_id)
+        .expect("get native maintenance")
+        .expect("stored native maintenance");
+    assert_eq!(stored_maintenance.starts_at, "2026-07-14T13:00:00.123456Z");
+    assert_eq!(stored_maintenance.ends_at, "2026-07-14T14:00:00.999999Z");
+    assert_eq!(stored_maintenance.updated_at, "2026-07-14T12:00:00.654321Z");
     assert!(
         store
-            .node_maintenance_active_at(&node.node_id, "2026-07-14T13:30:00Z")
+            .node_maintenance_active_at(&node.node_id, "2026-07-14T21:30:00.5+08:00")
             .expect("check native active maintenance")
     );
     assert!(
@@ -182,7 +186,7 @@ fn native_postgres_core_is_relational_atomic_and_future_schema_safe() {
     let capability = CapabilitySnapshot {
         node_id: node.node_id.clone(),
         endpoint_id: node.endpoint_id.clone(),
-        observed_at: "2026-07-14T12:01:00Z".into(),
+        observed_at: "2026-07-14T05:01:00.999999-07:00".into(),
         status: CapabilityNegotiationStatus::Compatible,
         agent_version: Some("0.3.0".into()),
         protocol_min: Some(1),
@@ -201,12 +205,13 @@ fn native_postgres_core_is_relational_atomic_and_future_schema_safe() {
     store
         .upsert_node_capability_snapshot_with_audit(&capability, &capability_audit)
         .expect("upsert native capability");
-    assert_eq!(
-        store
-            .get_node_capability_snapshot(&node.node_id)
-            .expect("get native capability"),
-        Some(capability)
-    );
+    let stored_capability = store
+        .get_node_capability_snapshot(&node.node_id)
+        .expect("get native capability")
+        .expect("stored native capability");
+    assert_eq!(stored_capability.observed_at, "2026-07-14T12:01:00.999999Z");
+    assert_eq!(stored_capability.node_id, capability.node_id);
+    assert_eq!(stored_capability.status, capability.status);
     assert_eq!(
         store
             .list_version_governance_inputs(10)
@@ -298,7 +303,7 @@ FOR EACH ROW EXECUTE FUNCTION fail_native_node_audit();
     let token = EnrollmentTokenInsert {
         token_id: "tok-native-c1-2".into(),
         token_hash: Store::hash_enrollment_token(token_plaintext),
-        expires_at: "2030-01-01T00:00:00Z".into(),
+        expires_at: "2030-01-01T08:00:00+08:00".into(),
         max_uses: 3,
         description: Some("native C1.2 integration".into()),
         labels_json: json!({"environment": "test"}),
@@ -308,6 +313,45 @@ FOR EACH ROW EXECUTE FUNCTION fail_native_node_audit();
         .create_enrollment_token(&token, "enrollment-admin")
         .expect("create native enrollment token");
     assert_eq!(created_token.used_count, 0);
+    assert_eq!(created_token.expires_at, "2030-01-01T00:00:00Z");
+    assert_eq!(
+        store
+            .create_enrollment_token(&token, "enrollment-admin")
+            .expect("retry offset native enrollment token")
+            .token_id,
+        token.token_id
+    );
+    for (index, (expires_at, canonical)) in [
+        ("2030-01-01T00:00:00.123456Z", "2030-01-01T00:00:00.123456Z"),
+        (
+            "2030-01-01T00:00:00.999999-07:00",
+            "2030-01-01T07:00:00.999999Z",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let retry_token = EnrollmentTokenInsert {
+            token_id: format!("tok-native-time-{index}"),
+            token_hash: Store::hash_enrollment_token(&format!("native-time-secret-{index}")),
+            expires_at: expires_at.into(),
+            max_uses: 1,
+            description: Some("native timestamp retry".into()),
+            labels_json: json!({}),
+            scope_json: json!({}),
+        };
+        let created = store
+            .create_enrollment_token(&retry_token, "enrollment-admin")
+            .expect("create fractional native enrollment token");
+        assert_eq!(created.expires_at, canonical);
+        assert_eq!(
+            store
+                .create_enrollment_token(&retry_token, "enrollment-admin")
+                .expect("retry fractional native enrollment token")
+                .token_id,
+            retry_token.token_id
+        );
+    }
 
     let enrolled_endpoint = iroh::SecretKey::generate().public().to_string();
     let request = JoinRequestInsert {
@@ -497,6 +541,39 @@ FOR EACH ROW EXECUTE FUNCTION fail_native_approval_audit();
         .revoke_enrollment_token(&token.token_id, "enrollment-admin", "integration complete")
         .expect("revoke native enrollment token");
     assert_eq!(revoked_token.status.as_str(), "revoked");
+
+    let mut overflow_tx = admin
+        .transaction()
+        .expect("start trust overflow transaction");
+    let overflow_insert = overflow_tx
+        .prepare(
+            "INSERT INTO ocfleet_native.endpoint_trust
+             (endpoint_id, node_id, status, generation, trust_bundle_json)
+             VALUES ($1, NULL, 'revoked', 1, CAST($2 AS text)::jsonb)",
+        )
+        .expect("prepare trust overflow insert");
+    for _ in 0..=MAX_STORE_READER_ROWS {
+        let endpoint_id = iroh::SecretKey::generate().public().to_string();
+        let payload = TrustBundlePayloadV1::new(
+            endpoint_id.clone(),
+            1,
+            "revoked".into(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("valid overflow trust payload")
+        .to_value();
+        overflow_tx
+            .execute(&overflow_insert, &[&endpoint_id, &payload.to_string()])
+            .expect("insert overflow trust row");
+    }
+    overflow_tx.commit().expect("commit trust overflow rows");
+    assert!(matches!(
+        store.trust_snapshot(None),
+        Err(PostgresError::InvalidState(message))
+            if message.contains("trust snapshot exceeds bounded limit")
+    ));
 
     let public_rows: i64 = admin
         .query_one("SELECT COUNT(*) FROM public.nodes", &[])

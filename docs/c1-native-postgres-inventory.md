@@ -69,10 +69,18 @@ The dormant native store now covers:
   atomic usage counters, join submit/reject/approve, and typed redacted audit;
 - atomic node, endpoint trust, join-state, and audit writes during enrollment.
 
+Native `TIMESTAMPTZ` values use typed Postgres/time conversion. Inputs are
+normalized to UTC RFC3339 at Postgres' microsecond precision, so equivalent
+offset forms and retry requests compare by instant without discarding
+fractional seconds. Full trust snapshots read one row beyond the 1,000-row
+bound and fail closed rather than returning an apparently complete prefix.
+
 The Docker regression exercises a v1-to-v2 upgrade, hostile `search_path`,
 metadata selectors, maintenance, capability projection, endpoint rotation and
 quarantine, successful/rejected/legacy enrollment flows, and trigger-injected
-audit failures that must roll back every registry and trust mutation.
+audit failures that must roll back every registry and trust mutation. It also
+covers offset and fractional timestamp retries plus a 1,001-row trust snapshot
+overflow.
 
 ## Completion Rule
 

@@ -25,6 +25,8 @@ pub mod ocserv_output;
 pub mod postgres_backend;
 #[cfg(feature = "postgres-backend")]
 pub mod postgres_commands;
+#[cfg(feature = "postgres-backend")]
+pub mod postgres_native;
 pub mod private_file;
 pub mod retention;
 pub mod rpc_client;

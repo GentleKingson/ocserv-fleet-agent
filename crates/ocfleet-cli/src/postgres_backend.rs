@@ -83,7 +83,7 @@ impl PostgresConnectionSource {
         }
     }
 
-    fn load(&self) -> Result<PrivatePostgresConfig, PostgresError> {
+    pub(crate) fn load(&self) -> Result<PrivatePostgresConfig, PostgresError> {
         self.validate()?;
         match self {
             Self::Environment { variable } => {
@@ -149,10 +149,10 @@ impl fmt::Debug for PostgresConnectionSource {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PrivatePostgresConfig {
-    dsn: String,
+pub(crate) struct PrivatePostgresConfig {
+    pub(crate) dsn: String,
     #[serde(default = "default_pool_size")]
-    pool_size: u32,
+    pub(crate) pool_size: u32,
 }
 
 fn default_pool_size() -> u32 {
@@ -175,6 +175,8 @@ pub enum PostgresError {
     UnsupportedBackendSchema(i32),
     #[error("Postgres imported state is invalid: {0}")]
     InvalidState(String),
+    #[error("Postgres backend input is invalid: {0}")]
+    InvalidInput(String),
     #[error("Postgres StoreWriter requires a current controller lease")]
     FenceRequired,
     #[error("Postgres controller lease is stale")]

@@ -1848,7 +1848,16 @@ fn alert_worker_daemon_drains_on_sigterm_and_restarts() {
     seed_stale_health_snapshot(&store);
     drop(store);
 
-    for previous_count in 0..2 {
+    for _ in 0..2 {
+        // A delayed test process must not mistake a later daemon cycle for startup.
+        let previous_count = Connection::open(&database)
+            .expect("open database before daemon start")
+            .query_row(
+                "SELECT count(*) FROM controller_audit_log WHERE event = 'alert.evaluate'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("evaluation count before daemon start");
         let mut child = spawn_ocfleet(&[
             "--database",
             &database_arg,
@@ -1858,7 +1867,7 @@ fn alert_worker_daemon_drains_on_sigterm_and_restarts() {
             "--hmac-secret-dir",
             &secret_dir_arg,
             "--interval-seconds",
-            "10",
+            "3600",
         ]);
         wait_for_alert_evaluation_count(
             &database,

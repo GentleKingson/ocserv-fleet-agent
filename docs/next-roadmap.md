@@ -21,7 +21,7 @@ automatic trust, automatic peer mesh, or automatic path-probe authorization.
 | Controller schema | SQLite schema version `25`; migrations `0001` through `0025` |
 | RPC protocol | Protocol version `1`; ALPN `/com.github.gentlekingson.ocfleet.mgmt/1` |
 | Other schemas | Config version `1`; trust-policy version `1`; collector snapshot `ocfleet.ocserv.snapshot.v2`; OpenAPI `3.1.1` |
-| Features | Every crate has an empty default feature set. `controlled-writes` exists in protocol/config/agent and is propagated by the agent. `postgres-backend` exists in the CLI. Both tracks are default-off. |
+| Features | Every crate has an empty default feature set. `controlled-writes` exists in protocol/config/agent and is propagated by the agent. `postgres-backend` exists in the CLI; the dormant native C1 work additionally requires `postgres-native-experimental`. All tracks are default-off. |
 | Runtime backends | SQLite only. The Postgres feature is a non-connecting scaffold. |
 | HTTP API | Read-only version `0.3.0`; sixteen declared `GET` paths including the dashboard root and metrics; API data access is SQLite read-only. |
 

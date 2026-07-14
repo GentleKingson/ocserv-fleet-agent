@@ -18,7 +18,7 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use crate::audit::AuditEvent;
 use crate::backend::MAX_STORE_READER_ROWS;
 use crate::input_validation::{validate_actor, validate_endpoint_id};
-use crate::postgres_backend::{PostgresConnectionSource, PostgresError};
+use crate::postgres_backend::{PostgresConnectionSource, PostgresError, validate_transport};
 use crate::storage_payloads::{AuditDetailPayloadV1, TrustBundlePayloadV1};
 use crate::store::{NodeInsert, NodeRecord, validate_low_sensitive_json};
 
@@ -26,6 +26,7 @@ type Manager = PostgresConnectionManager<NoTls>;
 type Connection = PooledConnection<Manager>;
 
 const MIGRATION_LOCK_ID: i64 = 0x4f43464c4e4154;
+const NATIVE_MIGRATION_1_NAME: &str = "0001_native_core";
 pub const NATIVE_BACKEND_SCHEMA_VERSION: i32 = 1;
 
 #[derive(Clone)]
@@ -45,8 +46,7 @@ pub fn connect_native(
     source: &PostgresConnectionSource,
 ) -> Result<PostgresNativeStore, PostgresError> {
     let private = source.load()?;
-    let config = Config::from_str(&private.dsn)
-        .map_err(|_| PostgresError::Configuration("Postgres DSN is invalid"))?;
+    let config = validated_native_config(&private.dsn)?;
     let manager = PostgresConnectionManager::new(config, NoTls);
     let pool = Pool::builder().max_size(private.pool_size).build(manager)?;
     let store = PostgresNativeStore { pool };
@@ -64,33 +64,63 @@ impl PostgresNativeStore {
         let mut tx = conn.transaction()?;
         tx.query_one("SELECT pg_advisory_xact_lock($1)", &[&MIGRATION_LOCK_ID])?;
 
-        let table_exists: bool = tx
-            .query_one(
-                "SELECT to_regclass('ocfleet_native_migrations') IS NOT NULL",
+        let schema_exists: bool = tx
+            .query_one("SELECT to_regnamespace('ocfleet_native') IS NOT NULL", &[])?
+            .get(0);
+        let migrations_exist = if schema_exists {
+            tx.query_one(
+                "SELECT to_regclass('ocfleet_native.migrations') IS NOT NULL",
                 &[],
             )?
-            .get(0);
-        if table_exists {
-            let existing: i32 = tx
+            .get(0)
+        } else {
+            false
+        };
+        let existing = if migrations_exist {
+            tx.query_one(
+                "SELECT COALESCE(MAX(version), 0) FROM ocfleet_native.migrations",
+                &[],
+            )?
+            .get::<_, i32>(0)
+        } else {
+            0
+        };
+        if existing > NATIVE_BACKEND_SCHEMA_VERSION {
+            return Err(PostgresError::UnsupportedBackendSchema(existing));
+        }
+        if existing >= 1 {
+            let migration_name: Option<String> = tx
                 .query_one(
-                    "SELECT COALESCE(MAX(version), 0) FROM ocfleet_native_migrations",
-                    &[],
+                    "SELECT (SELECT name FROM ocfleet_native.migrations WHERE version = $1)",
+                    &[&1_i32],
                 )?
                 .get(0);
-            if existing > NATIVE_BACKEND_SCHEMA_VERSION {
-                return Err(PostgresError::UnsupportedBackendSchema(existing));
+            if migration_name.as_deref() != Some(NATIVE_MIGRATION_1_NAME) {
+                return Err(PostgresError::InvalidState(
+                    "native Postgres migration history is inconsistent".to_string(),
+                ));
             }
         }
 
-        tx.batch_execute(
-            r#"
-CREATE TABLE IF NOT EXISTS ocfleet_native_migrations (
+        if !schema_exists {
+            tx.batch_execute("CREATE SCHEMA ocfleet_native")?;
+        }
+        if !migrations_exist {
+            tx.batch_execute(
+                r#"
+CREATE TABLE ocfleet_native.migrations (
   version INTEGER PRIMARY KEY CHECK (version > 0),
   name TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 128),
   applied_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
 );
+"#,
+            )?;
+        }
 
-CREATE TABLE IF NOT EXISTS nodes (
+        if existing < 1 {
+            tx.batch_execute(
+                r#"
+CREATE TABLE ocfleet_native.nodes (
   node_id TEXT PRIMARY KEY CHECK (length(node_id) BETWEEN 1 AND 128),
   endpoint_id TEXT NOT NULL UNIQUE CHECK (length(endpoint_id) BETWEEN 1 AND 128),
   name TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 128),
@@ -101,9 +131,9 @@ CREATE TABLE IF NOT EXISTS nodes (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
 );
 
-CREATE TABLE IF NOT EXISTS endpoint_trust (
-  endpoint_id TEXT PRIMARY KEY REFERENCES nodes(endpoint_id) ON DELETE CASCADE,
-  node_id TEXT NOT NULL UNIQUE REFERENCES nodes(node_id) ON DELETE CASCADE,
+CREATE TABLE ocfleet_native.endpoint_trust (
+  endpoint_id TEXT PRIMARY KEY REFERENCES ocfleet_native.nodes(endpoint_id) ON DELETE CASCADE,
+  node_id TEXT NOT NULL UNIQUE REFERENCES ocfleet_native.nodes(node_id) ON DELETE CASCADE,
   fingerprint TEXT,
   status TEXT NOT NULL CHECK (status IN ('active', 'rotated', 'revoked', 'quarantined')),
   generation BIGINT NOT NULL CHECK (generation > 0),
@@ -114,7 +144,7 @@ CREATE TABLE IF NOT EXISTS endpoint_trust (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
 );
 
-CREATE TABLE IF NOT EXISTS controller_audit_log (
+CREATE TABLE ocfleet_native.controller_audit_log (
   id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   ts TIMESTAMPTZ NOT NULL,
   actor TEXT NOT NULL CHECK (length(actor) BETWEEN 1 AND 128),
@@ -130,15 +160,18 @@ CREATE TABLE IF NOT EXISTS controller_audit_log (
   detail_json JSONB NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_native_audit_ts_id
-  ON controller_audit_log(ts, id);
+CREATE INDEX idx_native_audit_ts_id
+  ON ocfleet_native.controller_audit_log(ts, id);
 "#,
-        )?;
-        tx.execute(
-            "INSERT INTO ocfleet_native_migrations (version, name)
+            )?;
+            tx.execute(
+                "INSERT INTO ocfleet_native.migrations (version, name)
              VALUES ($1, $2) ON CONFLICT (version) DO NOTHING",
-            &[&1_i32, &"0001_native_core"],
-        )?;
+                &[&1_i32, &NATIVE_MIGRATION_1_NAME],
+            )?;
+        }
+
+        validate_native_schema(&mut tx)?;
         tx.commit()?;
         Ok(())
     }
@@ -147,7 +180,7 @@ CREATE INDEX IF NOT EXISTS idx_native_audit_ts_id
         let mut conn = self.connection()?;
         Ok(conn
             .query_one(
-                "SELECT COALESCE(MAX(version), 0) FROM ocfleet_native_migrations",
+                "SELECT COALESCE(MAX(version), 0) FROM ocfleet_native.migrations",
                 &[],
             )?
             .get(0))
@@ -158,7 +191,7 @@ CREATE INDEX IF NOT EXISTS idx_native_audit_ts_id
         let mut conn = self.connection()?;
         let mut tx = conn.transaction()?;
         tx.execute(
-            "INSERT INTO nodes (node_id, endpoint_id, name, region, role)
+            "INSERT INTO ocfleet_native.nodes (node_id, endpoint_id, name, region, role)
              VALUES ($1, $2, $3, $4, $5)",
             &[
                 &node.node_id,
@@ -180,7 +213,7 @@ CREATE INDEX IF NOT EXISTS idx_native_audit_ts_id
         .map_err(PostgresError::InvalidInput)?
         .to_value();
         tx.execute(
-            "INSERT INTO endpoint_trust
+            "INSERT INTO ocfleet_native.endpoint_trust
              (endpoint_id, node_id, status, generation, trust_bundle_json)
              VALUES ($1, $2, 'active', 1, CAST($3 AS text)::jsonb)",
             &[&node.endpoint_id, &node.node_id, &trust_bundle.to_string()],
@@ -217,7 +250,7 @@ CREATE INDEX IF NOT EXISTS idx_native_audit_ts_id
         let mut conn = self.connection()?;
         conn.query_opt(
             "SELECT node_id, endpoint_id, name, region, role, enabled
-             FROM nodes WHERE node_id = $1",
+             FROM ocfleet_native.nodes WHERE node_id = $1",
             &[&node_id],
         )?
         .map(|row| node_from_row(&row))
@@ -235,7 +268,7 @@ CREATE INDEX IF NOT EXISTS idx_native_audit_ts_id
         let mut conn = self.connection()?;
         conn.query(
             "SELECT node_id, endpoint_id, name, region, role, enabled
-             FROM nodes ORDER BY node_id LIMIT $1",
+             FROM ocfleet_native.nodes ORDER BY node_id LIMIT $1",
             &[&limit],
         )?
         .iter()
@@ -247,11 +280,66 @@ CREATE INDEX IF NOT EXISTS idx_native_audit_ts_id
         let mut conn = self.connection()?;
         Ok(conn
             .query_one(
-                "SELECT COUNT(*) FROM controller_audit_log WHERE event = $1",
+                "SELECT COUNT(*) FROM ocfleet_native.controller_audit_log WHERE event = $1",
                 &[&event],
             )?
             .get(0))
     }
+}
+
+fn validated_native_config(dsn: &str) -> Result<Config, PostgresError> {
+    let config = Config::from_str(dsn)
+        .map_err(|_| PostgresError::Configuration("Postgres DSN is invalid"))?;
+    validate_transport(&config)?;
+    Ok(config)
+}
+
+fn validate_native_schema(tx: &mut Transaction<'_>) -> Result<(), PostgresError> {
+    for relation in [
+        "ocfleet_native.migrations",
+        "ocfleet_native.nodes",
+        "ocfleet_native.endpoint_trust",
+        "ocfleet_native.controller_audit_log",
+    ] {
+        let is_table: bool = tx
+            .query_one(
+                "SELECT COALESCE((
+                   SELECT relkind IN ('r', 'p')
+                   FROM pg_class
+                   WHERE oid = to_regclass($1)
+                 ), FALSE)",
+                &[&relation],
+            )?
+            .get(0);
+        if !is_table {
+            return Err(PostgresError::InvalidState(format!(
+                "native Postgres relation {relation} is missing or incompatible"
+            )));
+        }
+    }
+
+    tx.query(
+        "SELECT version, name, applied_at FROM ocfleet_native.migrations LIMIT 0",
+        &[],
+    )?;
+    tx.query(
+        "SELECT node_id, endpoint_id, name, region, role, enabled, created_at, updated_at
+         FROM ocfleet_native.nodes LIMIT 0",
+        &[],
+    )?;
+    tx.query(
+        "SELECT endpoint_id, node_id, fingerprint, status, generation,
+                previous_endpoint_id, rotated_to, trust_bundle_json, created_at, updated_at
+         FROM ocfleet_native.endpoint_trust LIMIT 0",
+        &[],
+    )?;
+    tx.query(
+        "SELECT id, ts, actor, event, node_id, endpoint_id, method, request_id,
+                params_hash, ok, error_code, duration_ms, detail_json
+         FROM ocfleet_native.controller_audit_log LIMIT 0",
+        &[],
+    )?;
+    Ok(())
 }
 
 fn validate_node(node: &NodeInsert, actor: &str) -> Result<(), PostgresError> {
@@ -323,7 +411,7 @@ fn insert_audit(tx: &mut Transaction<'_>, event: &AuditEvent) -> Result<(), Post
         .transpose()
         .map_err(|_| PostgresError::InvalidInput("audit duration exceeds i64".to_string()))?;
     tx.execute(
-        "INSERT INTO controller_audit_log
+        "INSERT INTO ocfleet_native.controller_audit_log
          (ts, actor, event, node_id, endpoint_id, method, request_id, params_hash,
           ok, error_code, duration_ms, detail_json)
          VALUES (CAST($1 AS text)::timestamptz, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
@@ -348,6 +436,30 @@ fn insert_audit(tx: &mut Transaction<'_>, event: &AuditEvent) -> Result<(), Post
 
 #[cfg(test)]
 mod tests {
+    use super::validated_native_config;
+
+    #[test]
+    fn native_no_tls_rejects_remote_hosts() {
+        for dsn in [
+            "postgresql://db.example.test/ocfleet",
+            "postgresql://203.0.113.10/ocfleet",
+            "postgresql://[2001:db8::10]/ocfleet",
+        ] {
+            assert!(validated_native_config(dsn).is_err(), "accepted {dsn}");
+        }
+        for dsn in [
+            "postgresql://localhost/ocfleet",
+            "postgresql://127.0.0.1/ocfleet",
+            "postgresql://[::1]/ocfleet",
+        ] {
+            assert!(validated_native_config(dsn).is_ok(), "rejected {dsn}");
+        }
+        #[cfg(unix)]
+        assert!(
+            validated_native_config("postgresql:///ocfleet?host=%2Fvar%2Frun%2Fpostgresql").is_ok()
+        );
+    }
+
     #[test]
     fn native_backend_is_not_runtime_selectable_before_contract_parity() {
         for (name, source) in [

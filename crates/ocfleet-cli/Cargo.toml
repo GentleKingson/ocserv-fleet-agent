@@ -8,6 +8,7 @@ repository.workspace = true
 [features]
 default = []
 postgres-backend = ["dep:postgres", "dep:r2d2", "dep:r2d2_postgres", "dep:tempfile"]
+postgres-native-experimental = ["postgres-backend"]
 controlled-writes = ["ocfleet-config/controlled-writes", "ocfleet-protocol/controlled-writes"]
 
 [[bin]]

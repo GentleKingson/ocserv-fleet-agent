@@ -1,4 +1,4 @@
-#![cfg(feature = "postgres-backend")]
+#![cfg(feature = "postgres-native-experimental")]
 
 use std::fs;
 #[cfg(unix)]
@@ -39,8 +39,17 @@ fn native_postgres_core_is_relational_atomic_and_future_schema_safe() {
     let port = container
         .get_host_port_ipv4(5432.tcp())
         .expect("mapped Postgres port");
-    let dsn =
+    let base_dsn =
         format!("postgresql://ocfleet:test-only-password@127.0.0.1:{port}/ocfleet_native_test");
+    let mut admin = postgres::Client::connect(&base_dsn, postgres::NoTls).expect("admin client");
+    admin
+        .batch_execute(
+            "CREATE SCHEMA shadow;
+             CREATE TABLE public.nodes (foreign_marker TEXT PRIMARY KEY);
+             INSERT INTO public.nodes (foreign_marker) VALUES ('unrelated');",
+        )
+        .expect("install unrelated search-path object");
+    let dsn = format!("{base_dsn}?options=-csearch_path%3Dshadow%2Cpublic");
     let (_dir, source) = postgres_source(&dsn);
 
     let barrier = Arc::new(Barrier::new(3));
@@ -83,11 +92,10 @@ fn native_postgres_core_is_relational_atomic_and_future_schema_safe() {
     assert_eq!(store.list_nodes(10).expect("list nodes").len(), 1);
     assert_eq!(store.audit_count("node.add").expect("audit count"), 1);
 
-    let mut admin = postgres::Client::connect(&dsn, postgres::NoTls).expect("admin client");
     let trust = admin
         .query_one(
             "SELECT status, generation, trust_bundle_json->>'schema'
-             FROM endpoint_trust WHERE endpoint_id = $1",
+             FROM ocfleet_native.endpoint_trust WHERE endpoint_id = $1",
             &[&node.endpoint_id],
         )
         .expect("relational trust row");
@@ -97,7 +105,7 @@ fn native_postgres_core_is_relational_atomic_and_future_schema_safe() {
     let audit_schema: String = admin
         .query_one(
             "SELECT detail_json->'_audit'->>'schema'
-             FROM controller_audit_log WHERE event = 'node.add'",
+             FROM ocfleet_native.controller_audit_log WHERE event = 'node.add'",
             &[],
         )
         .expect("typed audit row")
@@ -116,7 +124,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 CREATE TRIGGER fail_native_node_audit
-BEFORE INSERT ON controller_audit_log
+BEFORE INSERT ON ocfleet_native.controller_audit_log
 FOR EACH ROW EXECUTE FUNCTION fail_native_node_audit();
 "#,
         )
@@ -137,7 +145,7 @@ FOR EACH ROW EXECUTE FUNCTION fail_native_node_audit();
     );
     let trust_count: i64 = admin
         .query_one(
-            "SELECT COUNT(*) FROM endpoint_trust WHERE endpoint_id = $1",
+            "SELECT COUNT(*) FROM ocfleet_native.endpoint_trust WHERE endpoint_id = $1",
             &[&rejected.endpoint_id],
         )
         .expect("rolled back trust query")
@@ -145,23 +153,47 @@ FOR EACH ROW EXECUTE FUNCTION fail_native_node_audit();
     assert_eq!(trust_count, 0);
     admin
         .batch_execute(
-            "DROP TRIGGER fail_native_node_audit ON controller_audit_log;
+            "DROP TRIGGER fail_native_node_audit ON ocfleet_native.controller_audit_log;
              DROP FUNCTION fail_native_node_audit();",
         )
         .expect("remove audit failure trigger");
 
+    let public_rows: i64 = admin
+        .query_one("SELECT COUNT(*) FROM public.nodes", &[])
+        .expect("unrelated public nodes table")
+        .get(0);
+    assert_eq!(public_rows, 1);
+
     admin
         .execute(
-            "INSERT INTO ocfleet_native_migrations (version, name) VALUES ($1, $2)",
+            "UPDATE ocfleet_native.migrations SET name = 'unexpected' WHERE version = 1",
+            &[],
+        )
+        .expect("corrupt migration name");
+    assert!(matches!(
+        connect_native(&source),
+        Err(PostgresError::InvalidState(message))
+            if message.contains("migration history is inconsistent")
+    ));
+    admin
+        .execute(
+            "UPDATE ocfleet_native.migrations SET name = '0001_native_core' WHERE version = 1",
+            &[],
+        )
+        .expect("restore migration name");
+
+    admin
+        .execute(
+            "INSERT INTO ocfleet_native.migrations (version, name) VALUES ($1, $2)",
             &[&(NATIVE_BACKEND_SCHEMA_VERSION + 1), &"future_schema"],
         )
         .expect("install future migration marker");
     let row = admin
         .query_one(
             "SELECT
-               (SELECT COUNT(*) FROM ocfleet_native_migrations),
-               (SELECT COUNT(*) FROM nodes),
-               (SELECT COUNT(*) FROM controller_audit_log)",
+               (SELECT COUNT(*) FROM ocfleet_native.migrations),
+               (SELECT COUNT(*) FROM ocfleet_native.nodes),
+               (SELECT COUNT(*) FROM ocfleet_native.controller_audit_log)",
             &[],
         )
         .expect("snapshot before rejected connect");
@@ -174,12 +206,45 @@ FOR EACH ROW EXECUTE FUNCTION fail_native_node_audit();
     let row = admin
         .query_one(
             "SELECT
-               (SELECT COUNT(*) FROM ocfleet_native_migrations),
-               (SELECT COUNT(*) FROM nodes),
-               (SELECT COUNT(*) FROM controller_audit_log)",
+               (SELECT COUNT(*) FROM ocfleet_native.migrations),
+               (SELECT COUNT(*) FROM ocfleet_native.nodes),
+               (SELECT COUNT(*) FROM ocfleet_native.controller_audit_log)",
             &[],
         )
         .expect("snapshot after rejected connect");
     let after: (i64, i64, i64) = (row.get(0), row.get(1), row.get(2));
     assert_eq!(after, before);
+
+    admin
+        .batch_execute(
+            "DROP SCHEMA ocfleet_native CASCADE;
+             CREATE SCHEMA ocfleet_native;
+             CREATE TABLE ocfleet_native.nodes (unexpected TEXT);",
+        )
+        .expect("install incompatible native object");
+    assert!(matches!(
+        connect_native(&source),
+        Err(PostgresError::Database(_))
+    ));
+    let migrations_created: bool = admin
+        .query_one(
+            "SELECT to_regclass('ocfleet_native.migrations') IS NOT NULL",
+            &[],
+        )
+        .expect("check rolled-back migration table")
+        .get(0);
+    assert!(!migrations_created);
+    let incompatible_survived: bool = admin
+        .query_one(
+            "SELECT EXISTS (
+               SELECT 1 FROM information_schema.columns
+               WHERE table_schema = 'ocfleet_native'
+                 AND table_name = 'nodes'
+                 AND column_name = 'unexpected'
+             )",
+            &[],
+        )
+        .expect("check incompatible object")
+        .get(0);
+    assert!(incompatible_survived);
 }

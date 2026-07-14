@@ -1051,7 +1051,7 @@ fn validate_dsn(dsn: &str) -> Result<(), PostgresError> {
     Ok(())
 }
 
-fn validate_transport(config: &Config) -> Result<(), PostgresError> {
+pub(crate) fn validate_transport(config: &Config) -> Result<(), PostgresError> {
     let local_only = config.get_hosts().iter().all(|host| match host {
         Host::Tcp(host) => matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1"),
         #[cfg(unix)]

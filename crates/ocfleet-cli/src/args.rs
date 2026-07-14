@@ -92,6 +92,7 @@ pub enum Command {
         command: ChangeCommand,
     },
     #[cfg(feature = "postgres-backend")]
+    /// Experimental Postgres-wrapped SQLite snapshot lifecycle commands.
     Postgres {
         #[command(subcommand)]
         command: PostgresCommand,

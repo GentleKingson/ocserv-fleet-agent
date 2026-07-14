@@ -18,7 +18,7 @@ pub const MAX_STORE_READER_ROWS: u64 = 1_000;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackendKind {
     Sqlite,
-    Postgres,
+    PostgresSnapshot,
 }
 
 /// Backend-neutral read contract. Every history query carries an explicit cap.

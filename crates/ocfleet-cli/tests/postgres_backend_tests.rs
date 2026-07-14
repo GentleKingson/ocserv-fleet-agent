@@ -57,9 +57,32 @@ fn postgres_migration_contention_and_transactional_fencing() {
     let first = clients.remove(0).join().expect("first client");
     let second = clients.remove(0).join().expect("second client");
     let first_doctor = first.doctor().expect("doctor");
-    assert_eq!(first_doctor.backend_schema_version, 2);
+    assert_eq!(
+        first_doctor.backend_kind,
+        "postgres-wrapped-sqlite-snapshot"
+    );
+    assert!(first_doctor.experimental);
+    assert_eq!(first_doctor.backend_schema_version, 3);
     assert_eq!(first_doctor.schema_version, 28);
+    assert_eq!(first_doctor.state_revision, 1);
+    assert!(!first_doctor.above_recommended_state_size);
     assert_eq!(second.doctor().expect("doctor").schema_version, 28);
+
+    let mut migration_admin =
+        postgres::Client::connect(&dsn, postgres::NoTls).expect("migration admin");
+    migration_admin
+        .batch_execute(
+            "DELETE FROM ocfleet_backend_migrations WHERE version = 3;
+             ALTER TABLE ocfleet_runtime_state
+               DROP CONSTRAINT IF EXISTS ocfleet_runtime_state_revision_positive;
+             ALTER TABLE ocfleet_runtime_state DROP COLUMN state_revision;",
+        )
+        .expect("downgrade snapshot backend schema to version 2");
+    let upgraded = connect(&source).expect("upgrade snapshot backend schema");
+    let upgraded_doctor = upgraded.doctor().expect("upgraded doctor");
+    assert_eq!(upgraded_doctor.backend_schema_version, 3);
+    assert_eq!(upgraded_doctor.state_revision, 1);
+    drop(migration_admin);
 
     let unfenced_node = NodeInsert {
         node_id: "node-pg-unfenced".into(),
@@ -135,20 +158,24 @@ fn postgres_migration_contention_and_transactional_fencing() {
         first.import_sqlite(&import_path, false),
         Err(PostgresError::FenceRequired)
     ));
-    writer_one
+    let first_import = writer_one
         .import_sqlite(&import_path, false)
         .expect("fenced import");
-    assert!(
-        writer_one
-            .import_sqlite(&import_path, false)
-            .expect("idempotent resumed import")
-            .already_current
-    );
+    assert_eq!(first_import.state_revision, Some(2));
+    let repeated_import = writer_one
+        .import_sqlite(&import_path, false)
+        .expect("idempotent resumed import");
+    assert!(repeated_import.already_current);
+    assert_eq!(repeated_import.state_revision, Some(2));
     assert!(
         StoreReader::read_node(&writer_one, "node-pg-imported")
             .expect("read imported node")
             .is_some()
     );
+    let read_metrics = writer_one.runtime_metrics();
+    assert!(read_metrics.read_operations >= 1);
+    assert!(read_metrics.last_read_total_us > 0);
+    assert!(read_metrics.last_materialize_us > 0);
 
     let wal_path = import_dir.path().join("controller-active-wal.sqlite3");
     let wal_store = Store::open(&wal_path).expect("create active WAL source");
@@ -300,4 +327,95 @@ fn postgres_migration_contention_and_transactional_fencing() {
             .expect("read rolled-back state")
             .is_none()
     );
+
+    let capacity_path = rollback_dir.path().join("capacity-96mib.sqlite3");
+    drop(Store::open(&capacity_path).expect("capacity fixture store"));
+    let capacity = rusqlite::Connection::open(&capacity_path).expect("capacity fixture");
+    capacity
+        .execute_batch(
+            "CREATE TABLE capacity_fixture (
+                 singleton INTEGER PRIMARY KEY,
+                 payload BLOB NOT NULL
+             );",
+        )
+        .expect("capacity table");
+    capacity
+        .execute(
+            "INSERT INTO capacity_fixture(singleton, payload) VALUES(1, zeroblob(?1))",
+            [96_i64 * 1024 * 1024],
+        )
+        .expect("allocate 96 MiB fixture");
+    drop(capacity);
+
+    admin
+        .execute(
+            "UPDATE ocfleet_controller_leases
+             SET lease_until = clock_timestamp() - interval '1 second'
+             WHERE lease_name = 'controller-writer'",
+            &[],
+        )
+        .expect("expire prior test lease");
+    let large_controller = connect(&source).expect("large snapshot controller");
+    let large_lease = large_controller
+        .acquire_lease("controller-writer", "replica-large", 300)
+        .expect("large snapshot lease query")
+        .expect("large snapshot lease");
+    let large_writer = large_controller
+        .fenced(large_lease.clone())
+        .expect("large snapshot writer");
+    let large_import = large_writer
+        .import_sqlite(&capacity_path, false)
+        .expect("96 MiB snapshot import");
+    assert!(large_import.above_recommended_state_size);
+    assert!(large_import.source_size > 64 * 1024 * 1024);
+    assert!(large_import.upload_commit_us > 0);
+    let large_revision = large_import.state_revision.expect("large state revision");
+    assert_eq!(
+        large_writer.doctor().expect("large doctor").state_revision,
+        large_revision
+    );
+
+    let expiring_controller = connect(&source).expect("expiring lease controller");
+    let expiring_lease = expiring_controller
+        .acquire_lease("controller-writer", "replica-large", 300)
+        .expect("renew large lease")
+        .expect("renewed large lease");
+    let expiring_writer = expiring_controller
+        .fenced(expiring_lease.clone())
+        .expect("expiring writer");
+    admin
+        .execute(
+            "UPDATE ocfleet_controller_leases
+             SET lease_until = clock_timestamp() + interval '1 second'
+             WHERE lease_name = 'controller-writer'",
+            &[],
+        )
+        .expect("shorten lease during large state test");
+    let expired_node = NodeInsert {
+        node_id: "node-pg-expired-during-write".into(),
+        endpoint_id: iroh::SecretKey::generate().public().to_string(),
+        name: "node-pg-expired-during-write".into(),
+        region: "test".into(),
+        role: "ocserv".into(),
+    };
+    assert!(matches!(
+        StoreWriter::write_node_add(&expiring_writer, &expired_node, "operator"),
+        Err(PostgresError::StaleFence)
+    ));
+    let expired_metrics = expiring_writer.runtime_metrics();
+    assert!(expired_metrics.last_lease_remaining_ms > 0);
+    assert!(expired_metrics.last_write_owned_image_bytes >= large_import.source_size * 2);
+    assert_eq!(expired_metrics.failed_write_operations, 1);
+    let after_expiry = expiring_writer.doctor().expect("state after expired write");
+    assert_eq!(after_expiry.state_revision, large_revision);
+    assert!(
+        StoreReader::read_node(&expiring_writer, "node-pg-expired-during-write")
+            .expect("read expired node")
+            .is_none()
+    );
+    let takeover = second
+        .acquire_lease("controller-writer", "replica-after-expiry", 30)
+        .expect("takeover after commit-time expiry")
+        .expect("takeover lease");
+    assert!(takeover.fencing_token > expiring_lease.fencing_token);
 }

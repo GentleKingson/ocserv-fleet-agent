@@ -111,9 +111,10 @@ The current implementation is intentionally narrow. It does not provide:
 - Web/API endpoints that trigger agent RPCs, run scheduler jobs, resolve or
   silence alerts, mutate retention policy, modify trust, or change node state
 - transparent Postgres selection for the read-only API or every legacy CLI
-  command; the default-off Postgres runtime currently exposes its explicit
-  `postgres doctor|import|export` lifecycle and backend-neutral store contract,
-  while SQLite remains the default command/API backend
+  command; the default-off experimental Postgres-wrapped SQLite snapshot
+  foundation exposes only `postgres doctor|import|export`, globally serializes
+  full-image writes, and is not a native Postgres data layer, while SQLite
+  remains the default command/API backend
 
 All local capabilities must be exposed through fixed RPC methods. There is no `shell.exec`, `command.run`, `occtl.raw`, `journalctl.raw`, or equivalent generic execution interface.
 
@@ -675,7 +676,7 @@ Networking must allow the controller to reach the agent through iroh using the r
 - `docs/a2-storage-inventory.md`: A2 payload-family closure inventory and
   migration/read-boundary evidence.
 - `docs/trust-policy.md`: trust policy as code schema, validation, and diff behavior.
-- `docs/backend.md`: SQLite contract and optional Postgres backend plan.
+- `docs/backend.md`: SQLite contract and experimental Postgres-wrapped SQLite snapshot boundaries.
 - `docs/archive-export.md`: long-term history archive and signed audit export guidance.
 
 ## Security Notes

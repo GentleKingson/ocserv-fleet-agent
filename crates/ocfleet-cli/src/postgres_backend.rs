@@ -1,16 +1,19 @@
-//! Explicit, default-off Postgres runtime backend.
+//! Explicit, default-off Postgres-wrapped SQLite snapshot backend.
 //!
-//! The first runtime format stores the already versioned SQLite state as a
-//! checksummed database image. That keeps the existing Store contract,
-//! projections, limits, redaction, retention, and atomic audit behavior
-//! identical while Postgres supplies pooling, durable transactions, migration
-//! serialization, and multi-controller coordination.
+//! This experimental format stores the complete, already versioned SQLite
+//! state as one checksummed Postgres value. It preserves the existing Store
+//! contract while providing durable snapshot replacement and fencing, but it
+//! is not a native relational Postgres data layer or a concurrent-write scale
+//! architecture.
 
 use std::fmt;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+use std::time::Instant;
 
 use postgres::config::Host;
 use postgres::{Config, NoTls, Transaction};
@@ -44,10 +47,12 @@ use crate::version_governance::CapabilitySnapshot;
 
 const MIGRATION_LOCK_ID: i64 = 0x4f43464c454554;
 const FORMAT_VERSION: i32 = 1;
-const BACKEND_SCHEMA_VERSION: i32 = 2;
+const BACKEND_SCHEMA_VERSION: i32 = 3;
+const IMPORT_INDEX_SCHEMA_VERSION: i32 = 2;
 const DEFAULT_POOL_SIZE: u32 = 8;
 const MAX_DSN_BYTES: usize = 8_192;
 const MAX_STATE_IMAGE_BYTES: u64 = 512 * 1024 * 1024;
+pub const RECOMMENDED_STATE_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_VERIFICATION_ROWS_PER_TABLE: u64 = 1_000_000;
 const BACKUP_PAGES_PER_STEP: i32 = 128;
 
@@ -113,7 +118,7 @@ impl PostgresConnectionSource {
     }
 
     pub const fn backend_kind(&self) -> BackendKind {
-        BackendKind::Postgres
+        BackendKind::PostgresSnapshot
     }
 }
 
@@ -213,36 +218,75 @@ impl From<rusqlite::Error> for PostgresError {
     }
 }
 
-pub struct PostgresStore {
-    pool: Pool<PostgresConnectionManager<NoTls>>,
-    write_fence: Option<ControllerLease>,
+#[derive(Default)]
+struct SnapshotMetrics {
+    state_image_bytes: AtomicU64,
+    read_operations: AtomicU64,
+    failed_read_operations: AtomicU64,
+    write_operations: AtomicU64,
+    failed_write_operations: AtomicU64,
+    last_download_us: AtomicU64,
+    last_read_total_us: AtomicU64,
+    last_write_total_us: AtomicU64,
+    last_write_owned_image_bytes: AtomicU64,
+    last_materialize_us: AtomicU64,
+    last_upload_commit_us: AtomicU64,
+    last_advisory_lock_wait_us: AtomicU64,
+    last_lease_remaining_ms: AtomicU64,
 }
 
-impl fmt::Debug for PostgresStore {
+impl SnapshotMetrics {
+    fn snapshot(&self) -> PostgresSnapshotRuntimeMetrics {
+        PostgresSnapshotRuntimeMetrics {
+            state_image_bytes: self.state_image_bytes.load(Ordering::Relaxed),
+            read_operations: self.read_operations.load(Ordering::Relaxed),
+            failed_read_operations: self.failed_read_operations.load(Ordering::Relaxed),
+            write_operations: self.write_operations.load(Ordering::Relaxed),
+            failed_write_operations: self.failed_write_operations.load(Ordering::Relaxed),
+            last_download_us: self.last_download_us.load(Ordering::Relaxed),
+            last_read_total_us: self.last_read_total_us.load(Ordering::Relaxed),
+            last_write_total_us: self.last_write_total_us.load(Ordering::Relaxed),
+            last_write_owned_image_bytes: self.last_write_owned_image_bytes.load(Ordering::Relaxed),
+            last_materialize_us: self.last_materialize_us.load(Ordering::Relaxed),
+            last_upload_commit_us: self.last_upload_commit_us.load(Ordering::Relaxed),
+            last_advisory_lock_wait_us: self.last_advisory_lock_wait_us.load(Ordering::Relaxed),
+            last_lease_remaining_ms: self.last_lease_remaining_ms.load(Ordering::Relaxed),
+        }
+    }
+}
+
+pub struct PostgresSnapshotStore {
+    pool: Pool<PostgresConnectionManager<NoTls>>,
+    write_fence: Option<ControllerLease>,
+    metrics: Arc<SnapshotMetrics>,
+}
+
+impl fmt::Debug for PostgresSnapshotStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("PostgresStore")
+        f.debug_struct("PostgresSnapshotStore")
             .field("pool", &"<redacted>")
             .field("write_fence", &self.write_fence)
             .finish()
     }
 }
 
-pub fn connect(source: &PostgresConnectionSource) -> Result<PostgresStore, PostgresError> {
+pub fn connect(source: &PostgresConnectionSource) -> Result<PostgresSnapshotStore, PostgresError> {
     let private = source.load()?;
     let config = Config::from_str(&private.dsn)
         .map_err(|_| PostgresError::Configuration("Postgres DSN is invalid"))?;
     validate_transport(&config)?;
     let manager = PostgresConnectionManager::new(config, NoTls);
     let pool = Pool::builder().max_size(private.pool_size).build(manager)?;
-    let store = PostgresStore {
+    let store = PostgresSnapshotStore {
         pool,
         write_fence: None,
+        metrics: Arc::new(SnapshotMetrics::default()),
     };
     store.migrate()?;
     Ok(store)
 }
 
-impl PostgresStore {
+impl PostgresSnapshotStore {
     pub fn migrate(&self) -> Result<(), PostgresError> {
         let mut conn = self.connection()?;
         let mut tx = conn.transaction()?;
@@ -254,6 +298,7 @@ impl PostgresStore {
                singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
                format_version INTEGER NOT NULL,
                sqlite_schema_version BIGINT NOT NULL,
+               state_revision BIGINT NOT NULL DEFAULT 1,
                state_sha256 TEXT NOT NULL CHECK (length(state_sha256) = 64),
                state_bytes BYTEA NOT NULL,
                updated_at TIMESTAMPTZ NOT NULL DEFAULT now());
@@ -278,8 +323,29 @@ impl PostgresStore {
         )?;
         tx.execute(
             "INSERT INTO ocfleet_backend_migrations(version) VALUES ($1) ON CONFLICT DO NOTHING",
-            &[&BACKEND_SCHEMA_VERSION],
+            &[&IMPORT_INDEX_SCHEMA_VERSION],
         )?;
+        let revision_migration_pending = tx
+            .query_opt(
+                "SELECT 1 FROM ocfleet_backend_migrations WHERE version=$1",
+                &[&BACKEND_SCHEMA_VERSION],
+            )?
+            .is_none();
+        if revision_migration_pending {
+            tx.batch_execute(
+                "ALTER TABLE ocfleet_runtime_state
+                   ADD COLUMN IF NOT EXISTS state_revision BIGINT NOT NULL DEFAULT 1;
+                 ALTER TABLE ocfleet_runtime_state
+                   DROP CONSTRAINT IF EXISTS ocfleet_runtime_state_revision_positive;
+                 ALTER TABLE ocfleet_runtime_state
+                   ADD CONSTRAINT ocfleet_runtime_state_revision_positive
+                   CHECK (state_revision > 0);",
+            )?;
+            tx.execute(
+                "INSERT INTO ocfleet_backend_migrations(version) VALUES ($1)",
+                &[&BACKEND_SCHEMA_VERSION],
+            )?;
+        }
         if tx
             .query_opt(
                 "SELECT 1 FROM ocfleet_runtime_state WHERE singleton = TRUE",
@@ -295,13 +361,27 @@ impl PostgresStore {
     }
 
     pub fn doctor(&self) -> Result<PostgresDoctor, PostgresError> {
+        let started = Instant::now();
         let mut conn = self.connection()?;
         check_state_size(&mut conn)?;
-        let row = conn.query_one("SELECT format_version, sqlite_schema_version, state_sha256, state_bytes FROM ocfleet_runtime_state WHERE singleton = TRUE", &[])?;
-        let image: Vec<u8> = row.get(3);
-        let checksum: String = row.get(2);
+        let download_started = Instant::now();
+        let row = conn.query_one(
+            "SELECT format_version, sqlite_schema_version, state_revision,
+                    state_sha256, state_bytes,
+                    to_char(updated_at AT TIME ZONE 'UTC',
+                            'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'),
+                    octet_length(state_bytes)::BIGINT
+             FROM ocfleet_runtime_state WHERE singleton = TRUE",
+            &[],
+        )?;
+        let download_us = elapsed_us(download_started);
+        let image: Vec<u8> = row.get(4);
+        let checksum: String = row.get(3);
         let schema_version: i64 = row.get(1);
+        let state_revision = positive_u64(row.get(2), "state revision")?;
+        let state_size = positive_u64(row.get(6), "state image size")?;
         let checksum_valid = sha256(&image) == checksum;
+        let materialize_started = Instant::now();
         if checksum_valid {
             let (image_schema_version, _) = verify_image(&image)?;
             if image_schema_version != schema_version {
@@ -310,7 +390,13 @@ impl PostgresStore {
                 ));
             }
         }
+        let materialize_us = elapsed_us(materialize_started);
+        self.metrics
+            .state_image_bytes
+            .store(state_size, Ordering::Relaxed);
         Ok(PostgresDoctor {
+            backend_kind: "postgres-wrapped-sqlite-snapshot",
+            experimental: true,
             connected: true,
             backend_schema_version: conn
                 .query_one("SELECT max(version) FROM ocfleet_backend_migrations", &[])?
@@ -318,58 +404,154 @@ impl PostgresStore {
                 .unwrap_or_default(),
             format_version: row.get(0),
             schema_version,
+            state_revision,
+            state_updated_at: row.get(5),
+            state_sha256: checksum,
+            state_size,
+            recommended_state_image_bytes: RECOMMENDED_STATE_IMAGE_BYTES,
+            hard_state_image_limit_bytes: MAX_STATE_IMAGE_BYTES,
+            above_recommended_state_size: state_size > RECOMMENDED_STATE_IMAGE_BYTES,
+            read_consistency: "snapshot-at-query-start; no cross-request read-after-write guarantee",
             checksum_valid,
             pool_max_size: self.pool.max_size(),
+            doctor_download_us: download_us,
+            doctor_materialize_us: materialize_us,
+            doctor_total_us: elapsed_us(started),
+            runtime_metrics: self.runtime_metrics(),
         })
     }
 
     pub fn import_sqlite(&self, path: &Path, dry_run: bool) -> Result<ImportReport, PostgresError> {
+        let total_started = Instant::now();
+        let snapshot_started = Instant::now();
         let (image, schema_version, counts) = snapshot_sqlite(path)?;
+        let snapshot_us = elapsed_us(snapshot_started);
         let source_sha256 = sha256(&image);
-        let already_current = if !dry_run {
-            let mut conn = self.connection()?;
-            let mut tx = conn.transaction()?;
-            tx.query_one("SELECT pg_advisory_xact_lock($1)", &[&MIGRATION_LOCK_ID])?;
-            self.lock_write_fence(&mut tx)?;
-            let current_sha256 = tx
-                .query_one(
-                    "SELECT state_sha256 FROM ocfleet_runtime_state WHERE singleton = TRUE FOR UPDATE",
+        let (
+            already_current,
+            advisory_lock_wait_us,
+            upload_commit_us,
+            lease_remaining_ms,
+            state_revision,
+        ) = if !dry_run {
+            self.metrics
+                .write_operations
+                .fetch_add(1, Ordering::Relaxed);
+            self.metrics
+                .last_write_owned_image_bytes
+                .store(image.len() as u64, Ordering::Relaxed);
+            let write_started = Instant::now();
+            let outcome = (|| {
+                let mut conn = self.connection()?;
+                let mut tx = conn.transaction()?;
+                let lock_started = Instant::now();
+                tx.query_one("SELECT pg_advisory_xact_lock($1)", &[&MIGRATION_LOCK_ID])?;
+                let advisory_lock_wait_us = elapsed_us(lock_started);
+                let lease_remaining_ms = self.lock_write_fence(&mut tx)?;
+                let row = tx.query_one(
+                    "SELECT state_sha256, state_revision
+                         FROM ocfleet_runtime_state
+                         WHERE singleton = TRUE FOR UPDATE",
                     &[],
-                )?
-                .get::<_, String>(0);
-            let already_current = current_sha256 == source_sha256;
-            if !already_current {
-                insert_state(&mut tx, &image)?;
-            }
-            let import_id = uuid::Uuid::new_v4().to_string();
-            tx.execute(
-                "INSERT INTO ocfleet_imports
-                   (import_id, source_sha256, source_size, verified, completed_at)
-                 VALUES ($1::text::uuid, $2, $3, TRUE, now())
-                 ON CONFLICT(source_sha256, source_size) DO UPDATE SET
-                   verified = TRUE, completed_at = COALESCE(ocfleet_imports.completed_at, now())",
-                &[&import_id, &source_sha256, &(image.len() as i64)],
-            )?;
-            tx.commit()?;
-            already_current
+                )?;
+                let current_sha256: String = row.get(0);
+                let current_revision = positive_u64(row.get(1), "state revision")?;
+                let already_current = current_sha256 == source_sha256;
+                let upload_started = Instant::now();
+                let state_revision = if already_current {
+                    current_revision
+                } else {
+                    insert_state(&mut tx, &image)?
+                };
+                let import_id = uuid::Uuid::new_v4().to_string();
+                tx.execute(
+                    "INSERT INTO ocfleet_imports
+                           (import_id, source_sha256, source_size, verified, completed_at)
+                         VALUES ($1::text::uuid, $2, $3, TRUE, clock_timestamp())
+                         ON CONFLICT(source_sha256, source_size) DO UPDATE SET
+                           verified = TRUE,
+                           completed_at = COALESCE(ocfleet_imports.completed_at,
+                                                   clock_timestamp())",
+                    &[&import_id, &source_sha256, &(image.len() as i64)],
+                )?;
+                self.recheck_write_fence(&mut tx)?;
+                tx.commit()?;
+                Ok((
+                    already_current,
+                    state_revision,
+                    advisory_lock_wait_us,
+                    elapsed_us(upload_started),
+                    lease_remaining_ms,
+                ))
+            })();
+            self.metrics
+                .last_write_total_us
+                .store(elapsed_us(write_started), Ordering::Relaxed);
+            let (already_current, state_revision, lock_us, upload_us, lease_ms) = match outcome {
+                Ok(values) => values,
+                Err(error) => {
+                    self.metrics
+                        .failed_write_operations
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(error);
+                }
+            };
+            self.metrics
+                .last_advisory_lock_wait_us
+                .store(lock_us, Ordering::Relaxed);
+            self.metrics
+                .last_upload_commit_us
+                .store(upload_us, Ordering::Relaxed);
+            self.metrics
+                .last_lease_remaining_ms
+                .store(lease_ms, Ordering::Relaxed);
+            self.metrics
+                .state_image_bytes
+                .store(image.len() as u64, Ordering::Relaxed);
+            (
+                already_current,
+                lock_us,
+                upload_us,
+                lease_ms,
+                Some(state_revision),
+            )
         } else {
             let mut conn = self.connection()?;
-            load_state(&mut conn).map(|state| sha256(&state) == source_sha256)?
+            (
+                load_state(&mut conn).map(|state| sha256(&state) == source_sha256)?,
+                0,
+                0,
+                0,
+                None,
+            )
         };
         Ok(ImportReport {
             dry_run,
             already_current,
             source_sha256,
             source_size: image.len() as u64,
+            recommended_state_image_bytes: RECOMMENDED_STATE_IMAGE_BYTES,
+            above_recommended_state_size: image.len() as u64 > RECOMMENDED_STATE_IMAGE_BYTES,
             schema_version,
             counts_verified: counts,
+            state_revision,
+            snapshot_us,
+            advisory_lock_wait_us,
+            upload_commit_us,
+            lease_remaining_ms,
+            total_us: elapsed_us(total_started),
         })
     }
 
     pub fn export_sqlite(&self, path: &Path) -> Result<ExportReport, PostgresError> {
+        let total_started = Instant::now();
         let mut conn = self.connection()?;
+        let download_started = Instant::now();
         let image = load_state(&mut conn)?;
+        let download_us = elapsed_us(download_started);
+        let verify_started = Instant::now();
         let (schema_version, counts_verified) = verify_image(&image)?;
+        let materialize_verify_us = elapsed_us(verify_started);
         let state_sha256 = sha256(&image);
         let mut output = private_file::open_private_create_new_strict(path)?;
         output.write_all(&image)?;
@@ -378,8 +560,13 @@ impl PostgresStore {
         Ok(ExportReport {
             state_sha256,
             state_size: image.len() as u64,
+            recommended_state_image_bytes: RECOMMENDED_STATE_IMAGE_BYTES,
+            above_recommended_state_size: image.len() as u64 > RECOMMENDED_STATE_IMAGE_BYTES,
             schema_version,
             counts_verified,
+            download_us,
+            materialize_verify_us,
+            total_us: elapsed_us(total_started),
         })
     }
 
@@ -416,7 +603,7 @@ impl PostgresStore {
     pub fn verify_fence(&self, lease: &ControllerLease) -> Result<bool, PostgresError> {
         let mut conn = self.connection()?;
         Ok(conn.query_opt(
-            "SELECT 1 FROM ocfleet_controller_leases WHERE lease_name=$1 AND owner_id=$2 AND fencing_token=$3 AND lease_until > now()",
+            "SELECT 1 FROM ocfleet_controller_leases WHERE lease_name=$1 AND owner_id=$2 AND fencing_token=$3 AND lease_until > clock_timestamp()",
             &[&lease.name, &lease.owner_id, &(lease.fencing_token as i64)],
         )?.is_some())
     }
@@ -431,7 +618,12 @@ impl PostgresStore {
         Ok(Self {
             pool: self.pool.clone(),
             write_fence: Some(lease),
+            metrics: Arc::clone(&self.metrics),
         })
+    }
+
+    pub fn runtime_metrics(&self) -> PostgresSnapshotRuntimeMetrics {
+        self.metrics.snapshot()
     }
 
     fn connection(
@@ -444,72 +636,162 @@ impl PostgresStore {
         &self,
         callback: impl FnOnce(&Store) -> Result<T, StoreError>,
     ) -> Result<T, PostgresError> {
-        let mut conn = self.connection()?;
-        let image = load_state(&mut conn)?;
-        let (_temp, store) = materialize(&image)?;
-        Ok(callback(&store)?)
+        self.metrics.read_operations.fetch_add(1, Ordering::Relaxed);
+        let total_started = Instant::now();
+        let outcome = (|| {
+            let mut conn = self.connection()?;
+            let download_started = Instant::now();
+            let image = load_state(&mut conn)?;
+            self.metrics
+                .last_download_us
+                .store(elapsed_us(download_started), Ordering::Relaxed);
+            self.metrics
+                .state_image_bytes
+                .store(image.len() as u64, Ordering::Relaxed);
+            let materialize_started = Instant::now();
+            let (_temp, store) = materialize(&image)?;
+            self.metrics
+                .last_materialize_us
+                .store(elapsed_us(materialize_started), Ordering::Relaxed);
+            Ok(callback(&store)?)
+        })();
+        self.metrics
+            .last_read_total_us
+            .store(elapsed_us(total_started), Ordering::Relaxed);
+        if outcome.is_err() {
+            self.metrics
+                .failed_read_operations
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        outcome
     }
 
     fn with_write<T>(
         &self,
         callback: impl FnOnce(&Store) -> Result<T, StoreError>,
     ) -> Result<T, PostgresError> {
-        let mut conn = self.connection()?;
-        let mut tx = conn.transaction()?;
-        tx.query_one(
-            "SELECT pg_advisory_xact_lock($1)",
-            &[&(MIGRATION_LOCK_ID + 1)],
-        )?;
-        self.lock_write_fence(&mut tx)?;
-        let state_size = tx
-            .query_one(
-                "SELECT octet_length(state_bytes)::BIGINT FROM ocfleet_runtime_state WHERE singleton = TRUE",
-                &[],
-            )?
-            .get::<_, i64>(0);
-        if state_size < 0 || state_size as u64 > MAX_STATE_IMAGE_BYTES {
-            return Err(PostgresError::InvalidState(
-                "stored state image exceeds the configured limit".into(),
-            ));
+        self.metrics
+            .write_operations
+            .fetch_add(1, Ordering::Relaxed);
+        let total_started = Instant::now();
+        let outcome = (|| {
+            let mut conn = self.connection()?;
+            let mut tx = conn.transaction()?;
+            let lock_started = Instant::now();
+            tx.query_one(
+                "SELECT pg_advisory_xact_lock($1)",
+                &[&(MIGRATION_LOCK_ID + 1)],
+            )?;
+            self.metrics
+                .last_advisory_lock_wait_us
+                .store(elapsed_us(lock_started), Ordering::Relaxed);
+            let lease_remaining_ms = self.lock_write_fence(&mut tx)?;
+            self.metrics
+                .last_lease_remaining_ms
+                .store(lease_remaining_ms, Ordering::Relaxed);
+            let state_size = tx
+                .query_one(
+                    "SELECT octet_length(state_bytes)::BIGINT FROM ocfleet_runtime_state WHERE singleton = TRUE",
+                    &[],
+                )?
+                .get::<_, i64>(0);
+            if state_size < 0 || state_size as u64 > MAX_STATE_IMAGE_BYTES {
+                return Err(PostgresError::InvalidState(
+                    "stored state image exceeds the configured limit".into(),
+                ));
+            }
+            let download_started = Instant::now();
+            let row = tx.query_one("SELECT format_version, state_sha256, state_bytes FROM ocfleet_runtime_state WHERE singleton = TRUE FOR UPDATE", &[])?;
+            self.metrics
+                .last_download_us
+                .store(elapsed_us(download_started), Ordering::Relaxed);
+            let format: i32 = row.get(0);
+            if format != FORMAT_VERSION {
+                return Err(PostgresError::UnsupportedFormat(format));
+            }
+            let checksum: String = row.get(1);
+            let image: Vec<u8> = row.get(2);
+            self.metrics
+                .state_image_bytes
+                .store(image.len() as u64, Ordering::Relaxed);
+            if sha256(&image) != checksum {
+                return Err(PostgresError::Checksum);
+            }
+            let materialize_started = Instant::now();
+            let (temp, store) = materialize(&image)?;
+            self.metrics
+                .last_materialize_us
+                .store(elapsed_us(materialize_started), Ordering::Relaxed);
+            let result = callback(&store)?;
+            drop(store);
+            if std::fs::metadata(temp.path())?.len() > MAX_STATE_IMAGE_BYTES {
+                return Err(PostgresError::InvalidState(
+                    "updated state image exceeds the configured limit".into(),
+                ));
+            }
+            let updated = std::fs::read(temp.path())?;
+            self.metrics.last_write_owned_image_bytes.store(
+                (image.len() as u64).saturating_add(updated.len() as u64),
+                Ordering::Relaxed,
+            );
+            let upload_started = Instant::now();
+            insert_state(&mut tx, &updated)?;
+            self.recheck_write_fence(&mut tx)?;
+            tx.commit()?;
+            self.metrics
+                .last_upload_commit_us
+                .store(elapsed_us(upload_started), Ordering::Relaxed);
+            self.metrics
+                .state_image_bytes
+                .store(updated.len() as u64, Ordering::Relaxed);
+            Ok(result)
+        })();
+        self.metrics
+            .last_write_total_us
+            .store(elapsed_us(total_started), Ordering::Relaxed);
+        if outcome.is_err() {
+            self.metrics
+                .failed_write_operations
+                .fetch_add(1, Ordering::Relaxed);
         }
-        let row = tx.query_one("SELECT format_version, state_sha256, state_bytes FROM ocfleet_runtime_state WHERE singleton = TRUE FOR UPDATE", &[])?;
-        let format: i32 = row.get(0);
-        if format != FORMAT_VERSION {
-            return Err(PostgresError::UnsupportedFormat(format));
-        }
-        let checksum: String = row.get(1);
-        let image: Vec<u8> = row.get(2);
-        if sha256(&image) != checksum {
-            return Err(PostgresError::Checksum);
-        }
-        let (temp, store) = materialize(&image)?;
-        let result = callback(&store)?;
-        drop(store);
-        if std::fs::metadata(temp.path())?.len() > MAX_STATE_IMAGE_BYTES {
-            return Err(PostgresError::InvalidState(
-                "updated state image exceeds the configured limit".into(),
-            ));
-        }
-        let updated = std::fs::read(temp.path())?;
-        insert_state(&mut tx, &updated)?;
-        tx.commit()?;
-        Ok(result)
+        outcome
     }
 
-    fn lock_write_fence(&self, tx: &mut Transaction<'_>) -> Result<(), PostgresError> {
+    fn lock_write_fence(&self, tx: &mut Transaction<'_>) -> Result<u64, PostgresError> {
         let fence = self
             .write_fence
             .as_ref()
             .ok_or(PostgresError::FenceRequired)?;
-        let fence_valid = tx
+        let remaining = tx
             .query_opt(
-                "SELECT 1 FROM ocfleet_controller_leases
-                 WHERE lease_name=$1 AND owner_id=$2 AND fencing_token=$3 AND lease_until > now()
+                "SELECT floor(extract(epoch FROM (lease_until - clock_timestamp())) * 1000)::BIGINT
+                 FROM ocfleet_controller_leases
+                 WHERE lease_name=$1 AND owner_id=$2 AND fencing_token=$3
                  FOR SHARE",
                 &[&fence.name, &fence.owner_id, &(fence.fencing_token as i64)],
             )?
+            .ok_or(PostgresError::StaleFence)?
+            .get::<_, i64>(0);
+        if remaining <= 0 {
+            return Err(PostgresError::StaleFence);
+        }
+        positive_u64(remaining, "lease remaining time")
+    }
+
+    fn recheck_write_fence(&self, tx: &mut Transaction<'_>) -> Result<(), PostgresError> {
+        let fence = self
+            .write_fence
+            .as_ref()
+            .ok_or(PostgresError::FenceRequired)?;
+        let valid = tx
+            .query_opt(
+                "SELECT 1 FROM ocfleet_controller_leases
+                 WHERE lease_name=$1 AND owner_id=$2 AND fencing_token=$3
+                   AND lease_until > clock_timestamp()",
+                &[&fence.name, &fence.owner_id, &(fence.fencing_token as i64)],
+            )?
             .is_some();
-        if !fence_valid {
+        if !valid {
             return Err(PostgresError::StaleFence);
         }
         Ok(())
@@ -518,12 +800,44 @@ impl PostgresStore {
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PostgresDoctor {
+    pub backend_kind: &'static str,
+    pub experimental: bool,
     pub connected: bool,
     pub backend_schema_version: i32,
     pub format_version: i32,
     pub schema_version: i64,
+    pub state_revision: u64,
+    pub state_updated_at: String,
+    pub state_sha256: String,
+    pub state_size: u64,
+    pub recommended_state_image_bytes: u64,
+    pub hard_state_image_limit_bytes: u64,
+    pub above_recommended_state_size: bool,
+    pub read_consistency: &'static str,
     pub checksum_valid: bool,
     pub pool_max_size: u32,
+    pub doctor_download_us: u64,
+    pub doctor_materialize_us: u64,
+    pub doctor_total_us: u64,
+    pub runtime_metrics: PostgresSnapshotRuntimeMetrics,
+}
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct PostgresSnapshotRuntimeMetrics {
+    pub state_image_bytes: u64,
+    pub read_operations: u64,
+    pub failed_read_operations: u64,
+    pub write_operations: u64,
+    pub failed_write_operations: u64,
+    pub last_download_us: u64,
+    pub last_read_total_us: u64,
+    pub last_write_total_us: u64,
+    /// Sum of snapshot `Vec` lengths owned at the write high-water point.
+    /// This excludes allocator, Postgres driver, and SQLite process overhead.
+    pub last_write_owned_image_bytes: u64,
+    pub last_materialize_us: u64,
+    pub last_upload_commit_us: u64,
+    pub last_advisory_lock_wait_us: u64,
+    pub last_lease_remaining_ms: u64,
 }
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ImportReport {
@@ -531,15 +845,28 @@ pub struct ImportReport {
     pub already_current: bool,
     pub source_sha256: String,
     pub source_size: u64,
+    pub recommended_state_image_bytes: u64,
+    pub above_recommended_state_size: bool,
     pub schema_version: i64,
     pub counts_verified: u64,
+    pub state_revision: Option<u64>,
+    pub snapshot_us: u64,
+    pub advisory_lock_wait_us: u64,
+    pub upload_commit_us: u64,
+    pub lease_remaining_ms: u64,
+    pub total_us: u64,
 }
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ExportReport {
     pub state_sha256: String,
     pub state_size: u64,
+    pub recommended_state_image_bytes: u64,
+    pub above_recommended_state_size: bool,
     pub schema_version: i64,
     pub counts_verified: u64,
+    pub download_us: u64,
+    pub materialize_verify_us: u64,
+    pub total_us: u64,
 }
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ControllerLease {
@@ -549,10 +876,10 @@ pub struct ControllerLease {
     pub lease_until_unix: i64,
 }
 
-impl StoreReader for PostgresStore {
+impl StoreReader for PostgresSnapshotStore {
     type Error = PostgresError;
     fn backend_kind(&self) -> BackendKind {
-        BackendKind::Postgres
+        BackendKind::PostgresSnapshot
     }
     fn read_nodes(&self, limit: u64) -> Result<Vec<NodeRecord>, Self::Error> {
         checked_limit(limit)?;
@@ -609,7 +936,7 @@ macro_rules! forward_write {
     };
 }
 
-impl StoreWriter for PostgresStore {
+impl StoreWriter for PostgresSnapshotStore {
     type Error = PostgresError;
     forward_write!(write_node_add(node: &NodeInsert, actor: &str) -> () => add_node);
     forward_write!(write_node_enable(node_id: &str, actor: &str) -> () => enable_node);
@@ -674,17 +1001,17 @@ impl StoreWriter for PostgresStore {
     forward_write!(write_endpoint_quarantine(endpoint_id: &str, actor: &str, reason: &str) -> EndpointTrustRecord => quarantine_endpoint);
 }
 
-impl MigrationManager for PostgresStore {
+impl MigrationManager for PostgresSnapshotStore {
     type Error = PostgresError;
     fn schema_version(&self) -> Result<i64, Self::Error> {
         Ok(self.doctor()?.schema_version)
     }
     fn migration_backend(&self) -> BackendKind {
-        BackendKind::Postgres
+        BackendKind::PostgresSnapshot
     }
 }
 
-impl AuditWriter for PostgresStore {
+impl AuditWriter for PostgresSnapshotStore {
     type Error = PostgresError;
     fn append_audit(&self, event: &AuditEvent) -> Result<(), Self::Error> {
         self.with_write(|store| store.insert_audit(event))
@@ -744,6 +1071,19 @@ fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+fn elapsed_us(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
+
+fn positive_u64(value: i64, label: &str) -> Result<u64, PostgresError> {
+    u64::try_from(value)
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            PostgresError::InvalidState(format!("{label} is outside the supported range"))
+        })
+}
+
 fn empty_sqlite_image() -> Result<Vec<u8>, PostgresError> {
     let directory = private_tempdir()?;
     let path = directory.path().join("state.sqlite3");
@@ -767,7 +1107,7 @@ fn load_state(conn: &mut postgres::Client) -> Result<Vec<u8>, PostgresError> {
     Ok(image)
 }
 
-fn insert_state(tx: &mut Transaction<'_>, image: &[u8]) -> Result<(), PostgresError> {
+fn insert_state(tx: &mut Transaction<'_>, image: &[u8]) -> Result<u64, PostgresError> {
     if image.len() as u64 > MAX_STATE_IMAGE_BYTES {
         return Err(PostgresError::InvalidState(
             "state image exceeds the configured limit".into(),
@@ -775,8 +1115,24 @@ fn insert_state(tx: &mut Transaction<'_>, image: &[u8]) -> Result<(), PostgresEr
     }
     let (schema, _) = verify_image(image)?;
     let checksum = sha256(image);
-    tx.execute("INSERT INTO ocfleet_runtime_state(singleton, format_version, sqlite_schema_version, state_sha256, state_bytes, updated_at) VALUES(TRUE,$1,$2,$3,$4,now()) ON CONFLICT(singleton) DO UPDATE SET format_version=EXCLUDED.format_version, sqlite_schema_version=EXCLUDED.sqlite_schema_version, state_sha256=EXCLUDED.state_sha256, state_bytes=EXCLUDED.state_bytes, updated_at=now()", &[&FORMAT_VERSION, &schema, &checksum, &image])?;
-    Ok(())
+    let revision = tx
+        .query_one(
+            "INSERT INTO ocfleet_runtime_state
+               (singleton, format_version, sqlite_schema_version, state_revision,
+                state_sha256, state_bytes, updated_at)
+             VALUES(TRUE,$1,$2,1,$3,$4,clock_timestamp())
+             ON CONFLICT(singleton) DO UPDATE SET
+               format_version=EXCLUDED.format_version,
+               sqlite_schema_version=EXCLUDED.sqlite_schema_version,
+               state_revision=ocfleet_runtime_state.state_revision + 1,
+               state_sha256=EXCLUDED.state_sha256,
+               state_bytes=EXCLUDED.state_bytes,
+               updated_at=clock_timestamp()
+             RETURNING state_revision",
+            &[&FORMAT_VERSION, &schema, &checksum, &image],
+        )?
+        .get::<_, i64>(0);
+    positive_u64(revision, "state revision")
 }
 
 fn check_state_size(conn: &mut postgres::Client) -> Result<u64, PostgresError> {

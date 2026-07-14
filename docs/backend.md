@@ -1,9 +1,10 @@
 # Controller Backends
 
-SQLite remains the default controller backend. A Postgres runtime backend is
-available only when the binary is built with `postgres-backend` and the caller
-explicitly supplies an approved connection source. No command silently selects
-Postgres and no Postgres dependency is present in the default feature set.
+SQLite remains the default controller backend. An experimental
+Postgres-wrapped SQLite snapshot backend is available only when the binary is
+built with `postgres-backend` and the caller explicitly supplies an approved
+connection source. It is not a native Postgres data layer. No command silently
+selects it and no Postgres dependency is present in the default feature set.
 
 ## Current SQLite Contract
 
@@ -19,9 +20,9 @@ operator model with simple deployment:
 The existing SQLite safety checks remain in place when Postgres support is
 compiled.
 
-## Optional Postgres Goals
+## Future Native Postgres Goals
 
-An optional Postgres backend should provide:
+A future native relational Postgres backend could provide:
 
 - larger fleet query capacity
 - longer observation/run/alert history
@@ -31,6 +32,11 @@ An optional Postgres backend should provide:
 
 It must not introduce unauthenticated writes, automatic trust, raw secrets in
 tables, or ocserv write operations.
+
+The current snapshot backend does not satisfy these scale goals. It deliberately
+reuses SQLite storage and stores the complete database image in one Postgres
+row; the distinction is part of its public contract rather than an invisible
+implementation detail.
 
 ## Store Abstraction Assessment
 
@@ -153,8 +159,8 @@ The API retains a narrower `ApiReadStore` adapter for API projections;
 `ReadOnlyStore` opens SQLite with read-only/query-only flags, validates private
 database/sidecar files, checks schema version/tables/integrity, and never exposes
 a writer to routes. Consolidating this adapter with the neutral reader remains
-future work; the API still uses SQLite even when the optional controller
-Postgres backend is compiled.
+future work; the API still uses SQLite even when the experimental controller
+Postgres snapshot backend is compiled.
 
 The controller `Store` also retains the absolute path it actually opened. A
 crate-private scheduler dispatch gate uses that bound path to open a short-lived
@@ -187,28 +193,87 @@ file checks or redaction. The scheduler writer expansions change no schema,
 protocol, agent capability, or API route; neither does the binding/lifecycle
 hardening. The API remains read-only.
 
-## Postgres Runtime
+## Experimental Postgres Snapshot Backend
 
 The `postgres-backend` feature is default-off. `PostgresConnectionSource`
 accepts only `OCFLEET_POSTGRES_URL`, `OCFLEET_TEST_POSTGRES_URL`, or an absolute
 private TOML file containing `dsn` and an optional bounded `pool_size`. Debug and
 error output never includes the DSN, password, or private path.
 
-The runtime uses an r2d2 pool and a Postgres migration transaction protected by
-`pg_advisory_xact_lock`. Its versioned, checksummed state image preserves the
-same SQLite `StoreReader`/`StoreWriter` contract and therefore the same bounded
-queries, typed projections, retention behavior, and actor-bound atomic audit.
-Each write requires a bound controller lease, locks that lease row, verifies its
-owner and fencing token, locks the singleton state row, and commits the updated
-checksum and database image in the same Postgres transaction. Controller leases
-use bounded TTLs; every ownership epoch, including same-owner reacquisition
-after expiry, receives a monotonically increasing fencing token.
+The experimental backend uses an r2d2 pool and a Postgres migration transaction
+protected by `pg_advisory_xact_lock`. The complete SQLite database is stored as
+one checksummed `BYTEA` in the singleton `ocfleet_runtime_state` row. It is
+therefore named `PostgresSnapshot` in the backend contract and reports
+`backend_kind=postgres-wrapped-sqlite-snapshot` from `doctor`.
+
+Every mutation globally serializes and performs this full-image sequence:
+
+1. acquire the writer advisory lock and lock the current controller lease;
+2. lock and download the singleton SQLite image;
+3. write and verify a private local SQLite file;
+4. execute one existing SQLite `StoreWriter` operation and its atomic audit;
+5. read and verify the complete updated file;
+6. replace the complete Postgres `BYTEA` and commit.
+
+This preserves the existing typed projections, retention rules, and atomic
+SQLite mutation/audit behavior. It does **not** provide concurrent writes,
+row-level Postgres updates, horizontal write scaling, or native Postgres query
+capacity. Postgres WAL and vacuum pressure, transaction duration, network I/O,
+temporary disk use, and process memory all grow with the complete image. A
+single mutation may temporarily require the Postgres value, multiple Rust byte
+buffers, and one or more local SQLite staging files.
+
+The recommended state image ceiling is 64 MiB. The 512 MiB value is a defensive
+hard rejection limit, not a production sizing recommendation. Images above the
+recommendation remain accepted only to support explicit testing and recovery;
+`doctor`, import, and export report `above_recommended_state_size=true`. This
+backend is intended only for low-write-frequency foundation evaluation, backup
+mobility, and fencing experiments. It is unsuitable for high-frequency
+observation, health, scheduler, or alert ingestion.
+
+Each successful state replacement increments a persistent `state_revision` and
+updates `state_updated_at` and `state_sha256`. Idempotent imports do not advance
+the revision. `doctor` exposes these fields, current image size, its own download
+and materialization timings, and process-local last-operation metrics for read,
+write, download, materialization, upload/commit, advisory-lock wait, and lease
+remaining time. The write metric also reports the high-water sum of Rust-owned
+snapshot `Vec` lengths; it deliberately does not claim to measure allocator,
+Postgres-driver, SQLite, or total RSS overhead. Import/export reports include
+their operation timings. These fixed fields contain no actor, node, DSN, path,
+or other high-cardinality label.
+
+Reads use one MVCC-consistent singleton row selected at query start, then query
+that immutable local image. They never observe a partial `BYTEA`, but they may
+return an older revision after a concurrent writer has committed. The contract
+is snapshot-at-query-start eventual consistency: it does not guarantee
+cross-request read-after-write or that a result is still current when returned.
+Callers that need freshness must compare `state_revision`/`state_sha256` from
+their operation report or a subsequent `doctor` result.
+
+Each write requires a bound controller lease and validates its owner and fencing
+token while holding the lease row. PostgreSQL `now()` transaction-start
+semantics are not used for the safety decision: initial and final checks use
+`clock_timestamp()`. After the complete image upload, the transaction checks
+the lease again immediately before commit. A lease that expires during local
+materialization or upload makes the transaction fail with `StaleFence` and
+rolls back the image and revision. Takeover remains blocked by the row lock only
+until that transaction rolls back or commits.
+
+The container-backed regression suite imports and rewrites a 96 MiB image. It
+asserts the recommendation warning, revision behavior, operation timings,
+owned-image-buffer high-water mark, commit-time lease expiry rollback, unchanged
+state after the rejected write, and a later writer takeover with a higher
+fencing token. Exact filesystem `ENOSPC` and process-RSS fault-injection tests
+remain part of C3/C-READY deployment testing; they are not represented as
+completed by this Draft foundation.
 
 The current client uses `NoTls` only for Unix sockets and loopback addresses.
 Remote hosts fail closed and must be reached through a certificate-verifying TLS
 implementation in a later reviewed change, not by weakening this restriction.
 State images are capped at 512 MiB before import, database retrieval, checksum,
-or replacement.
+or replacement. Production deployments should prefer a private config file or
+secret mount; an environment DSN can be exposed through process environments,
+crash dumps, or orchestration metadata.
 
 `import_sqlite(path, true)` opens the source read-only and uses SQLite's online
 backup API to create a transactionally consistent snapshot, including committed
@@ -259,4 +324,9 @@ its fencing token inside the replacing transaction. Export writes a new private
 SQLite file only after the stored image checksum, schema, bounds, and selected
 table counts pass. Existing output files are never overwritten. Legacy CLI
 commands and `ocfleet-api` still open SQLite; broad command/API backend
-selection remains a C1 follow-up rather than an implicit fallback.
+selection is not implemented. This module is independently mergeable only as
+default-off experimental foundation code, not independently deployable as the
+production controller backend. C3 HA failure/recovery work and the `C-READY`
+gate remain required before production use. Controlled-write D0 is a durable
+local approval/CLI state machine; D1-D4 dispatch remains intentionally absent,
+so this backend does not make any controlled operation reachable.

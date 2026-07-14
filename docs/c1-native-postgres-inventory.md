@@ -9,8 +9,8 @@ native parity.
 
 | Slice | Scope | Status |
 | --- | --- | --- |
-| C1.1 Native core | Private connection source reuse, advisory-locked and future-version-safe native migrations, relational nodes/endpoint trust/audit, atomic node-add audit, Docker failure injection | implemented on the Issue #49 branch |
-| C1.2 Registry and trust | Complete node metadata/maintenance/capability, enrollment, endpoint lifecycle, and audit parity | pending |
+| C1.1 Native core | Private connection source reuse, advisory-locked and future-version-safe native migrations, relational nodes/endpoint trust/audit, atomic node-add audit, Docker failure injection | merged |
+| C1.2 Registry and trust | Node metadata/maintenance/capability, enrollment, endpoint lifecycle, and atomic audit surface | implemented on the Issue #49 branch; shared contract gate remains C1.5 |
 | C1.3 Scheduler and observations | Jobs, claims, runs, outcomes, observations, maintenance, retention, fencing, and indexes | pending |
 | C1.4 Health and alerts | Health policy/evaluation/history/rollups, alerts, webhook queue/delivery, recovery, and retention | pending |
 | C1.5 Migration and parity gate | Verified SQLite-to-native import/export, full shared contract suite, TLS remote connections, backup/restore, performance and failure tests | pending |
@@ -48,6 +48,39 @@ and verifies complete rollback, and verifies a future schema marker causes a
 read-only fail-closed connect with all row counts unchanged. It also covers a
 hostile `search_path`, an unrelated `public.nodes`, inconsistent migration
 history, and an incompatible pre-existing native relation.
+
+## C1.2 Registry And Trust Boundary
+
+Native migration `0002_registry_trust` upgrades the C1.1 endpoint model without
+discarding its data, then adds relational metadata, maintenance, capability,
+enrollment-token, and join-request tables. It retains the fixed
+`ocfleet_native` namespace and validates both migration names before applying
+new DDL.
+
+The dormant native store now covers:
+
+- bounded node reads by role and metadata, node enable/disable/remove, metadata
+  upsert, maintenance set/clear, and version-governance inputs;
+- capability snapshots bound to the node's current endpoint with the RPC audit
+  inserted in the same transaction;
+- endpoint lookup/snapshot, rotation lineage, revocation, quarantine, automatic
+  node disabling, and legacy enrollment reconciliation;
+- enrollment token create/revoke, constant-shape credential rejection audits,
+  atomic usage counters, join submit/reject/approve, and typed redacted audit;
+- atomic node, endpoint trust, join-state, and audit writes during enrollment.
+
+Native `TIMESTAMPTZ` values use typed Postgres/time conversion. Inputs are
+normalized to UTC RFC3339 at Postgres' microsecond precision, so equivalent
+offset forms and retry requests compare by instant without discarding
+fractional seconds. Full trust snapshots read one row beyond the 1,000-row
+bound and fail closed rather than returning an apparently complete prefix.
+
+The Docker regression exercises a v1-to-v2 upgrade, hostile `search_path`,
+metadata selectors, maintenance, capability projection, endpoint rotation and
+quarantine, successful/rejected/legacy enrollment flows, and trigger-injected
+audit failures that must roll back every registry and trust mutation. It also
+covers offset and fractional timestamp retries plus a 1,001-row trust snapshot
+overflow.
 
 ## Completion Rule
 

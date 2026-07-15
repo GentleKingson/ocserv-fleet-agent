@@ -7,7 +7,7 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 
 use ocfleet_cli::audit::AuditEvent;
-use ocfleet_cli::backend::MAX_STORE_READER_ROWS;
+use ocfleet_cli::backend::{BackendKind, MAX_STORE_READER_ROWS, MigrationManager, StoreReader};
 use ocfleet_cli::postgres_backend::{PostgresConnectionSource, PostgresError};
 use ocfleet_cli::postgres_native::{NATIVE_BACKEND_SCHEMA_VERSION, connect_native};
 use ocfleet_cli::storage_payloads::{
@@ -40,6 +40,81 @@ fn postgres_source(dsn: &str) -> (tempfile::TempDir, PostgresConnectionSource) {
     #[cfg(unix)]
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("private config");
     (dir, PostgresConnectionSource::PrivateConfigFile { path })
+}
+
+fn assert_endpoint_binding_invariants(admin: &mut postgres::Client, node_id: &str) {
+    let active_count: i64 = admin
+        .query_one(
+            "SELECT COUNT(*) FROM ocfleet_native.endpoint_trust
+             WHERE node_id = $1 AND status = 'active'",
+            &[&node_id],
+        )
+        .expect("count active endpoints")
+        .get(0);
+    assert!(active_count <= 1, "node has multiple active endpoints");
+
+    let node = admin
+        .query_opt(
+            "SELECT endpoint_id, enabled FROM ocfleet_native.nodes WHERE node_id = $1",
+            &[&node_id],
+        )
+        .expect("read raced node state");
+    if let Some(node) = node {
+        let endpoint_id: String = node.get(0);
+        let enabled: bool = node.get(1);
+        let endpoint = admin
+            .query_one(
+                "SELECT node_id, status FROM ocfleet_native.endpoint_trust
+                 WHERE endpoint_id = $1",
+                &[&endpoint_id],
+            )
+            .expect("current endpoint trust exists");
+        assert_eq!(
+            endpoint.get::<_, Option<String>>(0).as_deref(),
+            Some(node_id)
+        );
+        let status: String = endpoint.get(1);
+        if status == "active" {
+            assert_eq!(active_count, 1);
+        } else {
+            assert!(!enabled, "node remained enabled with a non-active endpoint");
+            assert_eq!(active_count, 0);
+        }
+    } else {
+        assert_eq!(active_count, 0, "removed node retained an active endpoint");
+    }
+
+    let broken_lineage: i64 = admin
+        .query_one(
+            "SELECT COUNT(*)
+             FROM ocfleet_native.endpoint_trust old
+             LEFT JOIN ocfleet_native.endpoint_trust child
+               ON child.endpoint_id = old.rotated_to
+             WHERE old.node_id = $1
+               AND old.status = 'rotated'
+               AND (
+                 old.rotated_to IS NULL
+                 OR child.endpoint_id IS NULL
+                 OR child.previous_endpoint_id IS DISTINCT FROM old.endpoint_id
+                 OR child.node_id IS DISTINCT FROM old.node_id
+                 OR child.generation IS DISTINCT FROM old.generation
+               )",
+            &[&node_id],
+        )
+        .expect("check endpoint lineage")
+        .get(0);
+    assert_eq!(broken_lineage, 0, "endpoint rotation lineage is broken");
+}
+
+fn native_audit_count(admin: &mut postgres::Client, node_id: &str, event: &str) -> i64 {
+    admin
+        .query_one(
+            "SELECT COUNT(*) FROM ocfleet_native.controller_audit_log
+             WHERE node_id = $1 AND event = $2",
+            &[&node_id, &event],
+        )
+        .expect("count native audit events")
+        .get(0)
 }
 
 #[test]
@@ -163,6 +238,110 @@ fn native_postgres_core_is_relational_atomic_and_future_schema_safe() {
             .expect("list native nodes by label")
             .len(),
         1
+    );
+    let scalar_metadata = NodeMetadataRecord {
+        labels_json: json!({
+            "null-value": null,
+            "bool-value": true,
+            "number-value": 42,
+            "string-value": "42",
+        }),
+        updated_at: "2026-07-14T12:00:01.123456Z".into(),
+        ..metadata.clone()
+    };
+    store
+        .set_node_metadata(&scalar_metadata, "operator-a")
+        .expect("set native scalar label metadata");
+    for (field, expected) in [
+        ("label.null-value", "null"),
+        ("label.bool-value", "true"),
+        ("label.number-value", "42"),
+    ] {
+        assert!(
+            store
+                .list_nodes_by_metadata_limited(field, expected, 10)
+                .expect("query native non-string label")
+                .is_empty(),
+            "{field} unexpectedly matched a non-string scalar"
+        );
+    }
+    assert_eq!(
+        store
+            .list_nodes_by_metadata_limited("label.string-value", "42", 10)
+            .expect("query native string label")
+            .len(),
+        1
+    );
+
+    admin
+        .execute(
+            "UPDATE ocfleet_native.node_metadata
+             SET labels_json =
+                 '{\"purpose\":\"native-parity\",\"nested\":{\"invalid\":true}}'::jsonb
+             WHERE node_id = $1",
+            &[&node.node_id],
+        )
+        .expect("contaminate native metadata labels");
+    assert!(store.get_node_metadata(&node.node_id).is_err());
+    assert!(
+        store
+            .list_nodes_by_metadata_limited("label.purpose", "native-parity", 10)
+            .is_err(),
+        "selector accepted a matching label from an invalid metadata row"
+    );
+    admin
+        .execute(
+            "UPDATE ocfleet_native.node_metadata
+             SET labels_json = '{\"purpose\":\"native-parity\"}'::jsonb,
+                 environment = 'bad value'
+             WHERE node_id = $1",
+            &[&node.node_id],
+        )
+        .expect("contaminate native metadata field");
+    assert!(store.get_node_metadata(&node.node_id).is_err());
+    assert!(
+        store
+            .list_nodes_by_metadata_limited("label.purpose", "native-parity", 10)
+            .is_err(),
+        "selector accepted a row with an invalid environment"
+    );
+    admin
+        .execute(
+            "UPDATE ocfleet_native.node_metadata
+             SET environment = $2, expected_agent_version = $3 WHERE node_id = $1",
+            &[
+                &node.node_id,
+                &scalar_metadata.environment,
+                &"invalid\nversion",
+            ],
+        )
+        .expect("contaminate native metadata agent version");
+    assert!(
+        store
+            .list_nodes_by_metadata_limited("label.purpose", "native-parity", 10)
+            .is_err(),
+        "selector accepted a row with an invalid expected agent version"
+    );
+    admin
+        .execute(
+            "UPDATE ocfleet_native.node_metadata
+             SET labels_json = CAST($2 AS text)::jsonb,
+                 expected_agent_version = $3
+             WHERE node_id = $1",
+            &[
+                &node.node_id,
+                &scalar_metadata.labels_json.to_string(),
+                &scalar_metadata.expected_agent_version,
+            ],
+        )
+        .expect("restore native metadata");
+    assert_eq!(
+        store
+            .get_node_metadata(&node.node_id)
+            .expect("read restored native metadata")
+            .expect("restored native metadata exists")
+            .labels_json,
+        scalar_metadata.labels_json
     );
     let maintenance = NodeMaintenanceWindow {
         node_id: node.node_id.clone(),
@@ -351,6 +530,112 @@ fn native_postgres_core_is_relational_atomic_and_future_schema_safe() {
         .expect("quarantine native endpoint");
     assert_eq!(quarantined.status.as_str(), "quarantined");
     assert!(store.enable_node(&node.node_id, "operator-a").is_err());
+
+    let remove_rotate_node = NodeInsert {
+        node_id: "node-native-remove-rotate".into(),
+        endpoint_id: iroh::SecretKey::generate().public().to_string(),
+        name: "Native remove rotate race".into(),
+        region: "test".into(),
+        role: "ocserv".into(),
+    };
+    store
+        .add_node(&remove_rotate_node, "operator-race")
+        .expect("add remove-rotate race node");
+    let remove_rotate_destination = iroh::SecretKey::generate().public().to_string();
+    let race_barrier = Arc::new(Barrier::new(3));
+    let remove_store = store.clone();
+    let remove_node_id = remove_rotate_node.node_id.clone();
+    let remove_barrier = Arc::clone(&race_barrier);
+    let remove_thread = thread::spawn(move || {
+        remove_barrier.wait();
+        remove_store.remove_node(&remove_node_id, "operator-remove")
+    });
+    let rotate_store = store.clone();
+    let rotate_source = remove_rotate_node.endpoint_id.clone();
+    let rotate_barrier = Arc::clone(&race_barrier);
+    let rotate_thread = thread::spawn(move || {
+        rotate_barrier.wait();
+        rotate_store.rotate_endpoint(
+            &rotate_source,
+            &remove_rotate_destination,
+            "operator-rotate",
+            "concurrent remove-rotate test",
+        )
+    });
+    race_barrier.wait();
+    let remove_result = remove_thread.join().expect("join remove race");
+    let rotate_result = rotate_thread.join().expect("join rotate race");
+    assert!(remove_result.is_ok() || rotate_result.is_ok());
+    assert!(!format!("{remove_result:?}").contains("deadlock detected"));
+    assert!(!format!("{rotate_result:?}").contains("deadlock detected"));
+    assert_endpoint_binding_invariants(&mut admin, &remove_rotate_node.node_id);
+    assert_eq!(
+        native_audit_count(&mut admin, &remove_rotate_node.node_id, "node.remove"),
+        i64::from(remove_result.is_ok())
+    );
+    assert_eq!(
+        native_audit_count(&mut admin, &remove_rotate_node.node_id, "endpoint.rotate"),
+        i64::from(rotate_result.is_ok())
+    );
+
+    let rotate_quarantine_node = NodeInsert {
+        node_id: "node-native-rotate-quarantine".into(),
+        endpoint_id: iroh::SecretKey::generate().public().to_string(),
+        name: "Native rotate quarantine race".into(),
+        region: "test".into(),
+        role: "ocserv".into(),
+    };
+    store
+        .add_node(&rotate_quarantine_node, "operator-race")
+        .expect("add rotate-quarantine race node");
+    let rotate_quarantine_destination = iroh::SecretKey::generate().public().to_string();
+    let race_barrier = Arc::new(Barrier::new(3));
+    let rotate_store = store.clone();
+    let rotate_source = rotate_quarantine_node.endpoint_id.clone();
+    let rotate_barrier = Arc::clone(&race_barrier);
+    let rotate_thread = thread::spawn(move || {
+        rotate_barrier.wait();
+        rotate_store.rotate_endpoint(
+            &rotate_source,
+            &rotate_quarantine_destination,
+            "operator-rotate",
+            "concurrent rotate-quarantine test",
+        )
+    });
+    let quarantine_store = store.clone();
+    let quarantine_endpoint = rotate_quarantine_node.endpoint_id.clone();
+    let quarantine_barrier = Arc::clone(&race_barrier);
+    let quarantine_thread = thread::spawn(move || {
+        quarantine_barrier.wait();
+        quarantine_store.quarantine_endpoint(
+            &quarantine_endpoint,
+            "operator-quarantine",
+            "concurrent rotate-quarantine test",
+        )
+    });
+    race_barrier.wait();
+    let rotate_result = rotate_thread.join().expect("join rotation race");
+    let quarantine_result = quarantine_thread.join().expect("join quarantine race");
+    assert!(rotate_result.is_ok() || quarantine_result.is_ok());
+    assert!(!format!("{rotate_result:?}").contains("deadlock detected"));
+    assert!(!format!("{quarantine_result:?}").contains("deadlock detected"));
+    assert_endpoint_binding_invariants(&mut admin, &rotate_quarantine_node.node_id);
+    assert_eq!(
+        native_audit_count(
+            &mut admin,
+            &rotate_quarantine_node.node_id,
+            "endpoint.rotate"
+        ),
+        i64::from(rotate_result.is_ok())
+    );
+    assert_eq!(
+        native_audit_count(
+            &mut admin,
+            &rotate_quarantine_node.node_id,
+            "endpoint.quarantine"
+        ),
+        i64::from(quarantine_result.is_ok())
+    );
 
     admin
         .batch_execute(
@@ -623,6 +908,13 @@ FOR EACH ROW EXECUTE FUNCTION fail_native_node_audit();
             .claim_legacy_enrollment(&claim, "different-enrollment-admin")
             .is_err()
     );
+    admin
+        .execute(
+            "UPDATE ocfleet_native.controller_audit_log SET node_id = $2
+             WHERE event = 'enrollment.approve' AND request_id = $1",
+            &[&request.request_id, &claim.node_id],
+        )
+        .expect("restore native approval audit relationship");
 
     let rejected_request = JoinRequestInsert {
         request_id: "join-22222222-2222-4222-8222-222222222222".into(),
@@ -1987,6 +2279,71 @@ FOR EACH ROW EXECUTE FUNCTION fail_native_scheduler_audit();
              DROP FUNCTION fail_native_scheduler_audit();",
         )
         .expect("remove native scheduler audit failure trigger");
+
+    assert_eq!(
+        StoreReader::backend_kind(&store),
+        BackendKind::PostgresNative
+    );
+    assert_eq!(
+        MigrationManager::migration_backend(&store),
+        BackendKind::PostgresNative
+    );
+    assert_eq!(
+        MigrationManager::schema_version(&store).expect("native migration contract version"),
+        i64::from(NATIVE_BACKEND_SCHEMA_VERSION)
+    );
+    assert!(
+        !StoreReader::read_nodes(&store, 100)
+            .expect("native contract nodes")
+            .is_empty()
+    );
+    assert!(
+        StoreReader::read_node(&store, &node.node_id)
+            .expect("native contract node")
+            .is_some()
+    );
+    assert!(
+        !StoreReader::read_jobs(&store, 10)
+            .expect("native contract jobs")
+            .is_empty()
+    );
+    assert!(
+        !StoreReader::read_runs(&store, 10)
+            .expect("native contract runs")
+            .is_empty()
+    );
+    StoreReader::read_observations(&store, None, None, 10).expect("native contract observations");
+    assert!(
+        !StoreReader::read_health_snapshots(&store, 10)
+            .expect("native contract health")
+            .is_empty()
+    );
+    assert_eq!(
+        StoreReader::read_alerts(&store, 10)
+            .expect("native contract alerts")
+            .len(),
+        2
+    );
+    assert!(
+        !StoreReader::read_audit_window(
+            &store,
+            "2020-01-01T00:00:00Z",
+            "2040-01-01T00:00:00Z",
+            1_000,
+        )
+        .expect("native contract audit")
+        .is_empty()
+    );
+    assert!(StoreReader::read_nodes(&store, 0).is_err());
+    assert!(
+        StoreReader::read_audit_window(
+            &store,
+            "2020-01-01T00:00:00Z",
+            "2040-01-01T00:00:00Z",
+            MAX_STORE_READER_ROWS as usize + 1,
+        )
+        .is_err()
+    );
 
     let mut overflow_tx = admin
         .transaction()

@@ -24,7 +24,7 @@ use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
 use crate::audit::AuditEvent;
-use crate::backend::MAX_STORE_READER_ROWS;
+use crate::backend::{BackendKind, MAX_STORE_READER_ROWS, MigrationManager, StoreReader};
 use crate::input_validation::{
     validate_actor, validate_agent_fingerprint, validate_agent_public_key, validate_agent_version,
     validate_description, validate_endpoint_id, validate_hostname, validate_label_json,
@@ -42,7 +42,7 @@ use crate::store::{
     AlertDeliveryAttemptRecord, AlertDeliveryAttemptWrite, AlertDeliveryFinalizeWrite,
     AlertDeliveryQueueClaim, AlertDeliveryQueueEnqueue, AlertDeliveryQueueHealth,
     AlertDeliveryQueueOutcome, AlertEvaluationWrite, AlertEventRecord, AlertStateTransition,
-    AlertWebhookHookRecord, ApprovalInput, EndpointTrustRecord, EnrollmentTokenInsert,
+    AlertWebhookHookRecord, ApprovalInput, AuditRecord, EndpointTrustRecord, EnrollmentTokenInsert,
     EnrollmentTokenRecord, HealthEvaluationFailure, HealthEvaluationFinish,
     HealthEvaluationRunRecord, HealthEvaluationStart, HealthHistoryRecord, HealthPolicyRecord,
     HealthRollupRecord, HealthRollupSource, HealthRollupWrite, HealthSnapshotRecord,
@@ -859,40 +859,51 @@ ALTER TABLE ocfleet_native.retention_policies
                 .map_err(PostgresError::InvalidInput)?;
             return conn
                 .query(
-                    "SELECT n.node_id, n.endpoint_id, n.name, n.region, n.role, n.enabled
+                    "SELECT n.node_id, n.endpoint_id, n.name, n.region, n.role, n.enabled,
+                            m.node_id, m.environment, m.site, m.owner_team, m.service_tier,
+                            m.labels_json::text, m.expected_agent_version, m.updated_at
                      FROM ocfleet_native.nodes n
                      JOIN ocfleet_native.node_metadata m ON m.node_id = n.node_id
-                     WHERE m.labels_json ->> $1 = $2
+                     WHERE jsonb_typeof(m.labels_json -> $1) = 'string'
+                       AND m.labels_json ->> $1 = $2
                      ORDER BY n.node_id LIMIT $3",
                     &[&key, &expected, &limit],
                 )?
                 .iter()
-                .map(node_from_row)
+                .map(node_with_metadata_from_row)
                 .collect();
         }
         validate_metadata_value(expected, "selector metadata value")
             .map_err(PostgresError::InvalidInput)?;
         let sql = match field {
             "environment" => {
-                "SELECT n.node_id, n.endpoint_id, n.name, n.region, n.role, n.enabled
+                "SELECT n.node_id, n.endpoint_id, n.name, n.region, n.role, n.enabled,
+                        m.node_id, m.environment, m.site, m.owner_team, m.service_tier,
+                        m.labels_json::text, m.expected_agent_version, m.updated_at
                  FROM ocfleet_native.nodes n
                  JOIN ocfleet_native.node_metadata m ON m.node_id = n.node_id
                  WHERE m.environment = $1 ORDER BY n.node_id LIMIT $2"
             }
             "site" => {
-                "SELECT n.node_id, n.endpoint_id, n.name, n.region, n.role, n.enabled
+                "SELECT n.node_id, n.endpoint_id, n.name, n.region, n.role, n.enabled,
+                        m.node_id, m.environment, m.site, m.owner_team, m.service_tier,
+                        m.labels_json::text, m.expected_agent_version, m.updated_at
                  FROM ocfleet_native.nodes n
                  JOIN ocfleet_native.node_metadata m ON m.node_id = n.node_id
                  WHERE m.site = $1 ORDER BY n.node_id LIMIT $2"
             }
             "owner_team" => {
-                "SELECT n.node_id, n.endpoint_id, n.name, n.region, n.role, n.enabled
+                "SELECT n.node_id, n.endpoint_id, n.name, n.region, n.role, n.enabled,
+                        m.node_id, m.environment, m.site, m.owner_team, m.service_tier,
+                        m.labels_json::text, m.expected_agent_version, m.updated_at
                  FROM ocfleet_native.nodes n
                  JOIN ocfleet_native.node_metadata m ON m.node_id = n.node_id
                  WHERE m.owner_team = $1 ORDER BY n.node_id LIMIT $2"
             }
             "service_tier" => {
-                "SELECT n.node_id, n.endpoint_id, n.name, n.region, n.role, n.enabled
+                "SELECT n.node_id, n.endpoint_id, n.name, n.region, n.role, n.enabled,
+                        m.node_id, m.environment, m.site, m.owner_team, m.service_tier,
+                        m.labels_json::text, m.expected_agent_version, m.updated_at
                  FROM ocfleet_native.nodes n
                  JOIN ocfleet_native.node_metadata m ON m.node_id = n.node_id
                  WHERE m.service_tier = $1 ORDER BY n.node_id LIMIT $2"
@@ -905,7 +916,7 @@ ALTER TABLE ocfleet_native.retention_policies
         };
         conn.query(sql, &[&expected, &limit])?
             .iter()
-            .map(node_from_row)
+            .map(node_with_metadata_from_row)
             .collect()
     }
 
@@ -976,9 +987,26 @@ ALTER TABLE ocfleet_native.retention_policies
             .map_err(|error| PostgresError::InvalidInput(error.to_string()))?;
         let mut conn = self.connection()?;
         let mut tx = conn.transaction()?;
+        // Endpoint lifecycle paths lock endpoint -> node. Read the binding
+        // without a row lock first, then acquire locks in that same order and
+        // reject a concurrent binding change.
+        let binding_hint = tx
+            .query_opt(
+                "SELECT node_id, endpoint_id, name, region, role, enabled
+                 FROM ocfleet_native.nodes WHERE node_id = $1",
+                &[&node_id],
+            )?
+            .map(|row| node_from_row(&row))
+            .transpose()?
+            .ok_or_else(|| PostgresError::InvalidState("native node not found".to_string()))?;
+        let endpoint_before = get_endpoint_trust_tx(&mut tx, &binding_hint.endpoint_id)?;
         let before = get_node_tx(&mut tx, node_id)?
             .ok_or_else(|| PostgresError::InvalidState("native node not found".to_string()))?;
-        let endpoint_before = get_endpoint_trust_tx(&mut tx, &before.endpoint_id)?;
+        if before.endpoint_id != binding_hint.endpoint_id {
+            return Err(PostgresError::InvalidState(
+                "native node endpoint binding changed during removal".to_string(),
+            ));
+        }
         let endpoint_after = if let Some(endpoint) = endpoint_before.as_ref()
             && endpoint.status == EndpointStatus::Active
         {
@@ -3198,6 +3226,40 @@ ALTER TABLE ocfleet_native.retention_policies
                 &[&event],
             )?
             .get(0))
+    }
+
+    pub fn list_audit_window(
+        &self,
+        from: &str,
+        to: &str,
+        limit: usize,
+    ) -> Result<Vec<AuditRecord>, PostgresError> {
+        if limit == 0 || limit > MAX_STORE_READER_ROWS as usize {
+            return Err(PostgresError::InvalidInput(format!(
+                "audit query limit must be between 1 and {MAX_STORE_READER_ROWS}"
+            )));
+        }
+        let from = parse_postgres_timestamp(from, "audit window from")?;
+        let to = parse_postgres_timestamp(to, "audit window to")?;
+        if from >= to {
+            return Err(PostgresError::InvalidInput(
+                "audit window end must be later than start".into(),
+            ));
+        }
+        let limit = i64::try_from(limit)
+            .map_err(|_| PostgresError::InvalidInput("audit query limit is invalid".into()))?;
+        let mut conn = self.connection()?;
+        conn.query(
+            "SELECT id, ts, actor, event, node_id, endpoint_id, method, request_id,
+                    params_hash, ok, error_code, duration_ms, detail_json::text
+             FROM ocfleet_native.controller_audit_log
+             WHERE ts >= $1 AND ts < $2
+             ORDER BY ts, id LIMIT $3",
+            &[&from, &to, &limit],
+        )?
+        .iter()
+        .map(audit_record_from_postgres_row)
+        .collect()
     }
 }
 
@@ -7245,19 +7307,98 @@ fn get_node_metadata_tx(
 }
 
 fn node_metadata_from_row(row: &postgres::Row) -> Result<NodeMetadataRecord, PostgresError> {
-    let labels: String = row.try_get(5)?;
+    node_metadata_from_row_at(row, 0)
+}
+
+fn node_metadata_from_row_at(
+    row: &postgres::Row,
+    offset: usize,
+) -> Result<NodeMetadataRecord, PostgresError> {
+    let labels: String = row.try_get(offset + 5)?;
     let labels_json = serde_json::from_str(&labels)
         .map_err(|_| PostgresError::InvalidState("native node metadata JSON is invalid".into()))?;
-    validate_low_sensitive_json(&labels_json, "native node metadata labels")?;
-    Ok(NodeMetadataRecord {
-        node_id: row.try_get(0)?,
-        environment: row.try_get(1)?,
-        site: row.try_get(2)?,
-        owner_team: row.try_get(3)?,
-        service_tier: row.try_get(4)?,
+    let metadata = NodeMetadataRecord {
+        node_id: row.try_get(offset)?,
+        environment: row.try_get(offset + 1)?,
+        site: row.try_get(offset + 2)?,
+        owner_team: row.try_get(offset + 3)?,
+        service_tier: row.try_get(offset + 4)?,
         labels_json,
-        expected_agent_version: row.try_get(6)?,
-        updated_at: format_postgres_timestamp(row.try_get(7)?, "node metadata updated_at")?,
+        expected_agent_version: row.try_get(offset + 6)?,
+        updated_at: format_postgres_timestamp(
+            row.try_get(offset + 7)?,
+            "node metadata updated_at",
+        )?,
+    };
+    validate_node_metadata_record(&metadata).map_err(|error| {
+        PostgresError::InvalidState(format!("native node metadata is invalid: {error}"))
+    })?;
+    Ok(metadata)
+}
+
+fn node_with_metadata_from_row(row: &postgres::Row) -> Result<NodeRecord, PostgresError> {
+    let node = node_from_row(row)?;
+    let metadata = node_metadata_from_row_at(row, 6)?;
+    if metadata.node_id != node.node_id {
+        return Err(PostgresError::InvalidState(
+            "native node metadata references a different node".into(),
+        ));
+    }
+    Ok(node)
+}
+
+fn audit_record_from_postgres_row(row: &postgres::Row) -> Result<AuditRecord, PostgresError> {
+    let ts = format_postgres_timestamp(row.try_get(1)?, "audit timestamp")?;
+    let actor: String = row.try_get(2)?;
+    let event: String = row.try_get(3)?;
+    let node_id: Option<String> = row.try_get(4)?;
+    let endpoint_id: Option<String> = row.try_get(5)?;
+    let method: Option<String> = row.try_get(6)?;
+    let request_id: Option<String> = row.try_get(7)?;
+    let params_hash: Option<String> = row.try_get(8)?;
+    let ok: Option<bool> = row.try_get(9)?;
+    let error_code: Option<String> = row.try_get(10)?;
+    let duration_ms = row
+        .try_get::<_, Option<i64>>(11)?
+        .map(|value| checked_u64(value, "audit duration_ms"))
+        .transpose()?;
+    let detail: String = row.try_get(12)?;
+    let detail: Value = serde_json::from_str(&detail)
+        .map_err(|_| PostgresError::InvalidState("native audit JSON is invalid".into()))?;
+    let payload = AuditDetailPayloadV1::from_value(&detail).map_err(|error| {
+        PostgresError::InvalidState(format!("native audit is invalid: {error}"))
+    })?;
+    payload
+        .validate_relationship(
+            &ts,
+            &actor,
+            &event,
+            node_id.as_deref(),
+            endpoint_id.as_deref(),
+            method.as_deref(),
+            request_id.as_deref(),
+            params_hash.as_deref(),
+            ok,
+            error_code.as_deref(),
+            duration_ms,
+        )
+        .map_err(|error| {
+            PostgresError::InvalidState(format!("native audit relationship is invalid: {error}"))
+        })?;
+    Ok(AuditRecord {
+        id: row.try_get(0)?,
+        ts,
+        actor,
+        event,
+        node_id,
+        endpoint_id,
+        method,
+        request_id,
+        params_hash,
+        ok,
+        error_code,
+        duration_ms,
+        detail_json: payload.public_detail(),
     })
 }
 
@@ -8420,6 +8561,68 @@ fn insert_audit(tx: &mut Transaction<'_>, event: &AuditEvent) -> Result<(), Post
         ],
     )?;
     Ok(())
+}
+
+impl StoreReader for PostgresNativeStore {
+    type Error = PostgresError;
+
+    fn backend_kind(&self) -> BackendKind {
+        BackendKind::PostgresNative
+    }
+
+    fn read_nodes(&self, limit: u64) -> Result<Vec<NodeRecord>, Self::Error> {
+        self.list_nodes(limit)
+    }
+
+    fn read_node(&self, node_id: &str) -> Result<Option<NodeRecord>, Self::Error> {
+        self.get_node(node_id)
+    }
+
+    fn read_jobs(&self, limit: u64) -> Result<Vec<ObservabilityJobRecord>, Self::Error> {
+        self.list_observability_jobs(limit)
+    }
+
+    fn read_runs(&self, limit: u64) -> Result<Vec<ObservabilityRunRecord>, Self::Error> {
+        self.list_observability_runs(limit)
+    }
+
+    fn read_observations(
+        &self,
+        node_id: Option<&str>,
+        method: Option<&str>,
+        limit: u64,
+    ) -> Result<Vec<ProbeObservationRecord>, Self::Error> {
+        self.list_probe_observations_filtered(node_id, method, None, limit)
+    }
+
+    fn read_health_snapshots(&self, limit: u64) -> Result<Vec<HealthSnapshotRecord>, Self::Error> {
+        self.list_health_snapshots(limit)
+    }
+
+    fn read_alerts(&self, limit: u64) -> Result<Vec<AlertEventRecord>, Self::Error> {
+        self.list_alert_events(limit)
+    }
+
+    fn read_audit_window(
+        &self,
+        from: &str,
+        to: &str,
+        limit: usize,
+    ) -> Result<Vec<AuditRecord>, Self::Error> {
+        self.list_audit_window(from, to, limit)
+    }
+}
+
+impl MigrationManager for PostgresNativeStore {
+    type Error = PostgresError;
+
+    fn schema_version(&self) -> Result<i64, Self::Error> {
+        Ok(i64::from(PostgresNativeStore::schema_version(self)?))
+    }
+
+    fn migration_backend(&self) -> BackendKind {
+        BackendKind::PostgresNative
+    }
 }
 
 #[cfg(test)]

@@ -19,6 +19,7 @@ pub const MAX_STORE_READER_ROWS: u64 = 1_000;
 pub enum BackendKind {
     Sqlite,
     PostgresSnapshot,
+    PostgresNative,
 }
 
 /// Backend-neutral read contract. Every history query carries an explicit cap.
@@ -870,6 +871,65 @@ mod tests {
         let store = Store::open(&dir.path().join("controller.sqlite")).expect("open store");
         assert!(StoreReader::read_nodes(&store, 0).is_err());
         assert!(StoreReader::read_alerts(&store, MAX_STORE_READER_ROWS + 1).is_err());
+    }
+
+    #[test]
+    fn sqlite_label_selector_matches_only_string_scalars() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = Store::open(&dir.path().join("controller.sqlite")).expect("open store");
+        StoreWriter::write_node_add(
+            &store,
+            &NodeInsert {
+                node_id: "node-labels".into(),
+                endpoint_id: "endpoint-labels".into(),
+                name: "node-labels".into(),
+                region: "test".into(),
+                role: "ocserv".into(),
+            },
+            "operator",
+        )
+        .expect("add label node");
+        StoreWriter::write_node_metadata(
+            &store,
+            &NodeMetadataRecord {
+                node_id: "node-labels".into(),
+                environment: "test".into(),
+                site: "lab".into(),
+                owner_team: "platform".into(),
+                service_tier: "tier-1".into(),
+                labels_json: json!({
+                    "null-value": null,
+                    "bool-value": true,
+                    "number-value": 42,
+                    "string-value": "42",
+                }),
+                expected_agent_version: None,
+                updated_at: "2026-07-15T00:00:00Z".into(),
+            },
+            "operator",
+        )
+        .expect("set label metadata");
+
+        for (field, expected) in [
+            ("label.null-value", "null"),
+            ("label.bool-value", "true"),
+            ("label.number-value", "42"),
+        ] {
+            assert!(
+                store
+                    .list_nodes_by_metadata_limited(field, expected, 10)
+                    .expect("query non-string label")
+                    .is_empty(),
+                "{field} unexpectedly matched a non-string scalar"
+            );
+        }
+        assert_eq!(
+            store
+                .list_nodes_by_metadata_limited("label.string-value", "42", 10)
+                .expect("query string label")
+                .len(),
+            1
+        );
     }
 
     #[test]

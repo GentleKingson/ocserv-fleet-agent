@@ -1123,7 +1123,8 @@ impl Store {
             let sql = format!(
                 "SELECT {node_columns} FROM nodes n
                  JOIN node_metadata m ON m.node_id = n.node_id
-                 WHERE json_extract(m.labels_json, ?1) = ?2
+                 WHERE json_type(m.labels_json, ?1) = 'text'
+                   AND json_extract(m.labels_json, ?1) = ?2
                  ORDER BY n.node_id LIMIT ?3"
             );
             let mut stmt = self.conn.prepare(&sql)?;

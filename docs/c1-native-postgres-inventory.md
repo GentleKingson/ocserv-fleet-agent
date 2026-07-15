@@ -12,8 +12,8 @@ native parity.
 | C1.1 Native core | Private connection source reuse, advisory-locked and future-version-safe native migrations, relational nodes/endpoint trust/audit, atomic node-add audit, Docker failure injection | merged |
 | C1.2 Registry and trust | Node metadata/maintenance/capability, enrollment, endpoint lifecycle, and atomic audit surface | merged; shared contract gate remains C1.5 |
 | C1.3 Scheduler and observations | Jobs, claims, runs, outcomes, observations, maintenance, retention, fencing, and indexes | merged; shared contract gate remains C1.5 |
-| C1.4 Health and alerts | Health policy/evaluation/history/rollups, alerts, webhook queue/delivery, recovery, and retention | implemented on the Issue #49 branch; shared contract gate remains C1.5 |
-| C1.5 Migration and parity gate | Verified SQLite-to-native import/export, full shared contract suite, TLS remote connections, backup/restore, performance and failure tests | pending |
+| C1.4 Health and alerts | Health policy/evaluation/history/rollups, alerts, webhook queue/delivery, recovery, and retention | merged; shared contract gate remains C1.5 |
+| C1.5 Migration and parity gate | Verified SQLite-to-native import/export, full shared contract suite, TLS remote connections, backup/restore, performance and failure tests | in progress; reader contract and C1.2 hardening slice implemented on the Issue #49 branch |
 
 ## C1.1 Safety Boundary
 
@@ -170,6 +170,31 @@ evaluation replay, history and rollup projection, typed alert storage, webhook
 queue delivery, wrong-actor claim rejection, successful fenced outcome, queue
 health, and the expanded retention scope. The module remains unavailable to
 CLI, API, scheduler, and controller runtime selection.
+
+## C1.5 Parity Hardening In Progress
+
+The first C1.5 slice closes the accepted C1.2 follow-ups before any production
+selection path is added:
+
+- SQLite and native Postgres label selectors now match only JSON string
+  scalars. Null, boolean, and numeric values remain valid stored labels but are
+  never coerced to selector text; both backends run the same scalar vectors.
+- Native metadata readers re-run the complete metadata and label validator on
+  stored rows. Invalid scalar shapes, field characters, bounds, timestamps, or
+  versions fail closed even if an administrator bypassed normal writers.
+- Native node removal now follows the endpoint-to-node row-lock order already
+  used by rotation, quarantine, and revocation. A pre-lock binding projection
+  is revalidated after both locks, and concurrent remove/rotate plus
+  rotate/quarantine regressions reject deadlocks or partial state.
+- `PostgresNativeStore` now implements the bounded backend-neutral
+  `StoreReader` and `MigrationManager` contracts, including typed audit-window
+  validation and an explicit `PostgresNative` backend kind.
+
+This is not the final C1.5 gate. Native `StoreWriter` contract convergence,
+verified SQLite import/export, TLS remote transport, backup/restore, runtime
+selection, and production performance/failure acceptance remain pending. The
+experimental feature and source-boundary test therefore continue to keep the
+backend dormant.
 
 ## Completion Rule
 

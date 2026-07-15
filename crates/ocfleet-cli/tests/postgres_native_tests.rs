@@ -10,13 +10,19 @@ use ocfleet_cli::audit::AuditEvent;
 use ocfleet_cli::backend::MAX_STORE_READER_ROWS;
 use ocfleet_cli::postgres_backend::{PostgresConnectionSource, PostgresError};
 use ocfleet_cli::postgres_native::{NATIVE_BACKEND_SCHEMA_VERSION, connect_native};
-use ocfleet_cli::storage_payloads::{SchedulerSelectorPayloadV1, TrustBundlePayloadV1};
+use ocfleet_cli::storage_payloads::{
+    AlertDetailPayloadV1, AlertSummaryFieldsV1, HealthDegradedMethodsPayloadV1,
+    HealthSummaryPayloadV1, SchedulerSelectorPayloadV1, TrustBundlePayloadV1,
+};
 use ocfleet_cli::store::{
-    ApprovalInput, EnrollmentTokenInsert, JoinRequestInsert, LegacyEnrollmentClaimInput,
-    NodeInsert, NodeMaintenanceWindow, NodeMetadataRecord, ObservabilityJobRecord,
-    ProbeObservationInsert, RetentionApplyInput, RetentionPolicyRecord, SchedulerJobClaim,
-    SchedulerJobClockUpdate, SchedulerMaintenanceWindow, SchedulerOutcomeEntry,
-    SchedulerOutcomeWrite, SchedulerRunFinish, SchedulerRunStart, Store,
+    AlertDeliveryAttemptRecord, AlertDeliveryQueueEnqueue, AlertDeliveryQueueOutcome,
+    AlertEvaluationEntry, AlertEvaluationWrite, AlertEventRecord, AlertWebhookHookRecord,
+    ApprovalInput, EnrollmentTokenInsert, HealthEvaluationFinish, HealthEvaluationStart,
+    HealthPolicyRecord, HealthRollupRecord, HealthRollupWrite, HealthSnapshotRecord,
+    JoinRequestInsert, LegacyEnrollmentClaimInput, NodeInsert, NodeMaintenanceWindow,
+    NodeMetadataRecord, ObservabilityJobRecord, ProbeObservationInsert, RetentionApplyInput,
+    RetentionPolicyRecord, SchedulerJobClaim, SchedulerJobClockUpdate, SchedulerMaintenanceWindow,
+    SchedulerOutcomeEntry, SchedulerOutcomeWrite, SchedulerRunFinish, SchedulerRunStart, Store,
 };
 use ocfleet_cli::version_governance::{CapabilityNegotiationStatus, CapabilitySnapshot};
 use ocfleet_protocol::method::{NODE_CAPABILITIES, PROBE_CONTROLLER_PING};
@@ -1328,6 +1334,586 @@ FOR EACH ROW EXECUTE FUNCTION fail_native_approval_audit();
             .is_err()
     );
 
+    let health_policy = HealthPolicyRecord {
+        stale_window_seconds: 7_200,
+        unreachable_consecutive_failures: 4,
+        cert_warning_days: 21,
+        cert_critical_days: 5,
+        updated_at: "2031-01-02T01:00:00.123456+08:00".into(),
+    };
+    store
+        .set_health_policy(&health_policy, "health-controller")
+        .expect("set native health policy");
+    assert_eq!(
+        store.get_health_policy().expect("get native health policy"),
+        health_policy
+    );
+    let health_evaluation_id = "health-eval-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let health_start = HealthEvaluationStart {
+        evaluation_id: health_evaluation_id.into(),
+        input_watermark: "1".repeat(64),
+        policy_version: "2".repeat(64),
+        computation_version: "native-c1.4".into(),
+        started_at: "2031-01-02T02:00:00.123456+08:00".into(),
+    };
+    store
+        .write_health_evaluation_start(&health_start, "health-controller")
+        .expect("start native health evaluation");
+    store
+        .write_health_evaluation_start(&health_start, "health-controller")
+        .expect("replay native health evaluation start");
+    let health_snapshot = HealthSnapshotRecord {
+        node_id: node.node_id.clone(),
+        endpoint_id: Some(node.endpoint_id.clone()),
+        computed_at: "2031-01-02T02:00:01.654321+08:00".into(),
+        status: "healthy".into(),
+        freshness_seconds: Some(1),
+        last_success_at: Some("2031-01-02T02:00:01.654321+08:00".into()),
+        last_failure_at: None,
+        last_error_code: None,
+        degraded_methods_json: HealthDegradedMethodsPayloadV1::new(Vec::new())
+            .expect("empty degraded methods")
+            .to_value(),
+        summary_json: HealthSummaryPayloadV1::new(
+            Some("test".into()),
+            Some("ocserv".into()),
+            "healthy".into(),
+            Some("active".into()),
+            Some(0),
+        )
+        .expect("health summary")
+        .to_value(),
+    };
+    let health_finish = HealthEvaluationFinish {
+        evaluation_id: health_evaluation_id.into(),
+        finished_at: "2031-01-02T02:00:02.999999+08:00".into(),
+        snapshots: vec![health_snapshot.clone()],
+    };
+    admin
+        .batch_execute(
+            r#"
+CREATE FUNCTION fail_native_health_audit() RETURNS trigger AS $$
+BEGIN
+  IF NEW.event = 'health.evaluation.finish' THEN
+    RAISE EXCEPTION 'injected native health audit failure';
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER fail_native_health_audit
+BEFORE INSERT ON ocfleet_native.controller_audit_log
+FOR EACH ROW EXECUTE FUNCTION fail_native_health_audit();
+"#,
+        )
+        .expect("install native health audit failure trigger");
+    assert!(
+        store
+            .write_health_evaluation_finish(&health_finish, "health-controller")
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .get_health_evaluation_run(health_evaluation_id)
+            .expect("read rolled-back health evaluation")
+            .expect("running health evaluation")
+            .status,
+        "running"
+    );
+    assert!(
+        store
+            .list_health_snapshots(10)
+            .expect("read rolled-back health snapshots")
+            .is_empty()
+    );
+    admin
+        .batch_execute(
+            "DROP TRIGGER fail_native_health_audit ON ocfleet_native.controller_audit_log;
+             DROP FUNCTION fail_native_health_audit();",
+        )
+        .expect("remove native health audit failure trigger");
+    store
+        .write_health_evaluation_finish(&health_finish, "health-controller")
+        .expect("finish native health evaluation");
+    let stored_health = store
+        .list_health_snapshots(10)
+        .expect("list native health snapshots");
+    assert_eq!(stored_health.len(), 1);
+    assert_eq!(stored_health[0].computed_at, "2031-01-01T18:00:01.654321Z");
+    assert_eq!(
+        store
+            .list_health_history(
+                Some(&node.node_id),
+                "2031-01-01T17:00:00Z",
+                "2031-01-01T19:00:00Z",
+                10,
+            )
+            .expect("list native health history")
+            .len(),
+        1
+    );
+    assert!(
+        admin
+            .execute(
+                "UPDATE ocfleet_native.health_history SET status = 'unknown'
+                 WHERE evaluation_id = $1 AND node_id = $2",
+                &[&health_evaluation_id, &node.node_id],
+            )
+            .is_err()
+    );
+    let health_rollup = HealthRollupRecord {
+        node_id: node.node_id.clone(),
+        bucket_seconds: 300,
+        bucket_start: "2031-01-01T18:00:00Z".into(),
+        bucket_end: "2031-01-01T18:05:00Z".into(),
+        input_watermark: "3".repeat(64),
+        health_samples: 1,
+        covered_slots: 1,
+        expected_slots: 1,
+        healthy_count: 1,
+        degraded_count: 0,
+        unreachable_count: 0,
+        stale_count: 0,
+        disabled_count: 0,
+        unknown_count: 0,
+        observation_count: 1,
+        observation_error_count: 0,
+        duration_sample_count: 1,
+        duration_p50_ms: Some(10),
+        duration_p95_ms: Some(10),
+        cert_warning_count: 0,
+        cert_critical_count: 0,
+        fingerprint_sample_count: 0,
+        fingerprint_change_count: 0,
+        computed_at: "2031-01-01T18:05:01Z".into(),
+    };
+    store
+        .write_health_rollups(
+            &HealthRollupWrite {
+                operation_id: "health-rollup-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into(),
+                rows: vec![health_rollup.clone()],
+            },
+            "health-controller",
+        )
+        .expect("write native health rollup");
+    assert_eq!(
+        store
+            .list_health_rollups(
+                Some(&node.node_id),
+                300,
+                "2031-01-01T18:00:00Z",
+                "2031-01-01T19:00:00Z",
+                10,
+            )
+            .expect("list native health rollups"),
+        vec![health_rollup]
+    );
+
+    let alert = AlertEventRecord {
+        alert_id: "alert-native-a".into(),
+        dedupe_key: "node-native-a:unreachable".into(),
+        node_id: Some(node.node_id.clone()),
+        severity: "critical".into(),
+        state: "open".into(),
+        reason_code: "NODE_UNREACHABLE".into(),
+        first_seen_at: "2031-01-01T18:01:00.123456Z".into(),
+        last_seen_at: "2031-01-01T18:02:00.654321Z".into(),
+        last_sent_at: None,
+        resolved_at: None,
+        detail_json: AlertDetailPayloadV1::new(
+            vec![PROBE_CONTROLLER_PING.into()],
+            AlertSummaryFieldsV1 {
+                status: Some("unreachable".into()),
+                endpoint_id: Some(node.endpoint_id.clone()),
+                consecutive_failures: Some(4),
+                ..AlertSummaryFieldsV1::default()
+            },
+            None,
+            None,
+            None,
+        )
+        .expect("alert detail")
+        .public_detail(),
+    };
+    let alert_evaluation = AlertEvaluationWrite {
+        evaluation_id: "alert-eval-bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb".into(),
+        entries: vec![AlertEvaluationEntry {
+            before: None,
+            after: alert.clone(),
+        }],
+    };
+    admin
+        .batch_execute(
+            r#"
+CREATE FUNCTION fail_native_alert_audit() RETURNS trigger AS $$
+BEGIN
+  IF NEW.event = 'alert.evaluate' THEN
+    RAISE EXCEPTION 'injected native alert audit failure';
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER fail_native_alert_audit
+BEFORE INSERT ON ocfleet_native.controller_audit_log
+FOR EACH ROW EXECUTE FUNCTION fail_native_alert_audit();
+"#,
+        )
+        .expect("install native alert audit failure trigger");
+    assert!(
+        store
+            .write_alert_evaluation(&alert_evaluation, "alert-controller")
+            .is_err()
+    );
+    assert!(
+        store
+            .list_alert_events(10)
+            .expect("read rolled-back native alerts")
+            .is_empty()
+    );
+    admin
+        .batch_execute(
+            "DROP TRIGGER fail_native_alert_audit ON ocfleet_native.controller_audit_log;
+             DROP FUNCTION fail_native_alert_audit();",
+        )
+        .expect("remove native alert audit failure trigger");
+    store
+        .write_alert_evaluation(&alert_evaluation, "alert-controller")
+        .expect("write native alert evaluation");
+    store
+        .write_alert_evaluation(&alert_evaluation, "alert-controller")
+        .expect("replay native alert evaluation");
+    assert_eq!(
+        store.list_alert_events(10).expect("list native alerts"),
+        vec![alert.clone()]
+    );
+    let hook = AlertWebhookHookRecord {
+        hook_id: "hook-native-a".into(),
+        name: "Native webhook".into(),
+        hook_type: "webhook".into(),
+        endpoint_url: "https://alerts.example.test/ocfleet".into(),
+        endpoint_url_redacted: "https://alerts.example.test/ocfleet".into(),
+        endpoint_host: "alerts.example.test".into(),
+        host_allow: vec!["alerts.example.test".into()],
+        hmac_key_id: "native-hmac-a".into(),
+        enabled: true,
+        max_attempts: 3,
+        timeout_ms: 2_000,
+        created_at: "2031-01-01T18:03:00.123456Z".into(),
+        updated_at: "2031-01-01T18:03:00.123456Z".into(),
+    };
+    store
+        .write_alert_webhook_hook_create(&hook, "alert-controller")
+        .expect("create native alert hook");
+    let enqueue = AlertDeliveryQueueEnqueue {
+        queue_id: "delivery-queue-native-a".into(),
+        alert_id: alert.alert_id.clone(),
+        hook_id: hook.hook_id.clone(),
+        idempotency_key: "4".repeat(64),
+        group_key: "native-critical".into(),
+        enqueued_at: "2020-01-01T18:04:00.123456Z".into(),
+    };
+    store
+        .write_alert_delivery_queue_enqueue(&enqueue, "alert-controller")
+        .expect("enqueue native alert delivery");
+    let delivery_claim = store
+        .write_alert_delivery_queue_claim_next(
+            "delivery-worker-a",
+            "2031-01-01T18:04:01Z",
+            300,
+            "delivery-worker-a",
+        )
+        .expect("claim native alert delivery")
+        .expect("due native alert delivery");
+    assert_eq!(
+        store
+            .retention_candidate_report("alert-events", Some("2040-01-01T00:00:00Z"), None)
+            .expect("report claimed-alert retention")
+            .matched_count,
+        0
+    );
+    assert!(
+        store
+            .write_alert_delivery_queue_renew(
+                &delivery_claim,
+                "2031-01-01T18:04:02Z",
+                300,
+                "spoofed-delivery-worker",
+            )
+            .is_err()
+    );
+    let mut tampered_delivery_claim = delivery_claim.clone();
+    tampered_delivery_claim.group_key = "forged-group".into();
+    assert!(
+        store
+            .write_alert_delivery_queue_renew(
+                &tampered_delivery_claim,
+                "2031-01-01T18:04:02Z",
+                300,
+                "delivery-worker-a",
+            )
+            .is_err()
+    );
+    let delivery_attempt = AlertDeliveryAttemptRecord {
+        attempt_id: "attempt-native-a".into(),
+        alert_id: alert.alert_id.clone(),
+        hook_id: hook.hook_id.clone(),
+        attempt_no: 1,
+        attempted_at: delivery_claim.claimed_at.clone(),
+        status: "succeeded".into(),
+        http_status_class: Some("2xx".into()),
+        error_code: None,
+        bytes_sent: 256,
+    };
+    let delivery_outcome = AlertDeliveryQueueOutcome {
+        claim: delivery_claim.clone(),
+        attempt: delivery_attempt.clone(),
+        completed_at: delivery_claim.claimed_at.clone(),
+        retry_at: None,
+        retryable: false,
+        max_attempts: 3,
+    };
+    assert!(
+        store
+            .write_alert_delivery_queue_outcome(&delivery_outcome, "spoofed-delivery-worker")
+            .is_err()
+    );
+    store
+        .write_alert_delivery_queue_outcome(&delivery_outcome, "delivery-worker-a")
+        .expect("finish native alert delivery");
+    assert_eq!(
+        store
+            .list_alert_delivery_attempts(10)
+            .expect("list native delivery attempts"),
+        vec![delivery_attempt.clone()]
+    );
+    let queue_health = store
+        .alert_delivery_queue_health("2031-01-01T18:05:00Z")
+        .expect("native delivery queue health");
+    assert_eq!(queue_health.succeeded, 1);
+    assert_eq!(queue_health.claimed, 0);
+
+    let mut pending_alert = alert.clone();
+    pending_alert.alert_id = "alert-native-pending".into();
+    pending_alert.dedupe_key = "node-native-a:pending-delivery".into();
+    let mut retry_alert = alert.clone();
+    retry_alert.alert_id = "alert-native-retry".into();
+    retry_alert.dedupe_key = "node-native-a:retry-delivery".into();
+    let mut dead_letter_alert = alert.clone();
+    dead_letter_alert.alert_id = "alert-native-dead-letter".into();
+    dead_letter_alert.dedupe_key = "node-native-a:dead-letter-delivery".into();
+    for alert in [&pending_alert, &retry_alert, &dead_letter_alert] {
+        store
+            .upsert_alert_event(alert)
+            .expect("create native retention alert");
+    }
+
+    let pending_enqueue = AlertDeliveryQueueEnqueue {
+        queue_id: "delivery-queue-native-pending".into(),
+        alert_id: pending_alert.alert_id.clone(),
+        hook_id: hook.hook_id.clone(),
+        idempotency_key: "5".repeat(64),
+        group_key: "native-pending".into(),
+        enqueued_at: "2040-01-01T00:00:00Z".into(),
+    };
+    store
+        .write_alert_delivery_queue_enqueue(&pending_enqueue, "alert-controller")
+        .expect("enqueue pending native alert delivery");
+
+    let retry_enqueue = AlertDeliveryQueueEnqueue {
+        queue_id: "delivery-queue-native-retry".into(),
+        alert_id: retry_alert.alert_id.clone(),
+        hook_id: hook.hook_id.clone(),
+        idempotency_key: "6".repeat(64),
+        group_key: "native-retry".into(),
+        enqueued_at: "2020-01-01T00:00:00Z".into(),
+    };
+    store
+        .write_alert_delivery_queue_enqueue(&retry_enqueue, "alert-controller")
+        .expect("enqueue retry native alert delivery");
+    let retry_claim = store
+        .write_alert_delivery_queue_claim_next(
+            "delivery-worker-retry",
+            "2031-01-01T18:06:00Z",
+            300,
+            "delivery-worker-retry",
+        )
+        .expect("claim retry native alert delivery")
+        .expect("due retry native alert delivery");
+    assert_eq!(retry_claim.queue_id, retry_enqueue.queue_id);
+    let retry_attempt = AlertDeliveryAttemptRecord {
+        attempt_id: "attempt-native-retry".into(),
+        alert_id: retry_alert.alert_id.clone(),
+        hook_id: hook.hook_id.clone(),
+        attempt_no: 1,
+        attempted_at: retry_claim.claimed_at.clone(),
+        status: "failed".into(),
+        http_status_class: Some("5xx".into()),
+        error_code: Some("REMOTE_5XX".into()),
+        bytes_sent: 128,
+    };
+    let retry_at = (time::OffsetDateTime::parse(
+        &retry_claim.claimed_at,
+        &time::format_description::well_known::Rfc3339,
+    )
+    .expect("parse native retry claim timestamp")
+        + time::Duration::minutes(1))
+    .format(&time::format_description::well_known::Rfc3339)
+    .expect("format native retry timestamp");
+    store
+        .write_alert_delivery_queue_outcome(
+            &AlertDeliveryQueueOutcome {
+                claim: retry_claim.clone(),
+                attempt: retry_attempt.clone(),
+                completed_at: retry_claim.claimed_at.clone(),
+                retry_at: Some(retry_at),
+                retryable: true,
+                max_attempts: 3,
+            },
+            "delivery-worker-retry",
+        )
+        .expect("record retry native alert delivery");
+
+    let dead_letter_enqueue = AlertDeliveryQueueEnqueue {
+        queue_id: "delivery-queue-native-dead-letter".into(),
+        alert_id: dead_letter_alert.alert_id.clone(),
+        hook_id: hook.hook_id.clone(),
+        idempotency_key: "7".repeat(64),
+        group_key: "native-dead-letter".into(),
+        enqueued_at: "2020-01-01T00:01:00Z".into(),
+    };
+    store
+        .write_alert_delivery_queue_enqueue(&dead_letter_enqueue, "alert-controller")
+        .expect("enqueue dead-letter native alert delivery");
+    let dead_letter_claim = store
+        .write_alert_delivery_queue_claim_next(
+            "delivery-worker-dead-letter",
+            "2031-01-01T18:07:00Z",
+            300,
+            "delivery-worker-dead-letter",
+        )
+        .expect("claim dead-letter native alert delivery")
+        .expect("due dead-letter native alert delivery");
+    assert_eq!(dead_letter_claim.queue_id, dead_letter_enqueue.queue_id);
+    let dead_letter_attempt = AlertDeliveryAttemptRecord {
+        attempt_id: "attempt-native-dead-letter".into(),
+        alert_id: dead_letter_alert.alert_id.clone(),
+        hook_id: hook.hook_id.clone(),
+        attempt_no: 1,
+        attempted_at: dead_letter_claim.claimed_at.clone(),
+        status: "failed".into(),
+        http_status_class: None,
+        error_code: Some("REMOTE_REJECTED".into()),
+        bytes_sent: 0,
+    };
+    store
+        .write_alert_delivery_queue_outcome(
+            &AlertDeliveryQueueOutcome {
+                claim: dead_letter_claim.clone(),
+                attempt: dead_letter_attempt.clone(),
+                completed_at: dead_letter_claim.claimed_at.clone(),
+                retry_at: None,
+                retryable: false,
+                max_attempts: 3,
+            },
+            "delivery-worker-dead-letter",
+        )
+        .expect("record dead-letter native alert delivery");
+
+    assert_eq!(
+        store
+            .retention_candidate_report("alert-events", Some("2040-01-01T00:00:00Z"), None)
+            .expect("report active-delivery alert retention")
+            .matched_count,
+        2
+    );
+    let alert_retention = store
+        .apply_retention(
+            &RetentionApplyInput {
+                operation_id: "retention-44444444-4444-4444-8444-444444444444".into(),
+                scope: "alert-events".into(),
+                cutoff: Some("2040-01-01T00:00:00Z".into()),
+                max_age_days: None,
+                max_rows: None,
+                limit: None,
+                batch_size: 10,
+            },
+            "retention-admin",
+        )
+        .expect("apply native alert retention");
+    assert_eq!(alert_retention.candidate_report.matched_count, 2);
+    assert_eq!(alert_retention.rows_deleted, 2);
+
+    let active_alerts: i64 = admin
+        .query_one(
+            "SELECT COUNT(*) FROM ocfleet_native.alert_events
+             WHERE alert_id IN ($1, $2)",
+            &[&pending_alert.alert_id, &retry_alert.alert_id],
+        )
+        .expect("count retained active-delivery alerts")
+        .get(0);
+    assert_eq!(active_alerts, 2);
+    let active_queues: i64 = admin
+        .query_one(
+            "SELECT COUNT(*) FROM ocfleet_native.alert_delivery_queue
+             WHERE queue_id IN ($1, $2) AND status IN ('pending', 'retry')",
+            &[&pending_enqueue.queue_id, &retry_enqueue.queue_id],
+        )
+        .expect("count retained active delivery queue rows")
+        .get(0);
+    assert_eq!(active_queues, 2);
+    let retained_retry_attempts: i64 = admin
+        .query_one(
+            "SELECT COUNT(*) FROM ocfleet_native.alert_delivery_attempts
+             WHERE attempt_id = $1",
+            &[&retry_attempt.attempt_id],
+        )
+        .expect("count retained retry delivery attempts")
+        .get(0);
+    assert_eq!(retained_retry_attempts, 1);
+
+    let terminal_alerts: i64 = admin
+        .query_one(
+            "SELECT COUNT(*) FROM ocfleet_native.alert_events
+             WHERE alert_id IN ($1, $2)",
+            &[&alert.alert_id, &dead_letter_alert.alert_id],
+        )
+        .expect("count retained terminal alerts")
+        .get(0);
+    assert_eq!(terminal_alerts, 0);
+    let terminal_queues: i64 = admin
+        .query_one(
+            "SELECT COUNT(*) FROM ocfleet_native.alert_delivery_queue
+             WHERE queue_id IN ($1, $2)",
+            &[&enqueue.queue_id, &dead_letter_enqueue.queue_id],
+        )
+        .expect("count retained terminal delivery queue rows")
+        .get(0);
+    assert_eq!(terminal_queues, 0);
+    let terminal_attempts: i64 = admin
+        .query_one(
+            "SELECT COUNT(*) FROM ocfleet_native.alert_delivery_attempts
+             WHERE attempt_id IN ($1, $2)",
+            &[
+                &delivery_attempt.attempt_id,
+                &dead_letter_attempt.attempt_id,
+            ],
+        )
+        .expect("count retained terminal delivery attempts")
+        .get(0);
+    assert_eq!(terminal_attempts, 0);
+
+    let health_retention = RetentionPolicyRecord {
+        scope: "health-history".into(),
+        max_age_days: Some(30),
+        max_rows: Some(1_000),
+        updated_at: "2031-01-02T03:00:00Z".into(),
+    };
+    assert_eq!(
+        store
+            .set_retention_policy(&health_retention, "retention-admin")
+            .expect("set native health retention policy"),
+        health_retention
+    );
+
     admin
         .batch_execute(
             r#"
@@ -1611,4 +2197,18 @@ VALUES (1, '0001_native_core');
         .expect("count upgraded scheduler tables")
         .get(0);
     assert_eq!(scheduler_tables, 7);
+    let health_alert_tables: i64 = admin
+        .query_one(
+            "SELECT COUNT(*) FROM information_schema.tables
+             WHERE table_schema = 'ocfleet_native'
+               AND table_name IN (
+                 'health_policy', 'health_evaluation_runs', 'health_snapshots',
+                 'health_history', 'health_rollups', 'alert_events', 'alert_hooks',
+                 'alert_delivery_attempts', 'alert_delivery_queue'
+               )",
+            &[],
+        )
+        .expect("count upgraded health and alert tables")
+        .get(0);
+    assert_eq!(health_alert_tables, 9);
 }

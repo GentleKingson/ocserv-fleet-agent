@@ -8021,7 +8021,9 @@ fn health_policy_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HealthPol
     })
 }
 
-fn validate_alert_webhook_hook_record(hook: &AlertWebhookHookRecord) -> Result<(), StoreError> {
+pub(crate) fn validate_alert_webhook_hook_record(
+    hook: &AlertWebhookHookRecord,
+) -> Result<(), StoreError> {
     validate_description(&hook.name).map_err(StoreError::InvalidInput)?;
     validate_safe_id("hook_id", &hook.hook_id, 128)?;
     validate_safe_id("endpoint_host", &hook.endpoint_host, 253)?;
@@ -8056,7 +8058,7 @@ fn validate_alert_webhook_hook_record(hook: &AlertWebhookHookRecord) -> Result<(
     Ok(())
 }
 
-fn validate_alert_delivery_attempt_record(
+pub(crate) fn validate_alert_delivery_attempt_record(
     attempt: &AlertDeliveryAttemptRecord,
 ) -> Result<(), StoreError> {
     validate_safe_id("attempt_id", &attempt.attempt_id, 128)?;
@@ -8090,7 +8092,7 @@ fn validate_alert_delivery_attempt_record(
     Ok(())
 }
 
-fn validate_alert_delivery_queue_enqueue(
+pub(crate) fn validate_alert_delivery_queue_enqueue(
     enqueue: &AlertDeliveryQueueEnqueue,
 ) -> Result<(), StoreError> {
     validate_safe_id("delivery queue_id", &enqueue.queue_id, 96)?;
@@ -8106,7 +8108,7 @@ fn validate_alert_delivery_queue_enqueue(
     validate_rfc3339(&enqueue.enqueued_at, "delivery enqueued_at")
 }
 
-fn validate_alert_delivery_queue_claim_input(
+pub(crate) fn validate_alert_delivery_queue_claim_input(
     owner_id: &str,
     now: &str,
     lease_seconds: u64,
@@ -8121,7 +8123,9 @@ fn validate_alert_delivery_queue_claim_input(
     Ok(())
 }
 
-fn validate_alert_delivery_queue_claim(claim: &AlertDeliveryQueueClaim) -> Result<(), StoreError> {
+pub(crate) fn validate_alert_delivery_queue_claim(
+    claim: &AlertDeliveryQueueClaim,
+) -> Result<(), StoreError> {
     validate_safe_id("delivery queue_id", &claim.queue_id, 96)?;
     validate_safe_id("delivery alert_id", &claim.alert_id, 128)?;
     validate_safe_id("delivery hook_id", &claim.hook_id, 128)?;
@@ -8152,7 +8156,7 @@ fn validate_alert_delivery_queue_claim(claim: &AlertDeliveryQueueClaim) -> Resul
     Ok(())
 }
 
-fn validate_alert_delivery_queue_outcome(
+pub(crate) fn validate_alert_delivery_queue_outcome(
     outcome: &AlertDeliveryQueueOutcome,
 ) -> Result<(), StoreError> {
     validate_alert_delivery_queue_claim(&outcome.claim)?;
@@ -8341,7 +8345,9 @@ fn insert_alert_delivery_queue_audit_tx(
     insert_audit_tx(tx, &event)
 }
 
-fn validate_alert_delivery_finalize(write: &AlertDeliveryFinalizeWrite) -> Result<(), StoreError> {
+pub(crate) fn validate_alert_delivery_finalize(
+    write: &AlertDeliveryFinalizeWrite,
+) -> Result<(), StoreError> {
     validate_audit_text(&write.delivery_id, "alert delivery_id", 96)?;
     let Some(uuid) = write.delivery_id.strip_prefix("delivery-") else {
         return Err(StoreError::InvalidInput(
@@ -8419,7 +8425,7 @@ fn validate_alert_delivery_finalize(write: &AlertDeliveryFinalizeWrite) -> Resul
     Ok(())
 }
 
-fn alert_delivery_attempt_hash(attempt: &AlertDeliveryAttemptRecord) -> String {
+pub(crate) fn alert_delivery_attempt_hash(attempt: &AlertDeliveryAttemptRecord) -> String {
     let payload = serde_json::json!({
         "attempt_id": attempt.attempt_id,
         "alert_id": attempt.alert_id,
@@ -8436,7 +8442,7 @@ fn alert_delivery_attempt_hash(attempt: &AlertDeliveryAttemptRecord) -> String {
         .to_string()
 }
 
-fn alert_delivery_finalize_hash(write: &AlertDeliveryFinalizeWrite) -> String {
+pub(crate) fn alert_delivery_finalize_hash(write: &AlertDeliveryFinalizeWrite) -> String {
     let entries = write
         .entries
         .iter()
@@ -8486,7 +8492,7 @@ fn insert_alert_delivery_attempt_tx(
     Ok(())
 }
 
-fn delivery_attempt_detail_payload(
+pub(crate) fn delivery_attempt_detail_payload(
     attempt: &AlertDeliveryAttemptRecord,
 ) -> Result<DeliveryAttemptDetailPayloadV1, StoreError> {
     DeliveryAttemptDetailPayloadV1::new(
@@ -8516,7 +8522,7 @@ fn validate_safe_id(field: &'static str, value: &str, max_len: usize) -> Result<
     }
 }
 
-fn validate_health_policy(policy: &HealthPolicyRecord) -> Result<(), StoreError> {
+pub(crate) fn validate_health_policy(policy: &HealthPolicyRecord) -> Result<(), StoreError> {
     validate_u64_range(
         "stale_window_seconds",
         policy.stale_window_seconds,
@@ -8804,7 +8810,9 @@ fn get_retention_policy_tx(
     .map_err(StoreError::from)
 }
 
-fn validate_health_snapshot_write(write: &HealthSnapshotWrite) -> Result<(), StoreError> {
+pub(crate) fn validate_health_snapshot_write(
+    write: &HealthSnapshotWrite,
+) -> Result<(), StoreError> {
     validate_audit_text(&write.evaluation_id, "health evaluation_id", 96)?;
     let Some(uuid) = write.evaluation_id.strip_prefix("health-eval-") else {
         return Err(StoreError::InvalidInput(
@@ -8880,7 +8888,7 @@ fn validate_health_snapshot_write(write: &HealthSnapshotWrite) -> Result<(), Sto
     Ok(())
 }
 
-fn validate_health_rollup_bucket(bucket_seconds: u64) -> Result<(), StoreError> {
+pub(crate) fn validate_health_rollup_bucket(bucket_seconds: u64) -> Result<(), StoreError> {
     if matches!(bucket_seconds, 300 | 3_600 | 86_400) {
         Ok(())
     } else {
@@ -8912,7 +8920,7 @@ fn normalize_half_open_window(
     ))
 }
 
-fn validate_health_rollup_write(write: &HealthRollupWrite) -> Result<(), StoreError> {
+pub(crate) fn validate_health_rollup_write(write: &HealthRollupWrite) -> Result<(), StoreError> {
     validate_audit_text(&write.operation_id, "health rollup operation_id", 96)?;
     let Some(uuid) = write.operation_id.strip_prefix("health-rollup-") else {
         return Err(StoreError::InvalidInput(
@@ -9018,7 +9026,9 @@ fn validate_sha256_hex(value: &str, field: &str) -> Result<(), StoreError> {
     Ok(())
 }
 
-fn validate_health_evaluation_start(start: &HealthEvaluationStart) -> Result<(), StoreError> {
+pub(crate) fn validate_health_evaluation_start(
+    start: &HealthEvaluationStart,
+) -> Result<(), StoreError> {
     validate_health_evaluation_id(&start.evaluation_id)?;
     validate_sha256_hex(&start.input_watermark, "health input watermark")?;
     validate_sha256_hex(&start.policy_version, "health policy version")?;
@@ -9026,7 +9036,9 @@ fn validate_health_evaluation_start(start: &HealthEvaluationStart) -> Result<(),
     validate_rfc3339(&start.started_at, "health evaluation started_at")
 }
 
-fn validate_health_evaluation_finish(finish: &HealthEvaluationFinish) -> Result<(), StoreError> {
+pub(crate) fn validate_health_evaluation_finish(
+    finish: &HealthEvaluationFinish,
+) -> Result<(), StoreError> {
     validate_health_evaluation_id(&finish.evaluation_id)?;
     validate_rfc3339(&finish.finished_at, "health evaluation finished_at")?;
     validate_health_snapshot_write(&HealthSnapshotWrite {
@@ -9036,7 +9048,9 @@ fn validate_health_evaluation_finish(finish: &HealthEvaluationFinish) -> Result<
     })
 }
 
-fn validate_health_evaluation_failure(failure: &HealthEvaluationFailure) -> Result<(), StoreError> {
+pub(crate) fn validate_health_evaluation_failure(
+    failure: &HealthEvaluationFailure,
+) -> Result<(), StoreError> {
     validate_health_evaluation_id(&failure.evaluation_id)?;
     validate_rfc3339(&failure.finished_at, "health evaluation finished_at")?;
     validate_audit_text(&failure.failure_code, "health evaluation failure_code", 64)
@@ -9104,7 +9118,7 @@ fn validate_rfc3339(value: &str, field: &str) -> Result<(), StoreError> {
     Ok(())
 }
 
-fn health_snapshot_write_hash(write: &HealthSnapshotWrite) -> String {
+pub(crate) fn health_snapshot_write_hash(write: &HealthSnapshotWrite) -> String {
     let snapshots = write
         .snapshots
         .iter()
@@ -9205,7 +9219,7 @@ fn audit_request_replay_tx(
     })
 }
 
-fn health_rollup_write_hash(write: &HealthRollupWrite) -> String {
+pub(crate) fn health_rollup_write_hash(write: &HealthRollupWrite) -> String {
     let rows = write
         .rows
         .iter()
@@ -9372,7 +9386,9 @@ fn upsert_health_rollup_tx(
     Ok(())
 }
 
-fn validate_alert_evaluation_write(write: &AlertEvaluationWrite) -> Result<(), StoreError> {
+pub(crate) fn validate_alert_evaluation_write(
+    write: &AlertEvaluationWrite,
+) -> Result<(), StoreError> {
     validate_audit_text(&write.evaluation_id, "alert evaluation_id", 96)?;
     let Some(uuid) = write.evaluation_id.strip_prefix("alert-eval-") else {
         return Err(StoreError::InvalidInput(
@@ -9417,7 +9433,7 @@ fn validate_alert_evaluation_write(write: &AlertEvaluationWrite) -> Result<(), S
     Ok(())
 }
 
-fn validate_alert_event_record(alert: &AlertEventRecord) -> Result<(), StoreError> {
+pub(crate) fn validate_alert_event_record(alert: &AlertEventRecord) -> Result<(), StoreError> {
     validate_safe_id("alert_id", &alert.alert_id, 128)?;
     validate_safe_id("dedupe_key", &alert.dedupe_key, 256)?;
     if let Some(node_id) = &alert.node_id {
@@ -9449,7 +9465,7 @@ fn validate_alert_event_record(alert: &AlertEventRecord) -> Result<(), StoreErro
     Ok(())
 }
 
-fn alert_evaluation_write_hash(write: &AlertEvaluationWrite) -> String {
+pub(crate) fn alert_evaluation_write_hash(write: &AlertEvaluationWrite) -> String {
     let entries = write
         .entries
         .iter()
@@ -9599,7 +9615,9 @@ fn get_alert_event_tx(
     .map_err(StoreError::from)
 }
 
-fn validate_alert_state_transition(write: &AlertStateTransition) -> Result<(), StoreError> {
+pub(crate) fn validate_alert_state_transition(
+    write: &AlertStateTransition,
+) -> Result<(), StoreError> {
     validate_audit_text(&write.operation_id, "alert operation_id", 96)?;
     let Some(uuid) = write.operation_id.strip_prefix("alert-action-") else {
         return Err(StoreError::InvalidInput(
@@ -9674,7 +9692,7 @@ fn validate_alert_state_transition(write: &AlertStateTransition) -> Result<(), S
     Ok(())
 }
 
-fn alert_state_transition_hash(write: &AlertStateTransition) -> String {
+pub(crate) fn alert_state_transition_hash(write: &AlertStateTransition) -> String {
     let payload = serde_json::json!({
         "event": write.event,
         "before": alert_event_hash_json(&write.before),
@@ -9686,7 +9704,7 @@ fn alert_state_transition_hash(write: &AlertStateTransition) -> String {
         .to_string()
 }
 
-fn alert_webhook_hook_hash(hook: &AlertWebhookHookRecord) -> String {
+pub(crate) fn alert_webhook_hook_hash(hook: &AlertWebhookHookRecord) -> String {
     let payload = serde_json::json!({
         "hook_id": hook.hook_id,
         "name": hook.name,

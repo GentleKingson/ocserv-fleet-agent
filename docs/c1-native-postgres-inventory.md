@@ -11,8 +11,8 @@ native parity.
 | --- | --- | --- |
 | C1.1 Native core | Private connection source reuse, advisory-locked and future-version-safe native migrations, relational nodes/endpoint trust/audit, atomic node-add audit, Docker failure injection | merged |
 | C1.2 Registry and trust | Node metadata/maintenance/capability, enrollment, endpoint lifecycle, and atomic audit surface | merged; shared contract gate remains C1.5 |
-| C1.3 Scheduler and observations | Jobs, claims, runs, outcomes, observations, maintenance, retention, fencing, and indexes | implemented on the Issue #49 branch; shared contract gate remains C1.5 |
-| C1.4 Health and alerts | Health policy/evaluation/history/rollups, alerts, webhook queue/delivery, recovery, and retention | pending |
+| C1.3 Scheduler and observations | Jobs, claims, runs, outcomes, observations, maintenance, retention, fencing, and indexes | merged; shared contract gate remains C1.5 |
+| C1.4 Health and alerts | Health policy/evaluation/history/rollups, alerts, webhook queue/delivery, recovery, and retention | implemented on the Issue #49 branch; shared contract gate remains C1.5 |
 | C1.5 Migration and parity gate | Verified SQLite-to-native import/export, full shared contract suite, TLS remote connections, backup/restore, performance and failure tests | pending |
 
 ## C1.1 Safety Boundary
@@ -129,9 +129,51 @@ replay.
 Migration concurrency, future-schema rejection, and the dormant runtime
 boundary continue to run with the complete native integration suite.
 
+## C1.4 Health And Alerts Boundary
+
+Native migration `0004_health_alerts` adds relational health policy,
+evaluation-run, snapshot, append-only history, rollup, alert, webhook,
+delivery-attempt, and delivery-queue tables. Health, alert, allowlist, and
+delivery-attempt documents remain closed versioned `JSONB` values and are
+validated against their relational projections on every read.
+
+The dormant native store now covers:
+
+- health policy changes, evaluation start/finish/failure/recovery, current
+  snapshots, history windows, rollup source/read/write, and atomic audit;
+- optimistic alert evaluation and operator transitions with actor/request-bound
+  replay and stale-before-state rejection;
+- webhook creation and enable state, typed host allowlists, delivery attempts,
+  durable queue enqueue/claim/renew/defer/outcome, and queue health;
+- health snapshot/history/rollup and alert-event retention under the existing
+  bounded, actor-bound retention operation model; alert retention excludes
+  events referenced by pending, claimed, or retry delivery work, so it cannot
+  erase an unsent or recoverable delivery. Succeeded and dead-letter queue rows
+  are terminal and share the parent alert's retention lifecycle; their delivery
+  attempts are deleted only when that parent alert is retained away.
+
+Delivery claims use `SKIP LOCKED`, monotonic fence tokens, actor-bound owner
+records, and Postgres `clock_timestamp()` for all ownership decisions. Caller
+timestamps remain event metadata only. Renewal, defer, and outcome require the
+same queue ID, owner ID, audit actor, fence token, and a live database-time
+lease. Expired claims are recovered to retry in the same transaction as the
+next claim and each recovery receives an audit record.
+
+Health evaluation completion updates the durable run, current snapshot,
+append-only history, and audit in one transaction. Alert evaluation and
+delivery outcome likewise update relational state and audit atomically; an
+injected audit failure therefore cannot leave a partial health or alert
+transition.
+
+The Docker regression covers fractional and offset health timestamps, exact
+evaluation replay, history and rollup projection, typed alert storage, webhook
+queue delivery, wrong-actor claim rejection, successful fenced outcome, queue
+health, and the expanded retention scope. The module remains unavailable to
+CLI, API, scheduler, and controller runtime selection.
+
 ## Completion Rule
 
-Issue `#49` must remain open until C1.4-C1.5 are complete and the same bounded,
+Issue `#49` must remain open until C1.5 is complete and the same bounded,
 redacted, actor-bound contract suite passes against SQLite and native Postgres.
 Only then may runtime selection report `postgres-native` or the roadmap advance
 C1 beyond active implementation.

@@ -1683,13 +1683,223 @@ FOR EACH ROW EXECUTE FUNCTION fail_native_alert_audit();
         store
             .list_alert_delivery_attempts(10)
             .expect("list native delivery attempts"),
-        vec![delivery_attempt]
+        vec![delivery_attempt.clone()]
     );
     let queue_health = store
         .alert_delivery_queue_health("2031-01-01T18:05:00Z")
         .expect("native delivery queue health");
     assert_eq!(queue_health.succeeded, 1);
     assert_eq!(queue_health.claimed, 0);
+
+    let mut pending_alert = alert.clone();
+    pending_alert.alert_id = "alert-native-pending".into();
+    pending_alert.dedupe_key = "node-native-a:pending-delivery".into();
+    let mut retry_alert = alert.clone();
+    retry_alert.alert_id = "alert-native-retry".into();
+    retry_alert.dedupe_key = "node-native-a:retry-delivery".into();
+    let mut dead_letter_alert = alert.clone();
+    dead_letter_alert.alert_id = "alert-native-dead-letter".into();
+    dead_letter_alert.dedupe_key = "node-native-a:dead-letter-delivery".into();
+    for alert in [&pending_alert, &retry_alert, &dead_letter_alert] {
+        store
+            .upsert_alert_event(alert)
+            .expect("create native retention alert");
+    }
+
+    let pending_enqueue = AlertDeliveryQueueEnqueue {
+        queue_id: "delivery-queue-native-pending".into(),
+        alert_id: pending_alert.alert_id.clone(),
+        hook_id: hook.hook_id.clone(),
+        idempotency_key: "5".repeat(64),
+        group_key: "native-pending".into(),
+        enqueued_at: "2040-01-01T00:00:00Z".into(),
+    };
+    store
+        .write_alert_delivery_queue_enqueue(&pending_enqueue, "alert-controller")
+        .expect("enqueue pending native alert delivery");
+
+    let retry_enqueue = AlertDeliveryQueueEnqueue {
+        queue_id: "delivery-queue-native-retry".into(),
+        alert_id: retry_alert.alert_id.clone(),
+        hook_id: hook.hook_id.clone(),
+        idempotency_key: "6".repeat(64),
+        group_key: "native-retry".into(),
+        enqueued_at: "2020-01-01T00:00:00Z".into(),
+    };
+    store
+        .write_alert_delivery_queue_enqueue(&retry_enqueue, "alert-controller")
+        .expect("enqueue retry native alert delivery");
+    let retry_claim = store
+        .write_alert_delivery_queue_claim_next(
+            "delivery-worker-retry",
+            "2031-01-01T18:06:00Z",
+            300,
+            "delivery-worker-retry",
+        )
+        .expect("claim retry native alert delivery")
+        .expect("due retry native alert delivery");
+    assert_eq!(retry_claim.queue_id, retry_enqueue.queue_id);
+    let retry_attempt = AlertDeliveryAttemptRecord {
+        attempt_id: "attempt-native-retry".into(),
+        alert_id: retry_alert.alert_id.clone(),
+        hook_id: hook.hook_id.clone(),
+        attempt_no: 1,
+        attempted_at: retry_claim.claimed_at.clone(),
+        status: "failed".into(),
+        http_status_class: Some("5xx".into()),
+        error_code: Some("REMOTE_5XX".into()),
+        bytes_sent: 128,
+    };
+    let retry_at = (time::OffsetDateTime::parse(
+        &retry_claim.claimed_at,
+        &time::format_description::well_known::Rfc3339,
+    )
+    .expect("parse native retry claim timestamp")
+        + time::Duration::minutes(1))
+    .format(&time::format_description::well_known::Rfc3339)
+    .expect("format native retry timestamp");
+    store
+        .write_alert_delivery_queue_outcome(
+            &AlertDeliveryQueueOutcome {
+                claim: retry_claim.clone(),
+                attempt: retry_attempt.clone(),
+                completed_at: retry_claim.claimed_at.clone(),
+                retry_at: Some(retry_at),
+                retryable: true,
+                max_attempts: 3,
+            },
+            "delivery-worker-retry",
+        )
+        .expect("record retry native alert delivery");
+
+    let dead_letter_enqueue = AlertDeliveryQueueEnqueue {
+        queue_id: "delivery-queue-native-dead-letter".into(),
+        alert_id: dead_letter_alert.alert_id.clone(),
+        hook_id: hook.hook_id.clone(),
+        idempotency_key: "7".repeat(64),
+        group_key: "native-dead-letter".into(),
+        enqueued_at: "2020-01-01T00:01:00Z".into(),
+    };
+    store
+        .write_alert_delivery_queue_enqueue(&dead_letter_enqueue, "alert-controller")
+        .expect("enqueue dead-letter native alert delivery");
+    let dead_letter_claim = store
+        .write_alert_delivery_queue_claim_next(
+            "delivery-worker-dead-letter",
+            "2031-01-01T18:07:00Z",
+            300,
+            "delivery-worker-dead-letter",
+        )
+        .expect("claim dead-letter native alert delivery")
+        .expect("due dead-letter native alert delivery");
+    assert_eq!(dead_letter_claim.queue_id, dead_letter_enqueue.queue_id);
+    let dead_letter_attempt = AlertDeliveryAttemptRecord {
+        attempt_id: "attempt-native-dead-letter".into(),
+        alert_id: dead_letter_alert.alert_id.clone(),
+        hook_id: hook.hook_id.clone(),
+        attempt_no: 1,
+        attempted_at: dead_letter_claim.claimed_at.clone(),
+        status: "failed".into(),
+        http_status_class: None,
+        error_code: Some("REMOTE_REJECTED".into()),
+        bytes_sent: 0,
+    };
+    store
+        .write_alert_delivery_queue_outcome(
+            &AlertDeliveryQueueOutcome {
+                claim: dead_letter_claim.clone(),
+                attempt: dead_letter_attempt.clone(),
+                completed_at: dead_letter_claim.claimed_at.clone(),
+                retry_at: None,
+                retryable: false,
+                max_attempts: 3,
+            },
+            "delivery-worker-dead-letter",
+        )
+        .expect("record dead-letter native alert delivery");
+
+    assert_eq!(
+        store
+            .retention_candidate_report("alert-events", Some("2040-01-01T00:00:00Z"), None)
+            .expect("report active-delivery alert retention")
+            .matched_count,
+        2
+    );
+    let alert_retention = store
+        .apply_retention(
+            &RetentionApplyInput {
+                operation_id: "retention-44444444-4444-4444-8444-444444444444".into(),
+                scope: "alert-events".into(),
+                cutoff: Some("2040-01-01T00:00:00Z".into()),
+                max_age_days: None,
+                max_rows: None,
+                limit: None,
+                batch_size: 10,
+            },
+            "retention-admin",
+        )
+        .expect("apply native alert retention");
+    assert_eq!(alert_retention.candidate_report.matched_count, 2);
+    assert_eq!(alert_retention.rows_deleted, 2);
+
+    let active_alerts: i64 = admin
+        .query_one(
+            "SELECT COUNT(*) FROM ocfleet_native.alert_events
+             WHERE alert_id IN ($1, $2)",
+            &[&pending_alert.alert_id, &retry_alert.alert_id],
+        )
+        .expect("count retained active-delivery alerts")
+        .get(0);
+    assert_eq!(active_alerts, 2);
+    let active_queues: i64 = admin
+        .query_one(
+            "SELECT COUNT(*) FROM ocfleet_native.alert_delivery_queue
+             WHERE queue_id IN ($1, $2) AND status IN ('pending', 'retry')",
+            &[&pending_enqueue.queue_id, &retry_enqueue.queue_id],
+        )
+        .expect("count retained active delivery queue rows")
+        .get(0);
+    assert_eq!(active_queues, 2);
+    let retained_retry_attempts: i64 = admin
+        .query_one(
+            "SELECT COUNT(*) FROM ocfleet_native.alert_delivery_attempts
+             WHERE attempt_id = $1",
+            &[&retry_attempt.attempt_id],
+        )
+        .expect("count retained retry delivery attempts")
+        .get(0);
+    assert_eq!(retained_retry_attempts, 1);
+
+    let terminal_alerts: i64 = admin
+        .query_one(
+            "SELECT COUNT(*) FROM ocfleet_native.alert_events
+             WHERE alert_id IN ($1, $2)",
+            &[&alert.alert_id, &dead_letter_alert.alert_id],
+        )
+        .expect("count retained terminal alerts")
+        .get(0);
+    assert_eq!(terminal_alerts, 0);
+    let terminal_queues: i64 = admin
+        .query_one(
+            "SELECT COUNT(*) FROM ocfleet_native.alert_delivery_queue
+             WHERE queue_id IN ($1, $2)",
+            &[&enqueue.queue_id, &dead_letter_enqueue.queue_id],
+        )
+        .expect("count retained terminal delivery queue rows")
+        .get(0);
+    assert_eq!(terminal_queues, 0);
+    let terminal_attempts: i64 = admin
+        .query_one(
+            "SELECT COUNT(*) FROM ocfleet_native.alert_delivery_attempts
+             WHERE attempt_id IN ($1, $2)",
+            &[
+                &delivery_attempt.attempt_id,
+                &dead_letter_attempt.attempt_id,
+            ],
+        )
+        .expect("count retained terminal delivery attempts")
+        .get(0);
+    assert_eq!(terminal_attempts, 0);
 
     let health_retention = RetentionPolicyRecord {
         scope: "health-history".into(),

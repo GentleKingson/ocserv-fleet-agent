@@ -147,8 +147,10 @@ The dormant native store now covers:
   durable queue enqueue/claim/renew/defer/outcome, and queue health;
 - health snapshot/history/rollup and alert-event retention under the existing
   bounded, actor-bound retention operation model; alert retention excludes
-  events referenced by a claimed delivery so it cannot erase live recovery
-  state.
+  events referenced by pending, claimed, or retry delivery work, so it cannot
+  erase an unsent or recoverable delivery. Succeeded and dead-letter queue rows
+  are terminal and share the parent alert's retention lifecycle; their delivery
+  attempts are deleted only when that parent alert is retained away.
 
 Delivery claims use `SKIP LOCKED`, monotonic fence tokens, actor-bound owner
 records, and Postgres `clock_timestamp()` for all ownership decisions. Caller

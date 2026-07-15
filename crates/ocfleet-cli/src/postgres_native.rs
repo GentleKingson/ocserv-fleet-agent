@@ -6922,7 +6922,8 @@ fn simple_retention_report_sql(scope: &str) -> &'static str {
                FROM ocfleet_native.alert_events a
                WHERE NOT EXISTS (
                  SELECT 1 FROM ocfleet_native.alert_delivery_queue q
-                 WHERE q.alert_id = a.alert_id AND q.status = 'claimed'
+                 WHERE q.alert_id = a.alert_id
+                   AND q.status IN ('pending', 'claimed', 'retry')
                )
              ), candidates AS (
                SELECT ts FROM ranked
@@ -7087,7 +7088,8 @@ fn prune_retention_batch_tx(
                FROM ocfleet_native.alert_events a
                WHERE NOT EXISTS (
                  SELECT 1 FROM ocfleet_native.alert_delivery_queue q
-                 WHERE q.alert_id = a.alert_id AND q.status = 'claimed'
+                 WHERE q.alert_id = a.alert_id
+                   AND q.status IN ('pending', 'claimed', 'retry')
                )
              ), doomed AS (
                SELECT id FROM ranked

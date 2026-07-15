@@ -418,7 +418,7 @@ fn retention_tests_apply_deletes_expired_observability_runs() {
     let store = Store::open(&database).expect("open store");
     for (run_id, started_at) in [
         ("run-old", "2026-01-01T00:00:00Z"),
-        ("run-new", "2026-07-08T00:00:00Z"),
+        ("run-new", "2099-07-08T00:00:00Z"),
     ] {
         store
             .insert_observability_run(&ObservabilityRunInsert {

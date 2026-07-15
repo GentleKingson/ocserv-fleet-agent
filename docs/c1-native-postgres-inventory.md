@@ -93,8 +93,9 @@ validated against their relational columns when read.
 The dormant native store now covers:
 
 - bounded job, run, and observation readers plus atomic job state/audit writes;
-- transactionally fenced job acquisition, renewal, release, expired-lease
-  takeover, and abandoned-run recovery with monotonic fence tokens;
+- transactionally fenced job acquisition, renewal, guarded release,
+  expired-lease takeover, and abandoned-run recovery with monotonic fence
+  tokens and actor-bound ownership;
 - claimed run start, bounded multi-observation outcomes, run completion, job
   clocks, and audit records in the same Postgres transaction;
 - scheduler maintenance set/clear with atomic audit;
@@ -102,15 +103,29 @@ The dormant native store now covers:
   deletion, and actor/request-bound idempotent operation replay.
 
 Postgres claims use row locks and `SKIP LOCKED` for concurrent due-job selection.
-Every run-bound outcome and finish validates the active run and unexpired lease
-at the event timestamp; a stale owner cannot append observations or complete a
-run after takeover. Retention operation provenance is stored atomically with
-the deletion result and audit, so exact retries return the original result and
-mismatched actors or inputs fail closed.
+Postgres `clock_timestamp()` is authoritative for acquisition, renewal,
+takeover, release, outcome, and finish lease decisions; caller timestamps are
+event metadata only. Scheduler runs can start only with an actor-bound owner
+and fence token, and every run-bound outcome and finish revalidates that same
+owner, actor, fence, active run, and live database-time lease. Release refuses
+expired claims or claims with active runs, so it cannot erase abandoned-run
+recovery state.
+
+The native outcome API requires a claim even for runless invalid-job records;
+there is no unfenced scheduler outcome or scheduler-run start entry point.
+
+Retention excludes running runs, actively claimed runs, and observations whose
+parent run is running or actively claimed. Candidate reports and deletes use
+the same eligibility predicates under a write-excluding target lock. Retention
+operation provenance is stored atomically with the deletion result and audit,
+so exact retries return the original result and mismatched actors or inputs
+fail closed.
 
 The Docker regression covers typed fractional timestamps, claim contention,
-fence increments, stale-owner rejection, claimed start/outcome/finish, bounded
-observation reads, scheduler maintenance, retention deletion, and exact replay.
+fence increments, caller-clock skew, stale-owner rejection, actor/fence-bound
+start/outcome/finish, guarded release and recovery, bounded observation reads,
+scheduler maintenance, protected running-state retention, deletion, and exact
+replay.
 Migration concurrency, future-schema rejection, and the dormant runtime
 boundary continue to run with the complete native integration suite.
 

@@ -410,21 +410,26 @@ CREATE INDEX idx_native_observations_expires
 CREATE TABLE ocfleet_native.scheduler_job_claims (
   job_id TEXT PRIMARY KEY REFERENCES ocfleet_native.observability_jobs(job_id) ON DELETE CASCADE,
   owner_id TEXT,
+  owner_actor TEXT CHECK (owner_actor IS NULL OR length(owner_actor) BETWEEN 1 AND 128),
   fence_token BIGINT NOT NULL DEFAULT 0 CHECK (fence_token >= 0),
   claimed_at TIMESTAMPTZ,
   lease_expires_at TIMESTAMPTZ,
   active_run_id TEXT REFERENCES ocfleet_native.observability_runs(run_id) ON DELETE SET NULL,
   updated_at TIMESTAMPTZ NOT NULL,
   CHECK (
-    (owner_id IS NULL AND claimed_at IS NULL AND lease_expires_at IS NULL
+    (owner_id IS NULL AND owner_actor IS NULL AND claimed_at IS NULL AND lease_expires_at IS NULL
       AND active_run_id IS NULL)
     OR
-    (owner_id IS NOT NULL AND claimed_at IS NOT NULL AND lease_expires_at IS NOT NULL
+    (owner_id IS NOT NULL AND owner_actor IS NOT NULL
+      AND claimed_at IS NOT NULL AND lease_expires_at IS NOT NULL
       AND fence_token > 0 AND lease_expires_at > claimed_at)
   )
 );
 CREATE INDEX idx_native_scheduler_claim_expiry
   ON ocfleet_native.scheduler_job_claims(lease_expires_at, job_id);
+CREATE INDEX idx_native_scheduler_claim_active_run
+  ON ocfleet_native.scheduler_job_claims(active_run_id)
+  WHERE active_run_id IS NOT NULL;
 
 CREATE TABLE ocfleet_native.scheduler_maintenance (
   singleton_id SMALLINT PRIMARY KEY CHECK (singleton_id = 1),
@@ -2194,7 +2199,7 @@ CREATE TABLE ocfleet_native.retention_operations (
         lease_seconds: u64,
         actor: &str,
     ) -> Result<Option<SchedulerJobClaim>, PostgresError> {
-        let now = validate_scheduler_claim_input(owner_id, now, lease_seconds, actor)?;
+        validate_scheduler_claim_input(owner_id, now, lease_seconds, actor)?;
         let mut conn = self.connection()?;
         let mut tx = conn.transaction()?;
         let job_id: Option<String> = tx
@@ -2202,11 +2207,11 @@ CREATE TABLE ocfleet_native.retention_operations (
                 "SELECT j.job_id
              FROM ocfleet_native.observability_jobs j
              LEFT JOIN ocfleet_native.scheduler_job_claims c ON c.job_id = j.job_id
-             WHERE j.enabled AND (j.next_run_at IS NULL OR j.next_run_at <= $1)
-               AND (c.owner_id IS NULL OR c.lease_expires_at <= $1)
+             WHERE j.enabled AND (j.next_run_at IS NULL OR j.next_run_at <= clock_timestamp())
+               AND (c.owner_id IS NULL OR c.lease_expires_at <= clock_timestamp())
              ORDER BY j.next_run_at NULLS FIRST, j.job_id
              FOR UPDATE OF j SKIP LOCKED LIMIT 1",
-                &[&now],
+                &[],
             )?
             .map(|row| row.try_get(0))
             .transpose()?;
@@ -2214,15 +2219,8 @@ CREATE TABLE ocfleet_native.retention_operations (
             tx.commit()?;
             return Ok(None);
         };
-        let claim = acquire_scheduler_claim_tx(
-            &mut tx,
-            &job_id,
-            owner_id,
-            now,
-            lease_seconds,
-            actor,
-            true,
-        )?;
+        let claim =
+            acquire_scheduler_claim_tx(&mut tx, &job_id, owner_id, lease_seconds, actor, true)?;
         tx.commit()?;
         Ok(claim)
     }
@@ -2259,14 +2257,13 @@ CREATE TABLE ocfleet_native.retention_operations (
         require_due: bool,
     ) -> Result<Option<SchedulerJobClaim>, PostgresError> {
         validate_native_id("scheduler job_id", job_id, 128)?;
-        let now = validate_scheduler_claim_input(owner_id, now, lease_seconds, actor)?;
+        validate_scheduler_claim_input(owner_id, now, lease_seconds, actor)?;
         let mut conn = self.connection()?;
         let mut tx = conn.transaction()?;
         let claim = acquire_scheduler_claim_tx(
             &mut tx,
             job_id,
             owner_id,
-            now,
             lease_seconds,
             actor,
             require_due,
@@ -2283,27 +2280,32 @@ CREATE TABLE ocfleet_native.retention_operations (
         actor: &str,
     ) -> Result<SchedulerJobClaim, PostgresError> {
         validate_scheduler_claim(claim)?;
-        let now = validate_scheduler_claim_input(&claim.owner_id, now, lease_seconds, actor)?;
-        let lease_expires_at = now + time::Duration::seconds(checked_i64(lease_seconds, "lease")?);
+        validate_scheduler_claim_input(&claim.owner_id, now, lease_seconds, actor)?;
         let fence_token = checked_i64(claim.fence_token, "fence token")?;
+        let lease_seconds = checked_i64(lease_seconds, "lease")?;
         let mut conn = self.connection()?;
         let mut tx = conn.transaction()?;
-        let affected = tx.execute(
-            "UPDATE ocfleet_native.scheduler_job_claims
-             SET lease_expires_at = $1, updated_at = $2
-             WHERE job_id = $3 AND owner_id = $4 AND fence_token = $5
-               AND lease_expires_at > $2",
+        let renewed = tx.query_opt(
+            "WITH authority AS (SELECT clock_timestamp() AS now)
+             UPDATE ocfleet_native.scheduler_job_claims AS claim
+             SET lease_expires_at = authority.now + $1 * interval '1 second',
+                 updated_at = authority.now
+             FROM authority
+             WHERE claim.job_id = $2 AND claim.owner_id = $3 AND claim.fence_token = $4
+               AND claim.owner_actor = $5 AND claim.lease_expires_at > authority.now
+             RETURNING claim.lease_expires_at",
             &[
-                &lease_expires_at,
-                &now,
+                &lease_seconds,
                 &claim.job_id,
                 &claim.owner_id,
                 &fence_token,
+                &actor,
             ],
         )?;
-        if affected != 1 {
+        let Some(renewed) = renewed else {
             return Err(scheduler_claim_lost(&claim.job_id));
-        }
+        };
+        let lease_expires_at: OffsetDateTime = renewed.try_get(0)?;
         let renewed = SchedulerJobClaim {
             lease_expires_at: format_postgres_timestamp(lease_expires_at, "lease_expires_at")?,
             ..claim.clone()
@@ -2320,17 +2322,21 @@ CREATE TABLE ocfleet_native.retention_operations (
         actor: &str,
     ) -> Result<(), PostgresError> {
         validate_scheduler_claim(claim)?;
-        let released_at = parse_postgres_timestamp(released_at, "scheduler released_at")?;
+        parse_postgres_timestamp(released_at, "scheduler released_at")?;
         validate_actor(actor).map_err(PostgresError::InvalidInput)?;
         let fence_token = checked_i64(claim.fence_token, "fence token")?;
         let mut conn = self.connection()?;
         let mut tx = conn.transaction()?;
         let affected = tx.execute(
-            "UPDATE ocfleet_native.scheduler_job_claims
+            "WITH authority AS (SELECT clock_timestamp() AS now)
+             UPDATE ocfleet_native.scheduler_job_claims AS claim
              SET owner_id = NULL, claimed_at = NULL, lease_expires_at = NULL,
-                 active_run_id = NULL, updated_at = $1
-             WHERE job_id = $2 AND owner_id = $3 AND fence_token = $4",
-            &[&released_at, &claim.job_id, &claim.owner_id, &fence_token],
+                 owner_actor = NULL, active_run_id = NULL, updated_at = authority.now
+             FROM authority
+             WHERE claim.job_id = $1 AND claim.owner_id = $2 AND claim.fence_token = $3
+               AND claim.owner_actor = $4 AND claim.lease_expires_at > authority.now
+               AND claim.active_run_id IS NULL",
+            &[&claim.job_id, &claim.owner_id, &fence_token, &actor],
         )?;
         if affected != 1 {
             return Err(scheduler_claim_lost(&claim.job_id));
@@ -2357,40 +2363,21 @@ CREATE TABLE ocfleet_native.retention_operations (
         .transpose()
     }
 
-    pub fn write_scheduler_run_start(
-        &self,
-        start: &SchedulerRunStart,
-        actor: &str,
-    ) -> Result<(), PostgresError> {
-        self.write_scheduler_run_start_inner(start, None, actor)
-    }
-
     pub fn write_scheduler_claimed_run_start(
         &self,
         start: &SchedulerRunStart,
         claim: &SchedulerJobClaim,
         actor: &str,
     ) -> Result<(), PostgresError> {
-        self.write_scheduler_run_start_inner(start, Some(claim), actor)
-    }
-
-    fn write_scheduler_run_start_inner(
-        &self,
-        start: &SchedulerRunStart,
-        claim: Option<&SchedulerJobClaim>,
-        actor: &str,
-    ) -> Result<(), PostgresError> {
         validate_actor(actor).map_err(PostgresError::InvalidInput)?;
         validate_native_id("scheduler run_id", &start.run_id, 128)?;
         validate_native_id("scheduler job_id", &start.job_id, 128)?;
         let started_at = parse_postgres_timestamp(&start.started_at, "scheduler started_at")?;
-        if let Some(claim) = claim {
-            validate_scheduler_claim(claim)?;
-            if claim.job_id != start.job_id {
-                return Err(PostgresError::InvalidInput(
-                    "scheduler claim job_id does not match run start".into(),
-                ));
-            }
+        validate_scheduler_claim(claim)?;
+        if claim.job_id != start.job_id {
+            return Err(PostgresError::InvalidInput(
+                "scheduler claim job_id does not match run start".into(),
+            ));
         }
         let mut conn = self.connection()?;
         let mut tx = conn.transaction()?;
@@ -2423,24 +2410,23 @@ CREATE TABLE ocfleet_native.retention_operations (
                 &summary.to_value().to_string(),
             ],
         )?;
-        if let Some(claim) = claim {
-            let fence_token = checked_i64(claim.fence_token, "fence token")?;
-            let affected = tx.execute(
-                "UPDATE ocfleet_native.scheduler_job_claims
-                 SET active_run_id = $1, updated_at = $2
-                 WHERE job_id = $3 AND owner_id = $4 AND fence_token = $5
-                   AND active_run_id IS NULL AND lease_expires_at > $2",
-                &[
-                    &start.run_id,
-                    &started_at,
-                    &claim.job_id,
-                    &claim.owner_id,
-                    &fence_token,
-                ],
-            )?;
-            if affected != 1 {
-                return Err(scheduler_claim_lost(&start.job_id));
-            }
+        let fence_token = checked_i64(claim.fence_token, "fence token")?;
+        let affected = tx.execute(
+            "UPDATE ocfleet_native.scheduler_job_claims
+             SET active_run_id = $1, updated_at = clock_timestamp()
+             WHERE job_id = $2 AND owner_id = $3 AND fence_token = $4
+               AND owner_actor = $5 AND active_run_id IS NULL
+               AND lease_expires_at > clock_timestamp()",
+            &[
+                &start.run_id,
+                &claim.job_id,
+                &claim.owner_id,
+                &fence_token,
+                &actor,
+            ],
+        )?;
+        if affected != 1 {
+            return Err(scheduler_claim_lost(&start.job_id));
         }
         let mut event = AuditEvent::new(actor, "scheduler.run.start");
         event.ok = Some(true);
@@ -2452,6 +2438,7 @@ CREATE TABLE ocfleet_native.retention_operations (
             "result_class": "scheduler_summary",
         });
         insert_audit(&mut tx, &event)?;
+        ensure_scheduler_job_claim_tx(&mut tx, claim, Some(&start.run_id), actor)?;
         tx.commit()?;
         Ok(())
     }
@@ -2471,11 +2458,14 @@ CREATE TABLE ocfleet_native.retention_operations (
     pub fn write_scheduler_outcome(
         &self,
         outcome: &SchedulerOutcomeWrite,
+        claim: &SchedulerJobClaim,
         actor: &str,
     ) -> Result<(), PostgresError> {
         validate_scheduler_outcome(outcome, actor)?;
+        validate_scheduler_outcome_claim(outcome, claim)?;
         let mut conn = self.connection()?;
         let mut tx = conn.transaction()?;
+        ensure_scheduler_job_claim_tx(&mut tx, claim, outcome.run_id.as_deref(), actor)?;
         let job = get_observability_job_tx(&mut tx, &outcome.job_id)?.ok_or_else(|| {
             PostgresError::InvalidState(format!("native job not found: {}", outcome.job_id))
         })?;
@@ -2493,22 +2483,6 @@ CREATE TABLE ocfleet_native.retention_operations (
                     StoreError::ObservabilityRunNotRunning(run_id.to_string()),
                 ));
             }
-            let latest_observed_at = outcome
-                .entries
-                .iter()
-                .map(|entry| {
-                    parse_postgres_timestamp(&entry.observation.observed_at, "observed_at")
-                })
-                .collect::<Result<Vec<_>, _>>()?
-                .into_iter()
-                .max()
-                .expect("validated outcome has entries");
-            ensure_active_scheduler_run_claim_tx(
-                &mut tx,
-                &outcome.job_id,
-                run_id,
-                latest_observed_at,
-            )?;
             for entry in &outcome.entries {
                 if !scheduler_job_kind_allows_method(&job.kind, &entry.observation.method) {
                     return Err(PostgresError::InvalidInput(
@@ -2524,6 +2498,7 @@ CREATE TABLE ocfleet_native.retention_operations (
         if let Some(clock) = &outcome.job_clock {
             update_scheduler_job_clock_tx(&mut tx, clock)?;
         }
+        ensure_scheduler_job_claim_tx(&mut tx, claim, outcome.run_id.as_deref(), actor)?;
         tx.commit()?;
         Ok(())
     }
@@ -2531,10 +2506,17 @@ CREATE TABLE ocfleet_native.retention_operations (
     pub fn write_scheduler_run_finish(
         &self,
         finish: &SchedulerRunFinish,
+        claim: &SchedulerJobClaim,
         actor: &str,
     ) -> Result<(), PostgresError> {
         validate_actor(actor).map_err(PostgresError::InvalidInput)?;
         validate_native_id("scheduler run_id", &finish.run_id, 128)?;
+        validate_scheduler_claim(claim)?;
+        if claim.job_id != finish.job_clock.job_id {
+            return Err(PostgresError::InvalidInput(
+                "scheduler claim job_id does not match run finish".into(),
+            ));
+        }
         let finished_at = parse_postgres_timestamp(&finish.finished_at, "scheduler finished_at")?;
         let (next_run_at, last_run_at) = validate_scheduler_job_clock(&finish.job_clock)?;
         if finished_at != last_run_at {
@@ -2546,12 +2528,7 @@ CREATE TABLE ocfleet_native.retention_operations (
         let mut tx = conn.transaction()?;
         let job = get_observability_job_tx(&mut tx, &finish.job_clock.job_id)?
             .ok_or_else(|| PostgresError::InvalidState("native finish job disappeared".into()))?;
-        ensure_active_scheduler_run_claim_tx(
-            &mut tx,
-            &finish.job_clock.job_id,
-            &finish.run_id,
-            finished_at,
-        )?;
+        ensure_scheduler_job_claim_tx(&mut tx, claim, Some(&finish.run_id), actor)?;
         let run = get_observability_run_state_tx(&mut tx, &finish.run_id)?.ok_or_else(|| {
             PostgresError::InvalidState(format!("native run not found: {}", finish.run_id))
         })?;
@@ -2615,12 +2592,24 @@ CREATE TABLE ocfleet_native.retention_operations (
             next_run_at,
             last_run_at,
         )?;
-        tx.execute(
+        let fence_token = checked_i64(claim.fence_token, "fence token")?;
+        let cleared = tx.execute(
             "UPDATE ocfleet_native.scheduler_job_claims
-             SET active_run_id = NULL, updated_at = $1
-             WHERE job_id = $2 AND active_run_id = $3",
-            &[&finished_at, &finish.job_clock.job_id, &finish.run_id],
+             SET active_run_id = NULL, updated_at = clock_timestamp()
+             WHERE job_id = $1 AND owner_id = $2 AND fence_token = $3
+               AND owner_actor = $4 AND active_run_id = $5
+               AND lease_expires_at > clock_timestamp()",
+            &[
+                &finish.job_clock.job_id,
+                &claim.owner_id,
+                &fence_token,
+                &actor,
+                &finish.run_id,
+            ],
         )?;
+        if cleared != 1 {
+            return Err(scheduler_claim_lost(&claim.job_id));
+        }
         let mut event = AuditEvent::new(actor, "scheduler.run.finish");
         event.ok = Some(status != "failed");
         event.detail_json = json!({
@@ -3065,7 +3054,7 @@ fn validate_native_schema(tx: &mut Transaction<'_>) -> Result<(), PostgresError>
         &[],
     )?;
     tx.query(
-        "SELECT job_id, owner_id, fence_token, claimed_at, lease_expires_at,
+        "SELECT job_id, owner_id, owner_actor, fence_token, claimed_at, lease_expires_at,
                 active_run_id, updated_at
          FROM ocfleet_native.scheduler_job_claims LIMIT 0",
         &[],
@@ -3302,7 +3291,7 @@ fn validate_scheduler_claim_input(
     now: &str,
     lease_seconds: u64,
     actor: &str,
-) -> Result<OffsetDateTime, PostgresError> {
+) -> Result<(), PostgresError> {
     validate_native_id("scheduler owner_id", owner_id, 128)?;
     validate_actor(actor).map_err(PostgresError::InvalidInput)?;
     if !(MIN_SCHEDULER_LEASE_SECONDS..=MAX_SCHEDULER_LEASE_SECONDS).contains(&lease_seconds) {
@@ -3310,7 +3299,8 @@ fn validate_scheduler_claim_input(
             "scheduler lease must be between {MIN_SCHEDULER_LEASE_SECONDS} and {MAX_SCHEDULER_LEASE_SECONDS} seconds"
         )));
     }
-    parse_postgres_timestamp(now, "scheduler now")
+    parse_postgres_timestamp(now, "scheduler event timestamp")?;
+    Ok(())
 }
 
 fn validate_scheduler_claim(claim: &SchedulerJobClaim) -> Result<(), PostgresError> {
@@ -3368,11 +3358,14 @@ fn scheduler_claim_lost(job_id: &str) -> PostgresError {
     PostgresError::Store(StoreError::SchedulerClaimLost(job_id.to_string()))
 }
 
+fn postgres_clock_timestamp(tx: &mut Transaction<'_>) -> Result<OffsetDateTime, PostgresError> {
+    Ok(tx.query_one("SELECT clock_timestamp()", &[])?.try_get(0)?)
+}
+
 fn acquire_scheduler_claim_tx(
     tx: &mut Transaction<'_>,
     job_id: &str,
     owner_id: &str,
-    now: OffsetDateTime,
     lease_seconds: u64,
     actor: &str,
     require_due: bool,
@@ -3382,30 +3375,31 @@ fn acquire_scheduler_claim_tx(
     if !job.enabled {
         return Ok(None);
     }
+    let existing = tx.query_opt(
+        "SELECT job_id, owner_id, fence_token, claimed_at, lease_expires_at, active_run_id
+         FROM ocfleet_native.scheduler_job_claims WHERE job_id = $1 FOR UPDATE",
+        &[&job_id],
+    )?;
+    let authoritative_now = postgres_clock_timestamp(tx)?;
     if require_due
         && job
             .next_run_at
             .as_deref()
             .map(|value| parse_postgres_timestamp(value, "stored job next_run_at"))
             .transpose()?
-            .is_some_and(|next| next > now)
+            .is_some_and(|next| next > authoritative_now)
     {
         return Ok(None);
     }
-    let existing = tx.query_opt(
-        "SELECT job_id, owner_id, fence_token, claimed_at, lease_expires_at, active_run_id
-         FROM ocfleet_native.scheduler_job_claims WHERE job_id = $1 FOR UPDATE",
-        &[&job_id],
-    )?;
     if let Some(row) = &existing {
         let owner: Option<String> = row.try_get(1)?;
         let expires: Option<OffsetDateTime> = row.try_get(4)?;
-        if owner.is_some() && expires.is_some_and(|expires| expires > now) {
+        if owner.is_some() && expires.is_some_and(|expires| expires > authoritative_now) {
             return Ok(None);
         }
         let active_run_id: Option<String> = row.try_get(5)?;
         if let Some(run_id) = active_run_id {
-            recover_expired_scheduler_run_tx(tx, job_id, &run_id, now, actor)?;
+            recover_expired_scheduler_run_tx(tx, job_id, &run_id, authoritative_now, actor)?;
         }
     }
     let previous_fence = existing
@@ -3416,22 +3410,32 @@ fn acquire_scheduler_claim_tx(
     let fence_token = previous_fence.checked_add(1).ok_or_else(|| {
         PostgresError::InvalidState("native scheduler fence token overflow".into())
     })?;
-    let lease_expires_at = now + time::Duration::seconds(checked_i64(lease_seconds, "lease")?);
+    let lease_expires_at =
+        authoritative_now + time::Duration::seconds(checked_i64(lease_seconds, "lease")?);
     tx.execute(
         "INSERT INTO ocfleet_native.scheduler_job_claims
-         (job_id, owner_id, fence_token, claimed_at, lease_expires_at, active_run_id, updated_at)
-         VALUES ($1, $2, $3, $4, $5, NULL, $4)
+         (job_id, owner_id, owner_actor, fence_token, claimed_at,
+          lease_expires_at, active_run_id, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, NULL, $5)
          ON CONFLICT (job_id) DO UPDATE SET owner_id = EXCLUDED.owner_id,
-           fence_token = EXCLUDED.fence_token, claimed_at = EXCLUDED.claimed_at,
+           owner_actor = EXCLUDED.owner_actor, fence_token = EXCLUDED.fence_token,
+           claimed_at = EXCLUDED.claimed_at,
            lease_expires_at = EXCLUDED.lease_expires_at, active_run_id = NULL,
            updated_at = EXCLUDED.updated_at",
-        &[&job_id, &owner_id, &fence_token, &now, &lease_expires_at],
+        &[
+            &job_id,
+            &owner_id,
+            &actor,
+            &fence_token,
+            &authoritative_now,
+            &lease_expires_at,
+        ],
     )?;
     let claim = SchedulerJobClaim {
         job_id: job_id.to_string(),
         owner_id: owner_id.to_string(),
         fence_token: checked_u64(fence_token, "scheduler fence token")?,
-        claimed_at: format_postgres_timestamp(now, "scheduler claimed_at")?,
+        claimed_at: format_postgres_timestamp(authoritative_now, "scheduler claimed_at")?,
         lease_expires_at: format_postgres_timestamp(
             lease_expires_at,
             "scheduler lease_expires_at",
@@ -3546,8 +3550,10 @@ fn validate_observability_run_insert(run: &ObservabilityRunInsert) -> Result<(),
     ) {
         return Err(PostgresError::InvalidInput("run status is invalid".into()));
     }
-    if !matches!(run.triggered_by.as_str(), "manual" | "scheduler.run.once") {
-        return Err(PostgresError::InvalidInput("run trigger is invalid".into()));
+    if run.triggered_by != "manual" {
+        return Err(PostgresError::InvalidInput(
+            "native direct run insertion is reserved for manual runs".into(),
+        ));
     }
     if (run.status == "running") != finished_at.is_none() {
         return Err(PostgresError::InvalidInput(
@@ -3899,6 +3905,19 @@ fn validate_scheduler_outcome(
     Ok(())
 }
 
+fn validate_scheduler_outcome_claim(
+    outcome: &SchedulerOutcomeWrite,
+    claim: &SchedulerJobClaim,
+) -> Result<(), PostgresError> {
+    validate_scheduler_claim(claim)?;
+    if claim.job_id != outcome.job_id {
+        return Err(PostgresError::InvalidInput(
+            "scheduler claim job_id does not match outcome".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_scheduler_outcome_audit(
     audit: &AuditEvent,
     observation: &ProbeObservationInsert,
@@ -3989,28 +4008,30 @@ fn update_scheduler_job_clock_values_tx(
     Ok(())
 }
 
-fn ensure_active_scheduler_run_claim_tx(
+fn ensure_scheduler_job_claim_tx(
     tx: &mut Transaction<'_>,
-    job_id: &str,
-    run_id: &str,
-    at: OffsetDateTime,
+    expected: &SchedulerJobClaim,
+    active_run_id: Option<&str>,
+    actor: &str,
 ) -> Result<(), PostgresError> {
-    let claim = tx.query_opt(
-        "SELECT owner_id, active_run_id, lease_expires_at
-         FROM ocfleet_native.scheduler_job_claims WHERE job_id = $1 FOR UPDATE",
-        &[&job_id],
+    let fence_token = checked_i64(expected.fence_token, "fence token")?;
+    let matches = tx.query_opt(
+        "SELECT 1
+         FROM ocfleet_native.scheduler_job_claims
+         WHERE job_id = $1 AND owner_id = $2 AND fence_token = $3
+           AND owner_actor = $4 AND active_run_id IS NOT DISTINCT FROM $5
+           AND lease_expires_at > clock_timestamp()
+         FOR UPDATE",
+        &[
+            &expected.job_id,
+            &expected.owner_id,
+            &fence_token,
+            &actor,
+            &active_run_id,
+        ],
     )?;
-    let Some(claim) = claim else {
-        return Ok(());
-    };
-    let owner_id: Option<String> = claim.try_get(0)?;
-    let active_run_id: Option<String> = claim.try_get(1)?;
-    let lease_expires_at: Option<OffsetDateTime> = claim.try_get(2)?;
-    if owner_id.is_none()
-        || active_run_id.as_deref() != Some(run_id)
-        || lease_expires_at.is_none_or(|expires| expires <= at)
-    {
-        return Err(scheduler_claim_lost(job_id));
+    if matches.is_none() {
+        return Err(scheduler_claim_lost(&expected.job_id));
     }
     Ok(())
 }
@@ -4141,10 +4162,23 @@ fn retention_candidate_report_tx<C: GenericClient>(
     validate_retention_scope(scope)?;
     let sql = match scope {
         "observations" => {
-            "WITH ranked AS (
-               SELECT observation_id AS id, observed_at AS ts,
-                      row_number() OVER (ORDER BY observed_at DESC, observation_id DESC) AS rn
-               FROM ocfleet_native.probe_observations
+            "WITH eligible AS (
+               SELECT o.observation_id AS id, o.observed_at AS ts
+               FROM ocfleet_native.probe_observations o
+               WHERE o.run_id IS NULL OR (
+                 EXISTS (
+                   SELECT 1 FROM ocfleet_native.observability_runs r
+                   WHERE r.run_id = o.run_id
+                     AND r.status IN ('succeeded', 'failed', 'skipped')
+                 )
+                 AND NOT EXISTS (
+                   SELECT 1 FROM ocfleet_native.scheduler_job_claims c
+                   WHERE c.active_run_id = o.run_id
+                 )
+               )
+             ), ranked AS (
+               SELECT id, ts, row_number() OVER (ORDER BY ts DESC, id DESC) AS rn
+               FROM eligible
              ), candidates AS (
                SELECT ts FROM ranked
                WHERE ($1::timestamptz IS NOT NULL AND ts < $1)
@@ -4153,10 +4187,17 @@ fn retention_candidate_report_tx<C: GenericClient>(
              SELECT COUNT(*), MIN(ts), MAX(ts) FROM candidates"
         }
         "observability-runs" => {
-            "WITH ranked AS (
-               SELECT run_id AS id, started_at AS ts,
-                      row_number() OVER (ORDER BY started_at DESC, run_id DESC) AS rn
-               FROM ocfleet_native.observability_runs
+            "WITH eligible AS (
+               SELECT r.run_id AS id, r.started_at AS ts
+               FROM ocfleet_native.observability_runs r
+               WHERE r.status IN ('succeeded', 'failed', 'skipped')
+                 AND NOT EXISTS (
+                   SELECT 1 FROM ocfleet_native.scheduler_job_claims c
+                   WHERE c.active_run_id = r.run_id
+                 )
+             ), ranked AS (
+               SELECT id, ts, row_number() OVER (ORDER BY ts DESC, id DESC) AS rn
+               FROM eligible
              ), candidates AS (
                SELECT ts FROM ranked
                WHERE ($1::timestamptz IS NOT NULL AND ts < $1)
@@ -4209,10 +4250,23 @@ fn prune_retention_batch_tx(
 ) -> Result<u64, PostgresError> {
     let sql = match scope {
         "observations" => {
-            "WITH ranked AS (
-               SELECT observation_id AS id, observed_at AS ts,
-                      row_number() OVER (ORDER BY observed_at DESC, observation_id DESC) AS rn
-               FROM ocfleet_native.probe_observations
+            "WITH eligible AS (
+               SELECT o.observation_id AS id, o.observed_at AS ts
+               FROM ocfleet_native.probe_observations o
+               WHERE o.run_id IS NULL OR (
+                 EXISTS (
+                   SELECT 1 FROM ocfleet_native.observability_runs r
+                   WHERE r.run_id = o.run_id
+                     AND r.status IN ('succeeded', 'failed', 'skipped')
+                 )
+                 AND NOT EXISTS (
+                   SELECT 1 FROM ocfleet_native.scheduler_job_claims c
+                   WHERE c.active_run_id = o.run_id
+                 )
+               )
+             ), ranked AS (
+               SELECT id, ts, row_number() OVER (ORDER BY ts DESC, id DESC) AS rn
+               FROM eligible
              ), doomed AS (
                SELECT id FROM ranked
                WHERE ($1::timestamptz IS NOT NULL AND ts < $1)
@@ -4224,10 +4278,17 @@ fn prune_retention_batch_tx(
              RETURNING target.observation_id"
         }
         "observability-runs" => {
-            "WITH ranked AS (
-               SELECT run_id AS id, started_at AS ts,
-                      row_number() OVER (ORDER BY started_at DESC, run_id DESC) AS rn
-               FROM ocfleet_native.observability_runs
+            "WITH eligible AS (
+               SELECT r.run_id AS id, r.started_at AS ts
+               FROM ocfleet_native.observability_runs r
+               WHERE r.status IN ('succeeded', 'failed', 'skipped')
+                 AND NOT EXISTS (
+                   SELECT 1 FROM ocfleet_native.scheduler_job_claims c
+                   WHERE c.active_run_id = r.run_id
+                 )
+             ), ranked AS (
+               SELECT id, ts, row_number() OVER (ORDER BY ts DESC, id DESC) AS rn
+               FROM eligible
              ), doomed AS (
                SELECT id FROM ranked
                WHERE ($1::timestamptz IS NOT NULL AND ts < $1)

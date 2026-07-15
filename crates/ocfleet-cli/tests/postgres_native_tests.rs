@@ -14,9 +14,9 @@ use ocfleet_cli::storage_payloads::{SchedulerSelectorPayloadV1, TrustBundlePaylo
 use ocfleet_cli::store::{
     ApprovalInput, EnrollmentTokenInsert, JoinRequestInsert, LegacyEnrollmentClaimInput,
     NodeInsert, NodeMaintenanceWindow, NodeMetadataRecord, ObservabilityJobRecord,
-    ProbeObservationInsert, RetentionApplyInput, RetentionPolicyRecord, SchedulerJobClockUpdate,
-    SchedulerMaintenanceWindow, SchedulerOutcomeEntry, SchedulerOutcomeWrite, SchedulerRunFinish,
-    SchedulerRunStart, Store,
+    ProbeObservationInsert, RetentionApplyInput, RetentionPolicyRecord, SchedulerJobClaim,
+    SchedulerJobClockUpdate, SchedulerMaintenanceWindow, SchedulerOutcomeEntry,
+    SchedulerOutcomeWrite, SchedulerRunFinish, SchedulerRunStart, Store,
 };
 use ocfleet_cli::version_governance::{CapabilityNegotiationStatus, CapabilitySnapshot};
 use ocfleet_protocol::method::{NODE_CAPABILITIES, PROBE_CONTROLLER_PING};
@@ -916,7 +916,7 @@ FOR EACH ROW EXECUTE FUNCTION fail_native_approval_audit();
         jitter_seconds: 5,
         timeout_ms: 5_000,
         enabled: true,
-        next_run_at: Some("2031-01-01T00:00:00.123456+00:00".into()),
+        next_run_at: Some("2020-01-01T00:00:00.123456+00:00".into()),
         last_run_at: None,
         created_at: "2030-12-31T16:00:00.123456-08:00".into(),
         updated_at: "2030-12-31T16:00:00.123456-08:00".into(),
@@ -934,6 +934,85 @@ FOR EACH ROW EXECUTE FUNCTION fail_native_approval_audit();
         1
     );
 
+    let contention_job = ObservabilityJobRecord {
+        job_id: "native-claim-contention".into(),
+        next_run_at: Some("2099-01-01T00:00:00Z".into()),
+        ..job.clone()
+    };
+    store
+        .insert_observability_job(&contention_job, "scheduler-admin")
+        .expect("insert native contention job");
+    let claim_barrier = Arc::new(Barrier::new(3));
+    let mut contenders = Vec::new();
+    for (client, owner, event_time) in [
+        (
+            store.clone(),
+            "scheduler-contender-a",
+            "2000-01-01T00:00:00Z",
+        ),
+        (
+            second.clone(),
+            "scheduler-contender-b",
+            "2099-01-01T00:00:00Z",
+        ),
+    ] {
+        let job_id = contention_job.job_id.clone();
+        let barrier = Arc::clone(&claim_barrier);
+        contenders.push(thread::spawn(move || {
+            barrier.wait();
+            client
+                .claim_scheduler_job(&job_id, owner, event_time, 300, owner)
+                .expect("contending native claim")
+        }));
+    }
+    claim_barrier.wait();
+    let claims = contenders
+        .into_iter()
+        .map(|contender| contender.join().expect("native claim contender"))
+        .collect::<Vec<_>>();
+    assert_eq!(claims.iter().filter(|claim| claim.is_some()).count(), 1);
+    let contention_claim = claims
+        .into_iter()
+        .flatten()
+        .next()
+        .expect("one native contention winner");
+    admin
+        .execute(
+            "UPDATE ocfleet_native.scheduler_job_claims
+             SET claimed_at = clock_timestamp() - interval '2 seconds',
+                 lease_expires_at = clock_timestamp() - interval '1 second'
+             WHERE job_id = $1",
+            &[&contention_job.job_id],
+        )
+        .expect("expire inactive native claim");
+    assert!(
+        store
+            .release_scheduler_job_claim(
+                &contention_claim,
+                "2099-01-01T00:00:01Z",
+                &contention_claim.owner_id,
+            )
+            .is_err()
+    );
+    let cleanup_claim = store
+        .claim_scheduler_job(
+            &contention_job.job_id,
+            "scheduler-contention-cleanup",
+            "2000-01-01T00:00:00Z",
+            300,
+            "scheduler-contention-cleanup",
+        )
+        .expect("take over expired contention claim")
+        .expect("contention cleanup claim");
+    assert_eq!(cleanup_claim.fence_token, 2);
+    store
+        .release_scheduler_job_claim(
+            &cleanup_claim,
+            "2000-01-01T00:00:01Z",
+            "scheduler-contention-cleanup",
+        )
+        .expect("release contention cleanup claim");
+
     let claim = store
         .claim_next_due_scheduler_job(
             "scheduler-a",
@@ -944,6 +1023,17 @@ FOR EACH ROW EXECUTE FUNCTION fail_native_approval_audit();
         .expect("claim next due native job")
         .expect("due native claim");
     assert_eq!(claim.fence_token, 1);
+    let database_time_authoritative: bool = admin
+        .query_one(
+            "SELECT claimed_at BETWEEN clock_timestamp() - interval '10 seconds'
+                                   AND clock_timestamp() + interval '10 seconds'
+                    AND lease_expires_at <= clock_timestamp() + interval '301 seconds'
+             FROM ocfleet_native.scheduler_job_claims WHERE job_id = $1",
+            &[&job.job_id],
+        )
+        .expect("verify authoritative native claim clock")
+        .get(0);
+    assert!(database_time_authoritative);
     assert!(
         store
             .claim_scheduler_job(
@@ -989,20 +1079,89 @@ FOR EACH ROW EXECUTE FUNCTION fail_native_approval_audit();
     outcome_audit.ok = observation.ok;
     outcome_audit.duration_ms = observation.duration_ms;
     outcome_audit.detail_json = json!({"result_class": "scheduler_summary"});
+    let outcome = SchedulerOutcomeWrite {
+        job_id: job.job_id.clone(),
+        run_id: Some(start.run_id.clone()),
+        entries: vec![SchedulerOutcomeEntry {
+            observation: observation.clone(),
+            audit: outcome_audit,
+        }],
+        job_clock: None,
+    };
+    let wrong_owner_claim = SchedulerJobClaim {
+        owner_id: "scheduler-spoofed".into(),
+        ..claim.clone()
+    };
+    assert!(
+        store
+            .write_scheduler_outcome(&outcome, &wrong_owner_claim, "scheduler-a")
+            .is_err()
+    );
+    assert!(
+        store
+            .get_probe_observation(&observation.observation_id)
+            .expect("check rejected native observation")
+            .is_none()
+    );
     store
-        .write_scheduler_outcome(
-            &SchedulerOutcomeWrite {
-                job_id: job.job_id.clone(),
-                run_id: Some(start.run_id.clone()),
-                entries: vec![SchedulerOutcomeEntry {
-                    observation: observation.clone(),
-                    audit: outcome_audit,
-                }],
-                job_clock: None,
-            },
-            "scheduler-a",
-        )
+        .write_scheduler_outcome(&outcome, &claim, "scheduler-a")
         .expect("write native scheduler outcome");
+    assert_eq!(
+        store
+            .retention_candidate_report("observations", Some("2040-01-01T00:00:00Z"), None,)
+            .expect("report running-run observation retention")
+            .matched_count,
+        0
+    );
+    assert_eq!(
+        store
+            .retention_candidate_report("observability-runs", Some("2040-01-01T00:00:00Z"), None,)
+            .expect("report running-run retention")
+            .matched_count,
+        0
+    );
+    let protected_observations = RetentionApplyInput {
+        operation_id: "retention-22222222-2222-4222-8222-222222222222".into(),
+        scope: "observations".into(),
+        cutoff: Some("2040-01-01T00:00:00Z".into()),
+        max_age_days: None,
+        max_rows: None,
+        limit: Some(10),
+        batch_size: 10,
+    };
+    assert_eq!(
+        store
+            .apply_retention(&protected_observations, "retention-admin")
+            .expect("protect running-run observations")
+            .rows_deleted,
+        0
+    );
+    let protected_runs = RetentionApplyInput {
+        operation_id: "retention-33333333-3333-4333-8333-333333333333".into(),
+        scope: "observability-runs".into(),
+        ..protected_observations.clone()
+    };
+    assert_eq!(
+        store
+            .apply_retention(&protected_runs, "retention-admin")
+            .expect("protect running scheduler run")
+            .rows_deleted,
+        0
+    );
+    assert!(
+        store
+            .get_probe_observation(&observation.observation_id)
+            .expect("load protected running observation")
+            .is_some()
+    );
+    assert_eq!(
+        store
+            .get_observability_run(&start.run_id)
+            .expect("load protected running run")
+            .expect("protected running run exists")
+            .status,
+        "running"
+    );
     let finish = SchedulerRunFinish {
         run_id: start.run_id.clone(),
         finished_at: "2031-01-01T00:00:12.444444Z".into(),
@@ -1012,8 +1171,17 @@ FOR EACH ROW EXECUTE FUNCTION fail_native_approval_audit();
             last_run_at: "2031-01-01T00:00:12.444444Z".into(),
         },
     };
+    let wrong_fence_claim = SchedulerJobClaim {
+        fence_token: claim.fence_token + 1,
+        ..claim.clone()
+    };
+    assert!(
+        store
+            .write_scheduler_run_finish(&finish, &wrong_fence_claim, "scheduler-a")
+            .is_err()
+    );
     store
-        .write_scheduler_run_finish(&finish, "scheduler-a")
+        .write_scheduler_run_finish(&finish, &claim, "scheduler-a")
         .expect("finish native scheduler run");
     let stored_run = store
         .get_observability_run(&start.run_id)
@@ -1069,11 +1237,39 @@ FOR EACH ROW EXECUTE FUNCTION fail_native_approval_audit();
     store
         .write_scheduler_claimed_run_start(&abandoned_start, &takeover, "scheduler-b")
         .expect("start native run that will lose its lease");
+    assert!(
+        store
+            .release_scheduler_job_claim(&takeover, "2031-01-01T00:00:21Z", "scheduler-b",)
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .get_scheduler_job_claim(&job.job_id)
+            .expect("load active native claim")
+            .expect("active native claim exists")
+            .active_run_id
+            .as_deref(),
+        Some(abandoned_start.run_id.as_str())
+    );
+    admin
+        .execute(
+            "UPDATE ocfleet_native.scheduler_job_claims
+             SET claimed_at = clock_timestamp() - interval '2 seconds',
+                 lease_expires_at = clock_timestamp() - interval '1 second'
+             WHERE job_id = $1",
+            &[&job.job_id],
+        )
+        .expect("expire native claim using database time");
+    assert!(
+        store
+            .release_scheduler_job_claim(&takeover, "2031-01-01T00:06:00Z", "scheduler-b",)
+            .is_err()
+    );
     let recovered_claim = store
         .claim_scheduler_job(
             &job.job_id,
             "scheduler-c",
-            "2031-01-01T00:06:00Z",
+            "2000-01-01T00:00:00Z",
             300,
             "scheduler-c",
         )
@@ -1188,6 +1384,7 @@ FOR EACH ROW EXECUTE FUNCTION fail_native_scheduler_audit();
                     }],
                     job_clock: None,
                 },
+                &recovered_claim,
                 "scheduler-c",
             )
             .is_err()

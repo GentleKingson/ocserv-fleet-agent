@@ -1,8 +1,9 @@
 //! Native relational Postgres backend under construction for C1.
 //!
 //! This module is deliberately not wired into the CLI/runtime until every
-//! `StoreReader` and `StoreWriter` contract has native parity. The first slice
-//! establishes fail-closed migrations and the atomic node/audit boundary.
+//! `StoreReader` and `StoreWriter` contract has native parity. The current
+//! dormant slices cover registry/trust, scheduler/observations, and
+//! health/alerts while preserving fail-closed migrations and atomic audit.
 
 use std::fmt;
 use std::str::FromStr;
@@ -31,20 +32,38 @@ use crate::input_validation::{
 };
 use crate::postgres_backend::{PostgresConnectionSource, PostgresError, validate_transport};
 use crate::storage_payloads::{
-    AuditDetailPayloadV1, EnrollmentMetadataKindV1, EnrollmentMetadataPayloadV1,
+    AlertDetailPayloadV1, AlertHostAllowPayloadV1, AuditDetailPayloadV1, EnrollmentMetadataKindV1,
+    EnrollmentMetadataPayloadV1, HealthDegradedMethodsPayloadV1, HealthSummaryPayloadV1,
     ObservationSummaryPayloadV1, RunSummaryPayloadV1, SchedulerPairPayloadV1,
-    SchedulerSelectorPayloadV1, TrustBundlePayloadV1, validate_scheduler_payload_relationship,
+    SchedulerSelectorPayloadV1, TrustBundlePayloadV1, validate_health_payload_relationship,
+    validate_scheduler_payload_relationship,
 };
 use crate::store::{
-    ApprovalInput, EndpointTrustRecord, EnrollmentTokenInsert, EnrollmentTokenRecord,
-    JoinRequestInsert, JoinRequestRecord, LegacyEnrollmentClaimInput, MAX_ENROLLMENT_TOKEN_USES,
-    MAX_RETENTION_APPLY_LIMIT, MAX_RETENTION_BATCH_SIZE, MAX_RETENTION_POLICY_AGE_DAYS,
-    MAX_RETENTION_POLICY_ROWS, MAX_SCHEDULER_LEASE_SECONDS, MIN_SCHEDULER_LEASE_SECONDS,
-    NodeInsert, NodeMaintenanceWindow, NodeMetadataRecord, NodeRecord, ObservabilityJobRecord,
-    ObservabilityRunInsert, ObservabilityRunRecord, ProbeObservationInsert, ProbeObservationRecord,
-    RetentionApplyInput, RetentionApplyResult, RetentionCandidateReport, RetentionPolicyRecord,
-    SchedulerJobClaim, SchedulerJobClockUpdate, SchedulerMaintenanceWindow, SchedulerOutcomeWrite,
-    SchedulerRunFinish, SchedulerRunStart, Store, StoreError, TrustSnapshot,
+    AlertDeliveryAttemptRecord, AlertDeliveryAttemptWrite, AlertDeliveryFinalizeWrite,
+    AlertDeliveryQueueClaim, AlertDeliveryQueueEnqueue, AlertDeliveryQueueHealth,
+    AlertDeliveryQueueOutcome, AlertEvaluationWrite, AlertEventRecord, AlertStateTransition,
+    AlertWebhookHookRecord, ApprovalInput, EndpointTrustRecord, EnrollmentTokenInsert,
+    EnrollmentTokenRecord, HealthEvaluationFailure, HealthEvaluationFinish,
+    HealthEvaluationRunRecord, HealthEvaluationStart, HealthHistoryRecord, HealthPolicyRecord,
+    HealthRollupRecord, HealthRollupSource, HealthRollupWrite, HealthSnapshotRecord,
+    HealthSnapshotWrite, JoinRequestInsert, JoinRequestRecord, LegacyEnrollmentClaimInput,
+    MAX_ENROLLMENT_TOKEN_USES, MAX_RETENTION_APPLY_LIMIT, MAX_RETENTION_BATCH_SIZE,
+    MAX_RETENTION_POLICY_AGE_DAYS, MAX_RETENTION_POLICY_ROWS, MAX_SCHEDULER_LEASE_SECONDS,
+    MIN_SCHEDULER_LEASE_SECONDS, NodeInsert, NodeMaintenanceWindow, NodeMetadataRecord, NodeRecord,
+    ObservabilityJobRecord, ObservabilityRunInsert, ObservabilityRunRecord, ProbeObservationInsert,
+    ProbeObservationRecord, RetentionApplyInput, RetentionApplyResult, RetentionCandidateReport,
+    RetentionPolicyRecord, SchedulerJobClaim, SchedulerJobClockUpdate, SchedulerMaintenanceWindow,
+    SchedulerOutcomeWrite, SchedulerRunFinish, SchedulerRunStart, Store, StoreError, TrustSnapshot,
+    alert_delivery_attempt_hash, alert_delivery_finalize_hash, alert_evaluation_write_hash,
+    alert_state_transition_hash, alert_webhook_hook_hash, delivery_attempt_detail_payload,
+    health_rollup_write_hash, health_snapshot_write_hash, validate_alert_delivery_attempt_record,
+    validate_alert_delivery_finalize, validate_alert_delivery_queue_claim,
+    validate_alert_delivery_queue_claim_input, validate_alert_delivery_queue_enqueue,
+    validate_alert_delivery_queue_outcome, validate_alert_evaluation_write,
+    validate_alert_event_record, validate_alert_state_transition,
+    validate_alert_webhook_hook_record, validate_health_evaluation_failure,
+    validate_health_evaluation_finish, validate_health_evaluation_start, validate_health_policy,
+    validate_health_rollup_bucket, validate_health_rollup_write, validate_health_snapshot_write,
     validate_low_sensitive_json, validate_node_maintenance_record, validate_node_metadata_record,
 };
 use crate::version_governance::{
@@ -56,11 +75,13 @@ type Manager = PostgresConnectionManager<NoTls>;
 type Connection = PooledConnection<Manager>;
 
 const MIGRATION_LOCK_ID: i64 = 0x4f43464c4e4154;
+const OPERATION_LOCK_SALT: i64 = 0x4f43464c4f5053;
 const NATIVE_MIGRATION_1_NAME: &str = "0001_native_core";
 const NATIVE_MIGRATION_2_NAME: &str = "0002_registry_trust";
 const NATIVE_MIGRATION_3_NAME: &str = "0003_scheduler_observations";
+const NATIVE_MIGRATION_4_NAME: &str = "0004_health_alerts";
 const MAX_SCHEDULER_OUTCOME_ENTRIES: usize = 4;
-pub const NATIVE_BACKEND_SCHEMA_VERSION: i32 = 3;
+pub const NATIVE_BACKEND_SCHEMA_VERSION: i32 = 4;
 
 #[derive(Clone)]
 pub struct PostgresNativeStore {
@@ -125,6 +146,7 @@ impl PostgresNativeStore {
             (1_i32, NATIVE_MIGRATION_1_NAME),
             (2_i32, NATIVE_MIGRATION_2_NAME),
             (3_i32, NATIVE_MIGRATION_3_NAME),
+            (4_i32, NATIVE_MIGRATION_4_NAME),
         ] {
             if existing < version {
                 continue;
@@ -459,6 +481,245 @@ CREATE TABLE ocfleet_native.retention_operations (
             tx.execute(
                 "INSERT INTO ocfleet_native.migrations (version, name) VALUES ($1, $2)",
                 &[&3_i32, &NATIVE_MIGRATION_3_NAME],
+            )?;
+        }
+
+        if existing < 4 {
+            tx.batch_execute(
+                r#"
+CREATE TABLE ocfleet_native.health_policy (
+  singleton_id SMALLINT PRIMARY KEY CHECK (singleton_id = 1),
+  stale_window_seconds BIGINT NOT NULL CHECK (stale_window_seconds BETWEEN 60 AND 2592000),
+  unreachable_consecutive_failures BIGINT NOT NULL
+    CHECK (unreachable_consecutive_failures BETWEEN 1 AND 100),
+  cert_warning_days BIGINT NOT NULL CHECK (cert_warning_days BETWEEN 1 AND 3650),
+  cert_critical_days BIGINT NOT NULL CHECK (cert_critical_days BETWEEN 0 AND 3650),
+  updated_at TEXT NOT NULL CHECK (length(updated_at) BETWEEN 1 AND 64),
+  CHECK (cert_critical_days <= cert_warning_days)
+);
+INSERT INTO ocfleet_native.health_policy
+  (singleton_id, stale_window_seconds, unreachable_consecutive_failures,
+   cert_warning_days, cert_critical_days, updated_at)
+VALUES (1, 86400, 3, 30, 7, 'default');
+
+CREATE TABLE ocfleet_native.health_evaluation_runs (
+  evaluation_id TEXT PRIMARY KEY CHECK (length(evaluation_id) BETWEEN 1 AND 96),
+  input_watermark TEXT NOT NULL CHECK (length(input_watermark) = 64),
+  policy_version TEXT NOT NULL CHECK (length(policy_version) = 64),
+  computation_version TEXT NOT NULL CHECK (length(computation_version) BETWEEN 1 AND 64),
+  started_at TIMESTAMPTZ NOT NULL,
+  finished_at TIMESTAMPTZ,
+  status TEXT NOT NULL CHECK (status IN ('running', 'completed', 'failed')),
+  snapshot_count BIGINT NOT NULL DEFAULT 0 CHECK (snapshot_count BETWEEN 0 AND 1000),
+  failure_code TEXT CHECK (failure_code IS NULL OR length(failure_code) BETWEEN 1 AND 64),
+  CHECK (
+    (status = 'running' AND finished_at IS NULL AND failure_code IS NULL AND snapshot_count = 0)
+    OR (status = 'completed' AND finished_at IS NOT NULL AND failure_code IS NULL)
+    OR (status = 'failed' AND finished_at IS NOT NULL AND failure_code IS NOT NULL
+        AND snapshot_count = 0)
+  ),
+  CHECK (finished_at IS NULL OR finished_at >= started_at)
+);
+CREATE UNIQUE INDEX idx_native_health_evaluation_input
+  ON ocfleet_native.health_evaluation_runs(
+    input_watermark, policy_version, computation_version
+  );
+CREATE INDEX idx_native_health_evaluation_status_started
+  ON ocfleet_native.health_evaluation_runs(status, started_at, evaluation_id);
+
+CREATE TABLE ocfleet_native.health_snapshots (
+  node_id TEXT PRIMARY KEY CHECK (length(node_id) BETWEEN 1 AND 128),
+  endpoint_id TEXT CHECK (endpoint_id IS NULL OR length(endpoint_id) BETWEEN 1 AND 256),
+  computed_at TIMESTAMPTZ NOT NULL,
+  status TEXT NOT NULL CHECK (status IN (
+    'healthy', 'degraded', 'unreachable', 'stale', 'disabled', 'unknown'
+  )),
+  freshness_seconds BIGINT CHECK (freshness_seconds IS NULL OR freshness_seconds >= 0),
+  last_success_at TIMESTAMPTZ,
+  last_failure_at TIMESTAMPTZ,
+  last_error_code TEXT CHECK (last_error_code IS NULL OR length(last_error_code) BETWEEN 1 AND 64),
+  degraded_methods_json JSONB NOT NULL CHECK (jsonb_typeof(degraded_methods_json) = 'object'),
+  summary_json JSONB NOT NULL CHECK (jsonb_typeof(summary_json) = 'object')
+);
+CREATE INDEX idx_native_health_snapshots_computed
+  ON ocfleet_native.health_snapshots(computed_at DESC, node_id);
+
+CREATE TABLE ocfleet_native.health_history (
+  evaluation_id TEXT NOT NULL CHECK (length(evaluation_id) BETWEEN 1 AND 96),
+  node_id TEXT NOT NULL CHECK (length(node_id) BETWEEN 1 AND 128),
+  endpoint_id TEXT CHECK (endpoint_id IS NULL OR length(endpoint_id) BETWEEN 1 AND 256),
+  computed_at TIMESTAMPTZ NOT NULL,
+  status TEXT NOT NULL CHECK (status IN (
+    'healthy', 'degraded', 'unreachable', 'stale', 'disabled', 'unknown'
+  )),
+  freshness_seconds BIGINT CHECK (freshness_seconds IS NULL OR freshness_seconds >= 0),
+  last_success_at TIMESTAMPTZ,
+  last_failure_at TIMESTAMPTZ,
+  last_error_code TEXT CHECK (last_error_code IS NULL OR length(last_error_code) BETWEEN 1 AND 64),
+  degraded_methods_json JSONB NOT NULL CHECK (jsonb_typeof(degraded_methods_json) = 'object'),
+  summary_json JSONB NOT NULL CHECK (jsonb_typeof(summary_json) = 'object'),
+  PRIMARY KEY (evaluation_id, node_id)
+);
+CREATE INDEX idx_native_health_history_node_computed
+  ON ocfleet_native.health_history(node_id, computed_at DESC, evaluation_id);
+CREATE INDEX idx_native_health_history_computed
+  ON ocfleet_native.health_history(computed_at DESC, node_id, evaluation_id);
+CREATE FUNCTION ocfleet_native.reject_health_history_update() RETURNS trigger AS $$
+BEGIN
+  RAISE EXCEPTION 'native health history is append-only';
+END;
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER native_health_history_reject_update
+BEFORE UPDATE ON ocfleet_native.health_history
+FOR EACH ROW EXECUTE FUNCTION ocfleet_native.reject_health_history_update();
+
+CREATE TABLE ocfleet_native.health_rollups (
+  node_id TEXT NOT NULL CHECK (length(node_id) BETWEEN 1 AND 128),
+  bucket_seconds BIGINT NOT NULL CHECK (bucket_seconds IN (300, 3600, 86400)),
+  bucket_start TIMESTAMPTZ NOT NULL,
+  bucket_end TIMESTAMPTZ NOT NULL,
+  input_watermark TEXT NOT NULL CHECK (length(input_watermark) = 64),
+  health_samples BIGINT NOT NULL CHECK (health_samples >= 0),
+  covered_slots BIGINT NOT NULL CHECK (covered_slots >= 0),
+  expected_slots BIGINT NOT NULL CHECK (expected_slots > 0),
+  healthy_count BIGINT NOT NULL CHECK (healthy_count >= 0),
+  degraded_count BIGINT NOT NULL CHECK (degraded_count >= 0),
+  unreachable_count BIGINT NOT NULL CHECK (unreachable_count >= 0),
+  stale_count BIGINT NOT NULL CHECK (stale_count >= 0),
+  disabled_count BIGINT NOT NULL CHECK (disabled_count >= 0),
+  unknown_count BIGINT NOT NULL CHECK (unknown_count >= 0),
+  observation_count BIGINT NOT NULL CHECK (observation_count >= 0),
+  observation_error_count BIGINT NOT NULL CHECK (observation_error_count >= 0),
+  duration_sample_count BIGINT NOT NULL CHECK (duration_sample_count >= 0),
+  duration_p50_ms BIGINT CHECK (duration_p50_ms IS NULL OR duration_p50_ms >= 0),
+  duration_p95_ms BIGINT CHECK (duration_p95_ms IS NULL OR duration_p95_ms >= 0),
+  cert_warning_count BIGINT NOT NULL CHECK (cert_warning_count >= 0),
+  cert_critical_count BIGINT NOT NULL CHECK (cert_critical_count >= 0),
+  fingerprint_sample_count BIGINT NOT NULL CHECK (fingerprint_sample_count >= 0),
+  fingerprint_change_count BIGINT NOT NULL CHECK (fingerprint_change_count >= 0),
+  computed_at TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (node_id, bucket_seconds, bucket_start),
+  CHECK (bucket_end > bucket_start),
+  CHECK (expected_slots = bucket_seconds / 300),
+  CHECK (health_samples = covered_slots),
+  CHECK (covered_slots <= expected_slots),
+  CHECK (
+    healthy_count + degraded_count + unreachable_count + stale_count
+      + disabled_count + unknown_count = health_samples
+  ),
+  CHECK (observation_error_count <= observation_count),
+  CHECK (
+    (duration_sample_count = 0 AND duration_p50_ms IS NULL AND duration_p95_ms IS NULL)
+    OR (duration_sample_count > 0 AND duration_p50_ms IS NOT NULL AND duration_p95_ms IS NOT NULL)
+  ),
+  CHECK (duration_p50_ms IS NULL OR duration_p50_ms <= duration_p95_ms),
+  CHECK (fingerprint_change_count <= fingerprint_sample_count)
+);
+CREATE INDEX idx_native_health_rollups_window
+  ON ocfleet_native.health_rollups(bucket_seconds, bucket_start, node_id);
+
+CREATE TABLE ocfleet_native.alert_events (
+  alert_id TEXT PRIMARY KEY CHECK (length(alert_id) BETWEEN 1 AND 128),
+  dedupe_key TEXT NOT NULL UNIQUE CHECK (length(dedupe_key) BETWEEN 1 AND 256),
+  node_id TEXT CHECK (node_id IS NULL OR length(node_id) BETWEEN 1 AND 128),
+  severity TEXT NOT NULL CHECK (severity IN ('warning', 'critical')),
+  state TEXT NOT NULL CHECK (state IN ('open', 'resolved', 'silenced')),
+  reason_code TEXT NOT NULL CHECK (length(reason_code) BETWEEN 1 AND 64),
+  first_seen_at TIMESTAMPTZ NOT NULL,
+  last_seen_at TIMESTAMPTZ NOT NULL,
+  last_sent_at TIMESTAMPTZ,
+  resolved_at TIMESTAMPTZ,
+  detail_json JSONB NOT NULL CHECK (jsonb_typeof(detail_json) = 'object'),
+  CHECK (length(detail_json::text) <= 65536)
+);
+CREATE INDEX idx_native_alert_events_seen
+  ON ocfleet_native.alert_events(last_seen_at DESC, alert_id);
+CREATE INDEX idx_native_alert_events_filter
+  ON ocfleet_native.alert_events(state, severity, node_id, last_seen_at DESC);
+
+CREATE TABLE ocfleet_native.alert_hooks (
+  hook_id TEXT PRIMARY KEY CHECK (length(hook_id) BETWEEN 1 AND 128),
+  name TEXT NOT NULL UNIQUE CHECK (length(name) BETWEEN 1 AND 256),
+  hook_type TEXT NOT NULL CHECK (hook_type = 'webhook'),
+  endpoint_url TEXT NOT NULL,
+  endpoint_url_redacted TEXT NOT NULL,
+  endpoint_host TEXT NOT NULL CHECK (length(endpoint_host) BETWEEN 1 AND 253),
+  host_allow_json JSONB NOT NULL CHECK (jsonb_typeof(host_allow_json) = 'object'),
+  hmac_key_id TEXT NOT NULL CHECK (length(hmac_key_id) BETWEEN 1 AND 128),
+  enabled BOOLEAN NOT NULL DEFAULT TRUE,
+  max_attempts BIGINT NOT NULL CHECK (max_attempts BETWEEN 1 AND 5),
+  timeout_ms BIGINT NOT NULL CHECK (timeout_ms BETWEEN 1000 AND 5000),
+  created_at TIMESTAMPTZ NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX idx_native_alert_hooks_enabled_type
+  ON ocfleet_native.alert_hooks(enabled, hook_type);
+
+CREATE TABLE ocfleet_native.alert_delivery_attempts (
+  attempt_id TEXT PRIMARY KEY CHECK (length(attempt_id) BETWEEN 1 AND 128),
+  alert_id TEXT NOT NULL REFERENCES ocfleet_native.alert_events(alert_id) ON DELETE CASCADE,
+  hook_id TEXT NOT NULL REFERENCES ocfleet_native.alert_hooks(hook_id) ON DELETE CASCADE,
+  attempt_no BIGINT NOT NULL CHECK (attempt_no BETWEEN 1 AND 5),
+  attempted_at TIMESTAMPTZ NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('succeeded', 'failed', 'dry_run')),
+  http_status_class TEXT,
+  error_code TEXT CHECK (error_code IS NULL OR length(error_code) BETWEEN 1 AND 64),
+  bytes_sent BIGINT NOT NULL CHECK (bytes_sent BETWEEN 0 AND 1048576),
+  detail_json JSONB NOT NULL CHECK (jsonb_typeof(detail_json) = 'object'),
+  CHECK ((status = 'failed') = (error_code IS NOT NULL))
+);
+CREATE INDEX idx_native_alert_attempts_alert_hook
+  ON ocfleet_native.alert_delivery_attempts(alert_id, hook_id, attempted_at);
+
+CREATE TABLE ocfleet_native.alert_delivery_queue (
+  queue_id TEXT PRIMARY KEY CHECK (length(queue_id) BETWEEN 1 AND 96),
+  alert_id TEXT NOT NULL REFERENCES ocfleet_native.alert_events(alert_id) ON DELETE CASCADE,
+  hook_id TEXT NOT NULL REFERENCES ocfleet_native.alert_hooks(hook_id) ON DELETE CASCADE,
+  idempotency_key TEXT NOT NULL UNIQUE CHECK (length(idempotency_key) = 64),
+  group_key TEXT NOT NULL CHECK (length(group_key) BETWEEN 1 AND 128),
+  status TEXT NOT NULL CHECK (status IN (
+    'pending', 'claimed', 'retry', 'dead_letter', 'succeeded'
+  )),
+  attempt_count BIGINT NOT NULL DEFAULT 0 CHECK (attempt_count BETWEEN 0 AND 5),
+  next_attempt_at TIMESTAMPTZ NOT NULL,
+  owner_id TEXT,
+  owner_actor TEXT CHECK (owner_actor IS NULL OR length(owner_actor) BETWEEN 1 AND 128),
+  fence_token BIGINT NOT NULL DEFAULT 0 CHECK (fence_token >= 0),
+  claimed_at TIMESTAMPTZ,
+  lease_expires_at TIMESTAMPTZ,
+  last_error_code TEXT CHECK (last_error_code IS NULL OR length(last_error_code) BETWEEN 1 AND 64),
+  created_at TIMESTAMPTZ NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL,
+  delivered_at TIMESTAMPTZ,
+  CHECK (
+    (status = 'claimed' AND owner_id IS NOT NULL AND owner_actor IS NOT NULL
+      AND claimed_at IS NOT NULL AND lease_expires_at IS NOT NULL
+      AND fence_token > 0 AND lease_expires_at > claimed_at)
+    OR (status <> 'claimed' AND owner_id IS NULL AND owner_actor IS NULL
+      AND claimed_at IS NULL AND lease_expires_at IS NULL)
+  ),
+  CHECK ((status = 'succeeded') = (delivered_at IS NOT NULL)),
+  CHECK (status <> 'dead_letter' OR last_error_code IS NOT NULL)
+);
+CREATE UNIQUE INDEX idx_native_alert_queue_alert_hook_key
+  ON ocfleet_native.alert_delivery_queue(alert_id, hook_id, idempotency_key);
+CREATE INDEX idx_native_alert_queue_due
+  ON ocfleet_native.alert_delivery_queue(status, next_attempt_at, queue_id);
+CREATE INDEX idx_native_alert_queue_lease
+  ON ocfleet_native.alert_delivery_queue(lease_expires_at, queue_id);
+
+ALTER TABLE ocfleet_native.retention_policies
+  DROP CONSTRAINT retention_policies_scope_check;
+ALTER TABLE ocfleet_native.retention_policies
+  ADD CONSTRAINT retention_policies_scope_check CHECK (scope IN (
+    'observations', 'observability-runs', 'health-snapshots',
+    'health-history', 'health-rollups', 'alert-events'
+  ));
+"#,
+            )?;
+            tx.execute(
+                "INSERT INTO ocfleet_native.migrations (version, name) VALUES ($1, $2)",
+                &[&4_i32, &NATIVE_MIGRATION_4_NAME],
             )?;
         }
 
@@ -2940,6 +3201,2314 @@ CREATE TABLE ocfleet_native.retention_operations (
     }
 }
 
+impl PostgresNativeStore {
+    pub fn get_health_policy(&self) -> Result<HealthPolicyRecord, PostgresError> {
+        let mut conn = self.connection()?;
+        conn.query_opt(
+            "SELECT stale_window_seconds, unreachable_consecutive_failures,
+                    cert_warning_days, cert_critical_days, updated_at
+             FROM ocfleet_native.health_policy WHERE singleton_id = 1",
+            &[],
+        )?
+        .as_ref()
+        .map(health_policy_from_postgres_row)
+        .transpose()?
+        .ok_or_else(|| PostgresError::InvalidState("native health policy is missing".into()))
+    }
+
+    pub fn set_health_policy(
+        &self,
+        policy: &HealthPolicyRecord,
+        actor: &str,
+    ) -> Result<(), PostgresError> {
+        validate_actor(actor).map_err(PostgresError::InvalidInput)?;
+        map_store_validation(validate_health_policy(policy))?;
+        validate_native_id("health policy updated_at", &policy.updated_at, 64)?;
+        let mut conn = self.connection()?;
+        let mut tx = conn.transaction()?;
+        let before = tx.query_one(
+            "SELECT stale_window_seconds, unreachable_consecutive_failures,
+                    cert_warning_days, cert_critical_days, updated_at
+             FROM ocfleet_native.health_policy WHERE singleton_id = 1 FOR UPDATE",
+            &[],
+        )?;
+        let before = health_policy_from_postgres_row(&before)?;
+        if before == *policy {
+            tx.commit()?;
+            return Ok(());
+        }
+        tx.execute(
+            "UPDATE ocfleet_native.health_policy
+             SET stale_window_seconds = $1, unreachable_consecutive_failures = $2,
+                 cert_warning_days = $3, cert_critical_days = $4, updated_at = $5
+             WHERE singleton_id = 1",
+            &[
+                &checked_i64(policy.stale_window_seconds, "stale_window_seconds")?,
+                &checked_i64(
+                    policy.unreachable_consecutive_failures,
+                    "unreachable_consecutive_failures",
+                )?,
+                &checked_i64(policy.cert_warning_days, "cert_warning_days")?,
+                &checked_i64(policy.cert_critical_days, "cert_critical_days")?,
+                &policy.updated_at,
+            ],
+        )?;
+        let mut event = AuditEvent::new(actor, "health.policy.set");
+        event.ok = Some(true);
+        event.detail_json = json!({
+            "actor_type": "user",
+            "target_type": "health_policy",
+            "target_id": "global",
+            "before": health_policy_audit_json_native(&before),
+            "after": health_policy_audit_json_native(policy),
+            "reason": Value::Null,
+        });
+        insert_audit(&mut tx, &event)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn write_health_snapshots(
+        &self,
+        write: &HealthSnapshotWrite,
+        actor: &str,
+    ) -> Result<(), PostgresError> {
+        validate_actor(actor).map_err(PostgresError::InvalidInput)?;
+        map_store_validation(validate_health_snapshot_write(write))?;
+        let params_hash = health_snapshot_write_hash(write);
+        let mut conn = self.connection()?;
+        let mut tx = conn.transaction()?;
+        if native_audit_replay_tx(
+            &mut tx,
+            &write.evaluation_id,
+            &write.event,
+            actor,
+            &params_hash,
+        )? {
+            tx.commit()?;
+            return Ok(());
+        }
+        for snapshot in &write.snapshots {
+            upsert_health_snapshot_postgres_tx(&mut tx, snapshot)?;
+            insert_health_history_postgres_tx(&mut tx, &write.evaluation_id, snapshot)?;
+        }
+        let mut status_counts = serde_json::Map::new();
+        for status in [
+            "healthy",
+            "degraded",
+            "unreachable",
+            "stale",
+            "disabled",
+            "unknown",
+        ] {
+            status_counts.insert(
+                status.to_string(),
+                Value::from(
+                    write
+                        .snapshots
+                        .iter()
+                        .filter(|snapshot| snapshot.status == status)
+                        .count(),
+                ),
+            );
+        }
+        let mut event = AuditEvent::new(actor, write.event.clone());
+        event.ok = Some(true);
+        event.request_id = Some(write.evaluation_id.clone());
+        event.params_hash = Some(params_hash);
+        event.detail_json = json!({
+            "actor_type": "user",
+            "target_type": "health_snapshot_batch",
+            "target_id": write.evaluation_id,
+            "node_count": write.snapshots.len(),
+            "status_counts": status_counts,
+            "reason": Value::Null,
+        });
+        insert_audit(&mut tx, &event)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn list_health_snapshots(
+        &self,
+        limit: u64,
+    ) -> Result<Vec<HealthSnapshotRecord>, PostgresError> {
+        let limit = checked_query_limit(limit)?;
+        let mut conn = self.connection()?;
+        conn.query(
+            "SELECT node_id, endpoint_id, computed_at, status, freshness_seconds,
+                    last_success_at, last_failure_at, last_error_code,
+                    degraded_methods_json::text, summary_json::text
+             FROM ocfleet_native.health_snapshots
+             ORDER BY computed_at DESC, node_id LIMIT $1",
+            &[&limit],
+        )?
+        .iter()
+        .map(health_snapshot_from_postgres_row)
+        .collect()
+    }
+
+    pub fn list_health_history(
+        &self,
+        node_id: Option<&str>,
+        from: &str,
+        to: &str,
+        limit: u64,
+    ) -> Result<Vec<HealthHistoryRecord>, PostgresError> {
+        if let Some(node_id) = node_id {
+            validate_node_id(node_id)
+                .map_err(|error| PostgresError::InvalidInput(error.to_string()))?;
+        }
+        let from = parse_postgres_timestamp(from, "health history from")?;
+        let to = parse_postgres_timestamp(to, "health history to")?;
+        if from >= to {
+            return Err(PostgresError::InvalidInput(
+                "health history from must precede to".into(),
+            ));
+        }
+        let limit = checked_query_limit(limit)?;
+        let mut conn = self.connection()?;
+        conn.query(
+            "SELECT evaluation_id, node_id, endpoint_id, computed_at, status,
+                    freshness_seconds, last_success_at, last_failure_at, last_error_code,
+                    degraded_methods_json::text, summary_json::text
+             FROM ocfleet_native.health_history
+             WHERE ($1::text IS NULL OR node_id = $1)
+               AND computed_at >= $2 AND computed_at < $3
+             ORDER BY computed_at DESC, node_id, evaluation_id LIMIT $4",
+            &[&node_id, &from, &to, &limit],
+        )?
+        .iter()
+        .map(health_history_from_postgres_row)
+        .collect()
+    }
+
+    pub fn health_rollup_source(
+        &self,
+        node_id: &str,
+        from: &str,
+        to: &str,
+    ) -> Result<HealthRollupSource, PostgresError> {
+        validate_node_id(node_id)
+            .map_err(|error| PostgresError::InvalidInput(error.to_string()))?;
+        let from = parse_postgres_timestamp(from, "health rollup source from")?;
+        let to = parse_postgres_timestamp(to, "health rollup source to")?;
+        if from >= to {
+            return Err(PostgresError::InvalidInput(
+                "health rollup source from must precede to".into(),
+            ));
+        }
+        const SOURCE_LIMIT: i64 = 100_001;
+        let mut conn = self.connection()?;
+        let history = conn
+            .query(
+                "SELECT evaluation_id, node_id, endpoint_id, computed_at, status,
+                        freshness_seconds, last_success_at, last_failure_at, last_error_code,
+                        degraded_methods_json::text, summary_json::text
+                 FROM ocfleet_native.health_history
+                 WHERE node_id = $1 AND computed_at >= $2 AND computed_at < $3
+                 ORDER BY computed_at, evaluation_id LIMIT $4",
+                &[&node_id, &from, &to, &SOURCE_LIMIT],
+            )?
+            .iter()
+            .map(health_history_from_postgres_row)
+            .collect::<Result<Vec<_>, _>>()?;
+        let observations = conn
+            .query(
+                "SELECT observation_id, run_id, node_id, endpoint_id, method, ok,
+                        error_code, duration_ms, observed_at, expires_at, result_class,
+                        summary_json::text
+                 FROM ocfleet_native.probe_observations
+                 WHERE node_id = $1 AND observed_at >= $2 AND observed_at < $3
+                 ORDER BY observed_at, observation_id LIMIT $4",
+                &[&node_id, &from, &to, &SOURCE_LIMIT],
+            )?
+            .iter()
+            .map(probe_observation_from_row)
+            .collect::<Result<Vec<_>, _>>()?;
+        if history.len() >= SOURCE_LIMIT as usize || observations.len() >= SOURCE_LIMIT as usize {
+            return Err(PostgresError::InvalidInput(
+                "health rollup source exceeds 100000 rows in one bucket".into(),
+            ));
+        }
+        Ok(HealthRollupSource {
+            history,
+            observations,
+        })
+    }
+
+    pub fn health_rollup_node_ids(
+        &self,
+        from: &str,
+        to: &str,
+    ) -> Result<Vec<String>, PostgresError> {
+        let from = parse_postgres_timestamp(from, "health rollup nodes from")?;
+        let to = parse_postgres_timestamp(to, "health rollup nodes to")?;
+        if from >= to {
+            return Err(PostgresError::InvalidInput(
+                "health rollup nodes from must precede to".into(),
+            ));
+        }
+        let mut conn = self.connection()?;
+        let rows = conn.query(
+            "SELECT node_id FROM (
+               SELECT node_id FROM ocfleet_native.health_history
+               WHERE computed_at >= $1 AND computed_at < $2
+               UNION
+               SELECT node_id FROM ocfleet_native.probe_observations
+               WHERE node_id IS NOT NULL AND observed_at >= $1 AND observed_at < $2
+             ) source ORDER BY node_id LIMIT 1001",
+            &[&from, &to],
+        )?;
+        if rows.len() > 1_000 {
+            return Err(PostgresError::InvalidInput(
+                "health rollup window exceeds 1000 nodes".into(),
+            ));
+        }
+        rows.iter()
+            .map(|row| row.try_get(0).map_err(Into::into))
+            .collect()
+    }
+
+    pub fn write_health_rollups(
+        &self,
+        write: &HealthRollupWrite,
+        actor: &str,
+    ) -> Result<(), PostgresError> {
+        validate_actor(actor).map_err(PostgresError::InvalidInput)?;
+        map_store_validation(validate_health_rollup_write(write))?;
+        let params_hash = health_rollup_write_hash(write);
+        let mut conn = self.connection()?;
+        let mut tx = conn.transaction()?;
+        if native_audit_replay_tx(
+            &mut tx,
+            &write.operation_id,
+            "health.rollup.recompute",
+            actor,
+            &params_hash,
+        )? {
+            tx.commit()?;
+            return Ok(());
+        }
+        for row in &write.rows {
+            upsert_health_rollup_postgres_tx(&mut tx, row)?;
+        }
+        let mut event = AuditEvent::new(actor, "health.rollup.recompute");
+        event.ok = Some(true);
+        event.request_id = Some(write.operation_id.clone());
+        event.params_hash = Some(params_hash);
+        event.detail_json = json!({
+            "actor_type": "system",
+            "target_type": "health_rollup_batch",
+            "target_id": write.operation_id,
+            "batch_count": write.rows.len(),
+            "reason": Value::Null,
+        });
+        insert_audit(&mut tx, &event)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn list_health_rollups(
+        &self,
+        node_id: Option<&str>,
+        bucket_seconds: u64,
+        from: &str,
+        to: &str,
+        limit: u64,
+    ) -> Result<Vec<HealthRollupRecord>, PostgresError> {
+        if let Some(node_id) = node_id {
+            validate_node_id(node_id)
+                .map_err(|error| PostgresError::InvalidInput(error.to_string()))?;
+        }
+        map_store_validation(validate_health_rollup_bucket(bucket_seconds))?;
+        let bucket_seconds = checked_i64(bucket_seconds, "health rollup bucket")?;
+        let from = parse_postgres_timestamp(from, "health rollup from")?;
+        let to = parse_postgres_timestamp(to, "health rollup to")?;
+        if from >= to {
+            return Err(PostgresError::InvalidInput(
+                "health rollup from must precede to".into(),
+            ));
+        }
+        if limit == 0 || limit > 100_000 {
+            return Err(PostgresError::InvalidInput(
+                "health rollup limit must be between 1 and 100000".into(),
+            ));
+        }
+        let limit = checked_i64(limit, "health rollup limit")?;
+        let mut conn = self.connection()?;
+        conn.query(
+            "SELECT node_id, bucket_seconds, bucket_start, bucket_end, input_watermark,
+                    health_samples, covered_slots, expected_slots, healthy_count,
+                    degraded_count, unreachable_count, stale_count, disabled_count,
+                    unknown_count, observation_count, observation_error_count,
+                    duration_sample_count, duration_p50_ms, duration_p95_ms,
+                    cert_warning_count, cert_critical_count, fingerprint_sample_count,
+                    fingerprint_change_count, computed_at
+             FROM ocfleet_native.health_rollups
+             WHERE ($1::text IS NULL OR node_id = $1) AND bucket_seconds = $2
+               AND bucket_start >= $3 AND bucket_start < $4
+             ORDER BY bucket_start, node_id LIMIT $5",
+            &[&node_id, &bucket_seconds, &from, &to, &limit],
+        )?
+        .iter()
+        .map(health_rollup_from_postgres_row)
+        .collect()
+    }
+
+    pub fn health_rollup_stored_node_ids(
+        &self,
+        bucket_seconds: u64,
+        from: &str,
+        to: &str,
+    ) -> Result<Vec<String>, PostgresError> {
+        map_store_validation(validate_health_rollup_bucket(bucket_seconds))?;
+        let bucket_seconds = checked_i64(bucket_seconds, "health rollup bucket")?;
+        let from = parse_postgres_timestamp(from, "health SLO from")?;
+        let to = parse_postgres_timestamp(to, "health SLO to")?;
+        if from >= to {
+            return Err(PostgresError::InvalidInput(
+                "health SLO from must precede to".into(),
+            ));
+        }
+        let mut conn = self.connection()?;
+        let rows = conn.query(
+            "SELECT DISTINCT node_id FROM ocfleet_native.health_rollups
+             WHERE bucket_seconds = $1 AND bucket_start >= $2 AND bucket_start < $3
+             ORDER BY node_id LIMIT 1001",
+            &[&bucket_seconds, &from, &to],
+        )?;
+        if rows.len() > 1_000 {
+            return Err(PostgresError::InvalidInput(
+                "health SLO window exceeds 1000 nodes".into(),
+            ));
+        }
+        rows.iter()
+            .map(|row| row.try_get(0).map_err(PostgresError::from))
+            .collect()
+    }
+
+    pub fn get_health_evaluation_run(
+        &self,
+        evaluation_id: &str,
+    ) -> Result<Option<HealthEvaluationRunRecord>, PostgresError> {
+        validate_native_id("health evaluation_id", evaluation_id, 96)?;
+        let mut conn = self.connection()?;
+        conn.query_opt(
+            "SELECT evaluation_id, input_watermark, policy_version, computation_version,
+                    started_at, finished_at, status, snapshot_count, failure_code
+             FROM ocfleet_native.health_evaluation_runs WHERE evaluation_id = $1",
+            &[&evaluation_id],
+        )?
+        .as_ref()
+        .map(health_evaluation_from_postgres_row)
+        .transpose()
+    }
+
+    pub fn write_health_evaluation_start(
+        &self,
+        start: &HealthEvaluationStart,
+        actor: &str,
+    ) -> Result<(), PostgresError> {
+        validate_actor(actor).map_err(PostgresError::InvalidInput)?;
+        map_store_validation(validate_health_evaluation_start(start))?;
+        let started_at = parse_postgres_timestamp(&start.started_at, "health started_at")?;
+        let mut conn = self.connection()?;
+        let mut tx = conn.transaction()?;
+        lock_native_operation_tx(&mut tx, &start.evaluation_id)?;
+        let existing = tx.query_opt(
+            "SELECT evaluation_id, input_watermark, policy_version, computation_version,
+                    started_at, finished_at, status, snapshot_count, failure_code
+             FROM ocfleet_native.health_evaluation_runs
+             WHERE evaluation_id = $1 OR (
+               input_watermark = $2 AND policy_version = $3 AND computation_version = $4
+             ) FOR UPDATE",
+            &[
+                &start.evaluation_id,
+                &start.input_watermark,
+                &start.policy_version,
+                &start.computation_version,
+            ],
+        )?;
+        if let Some(existing) = existing {
+            let existing = health_evaluation_from_postgres_row(&existing)?;
+            if existing.evaluation_id == start.evaluation_id
+                && existing.input_watermark == start.input_watermark
+                && existing.policy_version == start.policy_version
+                && existing.computation_version == start.computation_version
+                && native_audit_actor_matches_tx(
+                    &mut tx,
+                    &start.evaluation_id,
+                    "health.evaluation.start",
+                    actor,
+                )?
+            {
+                tx.commit()?;
+                return Ok(());
+            }
+            return Err(health_evaluation_conflict(
+                &start.evaluation_id,
+                "evaluation identity, replay key, or audit provenance is already bound",
+            ));
+        }
+        tx.execute(
+            "INSERT INTO ocfleet_native.health_evaluation_runs
+             (evaluation_id, input_watermark, policy_version, computation_version,
+              started_at, status)
+             VALUES ($1, $2, $3, $4, $5, 'running')",
+            &[
+                &start.evaluation_id,
+                &start.input_watermark,
+                &start.policy_version,
+                &start.computation_version,
+                &started_at,
+            ],
+        )?;
+        insert_health_evaluation_audit_postgres_tx(
+            &mut tx,
+            actor,
+            "health.evaluation.start",
+            &start.evaluation_id,
+            true,
+            None,
+            0,
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn write_health_evaluation_finish(
+        &self,
+        finish: &HealthEvaluationFinish,
+        actor: &str,
+    ) -> Result<(), PostgresError> {
+        validate_actor(actor).map_err(PostgresError::InvalidInput)?;
+        map_store_validation(validate_health_evaluation_finish(finish))?;
+        let finished_at = parse_postgres_timestamp(&finish.finished_at, "health finished_at")?;
+        let mut conn = self.connection()?;
+        let mut tx = conn.transaction()?;
+        let changed = tx.execute(
+            "UPDATE ocfleet_native.health_evaluation_runs
+             SET finished_at = $2, status = 'completed', snapshot_count = $3
+             WHERE evaluation_id = $1 AND status = 'running' AND finished_at IS NULL
+               AND started_at <= $2",
+            &[
+                &finish.evaluation_id,
+                &finished_at,
+                &checked_i64(finish.snapshots.len() as u64, "health snapshot count")?,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(health_evaluation_conflict(
+                &finish.evaluation_id,
+                "evaluation is missing, not running, or has invalid finish order",
+            ));
+        }
+        for snapshot in &finish.snapshots {
+            upsert_health_snapshot_postgres_tx(&mut tx, snapshot)?;
+            insert_health_history_postgres_tx(&mut tx, &finish.evaluation_id, snapshot)?;
+        }
+        insert_health_evaluation_audit_postgres_tx(
+            &mut tx,
+            actor,
+            "health.evaluation.finish",
+            &finish.evaluation_id,
+            true,
+            None,
+            finish.snapshots.len(),
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn write_health_evaluation_failure(
+        &self,
+        failure: &HealthEvaluationFailure,
+        actor: &str,
+    ) -> Result<(), PostgresError> {
+        validate_actor(actor).map_err(PostgresError::InvalidInput)?;
+        map_store_validation(validate_health_evaluation_failure(failure))?;
+        let finished_at = parse_postgres_timestamp(&failure.finished_at, "health finished_at")?;
+        let mut conn = self.connection()?;
+        let mut tx = conn.transaction()?;
+        let changed = tx.execute(
+            "UPDATE ocfleet_native.health_evaluation_runs
+             SET finished_at = $2, status = 'failed', failure_code = $3
+             WHERE evaluation_id = $1 AND status = 'running' AND finished_at IS NULL
+               AND started_at <= $2",
+            &[&failure.evaluation_id, &finished_at, &failure.failure_code],
+        )?;
+        if changed != 1 {
+            return Err(health_evaluation_conflict(
+                &failure.evaluation_id,
+                "evaluation is missing, not running, or has invalid finish order",
+            ));
+        }
+        insert_health_evaluation_audit_postgres_tx(
+            &mut tx,
+            actor,
+            "health.evaluation.fail",
+            &failure.evaluation_id,
+            false,
+            Some(&failure.failure_code),
+            0,
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn write_health_evaluation_recovery(
+        &self,
+        cutoff: &str,
+        recovered_at: &str,
+        actor: &str,
+    ) -> Result<usize, PostgresError> {
+        validate_actor(actor).map_err(PostgresError::InvalidInput)?;
+        let cutoff = parse_postgres_timestamp(cutoff, "health recovery cutoff")?;
+        let recovered_at = parse_postgres_timestamp(recovered_at, "health recovered_at")?;
+        if recovered_at < cutoff {
+            return Err(PostgresError::InvalidInput(
+                "health evaluation recovered_at precedes cutoff".into(),
+            ));
+        }
+        let mut conn = self.connection()?;
+        let mut tx = conn.transaction()?;
+        let candidates = tx.query(
+            "SELECT evaluation_id FROM ocfleet_native.health_evaluation_runs
+             WHERE status = 'running' AND started_at < $1
+             ORDER BY started_at, evaluation_id LIMIT 100 FOR UPDATE SKIP LOCKED",
+            &[&cutoff],
+        )?;
+        let evaluation_ids = candidates
+            .iter()
+            .map(|row| row.try_get::<_, String>(0))
+            .collect::<Result<Vec<_>, _>>()?;
+        for evaluation_id in &evaluation_ids {
+            let changed = tx.execute(
+                "UPDATE ocfleet_native.health_evaluation_runs
+                 SET finished_at = $2, status = 'failed',
+                     failure_code = 'HEALTH_EVALUATION_ABANDONED'
+                 WHERE evaluation_id = $1 AND status = 'running'",
+                &[evaluation_id, &recovered_at],
+            )?;
+            if changed != 1 {
+                return Err(health_evaluation_conflict(
+                    evaluation_id,
+                    "evaluation changed during recovery",
+                ));
+            }
+            insert_health_evaluation_audit_postgres_tx(
+                &mut tx,
+                actor,
+                "health.evaluation.recover",
+                evaluation_id,
+                false,
+                Some("HEALTH_EVALUATION_ABANDONED"),
+                0,
+            )?;
+        }
+        tx.commit()?;
+        Ok(evaluation_ids.len())
+    }
+}
+
+impl PostgresNativeStore {
+    pub fn upsert_alert_event(&self, alert: &AlertEventRecord) -> Result<(), PostgresError> {
+        map_store_validation(validate_alert_event_record(alert))?;
+        let mut conn = self.connection()?;
+        let mut tx = conn.transaction()?;
+        upsert_alert_event_postgres_tx(&mut tx, alert)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn write_alert_evaluation(
+        &self,
+        write: &AlertEvaluationWrite,
+        actor: &str,
+    ) -> Result<(), PostgresError> {
+        validate_actor(actor).map_err(PostgresError::InvalidInput)?;
+        map_store_validation(validate_alert_evaluation_write(write))?;
+        let params_hash = alert_evaluation_write_hash(write);
+        let mut conn = self.connection()?;
+        let mut tx = conn.transaction()?;
+        if native_audit_replay_tx(
+            &mut tx,
+            &write.evaluation_id,
+            "alert.evaluate",
+            actor,
+            &params_hash,
+        )? {
+            tx.commit()?;
+            return Ok(());
+        }
+        for entry in &write.entries {
+            let current = get_alert_event_postgres_tx(&mut tx, &entry.after.dedupe_key, true)?;
+            if !optional_alerts_equivalent(current.as_ref(), entry.before.as_ref())? {
+                return Err(alert_evaluation_conflict(
+                    &write.evaluation_id,
+                    "alert state changed after candidate evaluation",
+                ));
+            }
+            upsert_alert_event_postgres_tx(&mut tx, &entry.after)?;
+        }
+        let open_alerts = write
+            .entries
+            .iter()
+            .filter(|entry| entry.after.state == "open")
+            .count();
+        let mut event = AuditEvent::new(actor, "alert.evaluate");
+        event.ok = Some(true);
+        event.request_id = Some(write.evaluation_id.clone());
+        event.params_hash = Some(params_hash);
+        event.detail_json = json!({
+            "actor_type": "user",
+            "target_type": "alert_evaluation",
+            "target_id": write.evaluation_id,
+            "evaluated_candidates": write.entries.len(),
+            "upserted_alerts": write.entries.len(),
+            "open_alerts": open_alerts,
+            "silenced_alerts": write.entries.len() - open_alerts,
+            "created_or_updated_count": write.entries.len(),
+            "reason": Value::Null,
+        });
+        insert_audit(&mut tx, &event)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn write_alert_state_transition(
+        &self,
+        write: &AlertStateTransition,
+        actor: &str,
+    ) -> Result<(), PostgresError> {
+        validate_actor(actor).map_err(PostgresError::InvalidInput)?;
+        map_store_validation(validate_alert_state_transition(write))?;
+        let params_hash = alert_state_transition_hash(write);
+        let mut conn = self.connection()?;
+        let mut tx = conn.transaction()?;
+        if native_audit_replay_tx(
+            &mut tx,
+            &write.operation_id,
+            &write.event,
+            actor,
+            &params_hash,
+        )? {
+            tx.commit()?;
+            return Ok(());
+        }
+        let current = get_alert_event_postgres_tx(&mut tx, &write.before.dedupe_key, true)?;
+        if !optional_alerts_equivalent(current.as_ref(), Some(&write.before))? {
+            return Err(alert_mutation_conflict(
+                &write.operation_id,
+                "alert state changed before operator transition",
+            ));
+        }
+        upsert_alert_event_postgres_tx(&mut tx, &write.after)?;
+        let mut event = AuditEvent::new(actor, write.event.clone());
+        event.ok = Some(true);
+        event.request_id = Some(write.operation_id.clone());
+        event.params_hash = Some(params_hash);
+        event.detail_json = json!({
+            "actor_type": "user",
+            "target_type": "alert",
+            "target_id": write.after.alert_id,
+            "dedupe_key": write.after.dedupe_key,
+            "before_state": write.before.state,
+            "after_state": write.after.state,
+            "reason": write.reason,
+        });
+        insert_audit(&mut tx, &event)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn list_alert_events(&self, limit: u64) -> Result<Vec<AlertEventRecord>, PostgresError> {
+        self.list_alert_events_filtered(None, None, None, limit)
+    }
+
+    pub fn list_alert_events_filtered(
+        &self,
+        state: Option<&str>,
+        severity: Option<&str>,
+        node_id: Option<&str>,
+        limit: u64,
+    ) -> Result<Vec<AlertEventRecord>, PostgresError> {
+        if state.is_some_and(|value| !matches!(value, "open" | "resolved" | "silenced")) {
+            return Err(PostgresError::InvalidInput(
+                "alert state filter is invalid".into(),
+            ));
+        }
+        if severity.is_some_and(|value| !matches!(value, "warning" | "critical")) {
+            return Err(PostgresError::InvalidInput(
+                "alert severity filter is invalid".into(),
+            ));
+        }
+        if let Some(node_id) = node_id {
+            validate_node_id(node_id)
+                .map_err(|error| PostgresError::InvalidInput(error.to_string()))?;
+        }
+        let limit = checked_query_limit(limit)?;
+        let mut conn = self.connection()?;
+        conn.query(
+            "SELECT alert_id, dedupe_key, node_id, severity, state, reason_code,
+                    first_seen_at, last_seen_at, last_sent_at, resolved_at,
+                    detail_json::text
+             FROM ocfleet_native.alert_events
+             WHERE ($1::text IS NULL OR state = $1)
+               AND ($2::text IS NULL OR severity = $2)
+               AND ($3::text IS NULL OR node_id = $3)
+             ORDER BY last_seen_at DESC, alert_id LIMIT $4",
+            &[&state, &severity, &node_id, &limit],
+        )?
+        .iter()
+        .map(alert_event_from_postgres_row)
+        .collect()
+    }
+
+    pub fn write_alert_webhook_hook_create(
+        &self,
+        hook: &AlertWebhookHookRecord,
+        actor: &str,
+    ) -> Result<(), PostgresError> {
+        validate_actor(actor).map_err(PostgresError::InvalidInput)?;
+        map_store_validation(validate_alert_webhook_hook_record(hook))?;
+        let created_at = parse_postgres_timestamp(&hook.created_at, "alert hook created_at")?;
+        let updated_at = parse_postgres_timestamp(&hook.updated_at, "alert hook updated_at")?;
+        let host_allow = AlertHostAllowPayloadV1::new(hook.host_allow.clone())
+            .map_err(PostgresError::InvalidInput)?;
+        let params_hash = alert_webhook_hook_hash(hook);
+        let mut conn = self.connection()?;
+        let mut tx = conn.transaction()?;
+        if native_audit_replay_tx(
+            &mut tx,
+            &hook.hook_id,
+            "alert.hook.add_webhook",
+            actor,
+            &params_hash,
+        )? {
+            tx.commit()?;
+            return Ok(());
+        }
+        tx.execute(
+            "INSERT INTO ocfleet_native.alert_hooks
+             (hook_id, name, hook_type, endpoint_url, endpoint_url_redacted,
+              endpoint_host, host_allow_json, hmac_key_id, enabled, max_attempts,
+              timeout_ms, created_at, updated_at)
+             VALUES ($1,$2,$3,$4,$5,$6,CAST($7 AS text)::jsonb,$8,$9,$10,$11,$12,$13)",
+            &[
+                &hook.hook_id,
+                &hook.name,
+                &hook.hook_type,
+                &hook.endpoint_url,
+                &hook.endpoint_url_redacted,
+                &hook.endpoint_host,
+                &host_allow.to_value().to_string(),
+                &hook.hmac_key_id,
+                &hook.enabled,
+                &checked_i64(hook.max_attempts, "alert max_attempts")?,
+                &checked_i64(hook.timeout_ms, "alert timeout_ms")?,
+                &created_at,
+                &updated_at,
+            ],
+        )?;
+        let mut event = AuditEvent::new(actor, "alert.hook.add_webhook");
+        event.ok = Some(true);
+        event.request_id = Some(hook.hook_id.clone());
+        event.params_hash = Some(params_hash);
+        event.detail_json = json!({
+            "actor_type": "user",
+            "target_type": "alert_webhook_hook",
+            "target_id": hook.hook_id,
+            "hook_type": hook.hook_type,
+            "endpoint_host": hook.endpoint_host,
+            "hmac_key_id": hook.hmac_key_id,
+            "enabled": hook.enabled,
+            "max_attempts": hook.max_attempts,
+            "timeout_ms": hook.timeout_ms,
+            "reason": Value::Null,
+        });
+        insert_audit(&mut tx, &event)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn list_alert_webhook_hooks(&self) -> Result<Vec<AlertWebhookHookRecord>, PostgresError> {
+        let mut conn = self.connection()?;
+        conn.query(
+            "SELECT hook_id, name, hook_type, endpoint_url, endpoint_url_redacted,
+                    endpoint_host, host_allow_json::text, hmac_key_id, enabled,
+                    max_attempts, timeout_ms, created_at, updated_at
+             FROM ocfleet_native.alert_hooks WHERE hook_type = 'webhook'
+             ORDER BY name, hook_id LIMIT 1001",
+            &[],
+        )?
+        .iter()
+        .map(alert_hook_from_postgres_row)
+        .collect::<Result<Vec<_>, _>>()
+        .and_then(|rows| {
+            if rows.len() > 1_000 {
+                Err(PostgresError::InvalidState(
+                    "native alert hook list exceeds 1000 rows".into(),
+                ))
+            } else {
+                Ok(rows)
+            }
+        })
+    }
+
+    pub fn get_alert_webhook_hook(
+        &self,
+        hook_id: &str,
+    ) -> Result<Option<AlertWebhookHookRecord>, PostgresError> {
+        validate_native_id("alert hook_id", hook_id, 128)?;
+        let mut conn = self.connection()?;
+        conn.query_opt(
+            "SELECT hook_id, name, hook_type, endpoint_url, endpoint_url_redacted,
+                    endpoint_host, host_allow_json::text, hmac_key_id, enabled,
+                    max_attempts, timeout_ms, created_at, updated_at
+             FROM ocfleet_native.alert_hooks
+             WHERE hook_id = $1 AND hook_type = 'webhook'",
+            &[&hook_id],
+        )?
+        .as_ref()
+        .map(alert_hook_from_postgres_row)
+        .transpose()
+    }
+
+    pub fn write_alert_webhook_hook_enabled(
+        &self,
+        hook_id: &str,
+        enabled: bool,
+        updated_at: &str,
+        actor: &str,
+    ) -> Result<bool, PostgresError> {
+        validate_actor(actor).map_err(PostgresError::InvalidInput)?;
+        validate_native_id("alert hook_id", hook_id, 128)?;
+        let updated_at_value = parse_postgres_timestamp(updated_at, "alert hook updated_at")?;
+        let mut conn = self.connection()?;
+        let mut tx = conn.transaction()?;
+        let current = tx.query_opt(
+            "SELECT enabled FROM ocfleet_native.alert_hooks
+             WHERE hook_id = $1 AND hook_type = 'webhook' FOR UPDATE",
+            &[&hook_id],
+        )?;
+        let Some(current) = current else {
+            return Err(PostgresError::InvalidInput(
+                "alert webhook hook does not exist".into(),
+            ));
+        };
+        let current: bool = current.try_get(0)?;
+        if current == enabled {
+            tx.commit()?;
+            return Ok(false);
+        }
+        tx.execute(
+            "UPDATE ocfleet_native.alert_hooks SET enabled = $2, updated_at = $3
+             WHERE hook_id = $1 AND enabled = $4",
+            &[&hook_id, &enabled, &updated_at_value, &current],
+        )?;
+        let event_name = if enabled {
+            "alert.hook.enable"
+        } else {
+            "alert.hook.disable"
+        };
+        let mut event = AuditEvent::new(actor, event_name);
+        event.ok = Some(true);
+        event.request_id = Some(format!("{event_name}:{hook_id}:{updated_at}"));
+        event.params_hash = Some(
+            blake3::hash(format!("{hook_id}:{enabled}:{updated_at}").as_bytes())
+                .to_hex()
+                .to_string(),
+        );
+        event.detail_json = json!({
+            "actor_type": "user",
+            "target_type": "alert_webhook_hook",
+            "target_id": hook_id,
+            "enabled": enabled,
+            "reason": Value::Null,
+        });
+        insert_audit(&mut tx, &event)?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    pub fn write_alert_delivery_attempt(
+        &self,
+        write: &AlertDeliveryAttemptWrite,
+        actor: &str,
+    ) -> Result<(), PostgresError> {
+        validate_actor(actor).map_err(PostgresError::InvalidInput)?;
+        map_store_validation(validate_alert_delivery_attempt_record(&write.attempt))?;
+        let params_hash = alert_delivery_attempt_hash(&write.attempt);
+        let mut conn = self.connection()?;
+        let mut tx = conn.transaction()?;
+        if native_audit_replay_tx(
+            &mut tx,
+            &write.attempt.attempt_id,
+            "alert.delivery.attempt",
+            actor,
+            &params_hash,
+        )? {
+            tx.commit()?;
+            return Ok(());
+        }
+        insert_alert_delivery_attempt_postgres_tx(&mut tx, &write.attempt)?;
+        insert_alert_attempt_audit_postgres_tx(&mut tx, &write.attempt, actor, &params_hash)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn list_alert_delivery_attempts(
+        &self,
+        limit: u64,
+    ) -> Result<Vec<AlertDeliveryAttemptRecord>, PostgresError> {
+        let limit = checked_query_limit(limit)?;
+        let mut conn = self.connection()?;
+        conn.query(
+            "SELECT attempt_id, alert_id, hook_id, attempt_no, attempted_at, status,
+                    http_status_class, error_code, bytes_sent, detail_json::text
+             FROM ocfleet_native.alert_delivery_attempts
+             ORDER BY attempted_at DESC, attempt_id LIMIT $1",
+            &[&limit],
+        )?
+        .iter()
+        .map(alert_attempt_from_postgres_row)
+        .collect()
+    }
+
+    pub fn write_alert_delivery_queue_enqueue(
+        &self,
+        enqueue: &AlertDeliveryQueueEnqueue,
+        actor: &str,
+    ) -> Result<(), PostgresError> {
+        validate_actor(actor).map_err(PostgresError::InvalidInput)?;
+        map_store_validation(validate_alert_delivery_queue_enqueue(enqueue))?;
+        let enqueued_at = parse_postgres_timestamp(&enqueue.enqueued_at, "delivery enqueued_at")?;
+        let mut conn = self.connection()?;
+        let mut tx = conn.transaction()?;
+        lock_native_operation_tx(&mut tx, &enqueue.idempotency_key)?;
+        let existing = tx.query_opt(
+            "SELECT queue_id, alert_id, hook_id, idempotency_key, group_key
+             FROM ocfleet_native.alert_delivery_queue
+             WHERE queue_id = $1 OR idempotency_key = $2 FOR UPDATE",
+            &[&enqueue.queue_id, &enqueue.idempotency_key],
+        )?;
+        if let Some(existing) = existing {
+            let matches = existing.try_get::<_, String>(0)? == enqueue.queue_id
+                && existing.try_get::<_, String>(1)? == enqueue.alert_id
+                && existing.try_get::<_, String>(2)? == enqueue.hook_id
+                && existing.try_get::<_, String>(3)? == enqueue.idempotency_key
+                && existing.try_get::<_, String>(4)? == enqueue.group_key;
+            if matches
+                && native_audit_actor_matches_tx(
+                    &mut tx,
+                    &enqueue.queue_id,
+                    "alert.delivery.queue.enqueue",
+                    actor,
+                )?
+            {
+                tx.commit()?;
+                return Ok(());
+            }
+            return Err(alert_mutation_conflict(
+                &enqueue.queue_id,
+                "delivery queue identity, idempotency key, or audit provenance is already bound",
+            ));
+        }
+        let hook_ok = tx
+            .query_opt(
+                "SELECT 1 FROM ocfleet_native.alert_hooks
+             WHERE hook_id = $1 AND hook_type = 'webhook' AND enabled FOR SHARE",
+                &[&enqueue.hook_id],
+            )?
+            .is_some();
+        if !hook_ok {
+            return Err(PostgresError::InvalidInput(
+                "delivery queue hook is missing, disabled, or not a webhook".into(),
+            ));
+        }
+        let alert_ok = tx
+            .query_opt(
+                "SELECT 1 FROM ocfleet_native.alert_events
+             WHERE alert_id = $1 AND state = 'open' FOR SHARE",
+                &[&enqueue.alert_id],
+            )?
+            .is_some();
+        if !alert_ok {
+            return Err(PostgresError::InvalidInput(
+                "delivery queue alert is missing or is not open".into(),
+            ));
+        }
+        tx.execute(
+            "INSERT INTO ocfleet_native.alert_delivery_queue
+             (queue_id, alert_id, hook_id, idempotency_key, group_key, status,
+              next_attempt_at, created_at, updated_at)
+             VALUES ($1,$2,$3,$4,$5,'pending',$6,$6,$6)",
+            &[
+                &enqueue.queue_id,
+                &enqueue.alert_id,
+                &enqueue.hook_id,
+                &enqueue.idempotency_key,
+                &enqueue.group_key,
+                &enqueued_at,
+            ],
+        )?;
+        insert_alert_queue_audit_postgres_tx(
+            &mut tx,
+            actor,
+            "alert.delivery.queue.enqueue",
+            &enqueue.queue_id,
+            true,
+            None,
+            json!({
+                "queue_id": enqueue.queue_id,
+                "hook_id": enqueue.hook_id,
+                "alert_id": enqueue.alert_id,
+                "group_key": enqueue.group_key,
+                "state": "pending",
+            }),
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn alert_delivery_queue_health(
+        &self,
+        now: &str,
+    ) -> Result<AlertDeliveryQueueHealth, PostgresError> {
+        parse_postgres_timestamp(now, "delivery health timestamp")?;
+        let mut conn = self.connection()?;
+        let row = conn.query_one(
+            "SELECT
+               COUNT(*) FILTER (WHERE status = 'pending'),
+               COUNT(*) FILTER (WHERE status = 'claimed'),
+               COUNT(*) FILTER (WHERE status = 'retry'),
+               COUNT(*) FILTER (WHERE status = 'dead_letter'),
+               COUNT(*) FILTER (WHERE status = 'succeeded'),
+               COUNT(*) FILTER (
+                 WHERE status IN ('pending', 'retry') AND next_attempt_at <= clock_timestamp()
+               ),
+               COUNT(*) FILTER (
+                 WHERE status = 'claimed' AND lease_expires_at <= clock_timestamp()
+               ),
+               MIN(next_attempt_at) FILTER (WHERE status IN ('pending', 'retry')),
+               (SELECT MAX(attempted_at) FROM ocfleet_native.alert_delivery_attempts)
+             FROM ocfleet_native.alert_delivery_queue",
+            &[],
+        )?;
+        Ok(AlertDeliveryQueueHealth {
+            pending: checked_u64(row.try_get(0)?, "delivery pending count")?,
+            claimed: checked_u64(row.try_get(1)?, "delivery claimed count")?,
+            retry: checked_u64(row.try_get(2)?, "delivery retry count")?,
+            dead_letter: checked_u64(row.try_get(3)?, "delivery dead-letter count")?,
+            succeeded: checked_u64(row.try_get(4)?, "delivery succeeded count")?,
+            due: checked_u64(row.try_get(5)?, "delivery due count")?,
+            expired_claims: checked_u64(row.try_get(6)?, "delivery expired count")?,
+            oldest_due_at: row
+                .try_get::<_, Option<OffsetDateTime>>(7)?
+                .map(|value| format_postgres_timestamp(value, "delivery oldest due"))
+                .transpose()?,
+            last_attempt_at: row
+                .try_get::<_, Option<OffsetDateTime>>(8)?
+                .map(|value| format_postgres_timestamp(value, "delivery last attempt"))
+                .transpose()?,
+        })
+    }
+
+    pub fn write_alert_delivery_queue_claim_next(
+        &self,
+        owner_id: &str,
+        now: &str,
+        lease_seconds: u64,
+        actor: &str,
+    ) -> Result<Option<AlertDeliveryQueueClaim>, PostgresError> {
+        validate_actor(actor).map_err(PostgresError::InvalidInput)?;
+        map_store_validation(validate_alert_delivery_queue_claim_input(
+            owner_id,
+            now,
+            lease_seconds,
+        ))?;
+        let lease_seconds = f64::from(
+            u32::try_from(lease_seconds)
+                .map_err(|_| PostgresError::InvalidInput("delivery lease exceeds u32".into()))?,
+        );
+        let mut conn = self.connection()?;
+        let mut tx = conn.transaction()?;
+        recover_expired_alert_claims_postgres_tx(&mut tx, actor)?;
+        let row = tx.query_opt(
+            "SELECT queue_id FROM ocfleet_native.alert_delivery_queue
+             WHERE status IN ('pending', 'retry') AND next_attempt_at <= clock_timestamp()
+             ORDER BY next_attempt_at, queue_id LIMIT 1 FOR UPDATE SKIP LOCKED",
+            &[],
+        )?;
+        let Some(row) = row else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        let queue_id: String = row.try_get(0)?;
+        let row = tx.query_one(
+            "UPDATE ocfleet_native.alert_delivery_queue
+             SET status = 'claimed', owner_id = $2, owner_actor = $3,
+                 fence_token = fence_token + 1, claimed_at = clock_timestamp(),
+                 lease_expires_at = clock_timestamp() + make_interval(secs => $4),
+                 updated_at = clock_timestamp()
+             WHERE queue_id = $1 AND status IN ('pending', 'retry')
+             RETURNING queue_id, alert_id, hook_id, idempotency_key, group_key,
+                       attempt_count, owner_id, fence_token, claimed_at, lease_expires_at",
+            &[&queue_id, &owner_id, &actor, &lease_seconds],
+        )?;
+        let claim = alert_queue_claim_from_postgres_row(&row)?;
+        insert_alert_queue_audit_postgres_tx(
+            &mut tx,
+            actor,
+            "alert.delivery.queue.claim",
+            &claim.queue_id,
+            true,
+            None,
+            alert_queue_claim_audit_json_native(&claim, "claimed"),
+        )?;
+        tx.commit()?;
+        Ok(Some(claim))
+    }
+
+    pub fn write_alert_delivery_queue_renew(
+        &self,
+        claim: &AlertDeliveryQueueClaim,
+        now: &str,
+        lease_seconds: u64,
+        actor: &str,
+    ) -> Result<AlertDeliveryQueueClaim, PostgresError> {
+        validate_actor(actor).map_err(PostgresError::InvalidInput)?;
+        map_store_validation(validate_alert_delivery_queue_claim(claim))?;
+        map_store_validation(validate_alert_delivery_queue_claim_input(
+            &claim.owner_id,
+            now,
+            lease_seconds,
+        ))?;
+        let lease_seconds = f64::from(
+            u32::try_from(lease_seconds)
+                .map_err(|_| PostgresError::InvalidInput("delivery lease exceeds u32".into()))?,
+        );
+        let fence_token = checked_i64(claim.fence_token, "delivery fence_token")?;
+        let claimed_at = parse_postgres_timestamp(&claim.claimed_at, "delivery claimed_at")?;
+        let expected_lease =
+            parse_postgres_timestamp(&claim.lease_expires_at, "delivery lease_expires_at")?;
+        let mut conn = self.connection()?;
+        let mut tx = conn.transaction()?;
+        let row = tx.query_opt(
+            "UPDATE ocfleet_native.alert_delivery_queue
+             SET lease_expires_at = clock_timestamp() + make_interval(secs => $5),
+                 updated_at = clock_timestamp()
+             WHERE queue_id = $1 AND status = 'claimed' AND owner_id = $2
+               AND owner_actor = $3 AND fence_token = $4
+               AND alert_id = $6 AND hook_id = $7 AND idempotency_key = $8
+               AND group_key = $9 AND attempt_count = $10
+               AND claimed_at = $11 AND lease_expires_at = $12
+               AND lease_expires_at > clock_timestamp()
+             RETURNING queue_id, alert_id, hook_id, idempotency_key, group_key,
+                       attempt_count, owner_id, fence_token, claimed_at, lease_expires_at",
+            &[
+                &claim.queue_id,
+                &claim.owner_id,
+                &actor,
+                &fence_token,
+                &lease_seconds,
+                &claim.alert_id,
+                &claim.hook_id,
+                &claim.idempotency_key,
+                &claim.group_key,
+                &checked_i64(claim.attempt_count, "delivery attempt_count")?,
+                &claimed_at,
+                &expected_lease,
+            ],
+        )?;
+        let Some(row) = row else {
+            return Err(alert_mutation_conflict(
+                &claim.queue_id,
+                "delivery queue lease, owner actor, or fence was lost",
+            ));
+        };
+        let renewed = alert_queue_claim_from_postgres_row(&row)?;
+        insert_alert_queue_audit_postgres_tx(
+            &mut tx,
+            actor,
+            "alert.delivery.queue.renew",
+            &claim.queue_id,
+            true,
+            None,
+            alert_queue_claim_audit_json_native(&renewed, "renewed"),
+        )?;
+        tx.commit()?;
+        Ok(renewed)
+    }
+
+    pub fn write_alert_delivery_queue_outcome(
+        &self,
+        outcome: &AlertDeliveryQueueOutcome,
+        actor: &str,
+    ) -> Result<(), PostgresError> {
+        validate_actor(actor).map_err(PostgresError::InvalidInput)?;
+        map_store_validation(validate_alert_delivery_queue_outcome(outcome))?;
+        let completed_at =
+            parse_postgres_timestamp(&outcome.completed_at, "delivery completed_at")?;
+        let retry_at = parse_optional_postgres_timestamp(&outcome.retry_at, "delivery retry_at")?;
+        let fence_token = checked_i64(outcome.claim.fence_token, "delivery fence_token")?;
+        let claimed_at =
+            parse_postgres_timestamp(&outcome.claim.claimed_at, "delivery claimed_at")?;
+        let expected_lease =
+            parse_postgres_timestamp(&outcome.claim.lease_expires_at, "delivery lease_expires_at")?;
+        let next_attempt = outcome.claim.attempt_count + 1;
+        let next_attempt_count = checked_i64(next_attempt, "delivery attempt_count")?;
+        let succeeded = outcome.attempt.status == "succeeded";
+        let should_retry = !succeeded && outcome.retryable && next_attempt < outcome.max_attempts;
+        let status = if succeeded {
+            "succeeded"
+        } else if should_retry {
+            "retry"
+        } else {
+            "dead_letter"
+        };
+        let next_attempt_at = retry_at.unwrap_or(completed_at);
+        let delivered_at = succeeded.then_some(completed_at);
+        let mut conn = self.connection()?;
+        let mut tx = conn.transaction()?;
+        lock_live_alert_queue_claim_postgres_tx(&mut tx, &outcome.claim, actor)?;
+        insert_alert_delivery_attempt_postgres_tx(&mut tx, &outcome.attempt)?;
+        if succeeded
+            && tx.execute(
+                "UPDATE ocfleet_native.alert_events SET last_sent_at = $2 WHERE alert_id = $1",
+                &[&outcome.claim.alert_id, &completed_at],
+            )? != 1
+        {
+            return Err(alert_mutation_conflict(
+                &outcome.claim.queue_id,
+                "delivery alert disappeared before success finalization",
+            ));
+        }
+        insert_alert_queue_audit_postgres_tx(
+            &mut tx,
+            actor,
+            "alert.delivery.queue.outcome",
+            &outcome.claim.queue_id,
+            succeeded,
+            outcome.attempt.error_code.as_deref(),
+            json!({
+                "queue_id": outcome.claim.queue_id,
+                "hook_id": outcome.claim.hook_id,
+                "alert_id": outcome.claim.alert_id,
+                "attempt_no": next_attempt,
+                "state": status,
+                "next_attempt_at": if should_retry {
+                    outcome.retry_at.as_deref()
+                } else {
+                    None
+                },
+            }),
+        )?;
+        let changed = tx.execute(
+            "UPDATE ocfleet_native.alert_delivery_queue
+             SET status = $6, attempt_count = $7, next_attempt_at = $8,
+                 owner_id = NULL, owner_actor = NULL, claimed_at = NULL,
+                 lease_expires_at = NULL, last_error_code = $9,
+                 updated_at = $5, delivered_at = $10
+             WHERE queue_id = $1 AND status = 'claimed' AND owner_id = $2
+               AND owner_actor = $3 AND fence_token = $4
+               AND alert_id = $11 AND hook_id = $12 AND idempotency_key = $13
+               AND group_key = $14 AND attempt_count = $15
+               AND claimed_at = $16 AND lease_expires_at = $17
+               AND lease_expires_at > clock_timestamp()",
+            &[
+                &outcome.claim.queue_id,
+                &outcome.claim.owner_id,
+                &actor,
+                &fence_token,
+                &completed_at,
+                &status,
+                &next_attempt_count,
+                &next_attempt_at,
+                &outcome.attempt.error_code,
+                &delivered_at,
+                &outcome.claim.alert_id,
+                &outcome.claim.hook_id,
+                &outcome.claim.idempotency_key,
+                &outcome.claim.group_key,
+                &checked_i64(outcome.claim.attempt_count, "delivery attempt_count")?,
+                &claimed_at,
+                &expected_lease,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(alert_mutation_conflict(
+                &outcome.claim.queue_id,
+                "delivery queue lease, owner actor, or fence was lost before outcome",
+            ));
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn write_alert_delivery_queue_defer(
+        &self,
+        claim: &AlertDeliveryQueueClaim,
+        deferred_at: &str,
+        next_attempt_at: &str,
+        actor: &str,
+    ) -> Result<(), PostgresError> {
+        validate_actor(actor).map_err(PostgresError::InvalidInput)?;
+        map_store_validation(validate_alert_delivery_queue_claim(claim))?;
+        let deferred_at = parse_postgres_timestamp(deferred_at, "delivery deferred_at")?;
+        let next_attempt_at =
+            parse_postgres_timestamp(next_attempt_at, "delivery next_attempt_at")?;
+        if next_attempt_at <= deferred_at
+            || next_attempt_at - deferred_at > time::Duration::hours(1)
+        {
+            return Err(PostgresError::InvalidInput(
+                "delivery defer must be within one hour after deferral".into(),
+            ));
+        }
+        let fence_token = checked_i64(claim.fence_token, "delivery fence_token")?;
+        let claimed_at = parse_postgres_timestamp(&claim.claimed_at, "delivery claimed_at")?;
+        let expected_lease =
+            parse_postgres_timestamp(&claim.lease_expires_at, "delivery lease_expires_at")?;
+        let mut conn = self.connection()?;
+        let mut tx = conn.transaction()?;
+        let changed = tx.execute(
+            "UPDATE ocfleet_native.alert_delivery_queue
+             SET status = 'retry', owner_id = NULL, owner_actor = NULL,
+                 claimed_at = NULL, lease_expires_at = NULL,
+                 next_attempt_at = $5, updated_at = $4
+             WHERE queue_id = $1 AND status = 'claimed' AND owner_id = $2
+               AND owner_actor = $3 AND fence_token = $6
+               AND alert_id = $7 AND hook_id = $8 AND idempotency_key = $9
+               AND group_key = $10 AND attempt_count = $11
+               AND claimed_at = $12 AND lease_expires_at = $13
+               AND lease_expires_at > clock_timestamp()",
+            &[
+                &claim.queue_id,
+                &claim.owner_id,
+                &actor,
+                &deferred_at,
+                &next_attempt_at,
+                &fence_token,
+                &claim.alert_id,
+                &claim.hook_id,
+                &claim.idempotency_key,
+                &claim.group_key,
+                &checked_i64(claim.attempt_count, "delivery attempt_count")?,
+                &claimed_at,
+                &expected_lease,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(alert_mutation_conflict(
+                &claim.queue_id,
+                "delivery queue lease, owner actor, or fence was lost before deferral",
+            ));
+        }
+        insert_alert_queue_audit_postgres_tx(
+            &mut tx,
+            actor,
+            "alert.delivery.queue.defer",
+            &claim.queue_id,
+            true,
+            None,
+            json!({
+                "queue_id": claim.queue_id,
+                "hook_id": claim.hook_id,
+                "group_key": claim.group_key,
+                "state": "retry",
+                "next_attempt_at": format_postgres_timestamp(
+                    next_attempt_at,
+                    "delivery next_attempt_at",
+                )?,
+            }),
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn write_alert_delivery_finalize(
+        &self,
+        write: &AlertDeliveryFinalizeWrite,
+        actor: &str,
+    ) -> Result<(), PostgresError> {
+        validate_actor(actor).map_err(PostgresError::InvalidInput)?;
+        map_store_validation(validate_alert_delivery_finalize(write))?;
+        let params_hash = alert_delivery_finalize_hash(write);
+        let mut conn = self.connection()?;
+        let mut tx = conn.transaction()?;
+        if native_audit_replay_tx(
+            &mut tx,
+            &write.delivery_id,
+            "alert.delivery",
+            actor,
+            &params_hash,
+        )? {
+            tx.commit()?;
+            return Ok(());
+        }
+        for entry in &write.entries {
+            let before = entry.before.as_ref().expect("validated delivery entry");
+            let current = get_alert_event_postgres_tx(&mut tx, &before.dedupe_key, true)?;
+            if !optional_alerts_equivalent(current.as_ref(), Some(before))? {
+                return Err(alert_mutation_conflict(
+                    &write.delivery_id,
+                    "alert state changed before delivery finalization",
+                ));
+            }
+            upsert_alert_event_postgres_tx(&mut tx, &entry.after)?;
+        }
+        let mut event = AuditEvent::new(actor, "alert.delivery");
+        event.ok = Some(write.ok);
+        event.request_id = Some(write.delivery_id.clone());
+        event.params_hash = Some(params_hash);
+        event.detail_json = json!({
+            "actor_type": "user",
+            "target_type": "alert_delivery",
+            "target_id": write.delivery_id,
+            "ok": write.ok,
+            "hook_type": write.hook_type,
+            "alert_count": write.alert_count,
+            "bytes_written": write.bytes_written,
+            "dry_run": write.dry_run,
+            "error_code": write.error_code,
+            "updated_alerts": write.entries.len(),
+            "reason": Value::Null,
+        });
+        insert_audit(&mut tx, &event)?;
+        tx.commit()?;
+        Ok(())
+    }
+}
+
+fn canonical_alert_detail_native(value: &Value) -> Result<AlertDetailPayloadV1, PostgresError> {
+    AlertDetailPayloadV1::from_value(value)
+        .or_else(|_| AlertDetailPayloadV1::from_legacy(value))
+        .map_err(PostgresError::InvalidInput)
+}
+
+fn alert_event_from_postgres_row(row: &postgres::Row) -> Result<AlertEventRecord, PostgresError> {
+    let detail: String = row.try_get(10)?;
+    let detail: Value = serde_json::from_str(&detail)
+        .map_err(|_| PostgresError::InvalidState("native alert detail JSON is invalid".into()))?;
+    let detail = AlertDetailPayloadV1::from_value(&detail)
+        .map_err(PostgresError::InvalidState)?
+        .public_detail();
+    Ok(AlertEventRecord {
+        alert_id: row.try_get(0)?,
+        dedupe_key: row.try_get(1)?,
+        node_id: row.try_get(2)?,
+        severity: row.try_get(3)?,
+        state: row.try_get(4)?,
+        reason_code: row.try_get(5)?,
+        first_seen_at: format_postgres_timestamp(row.try_get(6)?, "alert first_seen_at")?,
+        last_seen_at: format_postgres_timestamp(row.try_get(7)?, "alert last_seen_at")?,
+        last_sent_at: row
+            .try_get::<_, Option<OffsetDateTime>>(8)?
+            .map(|value| format_postgres_timestamp(value, "alert last_sent_at"))
+            .transpose()?,
+        resolved_at: row
+            .try_get::<_, Option<OffsetDateTime>>(9)?
+            .map(|value| format_postgres_timestamp(value, "alert resolved_at"))
+            .transpose()?,
+        detail_json: detail,
+    })
+}
+
+fn get_alert_event_postgres_tx(
+    tx: &mut Transaction<'_>,
+    dedupe_key: &str,
+    lock: bool,
+) -> Result<Option<AlertEventRecord>, PostgresError> {
+    let suffix = if lock { " FOR UPDATE" } else { "" };
+    let sql = format!(
+        "SELECT alert_id, dedupe_key, node_id, severity, state, reason_code,
+                first_seen_at, last_seen_at, last_sent_at, resolved_at, detail_json::text
+         FROM ocfleet_native.alert_events WHERE dedupe_key = $1{suffix}"
+    );
+    tx.query_opt(&sql, &[&dedupe_key])?
+        .as_ref()
+        .map(alert_event_from_postgres_row)
+        .transpose()
+}
+
+fn upsert_alert_event_postgres_tx(
+    tx: &mut Transaction<'_>,
+    alert: &AlertEventRecord,
+) -> Result<(), PostgresError> {
+    let detail = canonical_alert_detail_native(&alert.detail_json)?;
+    let first_seen_at = parse_postgres_timestamp(&alert.first_seen_at, "alert first_seen_at")?;
+    let last_seen_at = parse_postgres_timestamp(&alert.last_seen_at, "alert last_seen_at")?;
+    let last_sent_at =
+        parse_optional_postgres_timestamp(&alert.last_sent_at, "alert last_sent_at")?;
+    let resolved_at = parse_optional_postgres_timestamp(&alert.resolved_at, "alert resolved_at")?;
+    tx.execute(
+        "INSERT INTO ocfleet_native.alert_events
+         (alert_id, dedupe_key, node_id, severity, state, reason_code, first_seen_at,
+          last_seen_at, last_sent_at, resolved_at, detail_json)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,CAST($11 AS text)::jsonb)
+         ON CONFLICT (dedupe_key) DO UPDATE SET
+           alert_id = EXCLUDED.alert_id, node_id = EXCLUDED.node_id,
+           severity = EXCLUDED.severity, state = EXCLUDED.state,
+           reason_code = EXCLUDED.reason_code, first_seen_at = EXCLUDED.first_seen_at,
+           last_seen_at = EXCLUDED.last_seen_at, last_sent_at = EXCLUDED.last_sent_at,
+           resolved_at = EXCLUDED.resolved_at, detail_json = EXCLUDED.detail_json",
+        &[
+            &alert.alert_id,
+            &alert.dedupe_key,
+            &alert.node_id,
+            &alert.severity,
+            &alert.state,
+            &alert.reason_code,
+            &first_seen_at,
+            &last_seen_at,
+            &last_sent_at,
+            &resolved_at,
+            &detail.to_value().to_string(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn optional_alerts_equivalent(
+    left: Option<&AlertEventRecord>,
+    right: Option<&AlertEventRecord>,
+) -> Result<bool, PostgresError> {
+    match (left, right) {
+        (None, None) => Ok(true),
+        (Some(left), Some(right)) => {
+            let left_detail = canonical_alert_detail_native(&left.detail_json)?.public_detail();
+            let right_detail = canonical_alert_detail_native(&right.detail_json)?.public_detail();
+            Ok(left.alert_id == right.alert_id
+                && left.dedupe_key == right.dedupe_key
+                && left.node_id == right.node_id
+                && left.severity == right.severity
+                && left.state == right.state
+                && left.reason_code == right.reason_code
+                && postgres_timestamps_equal(&left.first_seen_at, &right.first_seen_at)
+                && postgres_timestamps_equal(&left.last_seen_at, &right.last_seen_at)
+                && optional_postgres_timestamps_equal(
+                    left.last_sent_at.as_deref(),
+                    right.last_sent_at.as_deref(),
+                )
+                && optional_postgres_timestamps_equal(
+                    left.resolved_at.as_deref(),
+                    right.resolved_at.as_deref(),
+                )
+                && left_detail == right_detail)
+        }
+        _ => Ok(false),
+    }
+}
+
+fn optional_postgres_timestamps_equal(left: Option<&str>, right: Option<&str>) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => postgres_timestamps_equal(left, right),
+        _ => false,
+    }
+}
+
+fn alert_hook_from_postgres_row(
+    row: &postgres::Row,
+) -> Result<AlertWebhookHookRecord, PostgresError> {
+    let host_allow: String = row.try_get(6)?;
+    let host_allow: Value = serde_json::from_str(&host_allow).map_err(|_| {
+        PostgresError::InvalidState("native alert hook allowlist JSON is invalid".into())
+    })?;
+    let host_allow =
+        AlertHostAllowPayloadV1::from_value(&host_allow).map_err(PostgresError::InvalidState)?;
+    let endpoint_host: String = row.try_get(5)?;
+    host_allow
+        .validate_relationship(&endpoint_host)
+        .map_err(PostgresError::InvalidState)?;
+    Ok(AlertWebhookHookRecord {
+        hook_id: row.try_get(0)?,
+        name: row.try_get(1)?,
+        hook_type: row.try_get(2)?,
+        endpoint_url: row.try_get(3)?,
+        endpoint_url_redacted: row.try_get(4)?,
+        endpoint_host,
+        host_allow: host_allow.hosts,
+        hmac_key_id: row.try_get(7)?,
+        enabled: row.try_get(8)?,
+        max_attempts: checked_u64(row.try_get(9)?, "alert max_attempts")?,
+        timeout_ms: checked_u64(row.try_get(10)?, "alert timeout_ms")?,
+        created_at: format_postgres_timestamp(row.try_get(11)?, "alert hook created_at")?,
+        updated_at: format_postgres_timestamp(row.try_get(12)?, "alert hook updated_at")?,
+    })
+}
+
+fn insert_alert_delivery_attempt_postgres_tx(
+    tx: &mut Transaction<'_>,
+    attempt: &AlertDeliveryAttemptRecord,
+) -> Result<(), PostgresError> {
+    let attempted_at = parse_postgres_timestamp(&attempt.attempted_at, "alert attempted_at")?;
+    let detail = delivery_attempt_detail_payload(attempt).map_err(PostgresError::from)?;
+    tx.execute(
+        "INSERT INTO ocfleet_native.alert_delivery_attempts
+         (attempt_id, alert_id, hook_id, attempt_no, attempted_at, status,
+          http_status_class, error_code, bytes_sent, detail_json)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,CAST($10 AS text)::jsonb)",
+        &[
+            &attempt.attempt_id,
+            &attempt.alert_id,
+            &attempt.hook_id,
+            &checked_i64(attempt.attempt_no, "delivery attempt_no")?,
+            &attempted_at,
+            &attempt.status,
+            &attempt.http_status_class,
+            &attempt.error_code,
+            &checked_i64(attempt.bytes_sent, "delivery bytes_sent")?,
+            &detail.to_value().to_string(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn alert_attempt_from_postgres_row(
+    row: &postgres::Row,
+) -> Result<AlertDeliveryAttemptRecord, PostgresError> {
+    let record = AlertDeliveryAttemptRecord {
+        attempt_id: row.try_get(0)?,
+        alert_id: row.try_get(1)?,
+        hook_id: row.try_get(2)?,
+        attempt_no: checked_u64(row.try_get(3)?, "delivery attempt_no")?,
+        attempted_at: format_postgres_timestamp(row.try_get(4)?, "delivery attempted_at")?,
+        status: row.try_get(5)?,
+        http_status_class: row.try_get(6)?,
+        error_code: row.try_get(7)?,
+        bytes_sent: checked_u64(row.try_get(8)?, "delivery bytes_sent")?,
+    };
+    let detail: String = row.try_get(9)?;
+    let detail: Value = serde_json::from_str(&detail).map_err(|_| {
+        PostgresError::InvalidState("native delivery attempt detail JSON is invalid".into())
+    })?;
+    let stored = crate::storage_payloads::DeliveryAttemptDetailPayloadV1::from_value(&detail)
+        .map_err(PostgresError::InvalidState)?;
+    let expected = delivery_attempt_detail_payload(&record).map_err(PostgresError::from)?;
+    if stored != expected {
+        return Err(PostgresError::InvalidState(
+            "native delivery attempt detail is inconsistent with relational columns".into(),
+        ));
+    }
+    Ok(record)
+}
+
+fn insert_alert_attempt_audit_postgres_tx(
+    tx: &mut Transaction<'_>,
+    attempt: &AlertDeliveryAttemptRecord,
+    actor: &str,
+    params_hash: &str,
+) -> Result<(), PostgresError> {
+    let mut event = AuditEvent::new(actor, "alert.delivery.attempt");
+    event.ok = Some(attempt.status != "failed");
+    event.request_id = Some(attempt.attempt_id.clone());
+    event.params_hash = Some(params_hash.to_string());
+    event.detail_json = json!({
+        "actor_type": "user",
+        "target_type": "alert_delivery_attempt",
+        "target_id": attempt.attempt_id,
+        "alert_id": attempt.alert_id,
+        "hook_id": attempt.hook_id,
+        "attempt_no": attempt.attempt_no,
+        "status": attempt.status,
+        "http_status_class": attempt.http_status_class,
+        "error_code": attempt.error_code,
+        "bytes_sent": attempt.bytes_sent,
+        "reason": Value::Null,
+    });
+    insert_audit(tx, &event)
+}
+
+fn recover_expired_alert_claims_postgres_tx(
+    tx: &mut Transaction<'_>,
+    actor: &str,
+) -> Result<(), PostgresError> {
+    let rows = tx.query(
+        "UPDATE ocfleet_native.alert_delivery_queue
+         SET status = 'retry', owner_id = NULL, owner_actor = NULL,
+             claimed_at = NULL, lease_expires_at = NULL,
+             next_attempt_at = clock_timestamp(), updated_at = clock_timestamp(),
+             last_error_code = 'DELIVERY_CLAIM_EXPIRED'
+         WHERE queue_id IN (
+           SELECT queue_id FROM ocfleet_native.alert_delivery_queue
+           WHERE status = 'claimed' AND lease_expires_at <= clock_timestamp()
+           ORDER BY lease_expires_at, queue_id LIMIT 100 FOR UPDATE SKIP LOCKED
+         )
+         RETURNING queue_id, alert_id, hook_id, group_key",
+        &[],
+    )?;
+    for row in rows {
+        let queue_id: String = row.try_get(0)?;
+        insert_alert_queue_audit_postgres_tx(
+            tx,
+            actor,
+            "alert.delivery.queue.recover",
+            &queue_id,
+            false,
+            Some("DELIVERY_CLAIM_EXPIRED"),
+            json!({
+                "queue_id": queue_id,
+                "alert_id": row.try_get::<_, String>(1)?,
+                "hook_id": row.try_get::<_, String>(2)?,
+                "group_key": row.try_get::<_, String>(3)?,
+                "state": "retry",
+            }),
+        )?;
+    }
+    Ok(())
+}
+
+fn lock_live_alert_queue_claim_postgres_tx(
+    tx: &mut Transaction<'_>,
+    claim: &AlertDeliveryQueueClaim,
+    actor: &str,
+) -> Result<(), PostgresError> {
+    let fence_token = checked_i64(claim.fence_token, "delivery fence_token")?;
+    let attempt_count = checked_i64(claim.attempt_count, "delivery attempt_count")?;
+    let claimed_at = parse_postgres_timestamp(&claim.claimed_at, "delivery claimed_at")?;
+    let lease_expires_at =
+        parse_postgres_timestamp(&claim.lease_expires_at, "delivery lease_expires_at")?;
+    let row = tx.query_opt(
+        "SELECT 1 FROM ocfleet_native.alert_delivery_queue
+         WHERE queue_id = $1 AND status = 'claimed' AND owner_id = $2
+           AND owner_actor = $3 AND fence_token = $4
+           AND alert_id = $5 AND hook_id = $6 AND idempotency_key = $7
+           AND group_key = $8 AND attempt_count = $9
+           AND claimed_at = $10 AND lease_expires_at = $11
+           AND lease_expires_at > clock_timestamp()
+         FOR UPDATE",
+        &[
+            &claim.queue_id,
+            &claim.owner_id,
+            &actor,
+            &fence_token,
+            &claim.alert_id,
+            &claim.hook_id,
+            &claim.idempotency_key,
+            &claim.group_key,
+            &attempt_count,
+            &claimed_at,
+            &lease_expires_at,
+        ],
+    )?;
+    if row.is_none() {
+        return Err(alert_mutation_conflict(
+            &claim.queue_id,
+            "delivery queue lease, owner actor, fence, or claim projection was lost",
+        ));
+    }
+    Ok(())
+}
+
+fn alert_queue_claim_from_postgres_row(
+    row: &postgres::Row,
+) -> Result<AlertDeliveryQueueClaim, PostgresError> {
+    let claim = AlertDeliveryQueueClaim {
+        queue_id: row.try_get(0)?,
+        alert_id: row.try_get(1)?,
+        hook_id: row.try_get(2)?,
+        idempotency_key: row.try_get(3)?,
+        group_key: row.try_get(4)?,
+        attempt_count: checked_u64(row.try_get(5)?, "delivery attempt_count")?,
+        owner_id: row.try_get(6)?,
+        fence_token: checked_u64(row.try_get(7)?, "delivery fence_token")?,
+        claimed_at: format_postgres_timestamp(row.try_get(8)?, "delivery claimed_at")?,
+        lease_expires_at: format_postgres_timestamp(row.try_get(9)?, "delivery lease_expires_at")?,
+    };
+    map_store_validation(validate_alert_delivery_queue_claim(&claim))?;
+    Ok(claim)
+}
+
+fn alert_queue_claim_audit_json_native(claim: &AlertDeliveryQueueClaim, state: &str) -> Value {
+    json!({
+        "queue_id": claim.queue_id,
+        "hook_id": claim.hook_id,
+        "alert_id": claim.alert_id,
+        "group_key": claim.group_key,
+        "owner_id": claim.owner_id,
+        "generation": claim.fence_token,
+        "attempt_no": claim.attempt_count + 1,
+        "claimed_at": claim.claimed_at,
+        "lease_expires_at": claim.lease_expires_at,
+        "state": state,
+    })
+}
+
+fn insert_alert_queue_audit_postgres_tx(
+    tx: &mut Transaction<'_>,
+    actor: &str,
+    event_name: &str,
+    queue_id: &str,
+    ok: bool,
+    error_code: Option<&str>,
+    detail: Value,
+) -> Result<(), PostgresError> {
+    let mut event = AuditEvent::new(actor, event_name);
+    event.ok = Some(ok);
+    event.request_id = Some(queue_id.to_string());
+    event.error_code = error_code.map(str::to_string);
+    event.detail_json = detail;
+    insert_audit(tx, &event)
+}
+
+fn alert_evaluation_conflict(evaluation_id: &str, detail: &'static str) -> PostgresError {
+    PostgresError::Store(StoreError::AlertEvaluationConflict {
+        evaluation_id: evaluation_id.to_string(),
+        detail,
+    })
+}
+
+fn alert_mutation_conflict(operation_id: &str, detail: &'static str) -> PostgresError {
+    PostgresError::Store(StoreError::AlertMutationConflict {
+        operation_id: operation_id.to_string(),
+        detail,
+    })
+}
+
+fn health_policy_from_postgres_row(
+    row: &postgres::Row,
+) -> Result<HealthPolicyRecord, PostgresError> {
+    Ok(HealthPolicyRecord {
+        stale_window_seconds: checked_u64(row.try_get(0)?, "health stale window")?,
+        unreachable_consecutive_failures: checked_u64(
+            row.try_get(1)?,
+            "health unreachable failures",
+        )?,
+        cert_warning_days: checked_u64(row.try_get(2)?, "health warning days")?,
+        cert_critical_days: checked_u64(row.try_get(3)?, "health critical days")?,
+        updated_at: row.try_get(4)?,
+    })
+}
+
+fn health_policy_audit_json_native(policy: &HealthPolicyRecord) -> Value {
+    json!({
+        "stale_window_seconds": policy.stale_window_seconds,
+        "unreachable_consecutive_failures": policy.unreachable_consecutive_failures,
+        "cert_warning_days": policy.cert_warning_days,
+        "cert_critical_days": policy.cert_critical_days,
+    })
+}
+
+fn native_audit_replay_tx(
+    tx: &mut Transaction<'_>,
+    request_id: &str,
+    event: &str,
+    actor: &str,
+    params_hash: &str,
+) -> Result<bool, PostgresError> {
+    lock_native_operation_tx(tx, request_id)?;
+    let rows = tx.query(
+        "SELECT event, actor, params_hash
+         FROM ocfleet_native.controller_audit_log
+         WHERE request_id = $1 ORDER BY id LIMIT 2 FOR SHARE",
+        &[&request_id],
+    )?;
+    if rows.is_empty() {
+        return Ok(false);
+    }
+    if rows.len() == 1
+        && rows[0].try_get::<_, String>(0)? == event
+        && rows[0].try_get::<_, String>(1)? == actor
+        && rows[0].try_get::<_, Option<String>>(2)?.as_deref() == Some(params_hash)
+    {
+        return Ok(true);
+    }
+    Err(PostgresError::InvalidState(format!(
+        "native audit replay provenance for {request_id} is mismatched or ambiguous"
+    )))
+}
+
+fn lock_native_operation_tx(
+    tx: &mut Transaction<'_>,
+    operation_id: &str,
+) -> Result<(), PostgresError> {
+    tx.query_one(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, $2))",
+        &[&operation_id, &OPERATION_LOCK_SALT],
+    )?;
+    Ok(())
+}
+
+fn native_audit_actor_matches_tx(
+    tx: &mut Transaction<'_>,
+    request_id: &str,
+    event: &str,
+    actor: &str,
+) -> Result<bool, PostgresError> {
+    let rows = tx.query(
+        "SELECT actor FROM ocfleet_native.controller_audit_log
+         WHERE request_id = $1 AND event = $2 ORDER BY id LIMIT 2 FOR SHARE",
+        &[&request_id, &event],
+    )?;
+    Ok(rows.len() == 1 && rows[0].try_get::<_, String>(0)? == actor)
+}
+
+fn canonical_health_payloads(
+    snapshot: &HealthSnapshotRecord,
+) -> Result<(Value, Value), PostgresError> {
+    let degraded = HealthDegradedMethodsPayloadV1::from_value(&snapshot.degraded_methods_json)
+        .map_err(PostgresError::InvalidInput)?;
+    let summary = HealthSummaryPayloadV1::from_value(&snapshot.summary_json)
+        .map_err(PostgresError::InvalidInput)?;
+    validate_health_payload_relationship(&snapshot.status, &summary)
+        .map_err(PostgresError::InvalidInput)?;
+    Ok((degraded.to_value(), summary.to_value()))
+}
+
+fn upsert_health_snapshot_postgres_tx(
+    tx: &mut Transaction<'_>,
+    snapshot: &HealthSnapshotRecord,
+) -> Result<(), PostgresError> {
+    let computed_at = parse_postgres_timestamp(&snapshot.computed_at, "health computed_at")?;
+    let last_success_at =
+        parse_optional_postgres_timestamp(&snapshot.last_success_at, "health last_success_at")?;
+    let last_failure_at =
+        parse_optional_postgres_timestamp(&snapshot.last_failure_at, "health last_failure_at")?;
+    let freshness_seconds = snapshot
+        .freshness_seconds
+        .map(|value| checked_i64(value, "health freshness_seconds"))
+        .transpose()?;
+    let (degraded, summary) = canonical_health_payloads(snapshot)?;
+    tx.execute(
+        "INSERT INTO ocfleet_native.health_snapshots
+         (node_id, endpoint_id, computed_at, status, freshness_seconds,
+          last_success_at, last_failure_at, last_error_code,
+          degraded_methods_json, summary_json)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8,
+                 CAST($9 AS text)::jsonb, CAST($10 AS text)::jsonb)
+         ON CONFLICT (node_id) DO UPDATE SET
+           endpoint_id = EXCLUDED.endpoint_id,
+           computed_at = EXCLUDED.computed_at,
+           status = EXCLUDED.status,
+           freshness_seconds = EXCLUDED.freshness_seconds,
+           last_success_at = EXCLUDED.last_success_at,
+           last_failure_at = EXCLUDED.last_failure_at,
+           last_error_code = EXCLUDED.last_error_code,
+           degraded_methods_json = EXCLUDED.degraded_methods_json,
+           summary_json = EXCLUDED.summary_json",
+        &[
+            &snapshot.node_id,
+            &snapshot.endpoint_id,
+            &computed_at,
+            &snapshot.status,
+            &freshness_seconds,
+            &last_success_at,
+            &last_failure_at,
+            &snapshot.last_error_code,
+            &degraded.to_string(),
+            &summary.to_string(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_health_history_postgres_tx(
+    tx: &mut Transaction<'_>,
+    evaluation_id: &str,
+    snapshot: &HealthSnapshotRecord,
+) -> Result<(), PostgresError> {
+    let computed_at = parse_postgres_timestamp(&snapshot.computed_at, "health computed_at")?;
+    let last_success_at =
+        parse_optional_postgres_timestamp(&snapshot.last_success_at, "health last_success_at")?;
+    let last_failure_at =
+        parse_optional_postgres_timestamp(&snapshot.last_failure_at, "health last_failure_at")?;
+    let freshness_seconds = snapshot
+        .freshness_seconds
+        .map(|value| checked_i64(value, "health freshness_seconds"))
+        .transpose()?;
+    let (degraded, summary) = canonical_health_payloads(snapshot)?;
+    tx.execute(
+        "INSERT INTO ocfleet_native.health_history
+         (evaluation_id, node_id, endpoint_id, computed_at, status, freshness_seconds,
+          last_success_at, last_failure_at, last_error_code,
+          degraded_methods_json, summary_json)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9,
+                 CAST($10 AS text)::jsonb, CAST($11 AS text)::jsonb)",
+        &[
+            &evaluation_id,
+            &snapshot.node_id,
+            &snapshot.endpoint_id,
+            &computed_at,
+            &snapshot.status,
+            &freshness_seconds,
+            &last_success_at,
+            &last_failure_at,
+            &snapshot.last_error_code,
+            &degraded.to_string(),
+            &summary.to_string(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn health_snapshot_from_postgres_row(
+    row: &postgres::Row,
+) -> Result<HealthSnapshotRecord, PostgresError> {
+    let degraded: String = row.try_get(8)?;
+    let degraded: Value = serde_json::from_str(&degraded).map_err(|_| {
+        PostgresError::InvalidState("native health degraded payload is invalid".into())
+    })?;
+    HealthDegradedMethodsPayloadV1::from_value(&degraded).map_err(PostgresError::InvalidState)?;
+    let summary: String = row.try_get(9)?;
+    let summary: Value = serde_json::from_str(&summary).map_err(|_| {
+        PostgresError::InvalidState("native health summary payload is invalid".into())
+    })?;
+    let summary_payload =
+        HealthSummaryPayloadV1::from_value(&summary).map_err(PostgresError::InvalidState)?;
+    let status: String = row.try_get(3)?;
+    validate_health_payload_relationship(&status, &summary_payload)
+        .map_err(PostgresError::InvalidState)?;
+    Ok(HealthSnapshotRecord {
+        node_id: row.try_get(0)?,
+        endpoint_id: row.try_get(1)?,
+        computed_at: format_postgres_timestamp(row.try_get(2)?, "health computed_at")?,
+        status,
+        freshness_seconds: row
+            .try_get::<_, Option<i64>>(4)?
+            .map(|value| checked_u64(value, "health freshness_seconds"))
+            .transpose()?,
+        last_success_at: row
+            .try_get::<_, Option<OffsetDateTime>>(5)?
+            .map(|value| format_postgres_timestamp(value, "health last_success_at"))
+            .transpose()?,
+        last_failure_at: row
+            .try_get::<_, Option<OffsetDateTime>>(6)?
+            .map(|value| format_postgres_timestamp(value, "health last_failure_at"))
+            .transpose()?,
+        last_error_code: row.try_get(7)?,
+        degraded_methods_json: degraded,
+        summary_json: summary,
+    })
+}
+
+fn health_history_from_postgres_row(
+    row: &postgres::Row,
+) -> Result<HealthHistoryRecord, PostgresError> {
+    let degraded: String = row.try_get(9)?;
+    let degraded: Value = serde_json::from_str(&degraded).map_err(|_| {
+        PostgresError::InvalidState("native health degraded payload is invalid".into())
+    })?;
+    HealthDegradedMethodsPayloadV1::from_value(&degraded).map_err(PostgresError::InvalidState)?;
+    let summary: String = row.try_get(10)?;
+    let summary: Value = serde_json::from_str(&summary).map_err(|_| {
+        PostgresError::InvalidState("native health summary payload is invalid".into())
+    })?;
+    let summary_payload =
+        HealthSummaryPayloadV1::from_value(&summary).map_err(PostgresError::InvalidState)?;
+    let status: String = row.try_get(4)?;
+    validate_health_payload_relationship(&status, &summary_payload)
+        .map_err(PostgresError::InvalidState)?;
+    Ok(HealthHistoryRecord {
+        evaluation_id: row.try_get(0)?,
+        snapshot: HealthSnapshotRecord {
+            node_id: row.try_get(1)?,
+            endpoint_id: row.try_get(2)?,
+            computed_at: format_postgres_timestamp(row.try_get(3)?, "health computed_at")?,
+            status,
+            freshness_seconds: row
+                .try_get::<_, Option<i64>>(5)?
+                .map(|value| checked_u64(value, "health freshness_seconds"))
+                .transpose()?,
+            last_success_at: row
+                .try_get::<_, Option<OffsetDateTime>>(6)?
+                .map(|value| format_postgres_timestamp(value, "health last_success_at"))
+                .transpose()?,
+            last_failure_at: row
+                .try_get::<_, Option<OffsetDateTime>>(7)?
+                .map(|value| format_postgres_timestamp(value, "health last_failure_at"))
+                .transpose()?,
+            last_error_code: row.try_get(8)?,
+            degraded_methods_json: degraded,
+            summary_json: summary,
+        },
+    })
+}
+
+fn upsert_health_rollup_postgres_tx(
+    tx: &mut Transaction<'_>,
+    row: &HealthRollupRecord,
+) -> Result<(), PostgresError> {
+    let bucket_seconds = checked_i64(row.bucket_seconds, "health bucket_seconds")?;
+    let bucket_start = parse_postgres_timestamp(&row.bucket_start, "health bucket_start")?;
+    let bucket_end = parse_postgres_timestamp(&row.bucket_end, "health bucket_end")?;
+    let computed_at = parse_postgres_timestamp(&row.computed_at, "health computed_at")?;
+    let counts = [
+        row.health_samples,
+        row.covered_slots,
+        row.expected_slots,
+        row.healthy_count,
+        row.degraded_count,
+        row.unreachable_count,
+        row.stale_count,
+        row.disabled_count,
+        row.unknown_count,
+        row.observation_count,
+        row.observation_error_count,
+        row.duration_sample_count,
+        row.cert_warning_count,
+        row.cert_critical_count,
+        row.fingerprint_sample_count,
+        row.fingerprint_change_count,
+    ]
+    .into_iter()
+    .map(|value| checked_i64(value, "health rollup counter"))
+    .collect::<Result<Vec<_>, _>>()?;
+    let p50 = row
+        .duration_p50_ms
+        .map(|value| checked_i64(value, "health duration p50"))
+        .transpose()?;
+    let p95 = row
+        .duration_p95_ms
+        .map(|value| checked_i64(value, "health duration p95"))
+        .transpose()?;
+    tx.execute(
+        "INSERT INTO ocfleet_native.health_rollups
+         (node_id, bucket_seconds, bucket_start, bucket_end, input_watermark,
+          health_samples, covered_slots, expected_slots, healthy_count, degraded_count,
+          unreachable_count, stale_count, disabled_count, unknown_count,
+          observation_count, observation_error_count, duration_sample_count,
+          duration_p50_ms, duration_p95_ms, cert_warning_count, cert_critical_count,
+          fingerprint_sample_count, fingerprint_change_count, computed_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,
+                 $19,$20,$21,$22,$23,$24)
+         ON CONFLICT (node_id, bucket_seconds, bucket_start) DO UPDATE SET
+           bucket_end = EXCLUDED.bucket_end, input_watermark = EXCLUDED.input_watermark,
+           health_samples = EXCLUDED.health_samples, covered_slots = EXCLUDED.covered_slots,
+           expected_slots = EXCLUDED.expected_slots, healthy_count = EXCLUDED.healthy_count,
+           degraded_count = EXCLUDED.degraded_count,
+           unreachable_count = EXCLUDED.unreachable_count, stale_count = EXCLUDED.stale_count,
+           disabled_count = EXCLUDED.disabled_count, unknown_count = EXCLUDED.unknown_count,
+           observation_count = EXCLUDED.observation_count,
+           observation_error_count = EXCLUDED.observation_error_count,
+           duration_sample_count = EXCLUDED.duration_sample_count,
+           duration_p50_ms = EXCLUDED.duration_p50_ms,
+           duration_p95_ms = EXCLUDED.duration_p95_ms,
+           cert_warning_count = EXCLUDED.cert_warning_count,
+           cert_critical_count = EXCLUDED.cert_critical_count,
+           fingerprint_sample_count = EXCLUDED.fingerprint_sample_count,
+           fingerprint_change_count = EXCLUDED.fingerprint_change_count,
+           computed_at = EXCLUDED.computed_at",
+        &[
+            &row.node_id,
+            &bucket_seconds,
+            &bucket_start,
+            &bucket_end,
+            &row.input_watermark,
+            &counts[0],
+            &counts[1],
+            &counts[2],
+            &counts[3],
+            &counts[4],
+            &counts[5],
+            &counts[6],
+            &counts[7],
+            &counts[8],
+            &counts[9],
+            &counts[10],
+            &counts[11],
+            &p50,
+            &p95,
+            &counts[12],
+            &counts[13],
+            &counts[14],
+            &counts[15],
+            &computed_at,
+        ],
+    )?;
+    Ok(())
+}
+
+fn health_rollup_from_postgres_row(
+    row: &postgres::Row,
+) -> Result<HealthRollupRecord, PostgresError> {
+    let value = |index| -> Result<u64, PostgresError> {
+        checked_u64(row.try_get(index)?, "health rollup counter")
+    };
+    let optional = |index| -> Result<Option<u64>, PostgresError> {
+        row.try_get::<_, Option<i64>>(index)?
+            .map(|value| checked_u64(value, "health rollup duration"))
+            .transpose()
+    };
+    Ok(HealthRollupRecord {
+        node_id: row.try_get(0)?,
+        bucket_seconds: value(1)?,
+        bucket_start: format_postgres_timestamp(row.try_get(2)?, "health bucket_start")?,
+        bucket_end: format_postgres_timestamp(row.try_get(3)?, "health bucket_end")?,
+        input_watermark: row.try_get(4)?,
+        health_samples: value(5)?,
+        covered_slots: value(6)?,
+        expected_slots: value(7)?,
+        healthy_count: value(8)?,
+        degraded_count: value(9)?,
+        unreachable_count: value(10)?,
+        stale_count: value(11)?,
+        disabled_count: value(12)?,
+        unknown_count: value(13)?,
+        observation_count: value(14)?,
+        observation_error_count: value(15)?,
+        duration_sample_count: value(16)?,
+        duration_p50_ms: optional(17)?,
+        duration_p95_ms: optional(18)?,
+        cert_warning_count: value(19)?,
+        cert_critical_count: value(20)?,
+        fingerprint_sample_count: value(21)?,
+        fingerprint_change_count: value(22)?,
+        computed_at: format_postgres_timestamp(row.try_get(23)?, "health computed_at")?,
+    })
+}
+
+fn health_evaluation_from_postgres_row(
+    row: &postgres::Row,
+) -> Result<HealthEvaluationRunRecord, PostgresError> {
+    Ok(HealthEvaluationRunRecord {
+        evaluation_id: row.try_get(0)?,
+        input_watermark: row.try_get(1)?,
+        policy_version: row.try_get(2)?,
+        computation_version: row.try_get(3)?,
+        started_at: format_postgres_timestamp(row.try_get(4)?, "health started_at")?,
+        finished_at: row
+            .try_get::<_, Option<OffsetDateTime>>(5)?
+            .map(|value| format_postgres_timestamp(value, "health finished_at"))
+            .transpose()?,
+        status: row.try_get(6)?,
+        snapshot_count: checked_u64(row.try_get(7)?, "health snapshot_count")?,
+        failure_code: row.try_get(8)?,
+    })
+}
+
+fn health_evaluation_conflict(evaluation_id: &str, detail: &'static str) -> PostgresError {
+    PostgresError::Store(StoreError::HealthEvaluationConflict {
+        evaluation_id: evaluation_id.to_string(),
+        detail,
+    })
+}
+
+fn insert_health_evaluation_audit_postgres_tx(
+    tx: &mut Transaction<'_>,
+    actor: &str,
+    event_name: &str,
+    evaluation_id: &str,
+    ok: bool,
+    failure_code: Option<&str>,
+    snapshot_count: usize,
+) -> Result<(), PostgresError> {
+    let mut event = AuditEvent::new(actor, event_name);
+    event.ok = Some(ok);
+    event.request_id = Some(evaluation_id.to_string());
+    event.error_code = failure_code.map(str::to_string);
+    event.detail_json = json!({
+        "actor_type": "system",
+        "target_type": "health_evaluation",
+        "target_id": evaluation_id,
+        "batch_count": snapshot_count,
+        "reason": Value::Null,
+    });
+    insert_audit(tx, &event)
+}
+
 fn validated_native_config(dsn: &str) -> Result<Config, PostgresError> {
     let config = Config::from_str(dsn)
         .map_err(|_| PostgresError::Configuration("Postgres DSN is invalid"))?;
@@ -2965,6 +5534,15 @@ fn validate_native_schema(tx: &mut Transaction<'_>) -> Result<(), PostgresError>
         "ocfleet_native.scheduler_maintenance",
         "ocfleet_native.retention_policies",
         "ocfleet_native.retention_operations",
+        "ocfleet_native.health_policy",
+        "ocfleet_native.health_evaluation_runs",
+        "ocfleet_native.health_snapshots",
+        "ocfleet_native.health_history",
+        "ocfleet_native.health_rollups",
+        "ocfleet_native.alert_events",
+        "ocfleet_native.alert_hooks",
+        "ocfleet_native.alert_delivery_attempts",
+        "ocfleet_native.alert_delivery_queue",
     ] {
         let is_table: bool = tx
             .query_one(
@@ -3072,6 +5650,70 @@ fn validate_native_schema(tx: &mut Transaction<'_>) -> Result<(), PostgresError>
     tx.query(
         "SELECT operation_id, actor, input_json, result_json, created_at
          FROM ocfleet_native.retention_operations LIMIT 0",
+        &[],
+    )?;
+    tx.query(
+        "SELECT singleton_id, stale_window_seconds, unreachable_consecutive_failures,
+                cert_warning_days, cert_critical_days, updated_at
+         FROM ocfleet_native.health_policy LIMIT 0",
+        &[],
+    )?;
+    tx.query(
+        "SELECT evaluation_id, input_watermark, policy_version, computation_version,
+                started_at, finished_at, status, snapshot_count, failure_code
+         FROM ocfleet_native.health_evaluation_runs LIMIT 0",
+        &[],
+    )?;
+    tx.query(
+        "SELECT node_id, endpoint_id, computed_at, status, freshness_seconds,
+                last_success_at, last_failure_at, last_error_code,
+                degraded_methods_json, summary_json
+         FROM ocfleet_native.health_snapshots LIMIT 0",
+        &[],
+    )?;
+    tx.query(
+        "SELECT evaluation_id, node_id, endpoint_id, computed_at, status,
+                freshness_seconds, last_success_at, last_failure_at, last_error_code,
+                degraded_methods_json, summary_json
+         FROM ocfleet_native.health_history LIMIT 0",
+        &[],
+    )?;
+    tx.query(
+        "SELECT node_id, bucket_seconds, bucket_start, bucket_end, input_watermark,
+                health_samples, covered_slots, expected_slots, healthy_count,
+                degraded_count, unreachable_count, stale_count, disabled_count,
+                unknown_count, observation_count, observation_error_count,
+                duration_sample_count, duration_p50_ms, duration_p95_ms,
+                cert_warning_count, cert_critical_count, fingerprint_sample_count,
+                fingerprint_change_count, computed_at
+         FROM ocfleet_native.health_rollups LIMIT 0",
+        &[],
+    )?;
+    tx.query(
+        "SELECT alert_id, dedupe_key, node_id, severity, state, reason_code,
+                first_seen_at, last_seen_at, last_sent_at, resolved_at, detail_json
+         FROM ocfleet_native.alert_events LIMIT 0",
+        &[],
+    )?;
+    tx.query(
+        "SELECT hook_id, name, hook_type, endpoint_url, endpoint_url_redacted,
+                endpoint_host, host_allow_json, hmac_key_id, enabled, max_attempts,
+                timeout_ms, created_at, updated_at
+         FROM ocfleet_native.alert_hooks LIMIT 0",
+        &[],
+    )?;
+    tx.query(
+        "SELECT attempt_id, alert_id, hook_id, attempt_no, attempted_at, status,
+                http_status_class, error_code, bytes_sent, detail_json
+         FROM ocfleet_native.alert_delivery_attempts LIMIT 0",
+        &[],
+    )?;
+    tx.query(
+        "SELECT queue_id, alert_id, hook_id, idempotency_key, group_key, status,
+                attempt_count, next_attempt_at, owner_id, owner_actor, fence_token,
+                claimed_at, lease_expires_at, last_error_code, created_at, updated_at,
+                delivered_at
+         FROM ocfleet_native.alert_delivery_queue LIMIT 0",
         &[],
     )?;
     Ok(())
@@ -4037,11 +6679,19 @@ fn ensure_scheduler_job_claim_tx(
 }
 
 fn validate_retention_scope(scope: &str) -> Result<(), PostgresError> {
-    if matches!(scope, "observations" | "observability-runs") {
+    if matches!(
+        scope,
+        "observations"
+            | "observability-runs"
+            | "health-snapshots"
+            | "health-history"
+            | "health-rollups"
+            | "alert-events"
+    ) {
         Ok(())
     } else {
         Err(PostgresError::InvalidInput(
-            "native retention scope is not part of C1.3".into(),
+            "native retention scope is not supported".into(),
         ))
     }
 }
@@ -4205,6 +6855,9 @@ fn retention_candidate_report_tx<C: GenericClient>(
              )
              SELECT COUNT(*), MIN(ts), MAX(ts) FROM candidates"
         }
+        "health-snapshots" | "health-history" | "health-rollups" | "alert-events" => {
+            simple_retention_report_sql(scope)
+        }
         _ => unreachable!("validated retention scope"),
     };
     let row = conn.query_one(sql, &[&cutoff, &max_rows])?;
@@ -4221,6 +6874,66 @@ fn retention_candidate_report_tx<C: GenericClient>(
     })
 }
 
+fn simple_retention_report_sql(scope: &str) -> &'static str {
+    match scope {
+        "health-snapshots" => {
+            "WITH ranked AS (
+               SELECT node_id AS id, computed_at AS ts,
+                      row_number() OVER (ORDER BY computed_at DESC, node_id DESC) AS rn
+               FROM ocfleet_native.health_snapshots
+             ), candidates AS (
+               SELECT ts FROM ranked
+               WHERE ($1::timestamptz IS NOT NULL AND ts < $1)
+                  OR ($2::bigint IS NOT NULL AND rn > $2)
+             ) SELECT COUNT(*), MIN(ts), MAX(ts) FROM candidates"
+        }
+        "health-history" => {
+            "WITH ranked AS (
+               SELECT evaluation_id || ':' || node_id AS id, computed_at AS ts,
+                      row_number() OVER (
+                        ORDER BY computed_at DESC, evaluation_id DESC, node_id DESC
+                      ) AS rn
+               FROM ocfleet_native.health_history
+             ), candidates AS (
+               SELECT ts FROM ranked
+               WHERE ($1::timestamptz IS NOT NULL AND ts < $1)
+                  OR ($2::bigint IS NOT NULL AND rn > $2)
+             ) SELECT COUNT(*), MIN(ts), MAX(ts) FROM candidates"
+        }
+        "health-rollups" => {
+            "WITH ranked AS (
+               SELECT node_id, bucket_seconds, bucket_start AS ts,
+                      row_number() OVER (
+                        ORDER BY bucket_start DESC, node_id DESC, bucket_seconds DESC
+                      ) AS rn
+               FROM ocfleet_native.health_rollups
+             ), candidates AS (
+               SELECT ts FROM ranked
+               WHERE ($1::timestamptz IS NOT NULL AND ts < $1)
+                  OR ($2::bigint IS NOT NULL AND rn > $2)
+             ) SELECT COUNT(*), MIN(ts), MAX(ts) FROM candidates"
+        }
+        "alert-events" => {
+            "WITH ranked AS (
+               SELECT a.alert_id AS id, a.last_seen_at AS ts,
+                      row_number() OVER (
+                        ORDER BY a.last_seen_at DESC, a.alert_id DESC
+                      ) AS rn
+               FROM ocfleet_native.alert_events a
+               WHERE NOT EXISTS (
+                 SELECT 1 FROM ocfleet_native.alert_delivery_queue q
+                 WHERE q.alert_id = a.alert_id AND q.status = 'claimed'
+               )
+             ), candidates AS (
+               SELECT ts FROM ranked
+               WHERE ($1::timestamptz IS NOT NULL AND ts < $1)
+                  OR ($2::bigint IS NOT NULL AND rn > $2)
+             ) SELECT COUNT(*), MIN(ts), MAX(ts) FROM candidates"
+        }
+        _ => unreachable!("validated simple retention scope"),
+    }
+}
+
 fn lock_retention_target_tx(tx: &mut Transaction<'_>, scope: &str) -> Result<(), PostgresError> {
     match scope {
         "observations" => tx.batch_execute(
@@ -4230,6 +6943,21 @@ fn lock_retention_target_tx(tx: &mut Transaction<'_>, scope: &str) -> Result<(),
             "LOCK TABLE ocfleet_native.observability_runs,
                         ocfleet_native.probe_observations,
                         ocfleet_native.scheduler_job_claims
+             IN SHARE ROW EXCLUSIVE MODE",
+        )?,
+        "health-snapshots" => tx.batch_execute(
+            "LOCK TABLE ocfleet_native.health_snapshots IN SHARE ROW EXCLUSIVE MODE",
+        )?,
+        "health-history" => tx.batch_execute(
+            "LOCK TABLE ocfleet_native.health_history IN SHARE ROW EXCLUSIVE MODE",
+        )?,
+        "health-rollups" => tx.batch_execute(
+            "LOCK TABLE ocfleet_native.health_rollups IN SHARE ROW EXCLUSIVE MODE",
+        )?,
+        "alert-events" => tx.batch_execute(
+            "LOCK TABLE ocfleet_native.alert_events,
+                        ocfleet_native.alert_delivery_queue,
+                        ocfleet_native.alert_delivery_attempts
              IN SHARE ROW EXCLUSIVE MODE",
         )?,
         _ => {
@@ -4298,6 +7026,77 @@ fn prune_retention_batch_tx(
              DELETE FROM ocfleet_native.observability_runs target
              USING doomed WHERE target.run_id = doomed.id
              RETURNING target.run_id"
+        }
+        "health-snapshots" => {
+            "WITH ranked AS (
+               SELECT node_id AS id, computed_at AS ts,
+                      row_number() OVER (ORDER BY computed_at DESC, node_id DESC) AS rn
+               FROM ocfleet_native.health_snapshots
+             ), doomed AS (
+               SELECT id FROM ranked
+               WHERE ($1::timestamptz IS NOT NULL AND ts < $1)
+                  OR ($2::bigint IS NOT NULL AND rn > $2)
+               ORDER BY ts, id LIMIT $3
+             )
+             DELETE FROM ocfleet_native.health_snapshots target
+             USING doomed WHERE target.node_id = doomed.id RETURNING target.node_id"
+        }
+        "health-history" => {
+            "WITH ranked AS (
+               SELECT evaluation_id, node_id, computed_at AS ts,
+                      row_number() OVER (
+                        ORDER BY computed_at DESC, evaluation_id DESC, node_id DESC
+                      ) AS rn
+               FROM ocfleet_native.health_history
+             ), doomed AS (
+               SELECT evaluation_id, node_id FROM ranked
+               WHERE ($1::timestamptz IS NOT NULL AND ts < $1)
+                  OR ($2::bigint IS NOT NULL AND rn > $2)
+               ORDER BY ts, evaluation_id, node_id LIMIT $3
+             )
+             DELETE FROM ocfleet_native.health_history target USING doomed
+             WHERE target.evaluation_id = doomed.evaluation_id
+               AND target.node_id = doomed.node_id
+             RETURNING target.evaluation_id"
+        }
+        "health-rollups" => {
+            "WITH ranked AS (
+               SELECT node_id, bucket_seconds, bucket_start AS ts,
+                      row_number() OVER (
+                        ORDER BY bucket_start DESC, node_id DESC, bucket_seconds DESC
+                      ) AS rn
+               FROM ocfleet_native.health_rollups
+             ), doomed AS (
+               SELECT node_id, bucket_seconds, ts FROM ranked
+               WHERE ($1::timestamptz IS NOT NULL AND ts < $1)
+                  OR ($2::bigint IS NOT NULL AND rn > $2)
+               ORDER BY ts, node_id, bucket_seconds LIMIT $3
+             )
+             DELETE FROM ocfleet_native.health_rollups target USING doomed
+             WHERE target.node_id = doomed.node_id
+               AND target.bucket_seconds = doomed.bucket_seconds
+               AND target.bucket_start = doomed.ts
+             RETURNING target.node_id"
+        }
+        "alert-events" => {
+            "WITH ranked AS (
+               SELECT a.alert_id AS id, a.last_seen_at AS ts,
+                      row_number() OVER (
+                        ORDER BY a.last_seen_at DESC, a.alert_id DESC
+                      ) AS rn
+               FROM ocfleet_native.alert_events a
+               WHERE NOT EXISTS (
+                 SELECT 1 FROM ocfleet_native.alert_delivery_queue q
+                 WHERE q.alert_id = a.alert_id AND q.status = 'claimed'
+               )
+             ), doomed AS (
+               SELECT id FROM ranked
+               WHERE ($1::timestamptz IS NOT NULL AND ts < $1)
+                  OR ($2::bigint IS NOT NULL AND rn > $2)
+               ORDER BY ts, id LIMIT $3
+             )
+             DELETE FROM ocfleet_native.alert_events target
+             USING doomed WHERE target.alert_id = doomed.id RETURNING target.alert_id"
         }
         _ => {
             return Err(PostgresError::InvalidInput(

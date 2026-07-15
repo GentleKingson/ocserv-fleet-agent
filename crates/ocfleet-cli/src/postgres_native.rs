@@ -11,6 +11,10 @@ use ocfleet_config::validation::{validate_node_id, validate_region, validate_rol
 use ocfleet_protocol::enrollment::{
     EndpointStatus, EnrollmentTokenStatus, JoinRequestStatus, TrustBundle,
 };
+use ocfleet_protocol::method::{
+    OCSERV_CERT_EXPIRY, OCSERV_CONFIG_FINGERPRINT, OCSERV_SERVICE_SUMMARY, OCSERV_SESSIONS_SUMMARY,
+    OCSERV_VERSION, PROBE_CONTROLLER_PING, PROBE_PATH_ECHO,
+};
 use postgres::{Config, GenericClient, NoTls, Transaction};
 use r2d2::{Pool, PooledConnection};
 use r2d2_postgres::PostgresConnectionManager;
@@ -28,14 +32,20 @@ use crate::input_validation::{
 use crate::postgres_backend::{PostgresConnectionSource, PostgresError, validate_transport};
 use crate::storage_payloads::{
     AuditDetailPayloadV1, EnrollmentMetadataKindV1, EnrollmentMetadataPayloadV1,
-    TrustBundlePayloadV1,
+    ObservationSummaryPayloadV1, RunSummaryPayloadV1, SchedulerPairPayloadV1,
+    SchedulerSelectorPayloadV1, TrustBundlePayloadV1, validate_scheduler_payload_relationship,
 };
 use crate::store::{
     ApprovalInput, EndpointTrustRecord, EnrollmentTokenInsert, EnrollmentTokenRecord,
     JoinRequestInsert, JoinRequestRecord, LegacyEnrollmentClaimInput, MAX_ENROLLMENT_TOKEN_USES,
-    NodeInsert, NodeMaintenanceWindow, NodeMetadataRecord, NodeRecord, Store, StoreError,
-    TrustSnapshot, validate_low_sensitive_json, validate_node_maintenance_record,
-    validate_node_metadata_record,
+    MAX_RETENTION_APPLY_LIMIT, MAX_RETENTION_BATCH_SIZE, MAX_RETENTION_POLICY_AGE_DAYS,
+    MAX_RETENTION_POLICY_ROWS, MAX_SCHEDULER_LEASE_SECONDS, MIN_SCHEDULER_LEASE_SECONDS,
+    NodeInsert, NodeMaintenanceWindow, NodeMetadataRecord, NodeRecord, ObservabilityJobRecord,
+    ObservabilityRunInsert, ObservabilityRunRecord, ProbeObservationInsert, ProbeObservationRecord,
+    RetentionApplyInput, RetentionApplyResult, RetentionCandidateReport, RetentionPolicyRecord,
+    SchedulerJobClaim, SchedulerJobClockUpdate, SchedulerMaintenanceWindow, SchedulerOutcomeWrite,
+    SchedulerRunFinish, SchedulerRunStart, Store, StoreError, TrustSnapshot,
+    validate_low_sensitive_json, validate_node_maintenance_record, validate_node_metadata_record,
 };
 use crate::version_governance::{
     CapabilityNegotiationStatus, CapabilitySnapshot, MAX_VERSION_GOVERNANCE_NODES,
@@ -48,7 +58,9 @@ type Connection = PooledConnection<Manager>;
 const MIGRATION_LOCK_ID: i64 = 0x4f43464c4e4154;
 const NATIVE_MIGRATION_1_NAME: &str = "0001_native_core";
 const NATIVE_MIGRATION_2_NAME: &str = "0002_registry_trust";
-pub const NATIVE_BACKEND_SCHEMA_VERSION: i32 = 2;
+const NATIVE_MIGRATION_3_NAME: &str = "0003_scheduler_observations";
+const MAX_SCHEDULER_OUTCOME_ENTRIES: usize = 4;
+pub const NATIVE_BACKEND_SCHEMA_VERSION: i32 = 3;
 
 #[derive(Clone)]
 pub struct PostgresNativeStore {
@@ -112,6 +124,7 @@ impl PostgresNativeStore {
         for (version, expected_name) in [
             (1_i32, NATIVE_MIGRATION_1_NAME),
             (2_i32, NATIVE_MIGRATION_2_NAME),
+            (3_i32, NATIVE_MIGRATION_3_NAME),
         ] {
             if existing < version {
                 continue;
@@ -313,6 +326,139 @@ CREATE INDEX idx_native_join_token_status
             tx.execute(
                 "INSERT INTO ocfleet_native.migrations (version, name) VALUES ($1, $2)",
                 &[&2_i32, &NATIVE_MIGRATION_2_NAME],
+            )?;
+        }
+
+        if existing < 3 {
+            tx.batch_execute(
+                r#"
+CREATE TABLE ocfleet_native.observability_jobs (
+  job_id TEXT PRIMARY KEY CHECK (length(job_id) BETWEEN 1 AND 128),
+  kind TEXT NOT NULL CHECK (kind IN (
+    'controller-ping', 'ocserv-status', 'ocserv-cert', 'ocserv-sessions', 'path-probe'
+  )),
+  selector_json JSONB NOT NULL CHECK (jsonb_typeof(selector_json) = 'object'),
+  pair_selector_json JSONB CHECK (
+    pair_selector_json IS NULL OR jsonb_typeof(pair_selector_json) = 'object'
+  ),
+  interval_seconds BIGINT NOT NULL CHECK (interval_seconds BETWEEN 60 AND 86400),
+  jitter_seconds BIGINT NOT NULL DEFAULT 0 CHECK (jitter_seconds BETWEEN 0 AND 3600),
+  timeout_ms BIGINT NOT NULL CHECK (timeout_ms BETWEEN 1000 AND 30000),
+  enabled BOOLEAN NOT NULL DEFAULT TRUE,
+  next_run_at TIMESTAMPTZ,
+  last_run_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL,
+  CHECK (jitter_seconds <= interval_seconds)
+);
+CREATE INDEX idx_native_jobs_enabled_next_run
+  ON ocfleet_native.observability_jobs(enabled, next_run_at, job_id);
+
+CREATE TABLE ocfleet_native.observability_runs (
+  run_id TEXT PRIMARY KEY CHECK (length(run_id) BETWEEN 1 AND 128),
+  job_id TEXT REFERENCES ocfleet_native.observability_jobs(job_id) ON DELETE SET NULL,
+  started_at TIMESTAMPTZ NOT NULL,
+  finished_at TIMESTAMPTZ,
+  status TEXT NOT NULL CHECK (status IN ('running', 'succeeded', 'failed', 'skipped')),
+  triggered_by TEXT NOT NULL CHECK (triggered_by IN ('manual', 'scheduler.run.once')),
+  summary_json JSONB NOT NULL CHECK (jsonb_typeof(summary_json) = 'object'),
+  CHECK (
+    (status = 'running' AND finished_at IS NULL)
+    OR (status <> 'running' AND finished_at IS NOT NULL)
+  ),
+  CHECK (finished_at IS NULL OR finished_at >= started_at)
+);
+CREATE INDEX idx_native_runs_started
+  ON ocfleet_native.observability_runs(started_at DESC, run_id DESC);
+CREATE INDEX idx_native_runs_job_started
+  ON ocfleet_native.observability_runs(job_id, started_at DESC, run_id DESC);
+
+CREATE TABLE ocfleet_native.probe_observations (
+  observation_id TEXT PRIMARY KEY CHECK (length(observation_id) BETWEEN 1 AND 128),
+  run_id TEXT REFERENCES ocfleet_native.observability_runs(run_id) ON DELETE SET NULL,
+  node_id TEXT,
+  endpoint_id TEXT,
+  method TEXT NOT NULL CHECK (method IN (
+    'probe.controller.ping', 'probe.path.echo', 'ocserv.service.summary',
+    'ocserv.version', 'ocserv.sessions.summary', 'ocserv.cert.expiry',
+    'ocserv.config.fingerprint'
+  )),
+  ok BOOLEAN,
+  error_code TEXT CHECK (error_code IS NULL OR length(error_code) BETWEEN 1 AND 64),
+  duration_ms BIGINT CHECK (duration_ms IS NULL OR duration_ms >= 0),
+  observed_at TIMESTAMPTZ NOT NULL,
+  expires_at TIMESTAMPTZ,
+  result_class TEXT NOT NULL CHECK (result_class IN (
+    'controller_rpc_summary', 'low_sensitive_summary', 'scheduler_summary'
+  )),
+  summary_json JSONB NOT NULL CHECK (jsonb_typeof(summary_json) = 'object'),
+  CHECK (
+    (ok IS NULL AND error_code IS NULL)
+    OR (ok = TRUE AND error_code IS NULL)
+    OR (ok = FALSE AND error_code IS NOT NULL)
+  )
+);
+CREATE INDEX idx_native_observations_node_observed
+  ON ocfleet_native.probe_observations(node_id, observed_at DESC, observation_id DESC);
+CREATE INDEX idx_native_observations_method_observed
+  ON ocfleet_native.probe_observations(method, observed_at DESC, observation_id DESC);
+CREATE INDEX idx_native_observations_run
+  ON ocfleet_native.probe_observations(run_id, observation_id);
+CREATE INDEX idx_native_observations_expires
+  ON ocfleet_native.probe_observations(expires_at, observation_id);
+
+CREATE TABLE ocfleet_native.scheduler_job_claims (
+  job_id TEXT PRIMARY KEY REFERENCES ocfleet_native.observability_jobs(job_id) ON DELETE CASCADE,
+  owner_id TEXT,
+  owner_actor TEXT CHECK (owner_actor IS NULL OR length(owner_actor) BETWEEN 1 AND 128),
+  fence_token BIGINT NOT NULL DEFAULT 0 CHECK (fence_token >= 0),
+  claimed_at TIMESTAMPTZ,
+  lease_expires_at TIMESTAMPTZ,
+  active_run_id TEXT REFERENCES ocfleet_native.observability_runs(run_id) ON DELETE SET NULL,
+  updated_at TIMESTAMPTZ NOT NULL,
+  CHECK (
+    (owner_id IS NULL AND owner_actor IS NULL AND claimed_at IS NULL AND lease_expires_at IS NULL
+      AND active_run_id IS NULL)
+    OR
+    (owner_id IS NOT NULL AND owner_actor IS NOT NULL
+      AND claimed_at IS NOT NULL AND lease_expires_at IS NOT NULL
+      AND fence_token > 0 AND lease_expires_at > claimed_at)
+  )
+);
+CREATE INDEX idx_native_scheduler_claim_expiry
+  ON ocfleet_native.scheduler_job_claims(lease_expires_at, job_id);
+CREATE INDEX idx_native_scheduler_claim_active_run
+  ON ocfleet_native.scheduler_job_claims(active_run_id)
+  WHERE active_run_id IS NOT NULL;
+
+CREATE TABLE ocfleet_native.scheduler_maintenance (
+  singleton_id SMALLINT PRIMARY KEY CHECK (singleton_id = 1),
+  starts_at TIMESTAMPTZ NOT NULL,
+  ends_at TIMESTAMPTZ NOT NULL,
+  reason TEXT NOT NULL CHECK (length(reason) BETWEEN 1 AND 256),
+  updated_at TIMESTAMPTZ NOT NULL,
+  CHECK (ends_at > starts_at)
+);
+
+CREATE TABLE ocfleet_native.retention_policies (
+  scope TEXT PRIMARY KEY CHECK (scope IN ('observations', 'observability-runs')),
+  max_age_days BIGINT CHECK (max_age_days IS NULL OR max_age_days BETWEEN 1 AND 36500),
+  max_rows BIGINT CHECK (max_rows IS NULL OR max_rows BETWEEN 1 AND 10000000),
+  updated_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE ocfleet_native.retention_operations (
+  operation_id TEXT PRIMARY KEY CHECK (length(operation_id) BETWEEN 1 AND 128),
+  actor TEXT NOT NULL CHECK (length(actor) BETWEEN 1 AND 128),
+  input_json JSONB NOT NULL CHECK (jsonb_typeof(input_json) = 'object'),
+  result_json JSONB NOT NULL CHECK (jsonb_typeof(result_json) = 'object'),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+);
+"#,
+            )?;
+            tx.execute(
+                "INSERT INTO ocfleet_native.migrations (version, name) VALUES ($1, $2)",
+                &[&3_i32, &NATIVE_MIGRATION_3_NAME],
             )?;
         }
 
@@ -1840,6 +1986,949 @@ CREATE INDEX idx_native_join_token_status
         Ok(join)
     }
 
+    pub fn insert_observability_job(
+        &self,
+        job: &ObservabilityJobRecord,
+        actor: &str,
+    ) -> Result<(), PostgresError> {
+        validate_observability_job(job, actor)?;
+        let created_at = parse_postgres_timestamp(&job.created_at, "job created_at")?;
+        let updated_at = parse_postgres_timestamp(&job.updated_at, "job updated_at")?;
+        let next_run_at = parse_optional_postgres_timestamp(&job.next_run_at, "job next_run_at")?;
+        let last_run_at = parse_optional_postgres_timestamp(&job.last_run_at, "job last_run_at")?;
+        let interval_seconds = checked_i64(job.interval_seconds, "interval_seconds")?;
+        let jitter_seconds = checked_i64(job.jitter_seconds, "jitter_seconds")?;
+        let timeout_ms = checked_i64(job.timeout_ms, "timeout_ms")?;
+        let mut conn = self.connection()?;
+        let mut tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO ocfleet_native.observability_jobs
+             (job_id, kind, selector_json, pair_selector_json, interval_seconds,
+              jitter_seconds, timeout_ms, enabled, next_run_at, last_run_at, created_at, updated_at)
+             VALUES ($1, $2, CAST($3 AS text)::jsonb, CAST($4 AS text)::jsonb, $5, $6,
+                     $7, $8, $9, $10, $11, $12)",
+            &[
+                &job.job_id,
+                &job.kind,
+                &job.selector_json.to_string(),
+                &job.pair_selector_json.as_ref().map(Value::to_string),
+                &interval_seconds,
+                &jitter_seconds,
+                &timeout_ms,
+                &job.enabled,
+                &next_run_at,
+                &last_run_at,
+                &created_at,
+                &updated_at,
+            ],
+        )?;
+        let after = get_observability_job_tx(&mut tx, &job.job_id)?
+            .ok_or_else(|| PostgresError::InvalidState("native job insert disappeared".into()))?;
+        let mut event = AuditEvent::new(actor, "scheduler.job.add");
+        event.ok = Some(true);
+        event.detail_json = scheduler_job_audit_detail(&after, "created");
+        insert_audit(&mut tx, &event)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn list_observability_jobs(
+        &self,
+        limit: u64,
+    ) -> Result<Vec<ObservabilityJobRecord>, PostgresError> {
+        let limit = checked_query_limit(limit)?;
+        let mut conn = self.connection()?;
+        conn.query(
+            "SELECT job_id, kind, selector_json::text, pair_selector_json::text,
+                    interval_seconds, jitter_seconds, timeout_ms, enabled,
+                    next_run_at, last_run_at, created_at, updated_at
+             FROM ocfleet_native.observability_jobs ORDER BY job_id LIMIT $1",
+            &[&limit],
+        )?
+        .iter()
+        .map(observability_job_from_row)
+        .collect()
+    }
+
+    pub fn get_observability_job(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<ObservabilityJobRecord>, PostgresError> {
+        validate_native_id("scheduler job_id", job_id, 128)?;
+        let mut conn = self.connection()?;
+        conn.query_opt(
+            "SELECT job_id, kind, selector_json::text, pair_selector_json::text,
+                    interval_seconds, jitter_seconds, timeout_ms, enabled,
+                    next_run_at, last_run_at, created_at, updated_at
+             FROM ocfleet_native.observability_jobs WHERE job_id = $1",
+            &[&job_id],
+        )?
+        .as_ref()
+        .map(observability_job_from_row)
+        .transpose()
+    }
+
+    pub fn set_observability_job_enabled(
+        &self,
+        job_id: &str,
+        enabled: bool,
+        actor: &str,
+    ) -> Result<(), PostgresError> {
+        validate_native_id("scheduler job_id", job_id, 128)?;
+        validate_actor(actor).map_err(PostgresError::InvalidInput)?;
+        let mut conn = self.connection()?;
+        let mut tx = conn.transaction()?;
+        let before = get_observability_job_tx(&mut tx, job_id)?.ok_or_else(|| {
+            PostgresError::InvalidState(format!("native job not found: {job_id}"))
+        })?;
+        tx.execute(
+            "UPDATE ocfleet_native.observability_jobs
+             SET enabled = $1, updated_at = clock_timestamp() WHERE job_id = $2",
+            &[&enabled, &job_id],
+        )?;
+        let after = get_observability_job_tx(&mut tx, job_id)?
+            .ok_or_else(|| PostgresError::InvalidState("native job update disappeared".into()))?;
+        let mut event = AuditEvent::new(
+            actor,
+            if enabled {
+                "scheduler.job.enable"
+            } else {
+                "scheduler.job.disable"
+            },
+        );
+        event.ok = Some(true);
+        event.detail_json = json!({
+            "job_id": job_id,
+            "kind": after.kind,
+            "before_enabled": before.enabled,
+            "after_enabled": after.enabled,
+            "result_class": "scheduler_summary",
+        });
+        insert_audit(&mut tx, &event)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn get_scheduler_maintenance(
+        &self,
+    ) -> Result<Option<SchedulerMaintenanceWindow>, PostgresError> {
+        let mut conn = self.connection()?;
+        conn.query_opt(
+            "SELECT starts_at, ends_at, reason, updated_at
+             FROM ocfleet_native.scheduler_maintenance WHERE singleton_id = 1",
+            &[],
+        )?
+        .as_ref()
+        .map(scheduler_maintenance_from_row)
+        .transpose()
+    }
+
+    pub fn scheduler_maintenance_active_at(
+        &self,
+        now: &str,
+    ) -> Result<Option<SchedulerMaintenanceWindow>, PostgresError> {
+        let now = parse_postgres_timestamp(now, "scheduler maintenance check timestamp")?;
+        Ok(self.get_scheduler_maintenance()?.filter(|window| {
+            let starts =
+                parse_postgres_timestamp(&window.starts_at, "stored maintenance starts_at");
+            let ends = parse_postgres_timestamp(&window.ends_at, "stored maintenance ends_at");
+            matches!((starts, ends), (Ok(starts), Ok(ends)) if starts <= now && now < ends)
+        }))
+    }
+
+    pub fn set_scheduler_maintenance(
+        &self,
+        window: &SchedulerMaintenanceWindow,
+        actor: &str,
+    ) -> Result<(), PostgresError> {
+        validate_actor(actor).map_err(PostgresError::InvalidInput)?;
+        let (starts_at, ends_at, updated_at) = validate_scheduler_maintenance(window)?;
+        let mut conn = self.connection()?;
+        let mut tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO ocfleet_native.scheduler_maintenance
+             (singleton_id, starts_at, ends_at, reason, updated_at)
+             VALUES (1, $1, $2, $3, $4)
+             ON CONFLICT (singleton_id) DO UPDATE SET starts_at = EXCLUDED.starts_at,
+               ends_at = EXCLUDED.ends_at, reason = EXCLUDED.reason,
+               updated_at = EXCLUDED.updated_at",
+            &[&starts_at, &ends_at, &window.reason, &updated_at],
+        )?;
+        let mut event = AuditEvent::new(actor, "scheduler.maintenance.set");
+        event.ok = Some(true);
+        event.detail_json = json!({
+            "from": window.starts_at,
+            "to": window.ends_at,
+            "reason": window.reason,
+            "state": "configured",
+            "result_class": "scheduler_summary",
+        });
+        insert_audit(&mut tx, &event)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn clear_scheduler_maintenance(
+        &self,
+        cleared_at: &str,
+        actor: &str,
+    ) -> Result<bool, PostgresError> {
+        validate_actor(actor).map_err(PostgresError::InvalidInput)?;
+        parse_postgres_timestamp(cleared_at, "scheduler maintenance cleared_at")?;
+        let mut conn = self.connection()?;
+        let mut tx = conn.transaction()?;
+        let removed = tx.execute(
+            "DELETE FROM ocfleet_native.scheduler_maintenance WHERE singleton_id = 1",
+            &[],
+        )? == 1;
+        let mut event = AuditEvent::new(actor, "scheduler.maintenance.clear");
+        event.ok = Some(true);
+        event.detail_json = json!({
+            "state": if removed { "cleared" } else { "already_clear" },
+            "result_class": "scheduler_summary",
+        });
+        insert_audit(&mut tx, &event)?;
+        tx.commit()?;
+        Ok(removed)
+    }
+
+    pub fn claim_next_due_scheduler_job(
+        &self,
+        owner_id: &str,
+        now: &str,
+        lease_seconds: u64,
+        actor: &str,
+    ) -> Result<Option<SchedulerJobClaim>, PostgresError> {
+        validate_scheduler_claim_input(owner_id, now, lease_seconds, actor)?;
+        let mut conn = self.connection()?;
+        let mut tx = conn.transaction()?;
+        let job_id: Option<String> = tx
+            .query_opt(
+                "SELECT j.job_id
+             FROM ocfleet_native.observability_jobs j
+             LEFT JOIN ocfleet_native.scheduler_job_claims c ON c.job_id = j.job_id
+             WHERE j.enabled AND (j.next_run_at IS NULL OR j.next_run_at <= clock_timestamp())
+               AND (c.owner_id IS NULL OR c.lease_expires_at <= clock_timestamp())
+             ORDER BY j.next_run_at NULLS FIRST, j.job_id
+             FOR UPDATE OF j SKIP LOCKED LIMIT 1",
+                &[],
+            )?
+            .map(|row| row.try_get(0))
+            .transpose()?;
+        let Some(job_id) = job_id else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        let claim =
+            acquire_scheduler_claim_tx(&mut tx, &job_id, owner_id, lease_seconds, actor, true)?;
+        tx.commit()?;
+        Ok(claim)
+    }
+
+    pub fn claim_scheduler_job(
+        &self,
+        job_id: &str,
+        owner_id: &str,
+        now: &str,
+        lease_seconds: u64,
+        actor: &str,
+    ) -> Result<Option<SchedulerJobClaim>, PostgresError> {
+        self.claim_scheduler_job_inner(job_id, owner_id, now, lease_seconds, actor, false)
+    }
+
+    pub fn claim_due_scheduler_job(
+        &self,
+        job_id: &str,
+        owner_id: &str,
+        now: &str,
+        lease_seconds: u64,
+        actor: &str,
+    ) -> Result<Option<SchedulerJobClaim>, PostgresError> {
+        self.claim_scheduler_job_inner(job_id, owner_id, now, lease_seconds, actor, true)
+    }
+
+    fn claim_scheduler_job_inner(
+        &self,
+        job_id: &str,
+        owner_id: &str,
+        now: &str,
+        lease_seconds: u64,
+        actor: &str,
+        require_due: bool,
+    ) -> Result<Option<SchedulerJobClaim>, PostgresError> {
+        validate_native_id("scheduler job_id", job_id, 128)?;
+        validate_scheduler_claim_input(owner_id, now, lease_seconds, actor)?;
+        let mut conn = self.connection()?;
+        let mut tx = conn.transaction()?;
+        let claim = acquire_scheduler_claim_tx(
+            &mut tx,
+            job_id,
+            owner_id,
+            lease_seconds,
+            actor,
+            require_due,
+        )?;
+        tx.commit()?;
+        Ok(claim)
+    }
+
+    pub fn renew_scheduler_job_claim(
+        &self,
+        claim: &SchedulerJobClaim,
+        now: &str,
+        lease_seconds: u64,
+        actor: &str,
+    ) -> Result<SchedulerJobClaim, PostgresError> {
+        validate_scheduler_claim(claim)?;
+        validate_scheduler_claim_input(&claim.owner_id, now, lease_seconds, actor)?;
+        let fence_token = checked_i64(claim.fence_token, "fence token")?;
+        let lease_seconds = checked_i64(lease_seconds, "lease")?;
+        let mut conn = self.connection()?;
+        let mut tx = conn.transaction()?;
+        let renewed = tx.query_opt(
+            "WITH authority AS (SELECT clock_timestamp() AS now)
+             UPDATE ocfleet_native.scheduler_job_claims AS claim
+             SET lease_expires_at = authority.now + $1 * interval '1 second',
+                 updated_at = authority.now
+             FROM authority
+             WHERE claim.job_id = $2 AND claim.owner_id = $3 AND claim.fence_token = $4
+               AND claim.owner_actor = $5 AND claim.lease_expires_at > authority.now
+             RETURNING claim.lease_expires_at",
+            &[
+                &lease_seconds,
+                &claim.job_id,
+                &claim.owner_id,
+                &fence_token,
+                &actor,
+            ],
+        )?;
+        let Some(renewed) = renewed else {
+            return Err(scheduler_claim_lost(&claim.job_id));
+        };
+        let lease_expires_at: OffsetDateTime = renewed.try_get(0)?;
+        let renewed = SchedulerJobClaim {
+            lease_expires_at: format_postgres_timestamp(lease_expires_at, "lease_expires_at")?,
+            ..claim.clone()
+        };
+        insert_scheduler_claim_audit(&mut tx, "scheduler.claim.renew", &renewed, actor, "renewed")?;
+        tx.commit()?;
+        Ok(renewed)
+    }
+
+    pub fn release_scheduler_job_claim(
+        &self,
+        claim: &SchedulerJobClaim,
+        released_at: &str,
+        actor: &str,
+    ) -> Result<(), PostgresError> {
+        validate_scheduler_claim(claim)?;
+        parse_postgres_timestamp(released_at, "scheduler released_at")?;
+        validate_actor(actor).map_err(PostgresError::InvalidInput)?;
+        let fence_token = checked_i64(claim.fence_token, "fence token")?;
+        let mut conn = self.connection()?;
+        let mut tx = conn.transaction()?;
+        let affected = tx.execute(
+            "WITH authority AS (SELECT clock_timestamp() AS now)
+             UPDATE ocfleet_native.scheduler_job_claims AS claim
+             SET owner_id = NULL, claimed_at = NULL, lease_expires_at = NULL,
+                 owner_actor = NULL, active_run_id = NULL, updated_at = authority.now
+             FROM authority
+             WHERE claim.job_id = $1 AND claim.owner_id = $2 AND claim.fence_token = $3
+               AND claim.owner_actor = $4 AND claim.lease_expires_at > authority.now
+               AND claim.active_run_id IS NULL",
+            &[&claim.job_id, &claim.owner_id, &fence_token, &actor],
+        )?;
+        if affected != 1 {
+            return Err(scheduler_claim_lost(&claim.job_id));
+        }
+        insert_scheduler_claim_audit(&mut tx, "scheduler.claim.release", claim, actor, "released")?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn get_scheduler_job_claim(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<SchedulerJobClaim>, PostgresError> {
+        validate_native_id("scheduler job_id", job_id, 128)?;
+        let mut conn = self.connection()?;
+        conn.query_opt(
+            "SELECT job_id, owner_id, fence_token, claimed_at, lease_expires_at, active_run_id
+             FROM ocfleet_native.scheduler_job_claims
+             WHERE job_id = $1 AND owner_id IS NOT NULL",
+            &[&job_id],
+        )?
+        .as_ref()
+        .map(scheduler_claim_from_row)
+        .transpose()
+    }
+
+    pub fn write_scheduler_claimed_run_start(
+        &self,
+        start: &SchedulerRunStart,
+        claim: &SchedulerJobClaim,
+        actor: &str,
+    ) -> Result<(), PostgresError> {
+        validate_actor(actor).map_err(PostgresError::InvalidInput)?;
+        validate_native_id("scheduler run_id", &start.run_id, 128)?;
+        validate_native_id("scheduler job_id", &start.job_id, 128)?;
+        let started_at = parse_postgres_timestamp(&start.started_at, "scheduler started_at")?;
+        validate_scheduler_claim(claim)?;
+        if claim.job_id != start.job_id {
+            return Err(PostgresError::InvalidInput(
+                "scheduler claim job_id does not match run start".into(),
+            ));
+        }
+        let mut conn = self.connection()?;
+        let mut tx = conn.transaction()?;
+        let job = get_observability_job_tx(&mut tx, &start.job_id)?.ok_or_else(|| {
+            PostgresError::InvalidState(format!("native job not found: {}", start.job_id))
+        })?;
+        if !job.enabled {
+            return Err(PostgresError::InvalidInput(format!(
+                "scheduler job is disabled: {}",
+                start.job_id
+            )));
+        }
+        let summary = RunSummaryPayloadV1::new(
+            Some(start.job_id.clone()),
+            Some(job.kind.clone()),
+            "running".to_string(),
+            "scheduler.run.once".to_string(),
+            None,
+            None,
+        )
+        .map_err(PostgresError::InvalidInput)?;
+        tx.execute(
+            "INSERT INTO ocfleet_native.observability_runs
+             (run_id, job_id, started_at, finished_at, status, triggered_by, summary_json)
+             VALUES ($1, $2, $3, NULL, 'running', 'scheduler.run.once', CAST($4 AS text)::jsonb)",
+            &[
+                &start.run_id,
+                &start.job_id,
+                &started_at,
+                &summary.to_value().to_string(),
+            ],
+        )?;
+        let fence_token = checked_i64(claim.fence_token, "fence token")?;
+        let affected = tx.execute(
+            "UPDATE ocfleet_native.scheduler_job_claims
+             SET active_run_id = $1, updated_at = clock_timestamp()
+             WHERE job_id = $2 AND owner_id = $3 AND fence_token = $4
+               AND owner_actor = $5 AND active_run_id IS NULL
+               AND lease_expires_at > clock_timestamp()",
+            &[
+                &start.run_id,
+                &claim.job_id,
+                &claim.owner_id,
+                &fence_token,
+                &actor,
+            ],
+        )?;
+        if affected != 1 {
+            return Err(scheduler_claim_lost(&start.job_id));
+        }
+        let mut event = AuditEvent::new(actor, "scheduler.run.start");
+        event.ok = Some(true);
+        event.detail_json = json!({
+            "run_id": start.run_id,
+            "job_id": start.job_id,
+            "kind": job.kind,
+            "status": "running",
+            "result_class": "scheduler_summary",
+        });
+        insert_audit(&mut tx, &event)?;
+        ensure_scheduler_job_claim_tx(&mut tx, claim, Some(&start.run_id), actor)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn insert_observability_run(
+        &self,
+        run: &ObservabilityRunInsert,
+    ) -> Result<(), PostgresError> {
+        validate_observability_run_insert(run)?;
+        let mut conn = self.connection()?;
+        let mut tx = conn.transaction()?;
+        insert_observability_run_tx(&mut tx, run)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn write_scheduler_outcome(
+        &self,
+        outcome: &SchedulerOutcomeWrite,
+        claim: &SchedulerJobClaim,
+        actor: &str,
+    ) -> Result<(), PostgresError> {
+        validate_scheduler_outcome(outcome, actor)?;
+        validate_scheduler_outcome_claim(outcome, claim)?;
+        let mut conn = self.connection()?;
+        let mut tx = conn.transaction()?;
+        ensure_scheduler_job_claim_tx(&mut tx, claim, outcome.run_id.as_deref(), actor)?;
+        let job = get_observability_job_tx(&mut tx, &outcome.job_id)?.ok_or_else(|| {
+            PostgresError::InvalidState(format!("native job not found: {}", outcome.job_id))
+        })?;
+        if let Some(run_id) = outcome.run_id.as_deref() {
+            let run = get_observability_run_state_tx(&mut tx, run_id)?.ok_or_else(|| {
+                PostgresError::InvalidState(format!("native run not found: {run_id}"))
+            })?;
+            if run.job_id.as_deref() != Some(outcome.job_id.as_str()) {
+                return Err(PostgresError::InvalidInput(
+                    "scheduler outcome job_id does not match run".into(),
+                ));
+            }
+            if run.status != "running" || run.finished_at.is_some() {
+                return Err(PostgresError::Store(
+                    StoreError::ObservabilityRunNotRunning(run_id.to_string()),
+                ));
+            }
+            for entry in &outcome.entries {
+                if !scheduler_job_kind_allows_method(&job.kind, &entry.observation.method) {
+                    return Err(PostgresError::InvalidInput(
+                        "scheduler outcome method is not allowed for job kind".into(),
+                    ));
+                }
+            }
+        }
+        for entry in &outcome.entries {
+            insert_probe_observation_tx(&mut tx, &entry.observation)?;
+            insert_audit(&mut tx, &entry.audit)?;
+        }
+        if let Some(clock) = &outcome.job_clock {
+            update_scheduler_job_clock_tx(&mut tx, clock)?;
+        }
+        ensure_scheduler_job_claim_tx(&mut tx, claim, outcome.run_id.as_deref(), actor)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn write_scheduler_run_finish(
+        &self,
+        finish: &SchedulerRunFinish,
+        claim: &SchedulerJobClaim,
+        actor: &str,
+    ) -> Result<(), PostgresError> {
+        validate_actor(actor).map_err(PostgresError::InvalidInput)?;
+        validate_native_id("scheduler run_id", &finish.run_id, 128)?;
+        validate_scheduler_claim(claim)?;
+        if claim.job_id != finish.job_clock.job_id {
+            return Err(PostgresError::InvalidInput(
+                "scheduler claim job_id does not match run finish".into(),
+            ));
+        }
+        let finished_at = parse_postgres_timestamp(&finish.finished_at, "scheduler finished_at")?;
+        let (next_run_at, last_run_at) = validate_scheduler_job_clock(&finish.job_clock)?;
+        if finished_at != last_run_at {
+            return Err(PostgresError::InvalidInput(
+                "scheduler last_run_at must equal finished_at".into(),
+            ));
+        }
+        let mut conn = self.connection()?;
+        let mut tx = conn.transaction()?;
+        let job = get_observability_job_tx(&mut tx, &finish.job_clock.job_id)?
+            .ok_or_else(|| PostgresError::InvalidState("native finish job disappeared".into()))?;
+        ensure_scheduler_job_claim_tx(&mut tx, claim, Some(&finish.run_id), actor)?;
+        let run = get_observability_run_state_tx(&mut tx, &finish.run_id)?.ok_or_else(|| {
+            PostgresError::InvalidState(format!("native run not found: {}", finish.run_id))
+        })?;
+        if run.status != "running" || run.finished_at.is_some() {
+            return Err(PostgresError::Store(
+                StoreError::ObservabilityRunNotRunning(finish.run_id.clone()),
+            ));
+        }
+        if run.job_id.as_deref() != Some(finish.job_clock.job_id.as_str()) {
+            return Err(PostgresError::InvalidInput(
+                "scheduler finish job_id does not match run".into(),
+            ));
+        }
+        if finished_at < run.started_at {
+            return Err(PostgresError::InvalidInput(
+                "scheduler finished_at must not precede started_at".into(),
+            ));
+        }
+        let counts = tx.query_one(
+            "SELECT COUNT(*), COUNT(*) FILTER (WHERE ok = FALSE)
+             FROM ocfleet_native.probe_observations WHERE run_id = $1",
+            &[&finish.run_id],
+        )?;
+        let observation_count = checked_u64(counts.try_get(0)?, "observation count")?;
+        let failed_observation_count = checked_u64(counts.try_get(1)?, "failed observation count")?;
+        let status = if observation_count == 0 {
+            "skipped"
+        } else if failed_observation_count == 0 {
+            "succeeded"
+        } else {
+            "failed"
+        };
+        let summary = RunSummaryPayloadV1::new(
+            Some(finish.job_clock.job_id.clone()),
+            Some(job.kind.clone()),
+            status.to_string(),
+            "scheduler.run.once".to_string(),
+            Some(observation_count),
+            Some(failed_observation_count),
+        )
+        .map_err(PostgresError::InvalidState)?;
+        let affected = tx.execute(
+            "UPDATE ocfleet_native.observability_runs
+             SET finished_at = $1, status = $2, summary_json = CAST($3 AS text)::jsonb
+             WHERE run_id = $4 AND status = 'running' AND finished_at IS NULL",
+            &[
+                &finished_at,
+                &status,
+                &summary.to_value().to_string(),
+                &finish.run_id,
+            ],
+        )?;
+        if affected != 1 {
+            return Err(PostgresError::Store(
+                StoreError::ObservabilityRunNotRunning(finish.run_id.clone()),
+            ));
+        }
+        update_scheduler_job_clock_values_tx(
+            &mut tx,
+            &finish.job_clock.job_id,
+            next_run_at,
+            last_run_at,
+        )?;
+        let fence_token = checked_i64(claim.fence_token, "fence token")?;
+        let cleared = tx.execute(
+            "UPDATE ocfleet_native.scheduler_job_claims
+             SET active_run_id = NULL, updated_at = clock_timestamp()
+             WHERE job_id = $1 AND owner_id = $2 AND fence_token = $3
+               AND owner_actor = $4 AND active_run_id = $5
+               AND lease_expires_at > clock_timestamp()",
+            &[
+                &finish.job_clock.job_id,
+                &claim.owner_id,
+                &fence_token,
+                &actor,
+                &finish.run_id,
+            ],
+        )?;
+        if cleared != 1 {
+            return Err(scheduler_claim_lost(&claim.job_id));
+        }
+        let mut event = AuditEvent::new(actor, "scheduler.run.finish");
+        event.ok = Some(status != "failed");
+        event.detail_json = json!({
+            "run_id": finish.run_id,
+            "job_id": finish.job_clock.job_id,
+            "kind": job.kind,
+            "status": status,
+            "observations": observation_count,
+            "failed_observations": failed_observation_count,
+            "result_class": "scheduler_summary",
+        });
+        insert_audit(&mut tx, &event)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn insert_probe_observation(
+        &self,
+        observation: &ProbeObservationInsert,
+    ) -> Result<(), PostgresError> {
+        validate_probe_observation(observation)?;
+        let mut conn = self.connection()?;
+        let mut tx = conn.transaction()?;
+        insert_probe_observation_tx(&mut tx, observation)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn list_observability_runs(
+        &self,
+        limit: u64,
+    ) -> Result<Vec<ObservabilityRunRecord>, PostgresError> {
+        let limit = checked_query_limit(limit)?;
+        let mut conn = self.connection()?;
+        conn.query(
+            "SELECT r.run_id, r.job_id, r.started_at, r.finished_at, r.status,
+                    r.triggered_by, r.summary_json::text, COUNT(o.observation_id),
+                    COUNT(o.observation_id) FILTER (WHERE o.ok = FALSE), j.kind
+             FROM ocfleet_native.observability_runs r
+             LEFT JOIN ocfleet_native.probe_observations o ON o.run_id = r.run_id
+             LEFT JOIN ocfleet_native.observability_jobs j ON j.job_id = r.job_id
+             GROUP BY r.run_id, j.kind ORDER BY r.started_at DESC, r.run_id DESC LIMIT $1",
+            &[&limit],
+        )?
+        .iter()
+        .map(observability_run_from_row)
+        .collect()
+    }
+
+    pub fn get_observability_run(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<ObservabilityRunRecord>, PostgresError> {
+        validate_native_id("scheduler run_id", run_id, 128)?;
+        let mut conn = self.connection()?;
+        conn.query_opt(
+            "SELECT r.run_id, r.job_id, r.started_at, r.finished_at, r.status,
+                    r.triggered_by, r.summary_json::text, COUNT(o.observation_id),
+                    COUNT(o.observation_id) FILTER (WHERE o.ok = FALSE), j.kind
+             FROM ocfleet_native.observability_runs r
+             LEFT JOIN ocfleet_native.probe_observations o ON o.run_id = r.run_id
+             LEFT JOIN ocfleet_native.observability_jobs j ON j.job_id = r.job_id
+             WHERE r.run_id = $1 GROUP BY r.run_id, j.kind",
+            &[&run_id],
+        )?
+        .as_ref()
+        .map(observability_run_from_row)
+        .transpose()
+    }
+
+    pub fn list_probe_observations_filtered(
+        &self,
+        node_filter: Option<&str>,
+        method_filter: Option<&str>,
+        since: Option<&str>,
+        limit: u64,
+    ) -> Result<Vec<ProbeObservationRecord>, PostgresError> {
+        if let Some(node_id) = node_filter {
+            validate_native_id("observation node_id", node_id, 128)?;
+        }
+        if let Some(method) = method_filter {
+            validate_observation_method(method)?;
+        }
+        let since = since
+            .map(|value| parse_postgres_timestamp(value, "observation since"))
+            .transpose()?;
+        let limit = checked_query_limit(limit)?;
+        let mut conn = self.connection()?;
+        conn.query(
+            "SELECT observation_id, run_id, node_id, endpoint_id, method, ok, error_code,
+                    duration_ms, observed_at, expires_at, result_class, summary_json::text
+             FROM ocfleet_native.probe_observations
+             WHERE ($1::text IS NULL OR node_id = $1)
+               AND ($2::text IS NULL OR method = $2)
+               AND ($3::timestamptz IS NULL OR observed_at >= $3)
+             ORDER BY observed_at DESC, observation_id DESC LIMIT $4",
+            &[&node_filter, &method_filter, &since, &limit],
+        )?
+        .iter()
+        .map(probe_observation_from_row)
+        .collect()
+    }
+
+    pub fn get_probe_observation(
+        &self,
+        observation_id: &str,
+    ) -> Result<Option<ProbeObservationRecord>, PostgresError> {
+        validate_native_id("observation_id", observation_id, 128)?;
+        let mut conn = self.connection()?;
+        conn.query_opt(
+            "SELECT observation_id, run_id, node_id, endpoint_id, method, ok, error_code,
+                    duration_ms, observed_at, expires_at, result_class, summary_json::text
+             FROM ocfleet_native.probe_observations WHERE observation_id = $1",
+            &[&observation_id],
+        )?
+        .as_ref()
+        .map(probe_observation_from_row)
+        .transpose()
+    }
+
+    pub fn get_retention_policy(
+        &self,
+        scope: &str,
+    ) -> Result<Option<RetentionPolicyRecord>, PostgresError> {
+        validate_retention_scope(scope)?;
+        let mut conn = self.connection()?;
+        conn.query_opt(
+            "SELECT scope, max_age_days, max_rows, updated_at
+             FROM ocfleet_native.retention_policies WHERE scope = $1",
+            &[&scope],
+        )?
+        .as_ref()
+        .map(retention_policy_from_row)
+        .transpose()
+    }
+
+    pub fn set_retention_policy(
+        &self,
+        policy: &RetentionPolicyRecord,
+        actor: &str,
+    ) -> Result<RetentionPolicyRecord, PostgresError> {
+        validate_actor(actor).map_err(PostgresError::InvalidInput)?;
+        validate_retention_policy(policy)?;
+        let updated_at = parse_postgres_timestamp(&policy.updated_at, "retention updated_at")?;
+        let max_age_days = policy
+            .max_age_days
+            .map(|value| checked_i64(value, "retention max_age_days"))
+            .transpose()?;
+        let max_rows = policy
+            .max_rows
+            .map(|value| checked_i64(value, "retention max_rows"))
+            .transpose()?;
+        let mut conn = self.connection()?;
+        let mut tx = conn.transaction()?;
+        let before = get_retention_policy_tx(&mut tx, &policy.scope)?;
+        if before.as_ref().is_some_and(|existing| {
+            existing.max_age_days == policy.max_age_days && existing.max_rows == policy.max_rows
+        }) {
+            tx.commit()?;
+            return Ok(before.expect("checked existing policy"));
+        }
+        tx.execute(
+            "INSERT INTO ocfleet_native.retention_policies
+             (scope, max_age_days, max_rows, updated_at) VALUES ($1, $2, $3, $4)
+             ON CONFLICT (scope) DO UPDATE SET max_age_days = EXCLUDED.max_age_days,
+               max_rows = EXCLUDED.max_rows, updated_at = EXCLUDED.updated_at",
+            &[&policy.scope, &max_age_days, &max_rows, &updated_at],
+        )?;
+        let after = get_retention_policy_tx(&mut tx, &policy.scope)?.ok_or_else(|| {
+            PostgresError::InvalidState("native retention policy disappeared".into())
+        })?;
+        let mut event = AuditEvent::new(actor, "retention.set");
+        event.ok = Some(true);
+        event.detail_json = json!({
+            "actor_type": "user",
+            "target_type": "retention_policy",
+            "target_id": policy.scope,
+            "before": before.as_ref().map(retention_policy_json),
+            "after": retention_policy_json(&after),
+            "reason": Value::Null,
+        });
+        insert_audit(&mut tx, &event)?;
+        tx.commit()?;
+        Ok(after)
+    }
+
+    pub fn retention_candidate_report(
+        &self,
+        scope: &str,
+        cutoff: Option<&str>,
+        max_rows: Option<u64>,
+    ) -> Result<RetentionCandidateReport, PostgresError> {
+        validate_retention_scope(scope)?;
+        validate_retention_max_rows(max_rows)?;
+        let cutoff = cutoff
+            .map(|value| parse_postgres_timestamp(value, "retention cutoff"))
+            .transpose()?;
+        let max_rows = max_rows
+            .map(|value| checked_i64(value, "retention max_rows"))
+            .transpose()?;
+        let mut conn = self.connection()?;
+        retention_candidate_report_tx(&mut *conn, scope, cutoff, max_rows)
+    }
+
+    pub fn apply_retention(
+        &self,
+        input: &RetentionApplyInput,
+        actor: &str,
+    ) -> Result<RetentionApplyResult, PostgresError> {
+        validate_actor(actor).map_err(PostgresError::InvalidInput)?;
+        validate_retention_apply_input(input)?;
+        let input_json = retention_input_json(input);
+        let mut conn = self.connection()?;
+        let mut tx = conn.transaction()?;
+        lock_retention_target_tx(&mut tx, &input.scope)?;
+        if let Some(row) = tx.query_opt(
+            "SELECT actor, input_json::text, result_json::text
+             FROM ocfleet_native.retention_operations WHERE operation_id = $1 FOR UPDATE",
+            &[&input.operation_id],
+        )? {
+            let existing_actor: String = row.try_get(0)?;
+            let existing_input: String = row.try_get(1)?;
+            let existing_input: Value = serde_json::from_str(&existing_input).map_err(|_| {
+                PostgresError::InvalidState("native retention operation input is invalid".into())
+            })?;
+            if existing_actor != actor || existing_input != input_json {
+                return Err(retention_operation_conflict(&input.operation_id));
+            }
+            let result_json: String = row.try_get(2)?;
+            let result = retention_result_from_json(&result_json, &input.operation_id)?;
+            tx.commit()?;
+            return Ok(result);
+        }
+        let cutoff = match (&input.cutoff, input.max_age_days) {
+            (Some(cutoff), _) => Some(parse_postgres_timestamp(cutoff, "retention cutoff")?),
+            (None, Some(days)) => Some(
+                OffsetDateTime::now_utc()
+                    - time::Duration::days(checked_i64(days, "retention max_age_days")?),
+            ),
+            (None, None) => None,
+        };
+        let max_rows = input
+            .max_rows
+            .map(|value| checked_i64(value, "retention max_rows"))
+            .transpose()?;
+        let candidate_report =
+            retention_candidate_report_tx(&mut tx, &input.scope, cutoff, max_rows)?;
+        let planned_delete_count = input
+            .limit
+            .map(|limit| candidate_report.matched_count.min(limit))
+            .unwrap_or(candidate_report.matched_count);
+        let mut rows_deleted = 0_u64;
+        let mut batch_count = 0_u64;
+        while rows_deleted < planned_delete_count {
+            let batch = (planned_delete_count - rows_deleted).min(input.batch_size);
+            let deleted = prune_retention_batch_tx(
+                &mut tx,
+                &input.scope,
+                cutoff,
+                max_rows,
+                checked_i64(batch, "retention batch")?,
+            )?;
+            if deleted == 0 {
+                break;
+            }
+            rows_deleted = rows_deleted.checked_add(deleted).ok_or_else(|| {
+                PostgresError::InvalidState("native retention deleted count overflow".into())
+            })?;
+            batch_count = batch_count.checked_add(1).ok_or_else(|| {
+                PostgresError::InvalidState("native retention batch count overflow".into())
+            })?;
+        }
+        let result = RetentionApplyResult {
+            cutoff: cutoff
+                .map(|value| format_postgres_timestamp(value, "retention cutoff"))
+                .transpose()?,
+            candidate_report,
+            planned_delete_count,
+            rows_deleted,
+            batch_count,
+        };
+        let result_json = retention_result_json(&result);
+        tx.execute(
+            "INSERT INTO ocfleet_native.retention_operations
+             (operation_id, actor, input_json, result_json)
+             VALUES ($1, $2, CAST($3 AS text)::jsonb, CAST($4 AS text)::jsonb)",
+            &[
+                &input.operation_id,
+                &actor,
+                &input_json.to_string(),
+                &result_json.to_string(),
+            ],
+        )?;
+        let mut event = AuditEvent::new(actor, "retention.apply");
+        event.ok = Some(true);
+        event.request_id = Some(input.operation_id.clone());
+        event.detail_json = json!({
+            "actor_type": "user",
+            "target_type": "retention_scope",
+            "target_id": input.scope,
+            "requested_cutoff": input.cutoff,
+            "max_age_days": input.max_age_days,
+            "cutoff": result.cutoff,
+            "max_rows": input.max_rows,
+            "limit": input.limit,
+            "batch_size": input.batch_size,
+            "matched_count": result.candidate_report.matched_count,
+            "planned_delete_count": result.planned_delete_count,
+            "deleted_count": result.rows_deleted,
+            "batch_count": result.batch_count,
+            "oldest_candidate": result.candidate_report.oldest_timestamp,
+            "newest_candidate": result.candidate_report.newest_timestamp,
+            "reason": Value::Null,
+        });
+        insert_audit(&mut tx, &event)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
     pub fn audit_count(&self, event: &str) -> Result<i64, PostgresError> {
         let mut conn = self.connection()?;
         Ok(conn
@@ -1869,6 +2958,13 @@ fn validate_native_schema(tx: &mut Transaction<'_>) -> Result<(), PostgresError>
         "ocfleet_native.node_capability_snapshots",
         "ocfleet_native.enrollment_tokens",
         "ocfleet_native.join_requests",
+        "ocfleet_native.observability_jobs",
+        "ocfleet_native.observability_runs",
+        "ocfleet_native.probe_observations",
+        "ocfleet_native.scheduler_job_claims",
+        "ocfleet_native.scheduler_maintenance",
+        "ocfleet_native.retention_policies",
+        "ocfleet_native.retention_operations",
     ] {
         let is_table: bool = tx
             .query_one(
@@ -1939,6 +3035,45 @@ fn validate_native_schema(tx: &mut Transaction<'_>) -> Result<(), PostgresError>
          FROM ocfleet_native.join_requests LIMIT 0",
         &[],
     )?;
+    tx.query(
+        "SELECT job_id, kind, selector_json, pair_selector_json, interval_seconds,
+                jitter_seconds, timeout_ms, enabled, next_run_at, last_run_at,
+                created_at, updated_at
+         FROM ocfleet_native.observability_jobs LIMIT 0",
+        &[],
+    )?;
+    tx.query(
+        "SELECT run_id, job_id, started_at, finished_at, status, triggered_by, summary_json
+         FROM ocfleet_native.observability_runs LIMIT 0",
+        &[],
+    )?;
+    tx.query(
+        "SELECT observation_id, run_id, node_id, endpoint_id, method, ok, error_code,
+                duration_ms, observed_at, expires_at, result_class, summary_json
+         FROM ocfleet_native.probe_observations LIMIT 0",
+        &[],
+    )?;
+    tx.query(
+        "SELECT job_id, owner_id, owner_actor, fence_token, claimed_at, lease_expires_at,
+                active_run_id, updated_at
+         FROM ocfleet_native.scheduler_job_claims LIMIT 0",
+        &[],
+    )?;
+    tx.query(
+        "SELECT singleton_id, starts_at, ends_at, reason, updated_at
+         FROM ocfleet_native.scheduler_maintenance LIMIT 0",
+        &[],
+    )?;
+    tx.query(
+        "SELECT scope, max_age_days, max_rows, updated_at
+         FROM ocfleet_native.retention_policies LIMIT 0",
+        &[],
+    )?;
+    tx.query(
+        "SELECT operation_id, actor, input_json, result_json, created_at
+         FROM ocfleet_native.retention_operations LIMIT 0",
+        &[],
+    )?;
     Ok(())
 }
 
@@ -1957,6 +3092,1284 @@ fn checked_query_limit(limit: u64) -> Result<i64, PostgresError> {
     }
     i64::try_from(limit)
         .map_err(|_| PostgresError::InvalidInput("query limit exceeds i64".to_string()))
+}
+
+fn checked_i64(value: u64, field: &str) -> Result<i64, PostgresError> {
+    i64::try_from(value).map_err(|_| PostgresError::InvalidInput(format!("{field} exceeds i64")))
+}
+
+fn checked_u64(value: i64, field: &str) -> Result<u64, PostgresError> {
+    u64::try_from(value)
+        .map_err(|_| PostgresError::InvalidState(format!("native {field} is negative")))
+}
+
+fn validate_native_id(field: &str, value: &str, max_len: usize) -> Result<(), PostgresError> {
+    if value.is_empty()
+        || value.len() > max_len
+        || value
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+    {
+        return Err(PostgresError::InvalidInput(format!(
+            "{field} must be a bounded non-whitespace identifier"
+        )));
+    }
+    Ok(())
+}
+
+fn parse_optional_postgres_timestamp(
+    value: &Option<String>,
+    field: &str,
+) -> Result<Option<OffsetDateTime>, PostgresError> {
+    value
+        .as_deref()
+        .map(|value| parse_postgres_timestamp(value, field))
+        .transpose()
+}
+
+fn validate_scheduler_job_kind(kind: &str) -> Result<(), PostgresError> {
+    if matches!(
+        kind,
+        "controller-ping" | "ocserv-status" | "ocserv-cert" | "ocserv-sessions" | "path-probe"
+    ) {
+        Ok(())
+    } else {
+        Err(PostgresError::InvalidInput(
+            "scheduler job kind is invalid".to_string(),
+        ))
+    }
+}
+
+fn validate_observability_job(
+    job: &ObservabilityJobRecord,
+    actor: &str,
+) -> Result<(), PostgresError> {
+    validate_actor(actor).map_err(PostgresError::InvalidInput)?;
+    validate_native_id("scheduler job_id", &job.job_id, 128)?;
+    validate_scheduler_job_kind(&job.kind)?;
+    let selector = SchedulerSelectorPayloadV1::from_value(&job.selector_json)
+        .map_err(PostgresError::InvalidInput)?;
+    let pair = job
+        .pair_selector_json
+        .as_ref()
+        .map(SchedulerPairPayloadV1::from_value)
+        .transpose()
+        .map_err(PostgresError::InvalidInput)?;
+    validate_scheduler_payload_relationship(&job.kind, &selector, pair.as_ref())
+        .map_err(PostgresError::InvalidInput)?;
+    if !(60..=86_400).contains(&job.interval_seconds) {
+        return Err(PostgresError::InvalidInput(
+            "interval_seconds must be between 60 and 86400".to_string(),
+        ));
+    }
+    if job.jitter_seconds > 3_600 || job.jitter_seconds > job.interval_seconds {
+        return Err(PostgresError::InvalidInput(
+            "jitter_seconds must be at most 3600 and not exceed interval_seconds".to_string(),
+        ));
+    }
+    if !(1_000..=30_000).contains(&job.timeout_ms) {
+        return Err(PostgresError::InvalidInput(
+            "timeout_ms must be between 1000 and 30000".to_string(),
+        ));
+    }
+    parse_optional_postgres_timestamp(&job.next_run_at, "job next_run_at")?;
+    parse_optional_postgres_timestamp(&job.last_run_at, "job last_run_at")?;
+    parse_postgres_timestamp(&job.created_at, "job created_at")?;
+    parse_postgres_timestamp(&job.updated_at, "job updated_at")?;
+    Ok(())
+}
+
+fn observability_job_from_row(
+    row: &postgres::Row,
+) -> Result<ObservabilityJobRecord, PostgresError> {
+    let selector_json: String = row.try_get(2)?;
+    let selector_json: Value = serde_json::from_str(&selector_json)
+        .map_err(|_| PostgresError::InvalidState("native job selector JSON is invalid".into()))?;
+    let selector = SchedulerSelectorPayloadV1::from_value(&selector_json)
+        .map_err(|error| PostgresError::InvalidState(format!("native job selector: {error}")))?;
+    let pair_json: Option<String> = row.try_get(3)?;
+    let pair_selector_json = pair_json
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()
+        .map_err(|_| PostgresError::InvalidState("native job pair JSON is invalid".into()))?;
+    let pair = pair_selector_json
+        .as_ref()
+        .map(SchedulerPairPayloadV1::from_value)
+        .transpose()
+        .map_err(|error| PostgresError::InvalidState(format!("native job pair: {error}")))?;
+    let kind: String = row.try_get(1)?;
+    validate_scheduler_job_kind(&kind)
+        .map_err(|error| PostgresError::InvalidState(error.to_string()))?;
+    validate_scheduler_payload_relationship(&kind, &selector, pair.as_ref())
+        .map_err(|error| PostgresError::InvalidState(format!("native job payload: {error}")))?;
+    let record = ObservabilityJobRecord {
+        job_id: row.try_get(0)?,
+        kind,
+        selector_json,
+        pair_selector_json,
+        interval_seconds: checked_u64(row.try_get(4)?, "job interval_seconds")?,
+        jitter_seconds: checked_u64(row.try_get(5)?, "job jitter_seconds")?,
+        timeout_ms: checked_u64(row.try_get(6)?, "job timeout_ms")?,
+        enabled: row.try_get(7)?,
+        next_run_at: row
+            .try_get::<_, Option<OffsetDateTime>>(8)?
+            .map(|value| format_postgres_timestamp(value, "job next_run_at"))
+            .transpose()?,
+        last_run_at: row
+            .try_get::<_, Option<OffsetDateTime>>(9)?
+            .map(|value| format_postgres_timestamp(value, "job last_run_at"))
+            .transpose()?,
+        created_at: format_postgres_timestamp(row.try_get(10)?, "job created_at")?,
+        updated_at: format_postgres_timestamp(row.try_get(11)?, "job updated_at")?,
+    };
+    if record.jitter_seconds > record.interval_seconds {
+        return Err(PostgresError::InvalidState(
+            "native job jitter exceeds interval".into(),
+        ));
+    }
+    Ok(record)
+}
+
+fn get_observability_job_tx(
+    tx: &mut Transaction<'_>,
+    job_id: &str,
+) -> Result<Option<ObservabilityJobRecord>, PostgresError> {
+    tx.query_opt(
+        "SELECT job_id, kind, selector_json::text, pair_selector_json::text,
+                interval_seconds, jitter_seconds, timeout_ms, enabled,
+                next_run_at, last_run_at, created_at, updated_at
+         FROM ocfleet_native.observability_jobs WHERE job_id = $1 FOR UPDATE",
+        &[&job_id],
+    )?
+    .as_ref()
+    .map(observability_job_from_row)
+    .transpose()
+}
+
+fn scheduler_job_audit_detail(job: &ObservabilityJobRecord, state: &str) -> Value {
+    json!({
+        "job_id": job.job_id,
+        "kind": job.kind,
+        "enabled": job.enabled,
+        "state": state,
+        "result_class": "scheduler_summary",
+    })
+}
+
+fn validate_scheduler_maintenance(
+    window: &SchedulerMaintenanceWindow,
+) -> Result<(OffsetDateTime, OffsetDateTime, OffsetDateTime), PostgresError> {
+    validate_reason(&window.reason).map_err(PostgresError::InvalidInput)?;
+    let starts_at = parse_postgres_timestamp(&window.starts_at, "maintenance starts_at")?;
+    let ends_at = parse_postgres_timestamp(&window.ends_at, "maintenance ends_at")?;
+    let updated_at = parse_postgres_timestamp(&window.updated_at, "maintenance updated_at")?;
+    if ends_at <= starts_at {
+        return Err(PostgresError::InvalidInput(
+            "scheduler maintenance ends_at must be later than starts_at".into(),
+        ));
+    }
+    Ok((starts_at, ends_at, updated_at))
+}
+
+fn scheduler_maintenance_from_row(
+    row: &postgres::Row,
+) -> Result<SchedulerMaintenanceWindow, PostgresError> {
+    let window = SchedulerMaintenanceWindow {
+        starts_at: format_postgres_timestamp(row.try_get(0)?, "maintenance starts_at")?,
+        ends_at: format_postgres_timestamp(row.try_get(1)?, "maintenance ends_at")?,
+        reason: row.try_get(2)?,
+        updated_at: format_postgres_timestamp(row.try_get(3)?, "maintenance updated_at")?,
+    };
+    validate_scheduler_maintenance(&window)
+        .map_err(|error| PostgresError::InvalidState(error.to_string()))?;
+    Ok(window)
+}
+
+fn validate_scheduler_claim_input(
+    owner_id: &str,
+    now: &str,
+    lease_seconds: u64,
+    actor: &str,
+) -> Result<(), PostgresError> {
+    validate_native_id("scheduler owner_id", owner_id, 128)?;
+    validate_actor(actor).map_err(PostgresError::InvalidInput)?;
+    if !(MIN_SCHEDULER_LEASE_SECONDS..=MAX_SCHEDULER_LEASE_SECONDS).contains(&lease_seconds) {
+        return Err(PostgresError::InvalidInput(format!(
+            "scheduler lease must be between {MIN_SCHEDULER_LEASE_SECONDS} and {MAX_SCHEDULER_LEASE_SECONDS} seconds"
+        )));
+    }
+    parse_postgres_timestamp(now, "scheduler event timestamp")?;
+    Ok(())
+}
+
+fn validate_scheduler_claim(claim: &SchedulerJobClaim) -> Result<(), PostgresError> {
+    validate_native_id("scheduler job_id", &claim.job_id, 128)?;
+    validate_native_id("scheduler owner_id", &claim.owner_id, 128)?;
+    if claim.fence_token == 0 {
+        return Err(PostgresError::InvalidInput(
+            "scheduler fence token must be positive".into(),
+        ));
+    }
+    let claimed_at = parse_postgres_timestamp(&claim.claimed_at, "claim claimed_at")?;
+    let lease_expires_at =
+        parse_postgres_timestamp(&claim.lease_expires_at, "claim lease_expires_at")?;
+    if lease_expires_at <= claimed_at {
+        return Err(PostgresError::InvalidInput(
+            "scheduler lease must expire after claimed_at".into(),
+        ));
+    }
+    if let Some(run_id) = &claim.active_run_id {
+        validate_native_id("scheduler active_run_id", run_id, 128)?;
+    }
+    Ok(())
+}
+
+fn scheduler_claim_from_row(row: &postgres::Row) -> Result<SchedulerJobClaim, PostgresError> {
+    let owner_id: Option<String> = row.try_get(1)?;
+    let claimed_at: Option<OffsetDateTime> = row.try_get(3)?;
+    let lease_expires_at: Option<OffsetDateTime> = row.try_get(4)?;
+    let claim = SchedulerJobClaim {
+        job_id: row.try_get(0)?,
+        owner_id: owner_id.ok_or_else(|| {
+            PostgresError::InvalidState("native scheduler claim owner is missing".into())
+        })?,
+        fence_token: checked_u64(row.try_get(2)?, "scheduler fence token")?,
+        claimed_at: format_postgres_timestamp(
+            claimed_at.ok_or_else(|| {
+                PostgresError::InvalidState("native scheduler claimed_at is missing".into())
+            })?,
+            "scheduler claimed_at",
+        )?,
+        lease_expires_at: format_postgres_timestamp(
+            lease_expires_at.ok_or_else(|| {
+                PostgresError::InvalidState("native scheduler lease_expires_at is missing".into())
+            })?,
+            "scheduler lease_expires_at",
+        )?,
+        active_run_id: row.try_get(5)?,
+    };
+    validate_scheduler_claim(&claim)
+        .map_err(|error| PostgresError::InvalidState(error.to_string()))?;
+    Ok(claim)
+}
+
+fn scheduler_claim_lost(job_id: &str) -> PostgresError {
+    PostgresError::Store(StoreError::SchedulerClaimLost(job_id.to_string()))
+}
+
+fn postgres_clock_timestamp(tx: &mut Transaction<'_>) -> Result<OffsetDateTime, PostgresError> {
+    Ok(tx.query_one("SELECT clock_timestamp()", &[])?.try_get(0)?)
+}
+
+fn acquire_scheduler_claim_tx(
+    tx: &mut Transaction<'_>,
+    job_id: &str,
+    owner_id: &str,
+    lease_seconds: u64,
+    actor: &str,
+    require_due: bool,
+) -> Result<Option<SchedulerJobClaim>, PostgresError> {
+    let job = get_observability_job_tx(tx, job_id)?
+        .ok_or_else(|| PostgresError::InvalidState(format!("native job not found: {job_id}")))?;
+    if !job.enabled {
+        return Ok(None);
+    }
+    let existing = tx.query_opt(
+        "SELECT job_id, owner_id, fence_token, claimed_at, lease_expires_at, active_run_id
+         FROM ocfleet_native.scheduler_job_claims WHERE job_id = $1 FOR UPDATE",
+        &[&job_id],
+    )?;
+    let authoritative_now = postgres_clock_timestamp(tx)?;
+    if require_due
+        && job
+            .next_run_at
+            .as_deref()
+            .map(|value| parse_postgres_timestamp(value, "stored job next_run_at"))
+            .transpose()?
+            .is_some_and(|next| next > authoritative_now)
+    {
+        return Ok(None);
+    }
+    if let Some(row) = &existing {
+        let owner: Option<String> = row.try_get(1)?;
+        let expires: Option<OffsetDateTime> = row.try_get(4)?;
+        if owner.is_some() && expires.is_some_and(|expires| expires > authoritative_now) {
+            return Ok(None);
+        }
+        let active_run_id: Option<String> = row.try_get(5)?;
+        if let Some(run_id) = active_run_id {
+            recover_expired_scheduler_run_tx(tx, job_id, &run_id, authoritative_now, actor)?;
+        }
+    }
+    let previous_fence = existing
+        .as_ref()
+        .map(|row| row.try_get::<_, i64>(2))
+        .transpose()?
+        .unwrap_or(0);
+    let fence_token = previous_fence.checked_add(1).ok_or_else(|| {
+        PostgresError::InvalidState("native scheduler fence token overflow".into())
+    })?;
+    let lease_expires_at =
+        authoritative_now + time::Duration::seconds(checked_i64(lease_seconds, "lease")?);
+    tx.execute(
+        "INSERT INTO ocfleet_native.scheduler_job_claims
+         (job_id, owner_id, owner_actor, fence_token, claimed_at,
+          lease_expires_at, active_run_id, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, NULL, $5)
+         ON CONFLICT (job_id) DO UPDATE SET owner_id = EXCLUDED.owner_id,
+           owner_actor = EXCLUDED.owner_actor, fence_token = EXCLUDED.fence_token,
+           claimed_at = EXCLUDED.claimed_at,
+           lease_expires_at = EXCLUDED.lease_expires_at, active_run_id = NULL,
+           updated_at = EXCLUDED.updated_at",
+        &[
+            &job_id,
+            &owner_id,
+            &actor,
+            &fence_token,
+            &authoritative_now,
+            &lease_expires_at,
+        ],
+    )?;
+    let claim = SchedulerJobClaim {
+        job_id: job_id.to_string(),
+        owner_id: owner_id.to_string(),
+        fence_token: checked_u64(fence_token, "scheduler fence token")?,
+        claimed_at: format_postgres_timestamp(authoritative_now, "scheduler claimed_at")?,
+        lease_expires_at: format_postgres_timestamp(
+            lease_expires_at,
+            "scheduler lease_expires_at",
+        )?,
+        active_run_id: None,
+    };
+    insert_scheduler_claim_audit(tx, "scheduler.claim.acquire", &claim, actor, "acquired")?;
+    Ok(Some(claim))
+}
+
+fn recover_expired_scheduler_run_tx(
+    tx: &mut Transaction<'_>,
+    job_id: &str,
+    run_id: &str,
+    recovered_at: OffsetDateTime,
+    actor: &str,
+) -> Result<(), PostgresError> {
+    let run = get_observability_run_state_tx(tx, run_id)?.ok_or_else(|| {
+        PostgresError::Store(StoreError::ObservabilityRunNotFound(run_id.to_string()))
+    })?;
+    if run.job_id.as_deref() != Some(job_id) {
+        return Err(PostgresError::InvalidInput(
+            "expired scheduler claim references a run for another job".into(),
+        ));
+    }
+    if run.status != "running" || run.finished_at.is_some() {
+        return Ok(());
+    }
+    let finished_at = recovered_at.max(run.started_at);
+    let kind: String = tx
+        .query_one(
+            "SELECT kind FROM ocfleet_native.observability_jobs WHERE job_id = $1",
+            &[&job_id],
+        )?
+        .try_get(0)?;
+    let summary = RunSummaryPayloadV1::new(
+        Some(job_id.to_string()),
+        Some(kind.clone()),
+        "failed".to_string(),
+        "scheduler.run.once".to_string(),
+        Some(0),
+        Some(0),
+    )
+    .map_err(PostgresError::InvalidState)?;
+    let affected = tx.execute(
+        "UPDATE ocfleet_native.observability_runs
+         SET finished_at = $1, status = 'failed', summary_json = CAST($2 AS text)::jsonb
+         WHERE run_id = $3 AND job_id = $4 AND status = 'running' AND finished_at IS NULL",
+        &[
+            &finished_at,
+            &summary.to_value().to_string(),
+            &run_id,
+            &job_id,
+        ],
+    )?;
+    if affected != 1 {
+        return Err(PostgresError::Store(
+            StoreError::ObservabilityRunNotRunning(run_id.to_string()),
+        ));
+    }
+    let mut event = AuditEvent::new(actor, "scheduler.run.recover");
+    event.ok = Some(false);
+    event.error_code = Some("SCHEDULER_LEASE_EXPIRED".to_string());
+    event.detail_json = json!({
+        "run_id": run_id,
+        "job_id": job_id,
+        "kind": kind,
+        "status": "failed",
+        "reason_code": "SCHEDULER_LEASE_EXPIRED",
+        "result_class": "scheduler_summary",
+    });
+    insert_audit(tx, &event)
+}
+
+fn insert_scheduler_claim_audit(
+    tx: &mut Transaction<'_>,
+    event_name: &str,
+    claim: &SchedulerJobClaim,
+    actor: &str,
+    state: &str,
+) -> Result<(), PostgresError> {
+    let mut event = AuditEvent::new(actor, event_name);
+    event.ok = Some(true);
+    event.detail_json = json!({
+        "job_id": claim.job_id,
+        "correlation_id": claim.owner_id,
+        "generation": claim.fence_token,
+        "expires_at": claim.lease_expires_at,
+        "state": state,
+    });
+    insert_audit(tx, &event)
+}
+
+#[derive(Debug)]
+struct NativeRunState {
+    job_id: Option<String>,
+    started_at: OffsetDateTime,
+    finished_at: Option<OffsetDateTime>,
+    status: String,
+}
+
+fn validate_observability_run_insert(run: &ObservabilityRunInsert) -> Result<(), PostgresError> {
+    validate_native_id("observability run_id", &run.run_id, 128)?;
+    if let Some(job_id) = &run.job_id {
+        validate_native_id("observability job_id", job_id, 128)?;
+    }
+    let started_at = parse_postgres_timestamp(&run.started_at, "run started_at")?;
+    let finished_at = parse_optional_postgres_timestamp(&run.finished_at, "run finished_at")?;
+    if !matches!(
+        run.status.as_str(),
+        "running" | "succeeded" | "failed" | "skipped"
+    ) {
+        return Err(PostgresError::InvalidInput("run status is invalid".into()));
+    }
+    if run.triggered_by != "manual" {
+        return Err(PostgresError::InvalidInput(
+            "native direct run insertion is reserved for manual runs".into(),
+        ));
+    }
+    if (run.status == "running") != finished_at.is_none() {
+        return Err(PostgresError::InvalidInput(
+            "running run must be unfinished and completed run must be finished".into(),
+        ));
+    }
+    if finished_at.is_some_and(|finished| finished < started_at) {
+        return Err(PostgresError::InvalidInput(
+            "run finished_at must not precede started_at".into(),
+        ));
+    }
+    validate_low_sensitive_json(&run.summary_json, "observability run summary")?;
+    Ok(())
+}
+
+fn insert_observability_run_tx(
+    tx: &mut Transaction<'_>,
+    run: &ObservabilityRunInsert,
+) -> Result<(), PostgresError> {
+    let kind: Option<String> = match run.job_id.as_deref() {
+        Some(job_id) => tx
+            .query_opt(
+                "SELECT kind FROM ocfleet_native.observability_jobs WHERE job_id = $1",
+                &[&job_id],
+            )?
+            .map(|row| row.try_get(0))
+            .transpose()?,
+        None => None,
+    };
+    if run.job_id.is_some() && kind.is_none() {
+        return Err(PostgresError::InvalidState(
+            "native run references an unknown job".into(),
+        ));
+    }
+    let payload = RunSummaryPayloadV1::from_value(&run.summary_json)
+        .or_else(|_| {
+            RunSummaryPayloadV1::from_legacy(
+                run.job_id.as_deref(),
+                kind.as_deref(),
+                &run.status,
+                &run.triggered_by,
+                &run.summary_json,
+            )
+        })
+        .map_err(PostgresError::InvalidInput)?;
+    payload
+        .validate_relationship(
+            run.job_id.as_deref(),
+            kind.as_deref(),
+            &run.status,
+            &run.triggered_by,
+        )
+        .map_err(PostgresError::InvalidInput)?;
+    let started_at = parse_postgres_timestamp(&run.started_at, "run started_at")?;
+    let finished_at = parse_optional_postgres_timestamp(&run.finished_at, "run finished_at")?;
+    tx.execute(
+        "INSERT INTO ocfleet_native.observability_runs
+         (run_id, job_id, started_at, finished_at, status, triggered_by, summary_json)
+         VALUES ($1, $2, $3, $4, $5, $6, CAST($7 AS text)::jsonb)",
+        &[
+            &run.run_id,
+            &run.job_id,
+            &started_at,
+            &finished_at,
+            &run.status,
+            &run.triggered_by,
+            &payload.to_value().to_string(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn get_observability_run_state_tx(
+    tx: &mut Transaction<'_>,
+    run_id: &str,
+) -> Result<Option<NativeRunState>, PostgresError> {
+    tx.query_opt(
+        "SELECT job_id, started_at, finished_at, status
+         FROM ocfleet_native.observability_runs WHERE run_id = $1 FOR UPDATE",
+        &[&run_id],
+    )?
+    .map(|row| {
+        Ok(NativeRunState {
+            job_id: row.try_get(0)?,
+            started_at: row.try_get(1)?,
+            finished_at: row.try_get(2)?,
+            status: row.try_get(3)?,
+        })
+    })
+    .transpose()
+}
+
+fn observability_run_from_row(
+    row: &postgres::Row,
+) -> Result<ObservabilityRunRecord, PostgresError> {
+    let job_id: Option<String> = row.try_get(1)?;
+    let status: String = row.try_get(4)?;
+    let triggered_by: String = row.try_get(5)?;
+    let kind: Option<String> = row.try_get(9)?;
+    let summary: String = row.try_get(6)?;
+    let summary: Value = serde_json::from_str(&summary)
+        .map_err(|_| PostgresError::InvalidState("native run summary JSON is invalid".into()))?;
+    let payload = RunSummaryPayloadV1::from_value(&summary)
+        .map_err(|error| PostgresError::InvalidState(format!("native run summary: {error}")))?;
+    payload
+        .validate_relationship(job_id.as_deref(), kind.as_deref(), &status, &triggered_by)
+        .map_err(|error| PostgresError::InvalidState(format!("native run summary: {error}")))?;
+    Ok(ObservabilityRunRecord {
+        run_id: row.try_get(0)?,
+        job_id,
+        started_at: format_postgres_timestamp(row.try_get(2)?, "run started_at")?,
+        finished_at: row
+            .try_get::<_, Option<OffsetDateTime>>(3)?
+            .map(|value| format_postgres_timestamp(value, "run finished_at"))
+            .transpose()?,
+        status,
+        triggered_by,
+        summary_json: payload.public_summary(),
+        observation_count: checked_u64(row.try_get(7)?, "run observation count")?,
+        failed_observation_count: checked_u64(row.try_get(8)?, "run failed observation count")?,
+    })
+}
+
+fn validate_observation_method(method: &str) -> Result<(), PostgresError> {
+    if matches!(
+        method,
+        PROBE_CONTROLLER_PING
+            | PROBE_PATH_ECHO
+            | OCSERV_SERVICE_SUMMARY
+            | OCSERV_VERSION
+            | OCSERV_SESSIONS_SUMMARY
+            | OCSERV_CERT_EXPIRY
+            | OCSERV_CONFIG_FINGERPRINT
+    ) {
+        Ok(())
+    } else {
+        Err(PostgresError::InvalidInput(
+            "scheduler observation method is invalid".into(),
+        ))
+    }
+}
+
+fn validate_scheduler_observation(
+    observation: &ProbeObservationInsert,
+) -> Result<(), PostgresError> {
+    validate_probe_observation(observation)?;
+    if observation.ok.is_none() || observation.duration_ms.is_none() {
+        return Err(PostgresError::InvalidInput(
+            "scheduler observation ok and duration_ms are required".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_probe_observation(observation: &ProbeObservationInsert) -> Result<(), PostgresError> {
+    validate_native_id("scheduler observation_id", &observation.observation_id, 128)?;
+    if let Some(run_id) = &observation.run_id {
+        validate_native_id("scheduler observation run_id", run_id, 128)?;
+    }
+    if let Some(node_id) = &observation.node_id {
+        validate_native_id("scheduler observation node_id", node_id, 128)?;
+    }
+    if let Some(endpoint_id) = &observation.endpoint_id {
+        validate_native_id("scheduler observation endpoint_id", endpoint_id, 128)?;
+    }
+    validate_observation_method(&observation.method)?;
+    if let Some(error_code) = &observation.error_code {
+        validate_native_id("scheduler observation error_code", error_code, 64)?;
+    }
+    if matches!(observation.ok, Some(true)) && observation.error_code.is_some()
+        || matches!(observation.ok, Some(false)) && observation.error_code.is_none()
+        || observation.ok.is_none() && observation.error_code.is_some()
+    {
+        return Err(PostgresError::InvalidInput(
+            "scheduler observation result and error_code are inconsistent".into(),
+        ));
+    }
+    parse_postgres_timestamp(&observation.observed_at, "scheduler observed_at")?;
+    parse_optional_postgres_timestamp(&observation.expires_at, "scheduler expires_at")?;
+    if !matches!(
+        observation.result_class.as_str(),
+        "controller_rpc_summary" | "low_sensitive_summary" | "scheduler_summary"
+    ) {
+        return Err(PostgresError::InvalidInput(
+            "scheduler observation result_class is invalid".into(),
+        ));
+    }
+    validate_low_sensitive_json(&observation.summary_json, "observation summary")?;
+    canonical_observation_summary(observation)?;
+    Ok(())
+}
+
+fn canonical_observation_summary(
+    observation: &ProbeObservationInsert,
+) -> Result<Value, PostgresError> {
+    let payload = ObservationSummaryPayloadV1::from_value(&observation.summary_json)
+        .or_else(|_| {
+            ObservationSummaryPayloadV1::from_legacy(
+                &observation.method,
+                &observation.result_class,
+                &observation.summary_json,
+            )
+        })
+        .map_err(PostgresError::InvalidInput)?;
+    if payload.method != observation.method || payload.result_class != observation.result_class {
+        return Err(PostgresError::InvalidInput(
+            "observation summary does not match relational method/result class".into(),
+        ));
+    }
+    Ok(payload.to_value())
+}
+
+fn insert_probe_observation_tx(
+    tx: &mut Transaction<'_>,
+    observation: &ProbeObservationInsert,
+) -> Result<(), PostgresError> {
+    let summary = canonical_observation_summary(observation)?;
+    let duration_ms = observation
+        .duration_ms
+        .map(|value| checked_i64(value, "observation duration_ms"))
+        .transpose()?;
+    let observed_at = parse_postgres_timestamp(&observation.observed_at, "observed_at")?;
+    let expires_at = parse_optional_postgres_timestamp(&observation.expires_at, "expires_at")?;
+    tx.execute(
+        "INSERT INTO ocfleet_native.probe_observations
+         (observation_id, run_id, node_id, endpoint_id, method, ok, error_code,
+          duration_ms, observed_at, expires_at, result_class, summary_json)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+                 CAST($12 AS text)::jsonb)",
+        &[
+            &observation.observation_id,
+            &observation.run_id,
+            &observation.node_id,
+            &observation.endpoint_id,
+            &observation.method,
+            &observation.ok,
+            &observation.error_code,
+            &duration_ms,
+            &observed_at,
+            &expires_at,
+            &observation.result_class,
+            &summary.to_string(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn probe_observation_from_row(
+    row: &postgres::Row,
+) -> Result<ProbeObservationRecord, PostgresError> {
+    let method: String = row.try_get(4)?;
+    let result_class: String = row.try_get(10)?;
+    let summary: String = row.try_get(11)?;
+    let summary: Value = serde_json::from_str(&summary).map_err(|_| {
+        PostgresError::InvalidState("native observation summary JSON is invalid".into())
+    })?;
+    let payload = ObservationSummaryPayloadV1::from_value(&summary).map_err(|error| {
+        PostgresError::InvalidState(format!("native observation summary: {error}"))
+    })?;
+    if payload.method != method || payload.result_class != result_class {
+        return Err(PostgresError::InvalidState(
+            "native observation summary does not match relational fields".into(),
+        ));
+    }
+    Ok(ProbeObservationRecord {
+        observation_id: row.try_get(0)?,
+        run_id: row.try_get(1)?,
+        node_id: row.try_get(2)?,
+        endpoint_id: row.try_get(3)?,
+        method,
+        ok: row.try_get(5)?,
+        error_code: row.try_get(6)?,
+        duration_ms: row
+            .try_get::<_, Option<i64>>(7)?
+            .map(|value| checked_u64(value, "observation duration_ms"))
+            .transpose()?,
+        observed_at: format_postgres_timestamp(row.try_get(8)?, "observation observed_at")?,
+        expires_at: row
+            .try_get::<_, Option<OffsetDateTime>>(9)?
+            .map(|value| format_postgres_timestamp(value, "observation expires_at"))
+            .transpose()?,
+        result_class,
+        summary_json: payload.public_summary(),
+    })
+}
+
+fn validate_scheduler_outcome(
+    outcome: &SchedulerOutcomeWrite,
+    actor: &str,
+) -> Result<(), PostgresError> {
+    validate_actor(actor).map_err(PostgresError::InvalidInput)?;
+    validate_native_id("scheduler job_id", &outcome.job_id, 128)?;
+    if outcome.entries.is_empty() || outcome.entries.len() > MAX_SCHEDULER_OUTCOME_ENTRIES {
+        return Err(PostgresError::InvalidInput(format!(
+            "scheduler outcome must contain 1-{MAX_SCHEDULER_OUTCOME_ENTRIES} entries"
+        )));
+    }
+    match outcome.run_id.as_deref() {
+        Some(run_id) => {
+            validate_native_id("scheduler run_id", run_id, 128)?;
+            if outcome.job_clock.is_some() {
+                return Err(PostgresError::InvalidInput(
+                    "run-bound scheduler outcome cannot update job clocks".into(),
+                ));
+            }
+            for entry in &outcome.entries {
+                if entry.observation.run_id.as_deref() != Some(run_id) {
+                    return Err(PostgresError::InvalidInput(
+                        "scheduler outcome contains a mismatched run_id".into(),
+                    ));
+                }
+                if !matches!(
+                    entry.audit.event.as_str(),
+                    "rpc.completed" | "scheduler.task.outcome"
+                ) {
+                    return Err(PostgresError::InvalidInput(
+                        "run-bound scheduler outcome audit event is invalid".into(),
+                    ));
+                }
+            }
+        }
+        None => {
+            if outcome.entries.len() != 1
+                || outcome.entries[0].observation.run_id.is_some()
+                || outcome.entries[0].audit.event != "scheduler.job.invalid"
+                || outcome.entries[0].observation.ok != Some(false)
+                || outcome.entries[0].observation.error_code.as_deref()
+                    != Some("SCHEDULER_JOB_INVALID")
+            {
+                return Err(PostgresError::InvalidInput(
+                    "runless scheduler outcome must be one failed scheduler.job.invalid entry"
+                        .into(),
+                ));
+            }
+        }
+    }
+    if let Some(clock) = &outcome.job_clock {
+        validate_scheduler_job_clock(clock)?;
+        if clock.job_id != outcome.job_id {
+            return Err(PostgresError::InvalidInput(
+                "scheduler outcome clock job_id does not match outcome".into(),
+            ));
+        }
+    }
+    for entry in &outcome.entries {
+        validate_scheduler_observation(&entry.observation)?;
+        validate_scheduler_outcome_audit(&entry.audit, &entry.observation, actor)?;
+    }
+    Ok(())
+}
+
+fn validate_scheduler_outcome_claim(
+    outcome: &SchedulerOutcomeWrite,
+    claim: &SchedulerJobClaim,
+) -> Result<(), PostgresError> {
+    validate_scheduler_claim(claim)?;
+    if claim.job_id != outcome.job_id {
+        return Err(PostgresError::InvalidInput(
+            "scheduler claim job_id does not match outcome".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_scheduler_outcome_audit(
+    audit: &AuditEvent,
+    observation: &ProbeObservationInsert,
+    actor: &str,
+) -> Result<(), PostgresError> {
+    if audit.actor != actor
+        || audit.node_id != observation.node_id
+        || audit.endpoint_id != observation.endpoint_id
+        || audit.method.as_deref() != Some(observation.method.as_str())
+        || audit.ok != observation.ok
+        || audit.duration_ms != observation.duration_ms
+    {
+        return Err(PostgresError::InvalidInput(
+            "scheduler outcome audit fields do not match observation".into(),
+        ));
+    }
+    if matches!(audit.ok, Some(true)) && audit.error_code.is_some()
+        || matches!(audit.ok, Some(false)) && audit.error_code.is_none()
+    {
+        return Err(PostgresError::InvalidInput(
+            "scheduler outcome audit result and error_code are inconsistent".into(),
+        ));
+    }
+    if audit.event != "rpc.completed" && audit.error_code != observation.error_code {
+        return Err(PostgresError::InvalidInput(
+            "scheduler outcome audit error_code does not match observation".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn scheduler_job_kind_allows_method(kind: &str, method: &str) -> bool {
+    match kind {
+        "controller-ping" => method == PROBE_CONTROLLER_PING,
+        "ocserv-status" => matches!(
+            method,
+            OCSERV_SERVICE_SUMMARY
+                | OCSERV_VERSION
+                | OCSERV_SESSIONS_SUMMARY
+                | OCSERV_CONFIG_FINGERPRINT
+        ),
+        "ocserv-cert" => method == OCSERV_CERT_EXPIRY,
+        "ocserv-sessions" => method == OCSERV_SESSIONS_SUMMARY,
+        "path-probe" => method == PROBE_PATH_ECHO,
+        _ => false,
+    }
+}
+
+fn validate_scheduler_job_clock(
+    clock: &SchedulerJobClockUpdate,
+) -> Result<(OffsetDateTime, OffsetDateTime), PostgresError> {
+    validate_native_id("scheduler clock job_id", &clock.job_id, 128)?;
+    let next_run_at = parse_postgres_timestamp(&clock.next_run_at, "scheduler next_run_at")?;
+    let last_run_at = parse_postgres_timestamp(&clock.last_run_at, "scheduler last_run_at")?;
+    if next_run_at <= last_run_at {
+        return Err(PostgresError::InvalidInput(
+            "scheduler next_run_at must be later than last_run_at".into(),
+        ));
+    }
+    Ok((next_run_at, last_run_at))
+}
+
+fn update_scheduler_job_clock_tx(
+    tx: &mut Transaction<'_>,
+    clock: &SchedulerJobClockUpdate,
+) -> Result<(), PostgresError> {
+    let (next_run_at, last_run_at) = validate_scheduler_job_clock(clock)?;
+    update_scheduler_job_clock_values_tx(tx, &clock.job_id, next_run_at, last_run_at)
+}
+
+fn update_scheduler_job_clock_values_tx(
+    tx: &mut Transaction<'_>,
+    job_id: &str,
+    next_run_at: OffsetDateTime,
+    last_run_at: OffsetDateTime,
+) -> Result<(), PostgresError> {
+    let affected = tx.execute(
+        "UPDATE ocfleet_native.observability_jobs
+         SET next_run_at = $1, last_run_at = $2, updated_at = clock_timestamp()
+         WHERE job_id = $3 AND (last_run_at IS NULL OR last_run_at <= $2)",
+        &[&next_run_at, &last_run_at, &job_id],
+    )?;
+    if affected != 1 {
+        return Err(PostgresError::InvalidState(
+            "native scheduler job clock update was rejected".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_scheduler_job_claim_tx(
+    tx: &mut Transaction<'_>,
+    expected: &SchedulerJobClaim,
+    active_run_id: Option<&str>,
+    actor: &str,
+) -> Result<(), PostgresError> {
+    let fence_token = checked_i64(expected.fence_token, "fence token")?;
+    let matches = tx.query_opt(
+        "SELECT 1
+         FROM ocfleet_native.scheduler_job_claims
+         WHERE job_id = $1 AND owner_id = $2 AND fence_token = $3
+           AND owner_actor = $4 AND active_run_id IS NOT DISTINCT FROM $5
+           AND lease_expires_at > clock_timestamp()
+         FOR UPDATE",
+        &[
+            &expected.job_id,
+            &expected.owner_id,
+            &fence_token,
+            &actor,
+            &active_run_id,
+        ],
+    )?;
+    if matches.is_none() {
+        return Err(scheduler_claim_lost(&expected.job_id));
+    }
+    Ok(())
+}
+
+fn validate_retention_scope(scope: &str) -> Result<(), PostgresError> {
+    if matches!(scope, "observations" | "observability-runs") {
+        Ok(())
+    } else {
+        Err(PostgresError::InvalidInput(
+            "native retention scope is not part of C1.3".into(),
+        ))
+    }
+}
+
+fn validate_retention_max_rows(max_rows: Option<u64>) -> Result<(), PostgresError> {
+    if max_rows.is_some_and(|rows| rows == 0 || rows > MAX_RETENTION_POLICY_ROWS) {
+        return Err(PostgresError::InvalidInput(format!(
+            "retention max_rows must be 1-{MAX_RETENTION_POLICY_ROWS}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_retention_policy(policy: &RetentionPolicyRecord) -> Result<(), PostgresError> {
+    validate_retention_scope(&policy.scope)?;
+    if policy
+        .max_age_days
+        .is_some_and(|days| days == 0 || days > MAX_RETENTION_POLICY_AGE_DAYS)
+    {
+        return Err(PostgresError::InvalidInput(format!(
+            "retention max_age_days must be 1-{MAX_RETENTION_POLICY_AGE_DAYS}"
+        )));
+    }
+    validate_retention_max_rows(policy.max_rows)?;
+    parse_postgres_timestamp(&policy.updated_at, "retention updated_at")?;
+    Ok(())
+}
+
+fn validate_retention_apply_input(input: &RetentionApplyInput) -> Result<(), PostgresError> {
+    validate_native_id("retention operation_id", &input.operation_id, 96)?;
+    let uuid = input
+        .operation_id
+        .strip_prefix("retention-")
+        .ok_or_else(|| {
+            PostgresError::InvalidInput(
+                "retention operation_id must use retention-<uuid> format".into(),
+            )
+        })?;
+    Uuid::parse_str(uuid).map_err(|_| {
+        PostgresError::InvalidInput("retention operation_id must contain a UUID".into())
+    })?;
+    validate_retention_scope(&input.scope)?;
+    if let Some(cutoff) = &input.cutoff {
+        parse_postgres_timestamp(cutoff, "retention cutoff")?;
+    }
+    if input
+        .max_age_days
+        .is_some_and(|days| days == 0 || days > MAX_RETENTION_POLICY_AGE_DAYS)
+    {
+        return Err(PostgresError::InvalidInput(format!(
+            "retention max_age_days must be 1-{MAX_RETENTION_POLICY_AGE_DAYS}"
+        )));
+    }
+    validate_retention_max_rows(input.max_rows)?;
+    if input
+        .limit
+        .is_some_and(|limit| limit == 0 || limit > MAX_RETENTION_APPLY_LIMIT)
+    {
+        return Err(PostgresError::InvalidInput(format!(
+            "retention limit must be 1-{MAX_RETENTION_APPLY_LIMIT}"
+        )));
+    }
+    if input.batch_size == 0 || input.batch_size > MAX_RETENTION_BATCH_SIZE {
+        return Err(PostgresError::InvalidInput(format!(
+            "retention batch_size must be 1-{MAX_RETENTION_BATCH_SIZE}"
+        )));
+    }
+    Ok(())
+}
+
+fn retention_policy_from_row(row: &postgres::Row) -> Result<RetentionPolicyRecord, PostgresError> {
+    let policy = RetentionPolicyRecord {
+        scope: row.try_get(0)?,
+        max_age_days: row
+            .try_get::<_, Option<i64>>(1)?
+            .map(|value| checked_u64(value, "retention max_age_days"))
+            .transpose()?,
+        max_rows: row
+            .try_get::<_, Option<i64>>(2)?
+            .map(|value| checked_u64(value, "retention max_rows"))
+            .transpose()?,
+        updated_at: format_postgres_timestamp(row.try_get(3)?, "retention updated_at")?,
+    };
+    validate_retention_policy(&policy)
+        .map_err(|error| PostgresError::InvalidState(error.to_string()))?;
+    Ok(policy)
+}
+
+fn get_retention_policy_tx(
+    tx: &mut Transaction<'_>,
+    scope: &str,
+) -> Result<Option<RetentionPolicyRecord>, PostgresError> {
+    tx.query_opt(
+        "SELECT scope, max_age_days, max_rows, updated_at
+         FROM ocfleet_native.retention_policies WHERE scope = $1 FOR UPDATE",
+        &[&scope],
+    )?
+    .as_ref()
+    .map(retention_policy_from_row)
+    .transpose()
+}
+
+fn retention_policy_json(policy: &RetentionPolicyRecord) -> Value {
+    json!({
+        "scope": policy.scope,
+        "max_age_days": policy.max_age_days,
+        "max_rows": policy.max_rows,
+        "updated_at": policy.updated_at,
+    })
+}
+
+fn retention_candidate_report_tx<C: GenericClient>(
+    conn: &mut C,
+    scope: &str,
+    cutoff: Option<OffsetDateTime>,
+    max_rows: Option<i64>,
+) -> Result<RetentionCandidateReport, PostgresError> {
+    validate_retention_scope(scope)?;
+    let sql = match scope {
+        "observations" => {
+            "WITH eligible AS (
+               SELECT o.observation_id AS id, o.observed_at AS ts
+               FROM ocfleet_native.probe_observations o
+               WHERE o.run_id IS NULL OR (
+                 EXISTS (
+                   SELECT 1 FROM ocfleet_native.observability_runs r
+                   WHERE r.run_id = o.run_id
+                     AND r.status IN ('succeeded', 'failed', 'skipped')
+                 )
+                 AND NOT EXISTS (
+                   SELECT 1 FROM ocfleet_native.scheduler_job_claims c
+                   WHERE c.active_run_id = o.run_id
+                 )
+               )
+             ), ranked AS (
+               SELECT id, ts, row_number() OVER (ORDER BY ts DESC, id DESC) AS rn
+               FROM eligible
+             ), candidates AS (
+               SELECT ts FROM ranked
+               WHERE ($1::timestamptz IS NOT NULL AND ts < $1)
+                  OR ($2::bigint IS NOT NULL AND rn > $2)
+             )
+             SELECT COUNT(*), MIN(ts), MAX(ts) FROM candidates"
+        }
+        "observability-runs" => {
+            "WITH eligible AS (
+               SELECT r.run_id AS id, r.started_at AS ts
+               FROM ocfleet_native.observability_runs r
+               WHERE r.status IN ('succeeded', 'failed', 'skipped')
+                 AND NOT EXISTS (
+                   SELECT 1 FROM ocfleet_native.scheduler_job_claims c
+                   WHERE c.active_run_id = r.run_id
+                 )
+             ), ranked AS (
+               SELECT id, ts, row_number() OVER (ORDER BY ts DESC, id DESC) AS rn
+               FROM eligible
+             ), candidates AS (
+               SELECT ts FROM ranked
+               WHERE ($1::timestamptz IS NOT NULL AND ts < $1)
+                  OR ($2::bigint IS NOT NULL AND rn > $2)
+             )
+             SELECT COUNT(*), MIN(ts), MAX(ts) FROM candidates"
+        }
+        _ => unreachable!("validated retention scope"),
+    };
+    let row = conn.query_one(sql, &[&cutoff, &max_rows])?;
+    Ok(RetentionCandidateReport {
+        matched_count: checked_u64(row.try_get(0)?, "retention candidate count")?,
+        oldest_timestamp: row
+            .try_get::<_, Option<OffsetDateTime>>(1)?
+            .map(|value| format_postgres_timestamp(value, "oldest retention candidate"))
+            .transpose()?,
+        newest_timestamp: row
+            .try_get::<_, Option<OffsetDateTime>>(2)?
+            .map(|value| format_postgres_timestamp(value, "newest retention candidate"))
+            .transpose()?,
+    })
+}
+
+fn lock_retention_target_tx(tx: &mut Transaction<'_>, scope: &str) -> Result<(), PostgresError> {
+    match scope {
+        "observations" => tx.batch_execute(
+            "LOCK TABLE ocfleet_native.probe_observations IN SHARE ROW EXCLUSIVE MODE",
+        )?,
+        "observability-runs" => tx.batch_execute(
+            "LOCK TABLE ocfleet_native.observability_runs,
+                        ocfleet_native.probe_observations,
+                        ocfleet_native.scheduler_job_claims
+             IN SHARE ROW EXCLUSIVE MODE",
+        )?,
+        _ => {
+            return Err(PostgresError::InvalidInput(
+                "invalid retention scope".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn prune_retention_batch_tx(
+    tx: &mut Transaction<'_>,
+    scope: &str,
+    cutoff: Option<OffsetDateTime>,
+    max_rows: Option<i64>,
+    limit: i64,
+) -> Result<u64, PostgresError> {
+    let sql = match scope {
+        "observations" => {
+            "WITH eligible AS (
+               SELECT o.observation_id AS id, o.observed_at AS ts
+               FROM ocfleet_native.probe_observations o
+               WHERE o.run_id IS NULL OR (
+                 EXISTS (
+                   SELECT 1 FROM ocfleet_native.observability_runs r
+                   WHERE r.run_id = o.run_id
+                     AND r.status IN ('succeeded', 'failed', 'skipped')
+                 )
+                 AND NOT EXISTS (
+                   SELECT 1 FROM ocfleet_native.scheduler_job_claims c
+                   WHERE c.active_run_id = o.run_id
+                 )
+               )
+             ), ranked AS (
+               SELECT id, ts, row_number() OVER (ORDER BY ts DESC, id DESC) AS rn
+               FROM eligible
+             ), doomed AS (
+               SELECT id FROM ranked
+               WHERE ($1::timestamptz IS NOT NULL AND ts < $1)
+                  OR ($2::bigint IS NOT NULL AND rn > $2)
+               ORDER BY ts, id LIMIT $3
+             )
+             DELETE FROM ocfleet_native.probe_observations target
+             USING doomed WHERE target.observation_id = doomed.id
+             RETURNING target.observation_id"
+        }
+        "observability-runs" => {
+            "WITH eligible AS (
+               SELECT r.run_id AS id, r.started_at AS ts
+               FROM ocfleet_native.observability_runs r
+               WHERE r.status IN ('succeeded', 'failed', 'skipped')
+                 AND NOT EXISTS (
+                   SELECT 1 FROM ocfleet_native.scheduler_job_claims c
+                   WHERE c.active_run_id = r.run_id
+                 )
+             ), ranked AS (
+               SELECT id, ts, row_number() OVER (ORDER BY ts DESC, id DESC) AS rn
+               FROM eligible
+             ), doomed AS (
+               SELECT id FROM ranked
+               WHERE ($1::timestamptz IS NOT NULL AND ts < $1)
+                  OR ($2::bigint IS NOT NULL AND rn > $2)
+               ORDER BY ts, id LIMIT $3
+             )
+             DELETE FROM ocfleet_native.observability_runs target
+             USING doomed WHERE target.run_id = doomed.id
+             RETURNING target.run_id"
+        }
+        _ => {
+            return Err(PostgresError::InvalidInput(
+                "invalid retention scope".into(),
+            ));
+        }
+    };
+    let rows = tx.query(sql, &[&cutoff, &max_rows, &limit])?;
+    u64::try_from(rows.len())
+        .map_err(|_| PostgresError::InvalidState("retention batch count overflow".into()))
+}
+
+fn retention_input_json(input: &RetentionApplyInput) -> Value {
+    json!({
+        "scope": input.scope,
+        "cutoff": input.cutoff,
+        "max_age_days": input.max_age_days,
+        "max_rows": input.max_rows,
+        "limit": input.limit,
+        "batch_size": input.batch_size,
+    })
+}
+
+fn retention_result_json(result: &RetentionApplyResult) -> Value {
+    json!({
+        "cutoff": result.cutoff,
+        "matched_count": result.candidate_report.matched_count,
+        "oldest_timestamp": result.candidate_report.oldest_timestamp,
+        "newest_timestamp": result.candidate_report.newest_timestamp,
+        "planned_delete_count": result.planned_delete_count,
+        "rows_deleted": result.rows_deleted,
+        "batch_count": result.batch_count,
+    })
+}
+
+fn retention_operation_conflict(operation_id: &str) -> PostgresError {
+    PostgresError::Store(StoreError::RetentionOperationConflict {
+        operation_id: operation_id.to_string(),
+        detail: "operation provenance does not match the original request",
+    })
+}
+
+fn retention_result_from_json(
+    encoded: &str,
+    operation_id: &str,
+) -> Result<RetentionApplyResult, PostgresError> {
+    let value: Value =
+        serde_json::from_str(encoded).map_err(|_| retention_operation_conflict(operation_id))?;
+    let read_u64 = |key: &str| {
+        value
+            .get(key)
+            .and_then(Value::as_u64)
+            .ok_or_else(|| retention_operation_conflict(operation_id))
+    };
+    let read_optional = |key: &str| -> Result<Option<String>, PostgresError> {
+        match value.get(key) {
+            Some(Value::Null) => Ok(None),
+            Some(Value::String(value)) => Ok(Some(value.clone())),
+            _ => Err(retention_operation_conflict(operation_id)),
+        }
+    };
+    Ok(RetentionApplyResult {
+        cutoff: read_optional("cutoff")?,
+        candidate_report: RetentionCandidateReport {
+            matched_count: read_u64("matched_count")?,
+            oldest_timestamp: read_optional("oldest_timestamp")?,
+            newest_timestamp: read_optional("newest_timestamp")?,
+        },
+        planned_delete_count: read_u64("planned_delete_count")?,
+        rows_deleted: read_u64("rows_deleted")?,
+        batch_count: read_u64("batch_count")?,
+    })
 }
 
 fn parse_postgres_timestamp(value: &str, field: &str) -> Result<OffsetDateTime, PostgresError> {

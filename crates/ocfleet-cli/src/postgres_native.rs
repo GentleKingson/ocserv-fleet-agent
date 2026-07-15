@@ -859,7 +859,9 @@ ALTER TABLE ocfleet_native.retention_policies
                 .map_err(PostgresError::InvalidInput)?;
             return conn
                 .query(
-                    "SELECT n.node_id, n.endpoint_id, n.name, n.region, n.role, n.enabled
+                    "SELECT n.node_id, n.endpoint_id, n.name, n.region, n.role, n.enabled,
+                            m.node_id, m.environment, m.site, m.owner_team, m.service_tier,
+                            m.labels_json::text, m.expected_agent_version, m.updated_at
                      FROM ocfleet_native.nodes n
                      JOIN ocfleet_native.node_metadata m ON m.node_id = n.node_id
                      WHERE jsonb_typeof(m.labels_json -> $1) = 'string'
@@ -868,32 +870,40 @@ ALTER TABLE ocfleet_native.retention_policies
                     &[&key, &expected, &limit],
                 )?
                 .iter()
-                .map(node_from_row)
+                .map(node_with_metadata_from_row)
                 .collect();
         }
         validate_metadata_value(expected, "selector metadata value")
             .map_err(PostgresError::InvalidInput)?;
         let sql = match field {
             "environment" => {
-                "SELECT n.node_id, n.endpoint_id, n.name, n.region, n.role, n.enabled
+                "SELECT n.node_id, n.endpoint_id, n.name, n.region, n.role, n.enabled,
+                        m.node_id, m.environment, m.site, m.owner_team, m.service_tier,
+                        m.labels_json::text, m.expected_agent_version, m.updated_at
                  FROM ocfleet_native.nodes n
                  JOIN ocfleet_native.node_metadata m ON m.node_id = n.node_id
                  WHERE m.environment = $1 ORDER BY n.node_id LIMIT $2"
             }
             "site" => {
-                "SELECT n.node_id, n.endpoint_id, n.name, n.region, n.role, n.enabled
+                "SELECT n.node_id, n.endpoint_id, n.name, n.region, n.role, n.enabled,
+                        m.node_id, m.environment, m.site, m.owner_team, m.service_tier,
+                        m.labels_json::text, m.expected_agent_version, m.updated_at
                  FROM ocfleet_native.nodes n
                  JOIN ocfleet_native.node_metadata m ON m.node_id = n.node_id
                  WHERE m.site = $1 ORDER BY n.node_id LIMIT $2"
             }
             "owner_team" => {
-                "SELECT n.node_id, n.endpoint_id, n.name, n.region, n.role, n.enabled
+                "SELECT n.node_id, n.endpoint_id, n.name, n.region, n.role, n.enabled,
+                        m.node_id, m.environment, m.site, m.owner_team, m.service_tier,
+                        m.labels_json::text, m.expected_agent_version, m.updated_at
                  FROM ocfleet_native.nodes n
                  JOIN ocfleet_native.node_metadata m ON m.node_id = n.node_id
                  WHERE m.owner_team = $1 ORDER BY n.node_id LIMIT $2"
             }
             "service_tier" => {
-                "SELECT n.node_id, n.endpoint_id, n.name, n.region, n.role, n.enabled
+                "SELECT n.node_id, n.endpoint_id, n.name, n.region, n.role, n.enabled,
+                        m.node_id, m.environment, m.site, m.owner_team, m.service_tier,
+                        m.labels_json::text, m.expected_agent_version, m.updated_at
                  FROM ocfleet_native.nodes n
                  JOIN ocfleet_native.node_metadata m ON m.node_id = n.node_id
                  WHERE m.service_tier = $1 ORDER BY n.node_id LIMIT $2"
@@ -906,7 +916,7 @@ ALTER TABLE ocfleet_native.retention_policies
         };
         conn.query(sql, &[&expected, &limit])?
             .iter()
-            .map(node_from_row)
+            .map(node_with_metadata_from_row)
             .collect()
     }
 
@@ -7297,23 +7307,44 @@ fn get_node_metadata_tx(
 }
 
 fn node_metadata_from_row(row: &postgres::Row) -> Result<NodeMetadataRecord, PostgresError> {
-    let labels: String = row.try_get(5)?;
+    node_metadata_from_row_at(row, 0)
+}
+
+fn node_metadata_from_row_at(
+    row: &postgres::Row,
+    offset: usize,
+) -> Result<NodeMetadataRecord, PostgresError> {
+    let labels: String = row.try_get(offset + 5)?;
     let labels_json = serde_json::from_str(&labels)
         .map_err(|_| PostgresError::InvalidState("native node metadata JSON is invalid".into()))?;
     let metadata = NodeMetadataRecord {
-        node_id: row.try_get(0)?,
-        environment: row.try_get(1)?,
-        site: row.try_get(2)?,
-        owner_team: row.try_get(3)?,
-        service_tier: row.try_get(4)?,
+        node_id: row.try_get(offset)?,
+        environment: row.try_get(offset + 1)?,
+        site: row.try_get(offset + 2)?,
+        owner_team: row.try_get(offset + 3)?,
+        service_tier: row.try_get(offset + 4)?,
         labels_json,
-        expected_agent_version: row.try_get(6)?,
-        updated_at: format_postgres_timestamp(row.try_get(7)?, "node metadata updated_at")?,
+        expected_agent_version: row.try_get(offset + 6)?,
+        updated_at: format_postgres_timestamp(
+            row.try_get(offset + 7)?,
+            "node metadata updated_at",
+        )?,
     };
     validate_node_metadata_record(&metadata).map_err(|error| {
         PostgresError::InvalidState(format!("native node metadata is invalid: {error}"))
     })?;
     Ok(metadata)
+}
+
+fn node_with_metadata_from_row(row: &postgres::Row) -> Result<NodeRecord, PostgresError> {
+    let node = node_from_row(row)?;
+    let metadata = node_metadata_from_row_at(row, 6)?;
+    if metadata.node_id != node.node_id {
+        return Err(PostgresError::InvalidState(
+            "native node metadata references a different node".into(),
+        ));
+    }
+    Ok(node)
 }
 
 fn audit_record_from_postgres_row(row: &postgres::Row) -> Result<AuditRecord, PostgresError> {

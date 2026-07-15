@@ -42,6 +42,81 @@ fn postgres_source(dsn: &str) -> (tempfile::TempDir, PostgresConnectionSource) {
     (dir, PostgresConnectionSource::PrivateConfigFile { path })
 }
 
+fn assert_endpoint_binding_invariants(admin: &mut postgres::Client, node_id: &str) {
+    let active_count: i64 = admin
+        .query_one(
+            "SELECT COUNT(*) FROM ocfleet_native.endpoint_trust
+             WHERE node_id = $1 AND status = 'active'",
+            &[&node_id],
+        )
+        .expect("count active endpoints")
+        .get(0);
+    assert!(active_count <= 1, "node has multiple active endpoints");
+
+    let node = admin
+        .query_opt(
+            "SELECT endpoint_id, enabled FROM ocfleet_native.nodes WHERE node_id = $1",
+            &[&node_id],
+        )
+        .expect("read raced node state");
+    if let Some(node) = node {
+        let endpoint_id: String = node.get(0);
+        let enabled: bool = node.get(1);
+        let endpoint = admin
+            .query_one(
+                "SELECT node_id, status FROM ocfleet_native.endpoint_trust
+                 WHERE endpoint_id = $1",
+                &[&endpoint_id],
+            )
+            .expect("current endpoint trust exists");
+        assert_eq!(
+            endpoint.get::<_, Option<String>>(0).as_deref(),
+            Some(node_id)
+        );
+        let status: String = endpoint.get(1);
+        if status == "active" {
+            assert_eq!(active_count, 1);
+        } else {
+            assert!(!enabled, "node remained enabled with a non-active endpoint");
+            assert_eq!(active_count, 0);
+        }
+    } else {
+        assert_eq!(active_count, 0, "removed node retained an active endpoint");
+    }
+
+    let broken_lineage: i64 = admin
+        .query_one(
+            "SELECT COUNT(*)
+             FROM ocfleet_native.endpoint_trust old
+             LEFT JOIN ocfleet_native.endpoint_trust child
+               ON child.endpoint_id = old.rotated_to
+             WHERE old.node_id = $1
+               AND old.status = 'rotated'
+               AND (
+                 old.rotated_to IS NULL
+                 OR child.endpoint_id IS NULL
+                 OR child.previous_endpoint_id IS DISTINCT FROM old.endpoint_id
+                 OR child.node_id IS DISTINCT FROM old.node_id
+                 OR child.generation IS DISTINCT FROM old.generation
+               )",
+            &[&node_id],
+        )
+        .expect("check endpoint lineage")
+        .get(0);
+    assert_eq!(broken_lineage, 0, "endpoint rotation lineage is broken");
+}
+
+fn native_audit_count(admin: &mut postgres::Client, node_id: &str, event: &str) -> i64 {
+    admin
+        .query_one(
+            "SELECT COUNT(*) FROM ocfleet_native.controller_audit_log
+             WHERE node_id = $1 AND event = $2",
+            &[&node_id, &event],
+        )
+        .expect("count native audit events")
+        .get(0)
+}
+
 #[test]
 fn native_postgres_core_is_relational_atomic_and_future_schema_safe() {
     let container = GenericImage::new("postgres", "17-alpine")
@@ -201,26 +276,63 @@ fn native_postgres_core_is_relational_atomic_and_future_schema_safe() {
     admin
         .execute(
             "UPDATE ocfleet_native.node_metadata
-             SET labels_json = '{\"nested\":{\"not\":\"scalar\"}}'::jsonb
+             SET labels_json =
+                 '{\"purpose\":\"native-parity\",\"nested\":{\"invalid\":true}}'::jsonb
              WHERE node_id = $1",
             &[&node.node_id],
         )
         .expect("contaminate native metadata labels");
     assert!(store.get_node_metadata(&node.node_id).is_err());
+    assert!(
+        store
+            .list_nodes_by_metadata_limited("label.purpose", "native-parity", 10)
+            .is_err(),
+        "selector accepted a matching label from an invalid metadata row"
+    );
     admin
         .execute(
             "UPDATE ocfleet_native.node_metadata
-             SET labels_json = CAST($2 AS text)::jsonb, environment = 'bad value'
+             SET labels_json = '{\"purpose\":\"native-parity\"}'::jsonb,
+                 environment = 'bad value'
              WHERE node_id = $1",
-            &[&node.node_id, &scalar_metadata.labels_json.to_string()],
+            &[&node.node_id],
         )
         .expect("contaminate native metadata field");
     assert!(store.get_node_metadata(&node.node_id).is_err());
+    assert!(
+        store
+            .list_nodes_by_metadata_limited("label.purpose", "native-parity", 10)
+            .is_err(),
+        "selector accepted a row with an invalid environment"
+    );
     admin
         .execute(
             "UPDATE ocfleet_native.node_metadata
-             SET environment = $2 WHERE node_id = $1",
-            &[&node.node_id, &scalar_metadata.environment],
+             SET environment = $2, expected_agent_version = $3 WHERE node_id = $1",
+            &[
+                &node.node_id,
+                &scalar_metadata.environment,
+                &"invalid\nversion",
+            ],
+        )
+        .expect("contaminate native metadata agent version");
+    assert!(
+        store
+            .list_nodes_by_metadata_limited("label.purpose", "native-parity", 10)
+            .is_err(),
+        "selector accepted a row with an invalid expected agent version"
+    );
+    admin
+        .execute(
+            "UPDATE ocfleet_native.node_metadata
+             SET labels_json = CAST($2 AS text)::jsonb,
+                 expected_agent_version = $3
+             WHERE node_id = $1",
+            &[
+                &node.node_id,
+                &scalar_metadata.labels_json.to_string(),
+                &scalar_metadata.expected_agent_version,
+            ],
         )
         .expect("restore native metadata");
     assert_eq!(
@@ -456,6 +568,15 @@ fn native_postgres_core_is_relational_atomic_and_future_schema_safe() {
     assert!(remove_result.is_ok() || rotate_result.is_ok());
     assert!(!format!("{remove_result:?}").contains("deadlock detected"));
     assert!(!format!("{rotate_result:?}").contains("deadlock detected"));
+    assert_endpoint_binding_invariants(&mut admin, &remove_rotate_node.node_id);
+    assert_eq!(
+        native_audit_count(&mut admin, &remove_rotate_node.node_id, "node.remove"),
+        i64::from(remove_result.is_ok())
+    );
+    assert_eq!(
+        native_audit_count(&mut admin, &remove_rotate_node.node_id, "endpoint.rotate"),
+        i64::from(rotate_result.is_ok())
+    );
 
     let rotate_quarantine_node = NodeInsert {
         node_id: "node-native-rotate-quarantine".into(),
@@ -498,6 +619,23 @@ fn native_postgres_core_is_relational_atomic_and_future_schema_safe() {
     assert!(rotate_result.is_ok() || quarantine_result.is_ok());
     assert!(!format!("{rotate_result:?}").contains("deadlock detected"));
     assert!(!format!("{quarantine_result:?}").contains("deadlock detected"));
+    assert_endpoint_binding_invariants(&mut admin, &rotate_quarantine_node.node_id);
+    assert_eq!(
+        native_audit_count(
+            &mut admin,
+            &rotate_quarantine_node.node_id,
+            "endpoint.rotate"
+        ),
+        i64::from(rotate_result.is_ok())
+    );
+    assert_eq!(
+        native_audit_count(
+            &mut admin,
+            &rotate_quarantine_node.node_id,
+            "endpoint.quarantine"
+        ),
+        i64::from(quarantine_result.is_ok())
+    );
 
     admin
         .batch_execute(
